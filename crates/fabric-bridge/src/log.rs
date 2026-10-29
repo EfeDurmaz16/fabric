@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_core::managed::{OperationId, OperationKey};
 use fabric_journal::{
-    CommitError, Journal, ProviderAnswer, ProviderDispatch, ProviderError, ProviderStatus,
+    CleanupRefusal, CommitError, EffectClass, Journal, LocatorRecord, ProviderAnswer,
+    ProviderDispatch, ProviderError, ProviderStatus, Purpose,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -33,7 +34,8 @@ pub enum LogError {
     /// The key or the id is already in the log: never send it again.
     #[error("already in the journal: {0}")]
     Used(String),
-    /// The attempt is not the job's current live grant, or the job is closed.
+    /// The attempt is not the job's current live grant, or the job is
+    /// closed; a create of the job is unknown; or a cleanup was refused.
     #[error("fenced: {0}")]
     Fenced(String),
     /// The log has no such operation, or it cannot move to that status.
@@ -44,19 +46,28 @@ pub enum LogError {
     Storage(String),
 }
 
-/// A provider operation's scope, action, target, status and last locator.
+/// A provider operation as a read or a cleanup needs it: its identity,
+/// what it was dispatched as, its status and the last locator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The job, task, attempt and generation it was dispatched for.
     pub scope: Scope,
+    /// Its key.
+    pub key: OperationKey,
+    /// The profile it was dispatched under.
+    pub profile: String,
     /// The bridge action it was dispatched as.
     pub action: String,
-    /// The locator it was sent to, as JSON text; `None` for a create.
-    pub target: Option<String>,
+    /// The action's effect in that profile.
+    pub effect: EffectClass,
+    /// Why it was dispatched.
+    pub purpose: Purpose,
+    /// The locator it was sent to; `None` for a create.
+    pub target: Option<LocatorRecord>,
     /// Where it is.
     pub status: ProviderStatus,
-    /// The last locator the worker reported, as JSON text.
-    pub locator: Option<String>,
+    /// The last locator the worker reported.
+    pub locator: Option<LocatorRecord>,
 }
 
 /// What the bridge client writes to.
@@ -75,14 +86,32 @@ pub trait OperationLog {
         operation: OperationId,
         status: ProviderStatus,
         answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
+    ) -> Result<(), LogError>;
+
+    /// Records an `absent` answer to an attach of an `unknown` operation
+    /// and the scope it searched; the status stays `unknown`.
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
     ) -> Result<(), LogError>;
 
     /// Records a locator reported before the answer; the status stays.
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError>;
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError>;
 
-    /// The operation's status and locator, or `None`.
+    /// The operation as the log holds it, or `None`.
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError>;
+
+    /// The scope and the locator a cleanup of the create `creating` acts
+    /// on, or why no cleanup of it may be dispatched now (the journal's
+    /// rules, read before anything is written; `provider_begin` checks
+    /// them again in its transaction).
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError>;
 }
 
 /// How the bridge client reaches an [`OperationLog`] from async code
@@ -260,8 +289,11 @@ impl From<CommitError> for LogError {
             CommitError::Provider(
                 ProviderError::KeyUsed { .. } | ProviderError::OperationUsed { .. },
             ) => LogError::Used(e.to_string()),
+            CommitError::Domain(_)
+            | CommitError::Provider(
+                ProviderError::CreateUnresolved { .. } | ProviderError::Cleanup { .. },
+            ) => LogError::Fenced(e.to_string()),
             CommitError::Provider(_) => LogError::Transition(e.to_string()),
-            CommitError::Domain(_) => LogError::Fenced(e.to_string()),
             other => LogError::Storage(other.to_string()),
         }
     }
@@ -284,24 +316,99 @@ impl OperationLog for Journal {
         operation: OperationId,
         status: ProviderStatus,
         answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
     ) -> Result<(), LogError> {
         Ok(self.provider_record(operation, status, answer, locator, now_ms())?)
     }
 
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        Ok(self.provider_searched(operation, answer, searched, now_ms())?)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         Ok(self.provider_locate(operation, locator, now_ms())?)
     }
 
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         Ok(self.provider_operation(operation)?.map(|op| Entry {
             scope: scope_of(&op.dispatch),
+            key: op.dispatch.key,
+            profile: op.dispatch.profile,
             action: op.dispatch.action,
+            effect: op.dispatch.effect,
+            purpose: op.dispatch.purpose,
             target: op.dispatch.target,
             status: op.status,
             locator: op.locator,
         }))
     }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        let Some(create) = self.provider_operation(creating)? else {
+            return Ok(Err(CleanupRefusal::NotACreate));
+        };
+        let destroys = match &create.locator {
+            Some(locator) => self.provider_destroys(locator.key)?,
+            None => Vec::new(),
+        };
+        Ok(cleanup_rule(&entry_of(create), &destroys))
+    }
+}
+
+fn entry_of(op: fabric_journal::ProviderOperation) -> Entry {
+    Entry {
+        scope: scope_of(&op.dispatch),
+        key: op.dispatch.key,
+        profile: op.dispatch.profile,
+        action: op.dispatch.action,
+        effect: op.dispatch.effect,
+        purpose: op.dispatch.purpose,
+        target: op.dispatch.target,
+        status: op.status,
+        locator: op.locator,
+    }
+}
+
+/// The cleanup rules of docs/managed-jobs.md (step 3) over a create's
+/// entry and the destroys of its resource, by operation and status.
+fn cleanup_rule(
+    create: &Entry,
+    destroys: &[(OperationId, ProviderStatus)],
+) -> Result<(Scope, LocatorRecord), CleanupRefusal> {
+    if create.effect != EffectClass::Create {
+        return Err(CleanupRefusal::NotACreate);
+    }
+    let Some(locator) = &create.locator else {
+        return Err(CleanupRefusal::Unlocated);
+    };
+    if create.status == ProviderStatus::Dispatched {
+        return Err(CleanupRefusal::StillDispatched);
+    }
+    if destroys
+        .iter()
+        .any(|(_, s)| *s == ProviderStatus::Succeeded)
+    {
+        return Err(CleanupRefusal::AlreadyDestroyed);
+    }
+    if let Some((operation, _)) = destroys.iter().find(|(_, s)| {
+        matches!(
+            s,
+            ProviderStatus::Dispatched | ProviderStatus::Unknown | ProviderStatus::Observed
+        )
+    }) {
+        return Err(CleanupRefusal::InFlight {
+            operation: *operation,
+        });
+    }
+    Ok((create.scope, locator.clone()))
 }
 
 /// An in-memory log with the journal's rules but no fencing and no
@@ -346,7 +453,11 @@ impl OperationLog for MemoryLog {
             dispatch.operation,
             Entry {
                 scope: scope_of(dispatch),
+                key: dispatch.key.clone(),
+                profile: dispatch.profile.clone(),
                 action: dispatch.action.clone(),
+                effect: dispatch.effect,
+                purpose: dispatch.purpose,
                 target: dispatch.target.clone(),
                 status: if refusal.is_some() {
                     ProviderStatus::Rejected
@@ -364,14 +475,19 @@ impl OperationLog for MemoryLog {
         operation: OperationId,
         status: ProviderStatus,
         _answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
     ) -> Result<(), LogError> {
         let entry = self
             .entries
             .get_mut(&operation)
             .ok_or_else(|| LogError::Transition(format!("no provider operation {operation}")))?;
+        let unnamed = matches!(status, ProviderStatus::Attached | ProviderStatus::Observed)
+            && entry.locator.is_none()
+            && entry.target.is_none()
+            && locator.is_none();
         if entry.status.is_terminal()
             || (entry.status != status && !entry.status.may_become(status))
+            || unnamed
         {
             return Err(LogError::Transition(format!(
                 "{operation} cannot go from {} to {}",
@@ -381,23 +497,62 @@ impl OperationLog for MemoryLog {
         }
         entry.status = status;
         if let Some(locator) = locator {
-            entry.locator = Some(locator.to_owned());
+            entry.locator = Some(locator.clone());
         }
         Ok(())
     }
 
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        _answer: &ProviderAnswer,
+        _searched: &str,
+    ) -> Result<(), LogError> {
+        match self.entries.get(&operation) {
+            Some(entry) if entry.status == ProviderStatus::Unknown => Ok(()),
+            Some(entry) => Err(LogError::Transition(format!(
+                "{operation} is {}, not unknown",
+                entry.status.name()
+            ))),
+            None => Err(LogError::Transition(format!(
+                "no provider operation {operation}"
+            ))),
+        }
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         let entry = self
             .entries
             .get_mut(&operation)
             .ok_or_else(|| LogError::Transition(format!("no provider operation {operation}")))?;
         if !entry.status.is_terminal() {
-            entry.locator = Some(locator.to_owned());
+            entry.locator = Some(locator.clone());
         }
         Ok(())
     }
 
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         Ok(self.entries.get(&operation).cloned())
+    }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        let Some(create) = self.entries.get(&creating) else {
+            return Ok(Err(CleanupRefusal::NotACreate));
+        };
+        let key = create.locator.as_ref().map(|l| l.key);
+        let destroys: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.effect == EffectClass::Destroy
+                    && key.is_some()
+                    && e.target.as_ref().map(|t| t.key) == key
+            })
+            .map(|(id, e)| (*id, e.status))
+            .collect();
+        Ok(cleanup_rule(create, &destroys))
     }
 }

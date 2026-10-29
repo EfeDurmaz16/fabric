@@ -36,12 +36,14 @@ use fabric_core::managed::{
     AcceptedOperation, Attempt, AttemptId, AttemptStatus, DomainError, Envelope, EventFrame,
     EventSeq, ManagedState, NewIds, Observation, Operation, OperationId, OperationKey,
     OperationMark, OperationStatus, RequestDigest, StoredResult, Transition, WorkRevision,
-    accept_command, apply_observation, mark_operation, replay, request_digest,
+    apply_observation, mark_operation, replay, request_digest,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 pub use provider::{
-    ProviderAnswer, ProviderDispatch, ProviderError, ProviderOperation, ProviderStatus,
+    AbandonApproval, AbandonRefusal, Acknowledged, Blocker, CleanupRefusal, EffectClass,
+    LocatorRecord, MAX_ABANDON_REASON, ProviderAnswer, ProviderDispatch, ProviderError,
+    ProviderOperation, ProviderStatus, Purpose, Residual, ResourceKey,
 };
 pub use schema::{APPLICATION_ID, SCHEMA_VERSION};
 
@@ -61,6 +63,16 @@ pub enum OpenError {
     /// The file is not a Fabric journal.
     #[error("{0} is not a Fabric managed journal")]
     NotAJournal(PathBuf),
+    /// The journal was written by an unreleased draft of its schema
+    /// version (version 2 before ADR 0022 completed it); nothing released
+    /// wrote one, so it is refused rather than read with missing columns.
+    #[error(
+        "the journal has a draft of schema version {version} that no release wrote; recreate it"
+    )]
+    DraftSchema {
+        /// Its version.
+        version: u32,
+    },
     /// The file was written by a newer binary; nothing was written to it.
     #[error("the journal has schema version {found}, this binary knows up to {known}")]
     NewerSchema {
@@ -330,6 +342,11 @@ impl Journal {
             tx.pragma_update(None, "user_version", from + 1)?;
             tx.commit()?;
         }
+        // Version 2 was amended in place before any release (ADR 0022): a
+        // journal an unreleased build made has the draft table.
+        if conn.prepare(schema::V2_COMPLETE).is_err() {
+            return Err(OpenError::DraftSchema { version: 2 });
+        }
         Ok(Journal {
             conn,
             path: path.to_owned(),
@@ -409,7 +426,8 @@ impl Journal {
             None => None,
         };
         let kind = envelope.body.kind();
-        let (result, bytes) = match accept_command(state.as_ref(), envelope, &ids) {
+        let accepted = provider::accept(&tx, state.as_ref(), envelope, &ids)?;
+        let (result, bytes) = match accepted {
             Err(DomainError::Broken { reason }) => {
                 return Err(CommitError::Corrupt {
                     job: envelope.job,

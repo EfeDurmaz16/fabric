@@ -19,6 +19,7 @@ use std::str::FromStr;
 use fabric_client::frame::MAX_SAFE_INTEGER;
 use fabric_core::id::JobId;
 use fabric_core::managed::{AttemptId, Generation, OperationId, OperationKey, TaskId};
+use fabric_journal::{LocatorRecord, ResourceKey};
 use serde_json::{Map, Value};
 
 /// The bridge protocol major this build speaks.
@@ -1227,6 +1228,26 @@ pub struct Observe {
     pub wait_ms: u64,
 }
 
+/// A read that finds the resource an earlier create of this operation
+/// made, by the operation's identity, when Fabric holds no locator for it
+/// (docs/bridge-protocol.md, Reconciliation). It names no resource, needs
+/// no approval and makes no mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attach {
+    /// The transport correlation.
+    pub request_id: String,
+    /// The original create's operation id.
+    pub operation_id: OperationId,
+    /// The original create's key.
+    pub key: OperationKey,
+    /// The original operation's managed identities, under the request's rules.
+    pub scope: Scope,
+    /// The original action.
+    pub action: String,
+    /// The longest wait.
+    pub wait_ms: u64,
+}
+
 /// A request to stop waiting on an earlier request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cancel {
@@ -1260,6 +1281,8 @@ pub enum ToWorker {
     Request(Box<Request>),
     /// A read.
     Observe(Observe),
+    /// A read by identity of a lost create's resource.
+    Attach(Attach),
     /// A cancel.
     Cancel(Cancel),
     /// A drain and exit.
@@ -1293,6 +1316,15 @@ impl ToWorker {
                 ("resource", o.resource.to_value()),
                 ("wait_ms", o.wait_ms.into()),
             ]),
+            ToWorker::Attach(a) => object(vec![
+                ("type", "attach".into()),
+                ("request_id", a.request_id.clone().into()),
+                ("operation_id", a.operation_id.to_string().into()),
+                ("key", a.key.as_str().into()),
+                ("scope", a.scope.to_value()),
+                ("action", a.action.clone().into()),
+                ("wait_ms", a.wait_ms.into()),
+            ]),
             ToWorker::Cancel(c) => object(vec![
                 ("type", "cancel".into()),
                 ("request_id", c.request_id.clone().into()),
@@ -1325,6 +1357,7 @@ impl ToWorker {
                 Request::parse(&mut o).map_err(|e| e.code("invalid"))?,
             )),
             "observe" => parse_observe(&mut o).map_err(|e| e.code("invalid"))?,
+            "attach" => parse_attach(&mut o).map_err(|e| e.code("invalid"))?,
             "cancel" => {
                 let c = Cancel {
                     request_id: token(
@@ -1409,6 +1442,7 @@ impl ToWorker {
             }
             (Phase::Session, ToWorker::Request(r)) => fits_request(r, profile)?,
             (Phase::Session, ToWorker::Observe(o)) => fits_observe(o, profile)?,
+            (Phase::Session, ToWorker::Attach(a)) => attachable(&a.action, a.wait_ms, profile)?,
             (Phase::Session, ToWorker::Cancel(_) | ToWorker::Shutdown { .. }) => {}
         }
         Ok(message)
@@ -1457,6 +1491,43 @@ fn parse_observe(o: &mut Obj<'_>) -> Walk<ToWorker> {
         return Err(bad("limit", "wait_ms is 0"));
     }
     Ok(ToWorker::Observe(observe))
+}
+
+fn parse_attach(o: &mut Obj<'_>) -> Walk<ToWorker> {
+    let attach = Attach {
+        request_id: token(o.req("request_id")?, "request_id")?,
+        operation_id: id(o.req("operation_id")?, "operation_id")?,
+        key: o
+            .req("key")?
+            .as_str()
+            .and_then(|s| OperationKey::parse(s).ok())
+            .ok_or_else(|| bad("bad_id", "key"))?,
+        scope: Scope::parse(o.req("scope")?)?,
+        action: owned(o.req("action")?, "action", 128)?,
+        wait_ms: int(o.req("wait_ms")?, "wait_ms")?,
+    };
+    if attach.wait_ms == 0 {
+        return Err(bad("limit", "wait_ms is 0"));
+    }
+    Ok(ToWorker::Attach(attach))
+}
+
+/// Whether `profile` attaches `action` within `wait_ms`: an action it
+/// offers (`unsupported`/`action`), whose effect is `create` and whose
+/// `dedupe` lets a worker find its resource by the operation that made
+/// it, `provider_key` or `label_query` (`unsupported`/`attach`), and a
+/// wait within the profile's observe limit (`invalid`/`limit`).
+pub fn attachable(action: &str, wait_ms: u64, profile: &Profile) -> Result<(), Refusal> {
+    let Some(spec) = profile.action(action) else {
+        return Err(bad("action", action.to_owned()).code("unsupported"));
+    };
+    if spec.effect != Effect::Create || spec.dedupe == Dedupe::None {
+        return Err(bad("attach", action.to_owned()).code("unsupported"));
+    }
+    if wait_ms == 0 || wait_ms > profile.limits.max_observe_wait_ms {
+        return Err(bad("limit", "wait_ms is 0 or above the profile's").code("invalid"));
+    }
+    Ok(())
 }
 
 /// Whether `request` fits `profile`: an action it offers, a target of
@@ -1629,7 +1700,7 @@ impl ErrorCode {
                 "duplicate_request_id",
                 "idempotency_conflict",
             ],
-            ErrorCode::Unsupported => &["action", "observe", "cancel"],
+            ErrorCode::Unsupported => &["action", "observe", "attach", "cancel"],
             ErrorCode::Denied => &[
                 "policy_denied",
                 "approval_required",
@@ -1642,7 +1713,7 @@ impl ErrorCode {
             ErrorCode::Unavailable => &["busy", "shutting_down"],
             ErrorCode::ProviderFailed => &["provider_refused", "not_found", "quota"],
             ErrorCode::Pending => &["observation_deadline", "shutting_down"],
-            ErrorCode::Unknown => &["reply_lost", "observation_failed"],
+            ErrorCode::Unknown => &["reply_lost", "observation_failed", "absent"],
         }
     }
 }
@@ -1711,6 +1782,64 @@ pub struct ErrorBody {
     pub deadline_ms: Option<u64>,
     /// What cleanup did after an applied failure, as the worker wrote it.
     pub cleanup: Option<Value>,
+    /// The scope an attach searched; exactly with `unknown`/`absent`.
+    pub searched: Option<Searched>,
+}
+
+/// Where an attach looked and found nothing: the profile's provider, the
+/// worker's bound scope and the action's resource kind. Absence is
+/// evidence about this scope at this time only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Searched {
+    /// The provider, as the profile names it.
+    pub provider: String,
+    /// The worker's bound scope, exactly the profile's `scope_keys`.
+    pub scope: BTreeMap<String, String>,
+    /// The resource kind.
+    pub kind: String,
+}
+
+impl Searched {
+    fn parse(value: &Value, profile: &Profile) -> Walk<Searched> {
+        let mut o = Obj::new(value, "error.searched")?;
+        let provider = owned(o.req("provider")?, "searched.provider", MAX_LOCATOR_CHARS)?;
+        let scope = string_map(o.req("scope")?, "searched.scope")?;
+        let kind = owned(o.req("kind")?, "searched.kind", MAX_LOCATOR_CHARS)?;
+        o.finish()?;
+        let keys: Vec<&String> = scope.keys().collect();
+        let mut want: Vec<&String> = profile.scope_keys.iter().collect();
+        want.sort();
+        if provider != profile.provider || keys != want || !profile.resource_kinds.contains(&kind) {
+            return Err(bad(
+                "bad_locator",
+                format!(
+                    "searched does not fit profile {}: provider, scope keys or kind",
+                    profile.profile
+                ),
+            ));
+        }
+        Ok(Searched {
+            provider,
+            scope,
+            kind,
+        })
+    }
+
+    /// The JSON value of the scope.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        object(vec![
+            ("provider", Value::String(self.provider.clone())),
+            ("scope", map_value(&self.scope)),
+            ("kind", Value::String(self.kind.clone())),
+        ])
+    }
+
+    /// Its canonical JSON (keys sorted), as the journal stores it.
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        canonical(&self.to_value())
+    }
 }
 
 /// An `error`: the request did not complete, with the effect it had.
@@ -1951,6 +2080,9 @@ impl ToFabric {
                 }
                 if let Some(c) = &b.cleanup {
                     body.push(("cleanup", c.clone()));
+                }
+                if let Some(searched) = &b.searched {
+                    body.push(("searched", searched.to_value()));
                 }
                 object(vec![
                     ("type", "error".into()),
@@ -2236,6 +2368,10 @@ fn parse_error(o: &mut Obj<'_>, profile: &Profile) -> Walk<ToFabric> {
         .map(|v| int(v, "error.deadline_ms"))
         .transpose()?;
     let cleanup = b.opt("cleanup")?.cloned();
+    let searched = b
+        .opt("searched")?
+        .map(|v| Searched::parse(v, profile))
+        .transpose()?;
     b.finish()?;
     let allowed = match code {
         ErrorCode::ProviderFailed => {
@@ -2265,6 +2401,17 @@ fn parse_error(o: &mut Obj<'_>, profile: &Profile) -> Walk<ToFabric> {
             "cleanup belongs to an applied provider failure",
         ));
     }
+    let absent = code == ErrorCode::Unknown && reason == "absent";
+    match (absent, searched.is_some(), resource.is_some()) {
+        (true, false, _) => return Err(bad("missing_field", "error.searched")),
+        (true, true, true) => {
+            return Err(bad("unknown_field", "an absent answer names no resource"));
+        }
+        (false, true, _) => {
+            return Err(bad("unknown_field", "searched belongs to an absent answer"));
+        }
+        _ => {}
+    }
     Ok(ToFabric::Error(ErrorMessage {
         request_id,
         operation_id,
@@ -2278,6 +2425,7 @@ fn parse_error(o: &mut Obj<'_>, profile: &Profile) -> Walk<ToFabric> {
             observations,
             deadline_ms,
             cleanup,
+            searched,
         },
     }))
 }
@@ -2292,6 +2440,74 @@ pub fn request_digest(request: &Request) -> Digest {
     hasher.update(b"fabric.bridge.request.v1\0");
     hasher.update(canonical(&request.digest_content()).as_bytes());
     Digest(*hasher.finalize().as_bytes())
+}
+
+/// The key of a locator's identity (docs/managed-jobs.md, `ResourceKey`):
+/// blake3 under the `fabric.bridge.locator.v1` domain over the canonical
+/// JSON (keys sorted) of its provider, scope, kind and native id. The
+/// native operation id is left out, so two reports of one resource have
+/// one key whatever long-running operation each named.
+#[must_use]
+pub fn resource_key(locator: &Locator) -> ResourceKey {
+    let mut identity = Vec::with_capacity(256);
+    write_locator(locator, false, &mut identity);
+    key_of(&identity)
+}
+
+/// A locator as the journal stores it: its canonical JSON (keys sorted),
+/// so two reports of one resource store equal text, and its key. Written
+/// straight from the locator, with one buffer when it names no native
+/// operation id, as on the hot path of every exec and destroy.
+#[must_use]
+pub fn locator_record(locator: &Locator) -> LocatorRecord {
+    let mut text = Vec::with_capacity(256);
+    write_locator(locator, true, &mut text);
+    let key = if locator.native_operation_id.is_some() {
+        resource_key(locator)
+    } else {
+        key_of(&text)
+    };
+    LocatorRecord {
+        // Only JSON text was written: field names and serde_json strings.
+        text: String::from_utf8(text).unwrap_or_default(),
+        key,
+    }
+}
+
+fn key_of(identity: &[u8]) -> ResourceKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fabric.bridge.locator.v1\0");
+    hasher.update(identity);
+    ResourceKey::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// The canonical JSON of `locator`, keys in byte order at every depth as
+/// [`canonical`] writes them, with or without its native operation id.
+fn write_locator(locator: &Locator, operation: bool, out: &mut Vec<u8>) {
+    fn string(out: &mut Vec<u8>, s: &str) {
+        // Writing a string to a Vec cannot fail.
+        let _ = serde_json::to_writer(&mut *out, s);
+    }
+    out.extend_from_slice(b"{\"kind\":");
+    string(out, &locator.kind);
+    out.extend_from_slice(b",\"native_id\":");
+    string(out, &locator.native_id);
+    if operation && let Some(op) = &locator.native_operation_id {
+        out.extend_from_slice(b",\"native_operation_id\":");
+        string(out, op);
+    }
+    out.extend_from_slice(b",\"provider\":");
+    string(out, &locator.provider);
+    out.extend_from_slice(b",\"scope\":{");
+    for (i, (k, v)) in locator.scope.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        string(out, k);
+        out.push(b':');
+        string(out, v);
+    }
+    out.extend_from_slice(b"}}");
 }
 
 /// JSON text with object keys sorted at every depth, whatever order the map keeps.
@@ -2311,5 +2527,69 @@ fn canonical(value: &Value) -> String {
             format!("[{}]", items.join(","))
         }
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sandbox(native_operation_id: Option<&str>) -> Locator {
+        Locator {
+            provider: "fixture".into(),
+            scope: [("project", "proj-1"), ("account", "acct-a")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+            kind: "sandbox".into(),
+            native_id: "fx-provider-1".into(),
+            native_operation_id: native_operation_id.map(str::to_owned),
+        }
+    }
+
+    /// The stored text is the canonical JSON of the whole locator; the key
+    /// is blake3 under its domain of the canonical identity, which leaves
+    /// the native operation id out. Pinned bytes, since journals store them.
+    #[test]
+    fn a_locator_record_is_its_canonical_text_and_the_key_of_its_identity() {
+        let plain = sandbox(None);
+        let record = locator_record(&plain);
+        assert_eq!(record.text, canonical(&plain.to_value()));
+        let mut identity = plain.to_value();
+        if let Value::Object(map) = &mut identity {
+            map.remove("native_operation_id");
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fabric.bridge.locator.v1\0");
+        hasher.update(canonical(&identity).as_bytes());
+        assert_eq!(record.key.to_bytes(), *hasher.finalize().as_bytes());
+
+        let long = sandbox(Some("op-7"));
+        let long_record = locator_record(&long);
+        assert_eq!(long_record.text, canonical(&long.to_value()));
+        assert_ne!(long_record.text, record.text);
+        assert_eq!(long_record.key, record.key, "one resource, one key");
+        assert_eq!(resource_key(&long), record.key);
+
+        let mut other = sandbox(None);
+        other.native_id = "fx-provider-2".into();
+        assert_ne!(resource_key(&other), record.key);
+        // A value with JSON escapes writes as serde_json writes it.
+        other.native_id = "fx-\"quoted\"-\u{e9}".into();
+        assert_eq!(locator_record(&other).text, canonical(&other.to_value()));
+
+        let hex = record
+            .key
+            .to_bytes()
+            .iter()
+            .fold(String::new(), |mut hex, b| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{b:02x}");
+                hex
+            });
+        assert_eq!(
+            hex, "45f7bfd0c8e020ecfcfbc887ecb42e3b9578465abdc2d88ef22856cac82d984e",
+            "fabric-journal tests/fixtures.rs pins this key for its v2 fixture"
+        );
     }
 }

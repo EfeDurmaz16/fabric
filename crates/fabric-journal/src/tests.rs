@@ -492,6 +492,34 @@ fn files_that_are_not_journals_or_are_newer_are_refused_unwritten() {
     assert_eq!(std::fs::read(&newer).unwrap(), bytes);
 }
 
+/// A journal an unreleased build made with the draft version 2 table,
+/// before ADR 0022 completed it, is refused at open with what to do,
+/// rather than failing later on a missing column.
+#[test]
+fn a_draft_version_2_journal_is_refused_at_open() {
+    let f = Fixture::new();
+    let path = f.path();
+    drop(f.journal);
+    let conn = Connection::open(&path).unwrap();
+    // The draft table as an unreleased build wrote it.
+    conn.execute_batch(
+        "DROP TABLE provider_operations;
+         CREATE TABLE provider_operations (
+           operation_id BLOB PRIMARY KEY, op_key TEXT NOT NULL UNIQUE,
+           request_digest BLOB NOT NULL, job_id BLOB NOT NULL, task_id BLOB NOT NULL,
+           attempt_id BLOB NOT NULL, generation INTEGER NOT NULL, action TEXT NOT NULL,
+           target TEXT, status TEXT NOT NULL, code TEXT, reason TEXT, effect TEXT,
+           locator TEXT, dispatched_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL
+         ) STRICT;",
+    )
+    .unwrap();
+    drop(conn);
+    assert!(matches!(
+        Journal::open(&path),
+        Err(OpenError::DraftSchema { version: 2 })
+    ));
+}
+
 #[test]
 fn a_backup_opens_and_holds_the_same_jobs() {
     let mut f = Fixture::new();

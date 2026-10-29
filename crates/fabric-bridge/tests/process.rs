@@ -15,13 +15,13 @@ mod common;
 use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
-use common::{create, journal, operation, scope};
+use common::{Logged, create, journal, operation, scope};
 use fabric_bridge::wire::{
     Action, CancelState, CreateParams, ErrorCode, ExecParams, Locator, ResultState, Versions,
 };
 use fabric_bridge::{Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError};
 use fabric_core::managed::OperationId;
-use fabric_journal::{Journal, ProviderStatus};
+use fabric_journal::{AbandonApproval, Acknowledged, Journal, ProviderStatus};
 use rustix::process::Pid;
 use tokio::process::Command;
 
@@ -46,6 +46,23 @@ fn status(journal: &Journal, n: u8) -> Option<ProviderStatus> {
         .provider_operation(OperationId::from_bytes([n; 16]))
         .unwrap()
         .map(|op| op.status)
+}
+
+/// The owner gives up on operation `n`, which is `unknown`, through the
+/// log thread, acknowledging what it names.
+async fn abandon(journal: &Logged, n: u8, acknowledged: Acknowledged) {
+    let approval = AbandonApproval {
+        operation: OperationId::from_bytes([n; 16]),
+        expected: ProviderStatus::Unknown,
+        acknowledged,
+        reason: "the test gives up on it".into(),
+    };
+    journal
+        .log()
+        .call(move |j| j.provider_abandon(&approval, 0))
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 fn fx(key: &str) -> Locator {
@@ -79,8 +96,12 @@ async fn a_create_is_recorded_dispatched_then_succeeded_with_its_locator() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        op.locator.as_deref(),
-        Some(fx("key-1").to_value().to_string().as_str())
+        op.locator.as_ref().map(|l| l.text.as_str()),
+        Some(
+            fabric_bridge::wire::locator_record(&fx("key-1"))
+                .text
+                .as_str()
+        )
     );
     let exit = bridge.close().await.unwrap();
     assert_eq!(exit.code(), Some(0), "closing stdin is a clean shutdown");
@@ -166,8 +187,12 @@ async fn a_locator_reported_before_a_crash_is_kept_with_unknown() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        op.locator.as_deref(),
-        Some(fx("key-5").to_value().to_string().as_str())
+        op.locator.as_ref().map(|l| l.text.as_str()),
+        Some(
+            fabric_bridge::wire::locator_record(&fx("key-5"))
+                .text
+                .as_str()
+        )
     );
 }
 
@@ -195,6 +220,28 @@ async fn a_timeout_leaves_unknown_and_the_operation_is_never_sent_again() {
         "{again:?}"
     );
     assert_eq!(status(&journal, 6), Some(ProviderStatus::Unknown));
+    // A second create of the job waits while this one is unknown: never a
+    // second sandbox beside one nobody can name. Nothing is written.
+    let waits = bridge.request(&mut journal, create(7, "fixture/ok")).await;
+    assert!(
+        matches!(waits, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{waits:?}"
+    );
+    assert_eq!(status(&journal, 7), None);
+    // An attach finds nothing it made: it stays unknown, with the scope
+    // searched, and the owner gives up on it.
+    let lost = OperationId::from_bytes([6; 16]);
+    let absent = bridge
+        .attach(&mut journal, lost, 1000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(absent.status, ProviderStatus::Unknown);
+    let row = journal.provider_operation(lost).unwrap().unwrap();
+    assert_eq!(row.answer.reason.as_deref(), Some("absent"));
+    abandon(&journal, 6, Acknowledged::Searched(row.searched.unwrap())).await;
     // The worker is still there for other operations.
     let ok = bridge
         .request(&mut journal, create(7, "fixture/ok"))
@@ -621,7 +668,7 @@ async fn a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_res
         deadline_ms: 5000,
     };
     let flight = bridge.request(&mut journal, destroy).await.unwrap();
-    let target = Some(fx("key-a").to_value().to_string());
+    let target = Some(fabric_bridge::wire::locator_record(&fx("key-a")));
     let row = journal
         .provider_operation(OperationId::from_bytes([60; 16]))
         .unwrap()
@@ -650,7 +697,7 @@ async fn a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_res
     assert_eq!(row.dispatch.target, target);
 }
 
-fn locator(journal: &Journal, n: u8) -> Option<String> {
+fn locator(journal: &Journal, n: u8) -> Option<fabric_journal::LocatorRecord> {
     journal
         .provider_operation(OperationId::from_bytes([n; 16]))
         .unwrap()
@@ -735,6 +782,8 @@ async fn observe_reads_only_the_operations_own_action_and_resource() {
         "{refused:?}"
     );
     assert_eq!(status(&journal, 72), Some(ProviderStatus::Unknown));
+    // It names nothing; the owner gives up on it, so the job creates again.
+    abandon(&journal, 72, Acknowledged::Nothing).await;
 
     // A create that reported its sandbox and was lost: another job's
     // sandbox is not it.
@@ -746,7 +795,7 @@ async fn observe_reads_only_the_operations_own_action_and_resource() {
         .await
         .unwrap();
     assert_eq!(lost.status, ProviderStatus::Unknown);
-    let own = Some(fx("key-71").to_value().to_string());
+    let own = Some(fabric_bridge::wire::locator_record(&fx("key-71")));
     assert_eq!(locator(&journal, 71), own);
     let bridge = spawn().await;
     let create_op = OperationId::from_bytes([71; 16]);
@@ -780,7 +829,10 @@ async fn observe_reads_only_the_operations_own_action_and_resource() {
             .unwrap();
         assert_eq!(outcome.status, ProviderStatus::Succeeded, "{action}");
         let row = journal.provider_operation(op).unwrap().unwrap();
-        assert_eq!(row.locator, Some(resource.to_value().to_string()));
+        assert_eq!(
+            row.locator,
+            Some(fabric_bridge::wire::locator_record(&resource))
+        );
     }
     assert_eq!(
         bridge.late_answers(),
@@ -832,7 +884,7 @@ async fn progress_is_bounded_to_sixteen_frames_in_order() {
     assert_eq!(outcome.status, ProviderStatus::Unknown);
     assert_eq!(
         locator(&journal, 81),
-        Some(fx("key-81").to_value().to_string())
+        Some(fabric_bridge::wire::locator_record(&fx("key-81")))
     );
     assert!(bridge.lost().unwrap().contains("after progress 1"));
     let exit = bridge.close().await.unwrap();
@@ -918,7 +970,10 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
     bridge.record_late(&mut journal).await.unwrap();
     let own = fx("key-100");
     assert_eq!(status(&journal, 100), Some(ProviderStatus::Unknown));
-    assert_eq!(locator(&journal, 100), Some(own.to_value().to_string()));
+    assert_eq!(
+        locator(&journal, 100),
+        Some(fabric_bridge::wire::locator_record(&own))
+    );
     let observed = bridge
         .observe(
             &mut journal,
@@ -952,7 +1007,7 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
     assert_eq!(status(&journal, 101), Some(ProviderStatus::Dispatched));
     assert_eq!(
         locator(&journal, 101),
-        Some(fx("key-101").to_value().to_string())
+        Some(fabric_bridge::wire::locator_record(&fx("key-101")))
     );
     assert_eq!(
         next.finish(&mut journal).await.unwrap().status,

@@ -104,8 +104,8 @@ fn id(n: u8) -> OperationId {
 }
 
 /// What the journal stores for `locator`: its JSON text.
-fn stored(locator: &Locator) -> String {
-    locator.to_value().to_string()
+fn stored(locator: &Locator) -> fabric_journal::LocatorRecord {
+    fabric_bridge::wire::locator_record(locator)
 }
 
 fn result(outcome: &Outcome) -> &ResultMessage {
@@ -390,8 +390,9 @@ async fn replay(name: &str, dir: &Path) -> Tally {
 /// matches the fixture exactly (bar `message` strings) and parses with
 /// Fabric's own parser. Steps that read the in-process provider
 /// (`provider_calls`, `sandbox`, `advance`) or Fabric's journal are the
-/// other runs' to check; `exec_observed_until_exit` and
-/// `pending_destroy_with_locator` stop at their `advance`.
+/// other runs' to check; `attach_then_observe_until_ready`,
+/// `exec_observed_until_exit` and `pending_destroy_with_locator` stop at
+/// their `advance`.
 #[tokio::test]
 #[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
 async fn every_shared_scenario_over_the_workers_stdio() {
@@ -408,7 +409,7 @@ async fn every_shared_scenario_over_the_workers_stdio() {
         })
         .collect();
     names.sort();
-    assert_eq!(names.len(), 18, "the v1 scenario set");
+    assert_eq!(names.len(), 24, "the v1 scenario set");
     let mut stopped = Vec::new();
     for name in &names {
         let tally = replay(name, dir.path()).await;
@@ -423,7 +424,11 @@ async fn every_shared_scenario_over_the_workers_stdio() {
     }
     assert_eq!(
         stopped,
-        ["exec_observed_until_exit", "pending_destroy_with_locator"]
+        [
+            "attach_then_observe_until_ready",
+            "exec_observed_until_exit",
+            "pending_destroy_with_locator"
+        ]
     );
 }
 
@@ -495,7 +500,8 @@ fn fixture_config(extra_sandboxes: &[(&str, OperationId)]) -> Value {
 fn assert_scope_retained(journal: &Journal, ids: &[OperationId]) {
     for &op in ids {
         let entry = entry(journal, op);
-        let locator: Value = serde_json::from_str(entry.locator.as_deref().unwrap()).unwrap();
+        let locator: Value =
+            serde_json::from_str(entry.locator.as_ref().map(|l| l.text.as_str()).unwrap()).unwrap();
         assert_eq!(locator["provider"], "fixture", "{op:?}");
         assert_eq!(locator["kind"], "sandbox", "{op:?}");
         assert_eq!(
@@ -1200,7 +1206,8 @@ async fn observe_reads_only_the_operations_own_resource() {
         "{refused:?}"
     );
     // The restarted fixture provider holds fx-b again, so it is not gone:
-    // still unknown, never settled from another resource.
+    // seen under way after the loss, observed, never settled from another
+    // resource.
     let observed = bridge
         .observe(&mut journal, id(62), "sandbox.destroy", fx("fx-b"), 1_000)
         .await
@@ -1208,7 +1215,7 @@ async fn observe_reads_only_the_operations_own_resource() {
         .finish(&mut journal)
         .await
         .unwrap();
-    assert_eq!(observed.status, ProviderStatus::Unknown);
+    assert_eq!(observed.status, ProviderStatus::Observed);
     assert_eq!(refusal(&observed).0, ErrorCode::Pending);
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }

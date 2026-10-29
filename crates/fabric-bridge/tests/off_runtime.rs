@@ -16,12 +16,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{create, journal_for, operation, scope};
+use fabric_bridge::wire::Scope;
 use fabric_bridge::wire::{Action, ExecParams, Locator};
 use fabric_bridge::{
     Answer, Bridge, BridgeError, Config, Effect, Entry, LogError, LogThread, OperationLog,
 };
 use fabric_core::managed::OperationId;
-use fabric_journal::{Journal, ProviderAnswer, ProviderDispatch, ProviderStatus};
+use fabric_journal::{
+    CleanupRefusal, Journal, LocatorRecord, ProviderAnswer, ProviderDispatch, ProviderStatus,
+};
 use tokio::process::Command;
 
 /// What a [`Watched`] log saw: each call's kind and the thread it ran on.
@@ -55,13 +58,23 @@ impl OperationLog for Watched {
         operation: OperationId,
         status: ProviderStatus,
         answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
     ) -> Result<(), LogError> {
         self.note("record");
         self.journal.record(operation, status, answer, locator)
     }
 
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.note("searched");
+        self.journal.searched(operation, answer, searched)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         self.note("locate");
         self.journal.locate(operation, locator)
     }
@@ -69,6 +82,14 @@ impl OperationLog for Watched {
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         self.note("entry");
         self.journal.entry(operation)
+    }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        self.note("cleanup_target");
+        self.journal.cleanup_target(creating)
     }
 }
 
@@ -310,17 +331,33 @@ impl OperationLog for Slow {
         operation: OperationId,
         status: ProviderStatus,
         answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
     ) -> Result<(), LogError> {
         self.journal.record(operation, status, answer, locator)
     }
 
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.journal.searched(operation, answer, searched)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         self.journal.locate(operation, locator)
     }
 
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         self.journal.entry(operation)
+    }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        self.journal.cleanup_target(creating)
     }
 }
 
@@ -366,7 +403,10 @@ async fn a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_an
         .await
         .unwrap();
     assert_eq!(row.status, ProviderStatus::Dispatched);
-    assert_eq!(row.locator, Some(fx("key-1").to_value().to_string()));
+    assert_eq!(
+        row.locator,
+        Some(fabric_bridge::wire::locator_record(&fx("key-1")))
+    );
     // Nothing of the dropped request holds the worker's in-flight room.
     let next = bridge
         .request(&mut log, create(2, "fixture/ok"))

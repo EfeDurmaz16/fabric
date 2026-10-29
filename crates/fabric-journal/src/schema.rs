@@ -123,13 +123,19 @@ CREATE TRIGGER evidence_append_only_delete BEFORE DELETE ON evidence
 ";
 
 /// Version 2: provider operations, the effects an attempt asks a provider
-/// worker for over the bridge (ADR 0021). A provider operation shares the
-/// key and id space of `operations` (checked on insert) and names the
-/// attempt whose generation fenced it. `status` holds the bridge's journal
-/// statuses, `rejected` included, which an accepted command can never be;
-/// `target` is the locator Fabric sent the action to, written once at
-/// dispatch, and `locator` the last one the worker reported; both are JSON
-/// text, which the journal never parses.
+/// worker for over the bridge (ADR 0021), completed for reconciliation and
+/// cleanup by ADR 0022. Version 2 never shipped, so ADR 0022 amended this
+/// table in place rather than adding version 3.
+///
+/// A provider operation shares the key and id space of `operations`
+/// (checked on insert) and names the attempt whose generation fenced it,
+/// or, for a cleanup, the create it cleans and that create's scope.
+/// `status` holds the bridge's journal statuses, `rejected` included,
+/// which an accepted command can never be. `profile`, `effect_class`,
+/// `purpose`, `target` and `target_key` are written once at dispatch;
+/// `locator` and `locator_key` are the last locator the worker reported.
+/// Locators are Fabric's canonical JSON text, never parsed here, with a
+/// digest of their identity (`*_key`) that the journal compares.
 const V2: &str = "
 CREATE TABLE provider_operations (
   operation_id   BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
@@ -139,18 +145,40 @@ CREATE TABLE provider_operations (
   task_id        BLOB NOT NULL REFERENCES tasks(task_id),
   attempt_id     BLOB NOT NULL REFERENCES attempts(attempt_id),
   generation     INTEGER NOT NULL CHECK (generation >= 1),
+  profile        TEXT NOT NULL,
   action         TEXT NOT NULL,
+  effect_class   TEXT NOT NULL CHECK (effect_class IN ('create','mutate','destroy')),
+  purpose        TEXT NOT NULL CHECK (purpose IN ('effect','cleanup')),
+  cleans         BLOB REFERENCES provider_operations(operation_id),
   target         TEXT,
-  status         TEXT NOT NULL CHECK (status IN ('dispatched','succeeded','failed','cancelled','rejected','unknown')),
+  target_key     BLOB CHECK (target_key IS NULL OR length(target_key) = 32),
+  status         TEXT NOT NULL CHECK (status IN ('dispatched','unknown','attached','observed',
+                   'succeeded','failed','cancelled','rejected','abandoned')),
   code           TEXT,
   reason         TEXT,
   effect         TEXT CHECK (effect IS NULL OR effect IN ('none','applied','pending','unknown')),
   locator        TEXT,
+  locator_key    BLOB CHECK (locator_key IS NULL OR length(locator_key) = 32),
+  searched       TEXT,
+  abandon_reason TEXT,
   dispatched_ms  INTEGER NOT NULL,
-  updated_ms     INTEGER NOT NULL
+  updated_ms     INTEGER NOT NULL,
+  CHECK ((target IS NULL) = (target_key IS NULL)),
+  CHECK ((locator IS NULL) = (locator_key IS NULL)),
+  CHECK ((purpose = 'cleanup') = (cleans IS NOT NULL)),
+  CHECK (purpose = 'effect' OR effect_class = 'destroy'),
+  CHECK ((status = 'abandoned') = (abandon_reason IS NOT NULL)),
+  CHECK (status NOT IN ('attached','observed') OR locator IS NOT NULL OR target IS NOT NULL)
 ) STRICT;
 CREATE INDEX provider_operations_by_status ON provider_operations (status, dispatched_ms);
+CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
+  WHERE target_key IS NOT NULL;
 ";
+
+/// A query that prepares only on the version 2 table ADR 0022 completed:
+/// a draft version 2 journal, made by an unreleased build, lacks these.
+pub(crate) const V2_COMPLETE: &str = "SELECT profile, effect_class, purpose, cleans, target_key,
+  locator_key, searched, abandon_reason FROM provider_operations LIMIT 0";
 
 /// `MIGRATIONS[n - 1]` takes a journal from version `n` to `n + 1`; a new
 /// journal is `V1` and then every migration. Each new version adds one

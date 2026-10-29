@@ -28,6 +28,17 @@
 //!   destroy observe of a resource that is not there would.
 //! - A repeated key with the same digest replays the first answer; with
 //!   another digest it is an idempotency conflict.
+//! - `sandbox.create` of `double/made-crash` makes `fx-<key>`, then exits
+//!   before it answers, as a worker lost after its provider acted.
+//! - `attach` finds `fx-<key>` when a create of that key made it:
+//!   `completed` when that create was the attaching operation, else
+//!   `denied`/`owner_mismatch`; it answers `absent` with the scope it
+//!   searched when no create made it.
+//!
+//! `FABRIC_BRIDGE_DOUBLE_PROVIDER` names a directory the double's
+//! "provider" keeps what it made in, one file per sandbox holding the
+//! operation that made it, so a restarted double attaches what an earlier
+//! one made, as a provider outlives its worker.
 //!
 //! `FABRIC_BRIDGE_DOUBLE_HELLO` scripts the handshake: `ok` (the default),
 //! `raise_limit`, `wrong_profile`, `oversize`, `silent` or `exit`; with
@@ -44,9 +55,9 @@ use std::process::ExitCode;
 
 use fabric_bridge::frames;
 use fabric_bridge::wire::{
-    Action, CancelState, EffectState, ErrorBody, ErrorCode, ErrorMessage, Limits, Locator, Phase,
-    Profile, Refusal, Request, ResultMessage, ResultState, ToFabric, ToWorker, Unresolved,
-    Versions,
+    Action, Attach, CancelState, EffectState, ErrorBody, ErrorCode, ErrorMessage, Limits, Locator,
+    Phase, Profile, Refusal, Request, ResultMessage, ResultState, Searched, ToFabric, ToWorker,
+    Unresolved, Versions,
 };
 use fabric_core::managed::OperationId;
 use serde_json::{Map, Value};
@@ -64,6 +75,45 @@ struct Worker {
     silent: Vec<(String, OperationId, Locator)>,
     /// The execs this process ran, by operation: their argv.
     execs: HashMap<OperationId, Vec<String>>,
+    /// The sandboxes the provider made, by key: the operation that made each.
+    made: Provider,
+}
+
+/// What the double's provider made, in memory, and in
+/// `FABRIC_BRIDGE_DOUBLE_PROVIDER` when it names a directory.
+struct Provider {
+    made: HashMap<String, OperationId>,
+    dir: Option<std::path::PathBuf>,
+}
+
+impl Provider {
+    fn open() -> Provider {
+        let dir = std::env::var_os("FABRIC_BRIDGE_DOUBLE_PROVIDER").map(std::path::PathBuf::from);
+        let mut made = HashMap::new();
+        if let Some(entries) = dir.as_ref().and_then(|d| std::fs::read_dir(d).ok()) {
+            for entry in entries.flatten() {
+                let key = entry.file_name().to_string_lossy().into_owned();
+                let operation = std::fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok());
+                if let Some(operation) = operation {
+                    made.insert(key, operation);
+                }
+            }
+        }
+        Provider { made, dir }
+    }
+
+    /// Makes `fx-<key>` for `operation`, once: a repeated key keeps the first.
+    fn make(&mut self, key: &str, operation: OperationId) {
+        if self.made.contains_key(key) {
+            return;
+        }
+        self.made.insert(key.to_owned(), operation);
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::write(dir.join(key), operation.to_string());
+        }
+    }
 }
 
 fn profiles() -> Option<Vec<Profile>> {
@@ -113,6 +163,7 @@ fn error(request_id: &str, operation: OperationId, code: ErrorCode, reason: &str
             observations: None,
             deadline_ms: None,
             cleanup: None,
+            searched: None,
         },
     })
 }
@@ -133,6 +184,7 @@ fn pending(request: &Request, resource: &Locator) -> ToFabric {
             observations: None,
             deadline_ms: None,
             cleanup: None,
+            searched: None,
         },
     })
 }
@@ -216,7 +268,7 @@ fn script(request: &Request) -> Step {
                 ErrorCode::Denied,
                 "policy_denied",
             )),
-            "double/crash" => Step::Exit(3),
+            "double/crash" | "double/made-crash" => Step::Exit(3),
             "double/silent" => Step::Silent(locator(key)),
             "double/oversize" => Step::Oversize,
             "double/progress-crash" => Step::Progress(
@@ -363,8 +415,16 @@ impl Worker {
             };
             return (!send(&mut self.stdout, &message).await).then_some(1);
         }
-        if let Action::Exec { params, .. } = &request.action {
-            self.execs.insert(request.operation.id, params.argv.clone());
+        match &request.action {
+            Action::Exec { params, .. } => {
+                self.execs.insert(request.operation.id, params.argv.clone());
+            }
+            Action::Create(params)
+                if matches!(params.image.as_str(), "fixture/ok" | "double/made-crash") =>
+            {
+                self.made.make(&key, request.operation.id);
+            }
+            _ => {}
         }
         match script(request) {
             Step::Answer(message) => {
@@ -427,6 +487,7 @@ impl Worker {
                             observations: None,
                             deadline_ms: None,
                             cleanup: None,
+                            searched: None,
                         },
                     });
                 }
@@ -441,6 +502,50 @@ impl Worker {
             observe.resource,
             out,
         )
+    }
+
+    /// Finds `fx-<key>` by the attaching operation's identity, as a
+    /// `provider_key` profile does.
+    fn attach(&self, attach: Attach) -> ToFabric {
+        let key = attach.key.as_str();
+        match self.made.made.get(key) {
+            Some(made) if *made == attach.operation_id => result(
+                attach.request_id,
+                attach.operation_id,
+                ResultState::Completed,
+                locator(key),
+                output(&[("status", "ready".into())]),
+            ),
+            Some(_) => error(
+                &attach.request_id,
+                attach.operation_id,
+                ErrorCode::Denied,
+                "owner_mismatch",
+            ),
+            None => {
+                let here = locator(key);
+                ToFabric::Error(ErrorMessage {
+                    request_id: attach.request_id,
+                    operation_id: attach.operation_id,
+                    error: ErrorBody {
+                        code: ErrorCode::Unknown,
+                        reason: "absent".to_owned(),
+                        message: "unknown: absent".to_owned(),
+                        effect: EffectState::Unknown,
+                        resource: None,
+                        state: None,
+                        observations: Some(1),
+                        deadline_ms: Some(attach.wait_ms),
+                        cleanup: None,
+                        searched: Some(Searched {
+                            provider: here.provider,
+                            scope: here.scope,
+                            kind: here.kind,
+                        }),
+                    },
+                })
+            }
+        }
     }
 
     async fn cancel(&mut self, request_id: String, cancels: String) -> Option<u8> {
@@ -501,6 +606,10 @@ impl Worker {
                 Ok(ToWorker::Request(request)) => self.request(&request).await,
                 Ok(ToWorker::Observe(observe)) => {
                     let message = self.observe(observe);
+                    (!send(&mut self.stdout, &message).await).then_some(1)
+                }
+                Ok(ToWorker::Attach(attach)) => {
+                    let message = self.attach(attach);
                     (!send(&mut self.stdout, &message).await).then_some(1)
                 }
                 Ok(ToWorker::Cancel(cancel)) => {
@@ -633,6 +742,7 @@ async fn run() -> u8 {
         answered: HashMap::new(),
         silent: Vec::new(),
         execs: HashMap::new(),
+        made: Provider::open(),
     };
     worker.session().await
 }
