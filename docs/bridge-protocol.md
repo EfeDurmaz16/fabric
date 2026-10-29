@@ -1,6 +1,6 @@
 # Bridge protocol v1: Fabric and a Capsule provider worker
 
-Status: proposed, 2026-10-27 (ADR 0021). Amended 2026-10-29: an exec `timeout_ms` or `max_output_bytes` of 0 is invalid (decided by Efe that day), and v1 takes corrections until it first ships (Versioning); under that rule, an `observe` names the original operation's scope, both profiles observe `sandbox.exec`, and a fixture seed that names a job names the operation that made it. This document is the single source of truth for bridge protocol version 1. The golden fixtures in [`protocol/bridge/v1`](../protocol/bridge/v1) are part of it: where this text and a fixture disagree, that is a bug in one of them, and both implementations must fail their fixture tests until it is fixed. Capsule keeps a byte-identical copy of the fixtures and a short pointer to this file.
+Status: proposed, 2026-10-27 (ADR 0021). Amended 2026-10-29: an exec `timeout_ms` or `max_output_bytes` of 0 is invalid (decided by Efe that day), and v1 takes corrections until it first ships (Versioning); under that rule, an `observe` names the original operation's scope, both profiles observe `sandbox.exec`, and a fixture seed that names a job names the operation that made it. Amended again 2026-10-29 by ADR 0022 (M4): the `attach` message, the reasons `unsupported`/`attach` and `unknown`/`absent`, the error field `searched`, the fixture seed status `starting` and the scenario header `journal_state` (section "Reconciliation (M4)"), additions to v1 under the same rule. This document is the single source of truth for bridge protocol version 1. The golden fixtures in [`protocol/bridge/v1`](../protocol/bridge/v1) are part of it: where this text and a fixture disagree, that is a bug in one of them, and both implementations must fail their fixture tests until it is fixed. Capsule keeps a byte-identical copy of the fixtures and a short pointer to this file.
 
 ## What the bridge is
 
@@ -132,7 +132,7 @@ The first frame from Fabric is `hello`. The worker performs no provider call, re
 
 ## Session messages
 
-After the handshake Fabric may have up to `max_in_flight` requests and observes outstanding. A request beyond that is answered `unavailable`/`busy` with `effect: "none"`. Answers may arrive in any order; `request_id` correlates them.
+After the handshake Fabric may have up to `max_in_flight` requests, observes and attaches outstanding. A request beyond that is answered `unavailable`/`busy` with `effect: "none"`. Answers may arrive in any order; `request_id` correlates them.
 
 ### `request` (Fabric to worker)
 
@@ -237,14 +237,14 @@ The worker labels every resource it creates with the operation id, the job, the 
 | `code` | `reason` |
 | --- | --- |
 | `invalid` | `unknown_field`, `missing_field`, `bad_integer`, `bad_id`, `bad_string`, `bad_locator`, `limit`, `duplicate_request_id`, `idempotency_conflict` |
-| `unsupported` | `action`, `observe`, `cancel` |
+| `unsupported` | `action`, `observe`, `cancel`, `attach` |
 | `denied` | `policy_denied`, `approval_required`, `approval_expired`, `approval_scope`, `secret_not_allowed`, `scope_mismatch`, `owner_mismatch` |
 | `unavailable` | `busy`, `shutting_down` |
 | `provider_failed` | `provider_refused`, `not_found`, `quota` |
 | `pending` | `observation_deadline`, `shutting_down` |
-| `unknown` | `reply_lost`, `observation_failed` |
+| `unknown` | `reply_lost`, `observation_failed`, `absent` (an answer to `attach` only) |
 
-A code outside the table, or an `effect` that contradicts it (for example `denied` with `applied`), is a `protocol_violation`. `message` is a safe diagnostic of at most 1024 characters with no secret, credential or URL query; fixtures compare it for presence only. Optional fields: `resource`, `state` (last observed native state), `observations`, `deadline_ms`, and for `provider_failed` with `applied` a `cleanup` object `{ "status": "not-attempted" | "succeeded" | "failed" | "pending" | "unknown", "residual": [locator] }` (Capsule M1's `CleanupOutcome`).
+A code outside the table, or an `effect` that contradicts it (for example `denied` with `applied`), is a `protocol_violation`. `message` is a safe diagnostic of at most 1024 characters with no secret, credential or URL query; fixtures compare it for presence only. Optional fields: `resource`, `state` (last observed native state), `observations`, `deadline_ms`, for `provider_failed` with `applied` a `cleanup` object `{ "status": "not-attempted" | "succeeded" | "failed" | "pending" | "unknown", "residual": [locator] }` (Capsule M1's `CleanupOutcome`), and for `unknown`/`absent` the required `searched` object of "Reconciliation (M4)", which no other error carries.
 
 ### Idempotency
 
@@ -339,6 +339,8 @@ The fixture profile is a deterministic, stateful synthetic provider (draft P12 l
 
 Scenario step forms: `send` (Fabric to worker), `receive` (worker to Fabric), `provider_calls` (count of mutating provider calls so far), `journal` (operation status, or unchanged identity, Fabric records), `sandbox` (fixture provider state), `advance` (`settle`: scripted transitional states become terminal), `kill_worker`, `respawn`, `worker_exit` (exit status).
 
+A scenario may carry a `journal_state` header beside `provider_state` (M4): `{ "provider_operations": [ { "operation_id", "key", "digest", "scope", "action", "target", "status", "locator" } ] }`, the provider operations Fabric's journal holds before the first step, beside the scenario's job, task and attempt, as an authority restart leaves them. Fabric's runs write each row as `provider_begin` under the fixture profile and then record its status; the Capsule run ignores the header, since the worker keeps no journal.
+
 The same fixture set is copied byte for byte into Capsule at the same relative path. Each repository has a test that checks its copy against `manifest.sha256` and pins the manifest's own sha256, so a change in one repository fails the other until both carry it. To regenerate the manifest after an edit:
 
 ```sh
@@ -353,7 +355,7 @@ Then update the pinned manifest digest in `crates/fabric-client/tests/bridge_fix
 
 Bridge protocol v1 is independent of the client API version (ADR 0018). Within v1, fixtures only grow: a new action, a new profile or a new optional field arrives with new fixtures and keeps every existing fixture byte-identical. A changed or removed fixture, a new `reject` case for a value v1 accepted, a new error code, or a raised limit is v2. `hello_refused` and its fixtures never change. A profile's own `version` moves when its action table changes meaning.
 
-These rules bind from the first release of v1. Until then v1 exists only on draft pull requests, no Fabric or worker that speaks it has shipped, and an additive or corrective change goes into v1 itself, not into a v2 (decided by Efe on 2026-10-29): it arrives with its fixtures, the regenerated manifest and both repositories' pins in linked pull requests, and both implementations change with it. The first such change made 0 an invalid exec `timeout_ms` and `max_output_bytes`. The second, the same day, made `scope` a required field of `observe`, refused an observe of another job's resource for every action, turned on `observe` for `sandbox.exec` in both profiles, and gave every fixture seed that names a job its operation label (cases `observe_missing_scope` and `observe_exec_valid`; scenarios `exec_observed_until_exit`, `exec_observe_after_worker_loss` and `observe_checks_owner`; existing observe cases and scenarios gained the field). Capsule wrote these fixtures and Fabric copied them byte for byte, with the manifest pinned at `af9a31d70699b1e0fc1ffec8ede50eafbb3bd8fcb35d7b1dd99a9826098d7556` in both.
+These rules bind from the first release of v1. Until then v1 exists only on draft pull requests, no Fabric or worker that speaks it has shipped, and an additive or corrective change goes into v1 itself, not into a v2 (decided by Efe on 2026-10-29): it arrives with its fixtures, the regenerated manifest and both repositories' pins in linked pull requests, and both implementations change with it. The first such change made 0 an invalid exec `timeout_ms` and `max_output_bytes`. The second, the same day, made `scope` a required field of `observe`, refused an observe of another job's resource for every action, turned on `observe` for `sandbox.exec` in both profiles, and gave every fixture seed that names a job its operation label (cases `observe_missing_scope` and `observe_exec_valid`; scenarios `exec_observed_until_exit`, `exec_observe_after_worker_loss` and `observe_checks_owner`; existing observe cases and scenarios gained the field). Capsule wrote these fixtures and Fabric copied them byte for byte, with the manifest pinned at `af9a31d70699b1e0fc1ffec8ede50eafbb3bd8fcb35d7b1dd99a9826098d7556` in both. The third, also on 2026-10-29 with ADR 0022 (M4), added the `attach` message, the reasons `unsupported`/`attach` and `unknown`/`absent`, the `searched` field of an `absent` error, the fixture seed status `starting` and the scenario header `journal_state` (section "Reconciliation (M4)": eight cases and six scenarios, no existing fixture changed). Fabric wrote these fixtures ahead of both implementations, which fail on them until they carry M4, and Capsule copied them byte for byte, with the manifest pinned at `f96887e7224320b1e250109202e8920b283b1657b362c4822054fe9c018a7010` in both.
 
 ## Fabric's client as built (M3)
 
@@ -390,7 +392,7 @@ The client never calls the journal on the async runtime. It reaches its log thro
 
 Fabric writes frames from one task, whole and in the order they were recorded, each by its request's deadline; `request`, `observe`, `cancel` and `shutdown` record and queue, and never wait on the worker. A caller that stops waiting on one therefore leaves either nothing recorded or the operation recorded and its frame queued whole, never part of a frame, and a worker that stops reading holds nothing past the deadline: not the next request, not `close`, which closes the worker's input once the queued frames are written and stops waiting at the kill grace.
 
-`observe` is sent only for an action the profile observes within its `max_observe_wait_ms`, checked before the journal is read, and only for an operation the journal holds as `dispatched` or `unknown`, by its original id; otherwise it is refused before sending and the journal is unchanged. It carries the scope the journal recorded the operation with, never one a caller names, so the worker judges the resource's owner by the job that made the operation. An exec answered `running` stays `dispatched` with its target and is settled by observing it. It must also name the operation's own action and resource as the journal holds them: the target the operation was dispatched with, or, for an action without one such as a create, the locator its worker reported. Anything else is `ObserveMismatch` before sending, because the answer would settle the operation from another resource's state, such as a destroy recorded done while its target still runs, or one job's create settled on another job's sandbox. A create whose row names no locator cannot be observed and stays `unknown`; finding it by its labels is reconciliation (draft P11), not v1. Its `result` moves the operation to `succeeded` or `cancelled`, `unknown` moves a `dispatched` one to `unknown`, `pending` stores the locator, and a refused or failed observe changes nothing: it says nothing new about the operation it read. `cancel` of a request that is not outstanding is `not_found`, and of an action the profile does not cancel `unsupported`, both without a frame. A `cancel_ack` changes nothing in the journal. After `shutdown` new requests are refused before the journal is touched.
+`observe` is sent only for an action the profile observes within its `max_observe_wait_ms`, checked before the journal is read, and only for an operation the journal holds as `dispatched` or `unknown`, by its original id; otherwise it is refused before sending and the journal is unchanged. It carries the scope the journal recorded the operation with, never one a caller names, so the worker judges the resource's owner by the job that made the operation. An exec answered `running` stays `dispatched` with its target and is settled by observing it. It must also name the operation's own action and resource as the journal holds them: the target the operation was dispatched with, or, for an action without one such as a create, the locator its worker reported. Anything else is `ObserveMismatch` before sending, because the answer would settle the operation from another resource's state, such as a destroy recorded done while its target still runs, or one job's create settled on another job's sandbox. A create whose row names no locator cannot be observed and stays `unknown`; M4 finds it by its identity with `attach` (section "Reconciliation (M4)"). Its `result` moves the operation to `succeeded` or `cancelled`, `unknown` moves a `dispatched` one to `unknown`, `pending` stores the locator, and a refused or failed observe changes nothing: it says nothing new about the operation it read. `cancel` of a request that is not outstanding is `not_found`, and of an action the profile does not cancel `unsupported`, both without a frame. A `cancel_ack` changes nothing in the journal. After `shutdown` new requests are refused before the journal is touched.
 
 ### The fixtures from Fabric's side
 
@@ -399,6 +401,7 @@ The scenario test runs every scenario against a scripted in-process worker and a
 - `duplicate_idempotency_key` r-2 and r-3, `secrets_deny_all_and_intersection` r-3 and `fresh_approval_required` r-2 repeat an operation id the journal already holds (r-3 and r-2 of the last two with a new key). Fabric never sends an operation twice; a worker must still answer a repeat as the fixture says.
 - `scope_retained` r-2 names job `...J2` with the task and attempt ids of job `...J1`. A journal cannot hold that scope, so Fabric fences it before any effect; the worker refuses it before any effect too (`owner_mismatch`).
 - `observe_checks_owner` observes operations the journal does not hold (r-1, and r-2 and r-3 of the seed's creating operation, r-2 under another job's scope). Fabric observes only its own operations, with their own scope, so it refuses each as `NotObservable`; the worker's owner check is what the Capsule run exercises.
+- `attach_checks_owner` (M4) attaches operations the journal does not hold, under another job's scope or for another operation's resource. Fabric attaches only its own `unknown` creates, with their own scope and key, so it refuses each as `NotAttachable`; the Capsule run exercises the worker's owner check.
 
 These are observations about the fixtures, not changes: v1's fixtures stay byte for byte as they are.
 
@@ -428,6 +431,80 @@ CAPSULE_BRIDGE_WORKER=<capsule>/packages/bridge-worker/dist/bin.js \
 
 CI builds the worker from a pinned Capsule commit and runs these tests on Linux (job `bridge-interop`), where the Docker test skips: no image is on that runner and nothing pulls one. Job `bridge-docker` runs the Docker test against the runner's own engine with the same worker: it pulls one tiny public image by digest first (busybox 1.37.0), because the worker never pulls, and fails if any container with a `fabric.job` label is left. `scripts/bench-bridge.sh` measures the same worker when `CAPSULE_BRIDGE_WORKER` is set.
 
-## Forward compatibility with reconciliation (draft P11)
+## Reconciliation (M4)
 
-v1 already carries what M4 needs and promises nothing more: the journal's operation id and key on every request, the locator on every effect, `pending` and `unknown` as distinct answers, `observe` by original identity, labels on created resources and a per-profile `dedupe` statement. Automatic reconciliation, cleanup authorization after job cancellation and attach to a running execution are not v1 behaviors; a worker that does not support them says so through its profile.
+Status: proposed with ADR 0022, 2026-10-29, as additions to v1 (Versioning). The journal side, the reconciliation state machine, the replacement barrier and the cleanup flow are in docs/managed-jobs.md, section "Reconciliation and cleanup (M4)".
+
+v1 already carried most of what reconciliation needs: the journal's operation id and key on every request, the locator on every effect, `pending` and `unknown` as distinct answers, `observe` by original identity, owner and operation labels on created resources and a per-profile `dedupe` statement. One case had no way back: a create whose answer never reached Fabric, so that Fabric holds no locator to observe it by. `attach` closes it. Reconciliation only reads: Fabric never sends an operation's `request` again, whatever the profile's `dedupe`, and nothing in this section mutates a provider.
+
+### `attach` (Fabric to worker)
+
+```json
+{ "type": "attach", "request_id": "r-1", "operation_id": "01K8W3A0000000000000000P30", "key": "key-attach-1", "scope": { "job": "01K8W3A00000000000000000J1", "task": "01K8W3A00000000000000000T1", "attempt": "01K8W3A00000000000000000A1", "generation": "1" }, "action": "sandbox.create", "wait_ms": 1000 }
+```
+
+Finds the resource an earlier create of this operation made, by the operation's identity, and reports its state. It makes no mutating provider call, needs no approval and names no resource: an attach with a `resource` is `invalid`/`unknown_field`, because a caller that has a locator observes instead.
+
+| Field | Required | Rule |
+| --- | --- | --- |
+| `request_id` | yes | as for `request` |
+| `operation_id` | yes | the original create's `operation.id` |
+| `key` | yes | the original create's `operation.key`, under the `OperationKey` rule |
+| `scope` | yes | the original operation's scope, under the request's rules |
+| `action` | yes | the original action. Outside the profile it is `unsupported`/`action`; in the profile but not attachable it is `unsupported`/`attach` |
+| `wait_ms` | yes | 1 to the profile's `max_observe_wait_ms` (`invalid`/`limit`) |
+
+An action is attachable exactly when its profile entry has `effect: "create"` and `dedupe` `provider_key` or `label_query`. That `dedupe` statement is the profile's claim that the worker can find a resource by the operation that made it after a restart, so no other profile field is needed. In v1 that is `sandbox.create` in both profiles. `sandbox.exec` is never attachable: no exec handle survives the worker, and a `docker exec` instance cannot be attached again after its client ended. `sandbox.destroy` is not a create.
+
+The worker checks in the order of failure rule 1 (frame, JSON, schema, action in the profile), then that the action is attachable and the wait within the limit. Then it looks for the resource at elapsed 0, `observe_interval_ms`, twice that and so on while the elapsed time is below `wait_ms`, as an observe does. A look finds the resource under the profile's `dedupe`: for `provider_key` the resource the provider keys by `key` (the fixture: native id `fx-<key>`); for `label_query` the resource labelled `fabric.operation` = `operation_id` in the worker's bound scope (Docker: `docker ps` with that label filter). A resource the provider has destroyed is not found. Once found, the worker reads its owner labels before it reports anything: a resource whose job label is not `scope.job`, or whose operation label is not `operation_id`, is `denied`/`owner_mismatch` with `effect: "none"`, as for an observe (scenario `attach_checks_owner`). Then it reads its state as an observe of the action does, until the action's terminal state or `wait_ms`. `observations` counts the looks.
+
+| Answer | When | Fabric records (docs/managed-jobs.md) |
+| --- | --- | --- |
+| `result` `completed`, the locator, the action's output, `replayed: false`, `receipts: []` | the terminal state was observed | `succeeded`, with the locator |
+| `error` `pending`/`observation_deadline`, `effect: "pending"`, the locator, `state`, `observations`, `deadline_ms` (the `wait_ms`) | found, not terminal within `wait_ms` | `attached`, with the locator |
+| `error` `unknown`/`absent`, `effect: "unknown"`, no `resource`, `observations`, `deadline_ms` (the `wait_ms`) and `searched` | no look found a resource made by this operation | stays `unknown`; `searched` stored |
+| `error` `unknown`/`observation_failed`, with the locator when one was found | a look or a read failed | `attached` with a locator, else unchanged |
+| a refusal (`invalid`, `unsupported`, `denied`, `unavailable`, all `effect: "none"`) | as for every message | unchanged |
+
+`absent` never settles anything. A create may still land after the worker answered (a Docker create runs in a client of its own that outlives the worker), and a worker bound to another scope finds nothing; so absence is evidence about one scope at one time, and `searched` says which:
+
+```json
+{ "provider": "fixture", "scope": { "account": "acct-a", "project": "proj-1" }, "kind": "sandbox" }
+```
+
+`searched` is the profile's `provider`, the worker's bound scope (exactly the profile's `scope_keys`) and the action's resource kind. It is required with `absent` (without it, `protocol_violation`/`missing_field`) and refused on every other error (`protocol_violation`/`unknown_field`); an `absent` error with a `resource` is `protocol_violation`/`unknown_field`. Fabric treats as a `protocol_violation` a `result` that is not `completed` answering an attach, a `provider_failed` answering an attach (an attach makes no effect to fail) and an `absent` answering anything but an attach.
+
+An attach counts against `max_in_flight` like an observe, and at `shutdown` an attach still open is answered as an observe is: `pending`/`shutting_down` when its resource was found, else `unknown`/`absent` with the looks made so far.
+
+### Fabric's side
+
+Before anything is sent, `Bridge::attach` refuses with the worker's code and reason an action that is not in the profile or not attachable, or a `wait_ms` over the profile's (`RefusedLocally`, nothing written). Then it reads the journal and refuses with `NotAttachable` an operation that is not `unknown`, that has a target or a locator (it is observed instead), or that was dispatched under another profile. Otherwise it sends the attach with the operation's own `operation_id`, `key`, `scope` and `action` as the journal holds them, never ones the caller names. A worker lost or a deadline passed during an attach changes nothing: it was a read.
+
+### Cleanup on the wire
+
+A cleanup is an ordinary `request` for `sandbox.destroy`: target the create's locator, scope the create's own, `approval` the reference the caller supplied for this cleanup. The worker cannot tell it from any other destroy and needs no new rule: the grant must name `sandbox.destroy` on that resource and must not have expired, a create grant never authorizes it, and the owner labels must name the scope's job (scenario `cleanup_after_attach_needs_fresh_approval`). What makes it a cleanup is on Fabric's side: the journal accepts it after the attempt ended or the job closed, and records which create it cleans.
+
+### Fixture provider additions
+
+- A seed sandbox may have `status: "starting"`: a create the provider accepted and has not finished. It is not terminal for `sandbox.create`, it runs no exec, and `advance: settle` makes it `ready` (scenario `attach_then_observe_until_ready`).
+- Its `findCreated` is the `provider_key` look above: `fx-<key>` unless destroyed.
+
+### M4 fixtures
+
+| File | Pins |
+| --- | --- |
+| `cases/attach_valid.json` | an attach as above is accepted and writes back unchanged |
+| `cases/attach_missing_scope.json`, `cases/attach_missing_key.json` | `invalid`/`missing_field` |
+| `cases/attach_wait_above_profile.json` | `invalid`/`limit` |
+| `cases/attach_with_resource.json` | `invalid`/`unknown_field` |
+| `cases/error_unknown_absent_valid.json` | an `absent` answer with `searched` is accepted |
+| `cases/error_absent_without_searched.json` | `protocol_violation`/`missing_field` |
+| `cases/error_absent_with_resource.json` | `protocol_violation`/`unknown_field` |
+| `scenarios/attach_after_lost_create.json` | the journal holds a create `unknown` with no locator; the provider holds the sandbox it made; attach answers `completed` and Fabric records `succeeded`; no provider call |
+| `scenarios/attach_absent_stays_unknown.json` | nothing carries the operation's identity, though the job has another sandbox; attach answers `absent` with `searched`; the operation stays `unknown` |
+| `scenarios/attach_then_observe_until_ready.json` | attach finds a `starting` sandbox: `pending`, recorded `attached`; after `settle` an observe by the locator answers `completed`, recorded `succeeded` |
+| `scenarios/attach_checks_owner.json` | another job's scope, another operation's resource by the same key, and another job's resource are each `owner_mismatch`; the owner's own attach is `completed` |
+| `scenarios/attach_unsupported.json` | attach of `sandbox.exec` and `sandbox.destroy` is `unsupported`/`attach`, of an action outside the profile `unsupported`/`action`; no provider call |
+| `scenarios/cleanup_after_attach_needs_fresh_approval.json` | after an attach, a destroy under a create grant is `approval_scope`, under an expired destroy grant `approval_expired`, each `rejected` with no call; under a fresh destroy grant it is `completed` and the sandbox is destroyed |
+
+What stays out of v1: retrying a lost create under a provider's own dedupe, attaching to a running execution, and any cleanup Fabric starts by itself. A worker that cannot attach says so through its profile's `dedupe`.
