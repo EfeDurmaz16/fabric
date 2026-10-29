@@ -103,7 +103,7 @@ fn every_profile_parses_and_writes_back_the_same_document() {
 #[test]
 fn every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged() {
     let cases = dir("cases");
-    assert_eq!(cases.len(), 48, "the v1 case set");
+    assert_eq!(cases.len(), 50, "the v1 case set");
     for (name, case) in cases {
         let direction = case["direction"].as_str().unwrap();
         let at = phase(case["phase"].as_str().unwrap());
@@ -220,7 +220,7 @@ async fn every_frame_is_read_or_refused_as_it_says() {
 #[test]
 fn every_scenario_message_decodes_and_writes_back_unchanged() {
     let scenarios = dir("scenarios");
-    assert_eq!(scenarios.len(), 15, "the v1 scenario set");
+    assert_eq!(scenarios.len(), 18, "the v1 scenario set");
     for (name, scenario) in scenarios {
         let mut at = if scenario["steps"][0]["handshake"] == Value::Bool(false) {
             Phase::Handshake

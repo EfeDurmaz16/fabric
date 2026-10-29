@@ -1216,6 +1216,9 @@ pub struct Observe {
     pub request_id: String,
     /// The original operation.
     pub operation_id: OperationId,
+    /// The original operation's managed identities, under the request's
+    /// rules: the worker refuses a resource another job made.
+    pub scope: Scope,
     /// The original action.
     pub action: String,
     /// The resource.
@@ -1285,6 +1288,7 @@ impl ToWorker {
                 ("type", "observe".into()),
                 ("request_id", o.request_id.clone().into()),
                 ("operation_id", o.operation_id.to_string().into()),
+                ("scope", o.scope.to_value()),
                 ("action", o.action.clone().into()),
                 ("resource", o.resource.to_value()),
                 ("wait_ms", o.wait_ms.into()),
@@ -1444,6 +1448,7 @@ fn parse_observe(o: &mut Obj<'_>) -> Walk<ToWorker> {
     let observe = Observe {
         request_id: token(o.req("request_id")?, "request_id")?,
         operation_id: id(o.req("operation_id")?, "operation_id")?,
+        scope: Scope::parse(o.req("scope")?)?,
         action: owned(o.req("action")?, "action", 128)?,
         resource: Locator::parse(o.req("resource")?, "resource")?,
         wait_ms: int(o.req("wait_ms")?, "wait_ms")?,
@@ -1490,17 +1495,26 @@ pub fn fits_request(request: &Request, profile: &Profile) -> Result<(), Refusal>
 /// Whether `observe` fits `profile`: an action it offers with observe,
 /// a resource of its shape and a wait within its own.
 pub fn fits_observe(observe: &Observe, profile: &Profile) -> Result<(), Refusal> {
-    let Some(spec) = profile.action(&observe.action) else {
-        return Err(bad("action", observe.action.clone()).code("unsupported"));
+    observable(&observe.action, &observe.resource, observe.wait_ms, profile)
+}
+
+/// Whether `profile` observes `action` on `resource` within `wait_ms`:
+/// the profile's part of [`fits_observe`], which does not depend on the
+/// observing operation's scope.
+pub fn observable(
+    action: &str,
+    resource: &Locator,
+    wait_ms: u64,
+    profile: &Profile,
+) -> Result<(), Refusal> {
+    let Some(spec) = profile.action(action) else {
+        return Err(bad("action", action.to_owned()).code("unsupported"));
     };
     if !spec.observe {
-        return Err(bad("observe", observe.action.clone()).code("unsupported"));
+        return Err(bad("observe", action.to_owned()).code("unsupported"));
     }
-    observe
-        .resource
-        .fits(profile)
-        .map_err(|e| e.code("invalid"))?;
-    if observe.wait_ms > profile.limits.max_observe_wait_ms {
+    resource.fits(profile).map_err(|e| e.code("invalid"))?;
+    if wait_ms > profile.limits.max_observe_wait_ms {
         return Err(bad("limit", "wait_ms above the profile's").code("invalid"));
     }
     Ok(())

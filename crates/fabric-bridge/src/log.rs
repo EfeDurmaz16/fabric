@@ -25,6 +25,8 @@ use fabric_journal::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::wire::Scope;
+
 /// Why the log refused a change. Nothing was written.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LogError {
@@ -42,9 +44,11 @@ pub enum LogError {
     Storage(String),
 }
 
-/// A provider operation's action, target, status and last locator.
+/// A provider operation's scope, action, target, status and last locator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The job, task, attempt and generation it was dispatched for.
+    pub scope: Scope,
     /// The bridge action it was dispatched as.
     pub action: String,
     /// The locator it was sent to, as JSON text; `None` for a create.
@@ -234,6 +238,16 @@ impl<L: OperationLog + Send + 'static> Recorder for LogThread<L> {
     }
 }
 
+/// The scope a dispatch was recorded for.
+fn scope_of(dispatch: &ProviderDispatch) -> Scope {
+    Scope {
+        job: dispatch.job,
+        task: dispatch.task,
+        attempt: dispatch.attempt,
+        generation: dispatch.generation,
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -281,6 +295,7 @@ impl OperationLog for Journal {
 
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         Ok(self.provider_operation(operation)?.map(|op| Entry {
+            scope: scope_of(&op.dispatch),
             action: op.dispatch.action,
             target: op.dispatch.target,
             status: op.status,
@@ -330,6 +345,7 @@ impl OperationLog for MemoryLog {
         self.entries.insert(
             dispatch.operation,
             Entry {
+                scope: scope_of(dispatch),
                 action: dispatch.action.clone(),
                 target: dispatch.target.clone(),
                 status: if refusal.is_some() {

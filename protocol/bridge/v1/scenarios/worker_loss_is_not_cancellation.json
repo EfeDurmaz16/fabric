@@ -43,6 +43,7 @@
         "native_id": "fx-key-create-1",
         "project": "proj-1",
         "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A00000000000000000P1",
         "status": "ready"
       }
     ],
@@ -185,7 +186,7 @@
               "action": "sandbox.exec",
               "effect": "mutate",
               "terminal_only": false,
-              "observe": false,
+              "observe": true,
               "cancel": true,
               "approval": "optional",
               "dedupe": "none",

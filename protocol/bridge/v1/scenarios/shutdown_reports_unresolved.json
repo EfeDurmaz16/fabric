@@ -43,6 +43,7 @@
         "native_id": "fx-key-create-1",
         "project": "proj-1",
         "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A00000000000000000P1",
         "status": "ready"
       }
     ],
@@ -120,6 +121,12 @@
         "type": "observe",
         "request_id": "r-4",
         "operation_id": "01K8W3A00000000000000000P6",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
         "action": "sandbox.destroy",
         "resource": {
           "provider": "fixture",

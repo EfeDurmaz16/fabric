@@ -37,7 +37,7 @@
           "action": "sandbox.exec",
           "effect": "mutate",
           "terminal_only": false,
-          "observe": false,
+          "observe": true,
           "cancel": true,
           "approval": "optional",
           "dedupe": "none",

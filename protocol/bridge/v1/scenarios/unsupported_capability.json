@@ -1,6 +1,6 @@
 {
   "scenario": "unsupported_capability",
-  "summary": "An action outside the negotiated profile, and observe on an action without observe, fail before any effect.",
+  "summary": "An action outside the negotiated profile, in a request and in an observe, fails before any effect, and a cancel of nothing in flight is not_found.",
   "profile": "fixture",
   "provider_state": {
     "binding": {
@@ -43,6 +43,7 @@
         "native_id": "fx-key-create-1",
         "project": "proj-1",
         "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A00000000000000000P1",
         "status": "ready"
       }
     ],
@@ -106,7 +107,13 @@
         "type": "observe",
         "request_id": "r-2",
         "operation_id": "01K8W3A00000000000000000P2",
-        "action": "sandbox.exec",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.snapshot",
         "resource": {
           "provider": "fixture",
           "scope": {
@@ -126,8 +133,8 @@
         "operation_id": "01K8W3A00000000000000000P2",
         "error": {
           "code": "unsupported",
-          "reason": "observe",
-          "message": "unsupported: observe",
+          "reason": "action",
+          "message": "unsupported: action",
           "effect": "none"
         }
       }

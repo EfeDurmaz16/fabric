@@ -17,9 +17,14 @@
 //!   cap; with `double/running` it answers a running result, which a
 //!   terminal-only action never may; with `double/other-operation` it
 //!   answers under another operation id.
-//! - `sandbox.exec` echoes its argv; `sandbox.destroy` needs an approval,
-//!   and of `fx-stopping` it stays stopping: `pending` with its target.
-//! - `observe` answers `completed` for whatever resource it names, as a
+//! - `sandbox.exec` echoes its argv, except `double/running`, which it
+//!   answers `running` and keeps running; `sandbox.destroy` needs an
+//!   approval, and of `fx-stopping` it stays stopping: `pending` with its
+//!   target.
+//! - `observe` of an exec answers that exec's `completed` result once it
+//!   ran here (a running one ends when observed), and `unknown` for an exec
+//!   this process did not run, as a restarted worker would. Any other
+//!   observe answers `completed` for whatever resource it names, as a
 //!   destroy observe of a resource that is not there would.
 //! - A repeated key with the same digest replays the first answer; with
 //!   another digest it is an idempotency conflict.
@@ -57,6 +62,8 @@ struct Worker {
     limits: Limits,
     answered: HashMap<String, (String, ToFabric)>,
     silent: Vec<(String, OperationId, Locator)>,
+    /// The execs this process ran, by operation: their argv.
+    execs: HashMap<OperationId, Vec<String>>,
 }
 
 fn profiles() -> Option<Vec<Profile>> {
@@ -166,6 +173,16 @@ fn completed(request: &Request, resource: Locator, out: Map<String, Value>) -> T
     )
 }
 
+/// What an exec of `argv` printed: its argv.
+fn exec_output(argv: &[String]) -> Map<String, Value> {
+    let text = format!("{}\n", argv.join(" "));
+    output(&[
+        ("exit_code", 0.into()),
+        ("stdout", stream(&text)),
+        ("stderr", stream("")),
+    ])
+}
+
 fn stream(text: &str) -> Value {
     serde_json::json!({
         "text": text,
@@ -236,18 +253,26 @@ fn script(request: &Request) -> Step {
             )),
             _ => Step::Answer(completed(request, locator(key), ready())),
         },
-        Action::Exec { target, params } => {
-            let text = format!("{}\n", params.argv.join(" "));
-            Step::Answer(completed(
-                request,
+        Action::Exec { target, params }
+            if params.argv.first().is_some_and(|a| a == "double/running") =>
+        {
+            Step::Answer(result(
+                request.request_id.clone(),
+                request.operation.id,
+                ResultState::Running,
                 target.clone(),
                 output(&[
-                    ("exit_code", 0.into()),
-                    ("stdout", stream(&text)),
+                    ("exit_code", Value::Null),
+                    ("stdout", stream("")),
                     ("stderr", stream("")),
                 ]),
             ))
         }
+        Action::Exec { target, params } => Step::Answer(completed(
+            request,
+            target.clone(),
+            exec_output(&params.argv),
+        )),
         Action::Destroy { target } => {
             if request.approval.is_none() {
                 Step::Answer(error(
@@ -338,6 +363,9 @@ impl Worker {
             };
             return (!send(&mut self.stdout, &message).await).then_some(1);
         }
+        if let Action::Exec { params, .. } = &request.action {
+            self.execs.insert(request.operation.id, params.argv.clone());
+        }
         match script(request) {
             Step::Answer(message) => {
                 self.answered.insert(key, (digest, message.clone()));
@@ -379,6 +407,40 @@ impl Worker {
                 Some(code)
             }
         }
+    }
+
+    fn observe(&self, observe: fabric_bridge::wire::Observe) -> ToFabric {
+        let out = match observe.action.as_str() {
+            "sandbox.exec" => match self.execs.get(&observe.operation_id) {
+                Some(argv) => exec_output(argv),
+                None => {
+                    return ToFabric::Error(ErrorMessage {
+                        request_id: observe.request_id,
+                        operation_id: observe.operation_id,
+                        error: ErrorBody {
+                            code: ErrorCode::Unknown,
+                            reason: "observation_failed".to_owned(),
+                            message: "unknown: observation_failed".to_owned(),
+                            effect: EffectState::Unknown,
+                            resource: Some(observe.resource),
+                            state: None,
+                            observations: None,
+                            deadline_ms: None,
+                            cleanup: None,
+                        },
+                    });
+                }
+            },
+            "sandbox.destroy" => output(&[("status", "destroyed".into())]),
+            _ => output(&[("status", "ready".into())]),
+        };
+        result(
+            observe.request_id,
+            observe.operation_id,
+            ResultState::Completed,
+            observe.resource,
+            out,
+        )
     }
 
     async fn cancel(&mut self, request_id: String, cancels: String) -> Option<u8> {
@@ -438,18 +500,7 @@ impl Worker {
                 Err(refusal) => self.refuse(&value, &refusal).await,
                 Ok(ToWorker::Request(request)) => self.request(&request).await,
                 Ok(ToWorker::Observe(observe)) => {
-                    let status = if observe.action == "sandbox.destroy" {
-                        "destroyed"
-                    } else {
-                        "ready"
-                    };
-                    let message = result(
-                        observe.request_id,
-                        observe.operation_id,
-                        ResultState::Completed,
-                        observe.resource,
-                        output(&[("status", status.into())]),
-                    );
+                    let message = self.observe(observe);
                     (!send(&mut self.stdout, &message).await).then_some(1)
                 }
                 Ok(ToWorker::Cancel(cancel)) => {
@@ -581,6 +632,7 @@ async fn run() -> u8 {
         limits,
         answered: HashMap::new(),
         silent: Vec::new(),
+        execs: HashMap::new(),
     };
     worker.session().await
 }

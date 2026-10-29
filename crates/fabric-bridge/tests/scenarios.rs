@@ -379,8 +379,18 @@ impl Run {
             assert!(matches!(outcome.answer, Answer::Lost(_)), "{}", self.name);
             assert_eq!(outcome.status.name(), "unknown", "{}", self.name);
         }
+        // With nothing in flight, nothing waited for the bridge to read
+        // the end of the worker's output; wait for it here.
         let lost = self.bridge.take().unwrap();
-        assert!(lost.lost().is_some(), "{}", self.name);
+        let started = std::time::Instant::now();
+        while lost.lost().is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{}: the bridge never saw the worker go",
+                self.name
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -439,7 +449,7 @@ async fn fabric_runs_every_scenario_against_a_scripted_worker() {
         names.push(name);
     }
     names.sort();
-    assert_eq!(names.len(), 15, "{names:?}");
+    assert_eq!(names.len(), 18, "{names:?}");
 }
 
 /// The scenarios name their action through the profile; a sanity check

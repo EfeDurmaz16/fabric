@@ -869,14 +869,17 @@ impl Bridge {
     /// Reads the resource of an operation the log holds as `dispatched`
     /// or `unknown`, by its original id, waiting at most `wait_ms`. An
     /// action the profile does not observe, or a wait over its limit, is
-    /// refused before sending and changes nothing in the log.
+    /// refused before the log is read, and nothing is sent.
     ///
     /// `action` and `resource` must be the operation's own as the log
     /// holds them: its action, and the target it was sent to or, for an
     /// action without one such as a create, the locator its worker
     /// reported. Anything else is `ObserveMismatch` before sending, since
     /// the answer would settle this operation from another resource's
-    /// state: a destroy recorded done while its target still runs.
+    /// state: a destroy recorded done while its target still runs. The
+    /// observe carries the scope the log recorded the operation with, never
+    /// one the caller names, so the worker checks the resource against the
+    /// job that made the operation.
     pub async fn observe<L: Recorder>(
         &self,
         log: &mut L,
@@ -887,14 +890,7 @@ impl Bridge {
     ) -> Result<InFlight, BridgeError> {
         // A late answer may have named the resource this observe reads.
         record_found(&self.shared, log).await?;
-        let observe = Observe {
-            request_id: self.request_id(),
-            operation_id: operation,
-            action: action.to_owned(),
-            resource,
-            wait_ms,
-        };
-        self.as_worker_reads(&ToWorker::Observe(observe.clone()))
+        crate::wire::observable(action, &resource, wait_ms, &self.profile)
             .map_err(BridgeError::RefusedLocally)?;
         let entry = log
             .reserve()
@@ -910,8 +906,18 @@ impl Bridge {
         let Some(entry) = entry else {
             return Err(BridgeError::NotObservable(operation));
         };
-        own_resource(&entry, &observe.action, &observe.resource)
+        own_resource(&entry, action, &resource)
             .map_err(|why| BridgeError::ObserveMismatch { operation, why })?;
+        let observe = Observe {
+            request_id: self.request_id(),
+            operation_id: operation,
+            scope: entry.scope,
+            action: action.to_owned(),
+            resource,
+            wait_ms,
+        };
+        self.as_worker_reads(&ToWorker::Observe(observe.clone()))
+            .map_err(BridgeError::RefusedLocally)?;
         let frame = frames::encode(
             &ToWorker::Observe(observe.clone()).to_value(),
             cap_of(self.limits.max_request_bytes),

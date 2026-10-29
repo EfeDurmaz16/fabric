@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use common::{create, journal, operation, scope};
 use fabric_bridge::wire::{
-    Action, CancelState, CreateParams, ErrorCode, Locator, ResultState, Versions,
+    Action, CancelState, CreateParams, ErrorCode, ExecParams, Locator, ResultState, Versions,
 };
 use fabric_bridge::{Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError};
 use fabric_core::managed::OperationId;
@@ -438,13 +438,13 @@ async fn an_observe_of_an_unknown_operation_settles_it_and_a_refused_one_changes
         .observe(
             &mut journal,
             OperationId::from_bytes([30; 16]),
-            "sandbox.exec",
+            "sandbox.snapshot",
             fx("key-30"),
             1000,
         )
         .await;
     assert!(
-        matches!(refused, Err(BridgeError::RefusedLocally(_))),
+        matches!(&refused, Err(BridgeError::RefusedLocally(r)) if (r.code, r.reason) == ("unsupported", "action")),
         "{refused:?}"
     );
     assert_eq!(status(&journal, 30), Some(ProviderStatus::Unknown));
@@ -1097,4 +1097,105 @@ async fn a_dropped_bridge_takes_the_workers_group() {
         "the client outlived the bridge"
     );
     assert!(alive(children.effect));
+}
+
+/// An exec the worker answers `running` stays `dispatched` with its
+/// target. Observe by its original id, carrying the scope the journal
+/// recorded, settles it from the exec's own result. A restarted worker
+/// that never ran an exec answers `unknown`, and the exec is never sent
+/// again.
+#[tokio::test]
+async fn an_exec_answered_running_is_settled_by_observe() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let running = |n: u8| Effect {
+        operation: operation(n),
+        scope: scope(),
+        action: Action::Exec {
+            target: fx("key-a"),
+            params: ExecParams {
+                argv: vec!["double/running".into()],
+                stdin: None,
+                cwd: None,
+                timeout_ms: 60_000,
+                max_output_bytes: 1024,
+                secret_names: Vec::new(),
+            },
+        },
+        approval: None,
+        policy: None,
+        deadline_ms: 5000,
+    };
+    let answered = bridge
+        .request(&mut journal, running(120))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    let Answer::Result(r) = &answered.answer else {
+        panic!("{:?}", answered.answer)
+    };
+    assert_eq!(r.state, ResultState::Running);
+    assert_eq!(answered.status, ProviderStatus::Dispatched);
+    assert_eq!(status(&journal, 120), Some(ProviderStatus::Dispatched));
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([120; 16]),
+            "sandbox.exec",
+            fx("key-a"),
+            1000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    let Answer::Result(r) = &observed.answer else {
+        panic!("{:?}", observed.answer)
+    };
+    assert_eq!(r.state, ResultState::Completed);
+    assert_eq!(r.output["exit_code"], 0);
+    assert_eq!(r.output["stdout"]["text"], "double/running\n");
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
+    assert_eq!(status(&journal, 120), Some(ProviderStatus::Succeeded));
+
+    let answered = bridge
+        .request(&mut journal, running(121))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(answered.status, ProviderStatus::Dispatched);
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+    let bridge = spawn().await;
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([121; 16]),
+            "sandbox.exec",
+            fx("key-a"),
+            1000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    let Answer::Error(e) = &observed.answer else {
+        panic!("{:?}", observed.answer)
+    };
+    assert_eq!(
+        (e.error.code, e.error.reason.as_str()),
+        (ErrorCode::Unknown, "observation_failed")
+    );
+    assert_eq!(observed.status, ProviderStatus::Unknown);
+    let again = bridge.request(&mut journal, running(121)).await;
+    assert!(
+        matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
+        "{again:?}"
+    );
 }
