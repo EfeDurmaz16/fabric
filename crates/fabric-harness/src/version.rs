@@ -259,16 +259,19 @@ mod tests {
 
     /// A fake binary at `dir/tool` that logs each run, with its directory,
     /// to `dir/runs` and prints `version`.
-    fn counted_tool(dir: &std::path::Path, version: &str) -> std::io::Result<std::path::PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+    fn counted_tool(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
         let tool = dir.join("tool");
         let runs = dir.join("runs");
-        std::fs::write(
+        crate::fake_tool::write(
             &tool,
-            format!("#!/bin/sh\npwd >> '{}'\necho '{version}'\n", runs.display()),
-        )?;
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))?;
-        Ok(tool)
+            format!(
+                "#!/bin/sh\n{}pwd >> '{}'\necho '{version}'\n",
+                crate::fake_tool::WARM_GUARD,
+                runs.display()
+            )
+            .as_bytes(),
+        );
+        tool
     }
 
     fn runs(dir: &std::path::Path) -> Vec<String> {
@@ -290,7 +293,7 @@ mod tests {
         let (work, other) = (dir.join("work"), dir.join("other"));
         std::fs::create_dir_all(&work).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let tool = counted_tool(&dir, "tool 2.1.300").unwrap();
+        let tool = counted_tool(&dir, "tool 2.1.300");
         let session = fabric_core::session::SessionId::parse("s").unwrap();
         let recorded = HarnessVersion::parse("2.1.294").unwrap();
         let env: Vec<(fabric_core::env::EnvVarName, String)> = vec![(
@@ -340,7 +343,7 @@ mod tests {
     async fn a_restore_takes_an_installed_version_asked_ahead_only_for_the_same_binary() {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
-        let tool = counted_tool(&dir, "tool 0.160.0").unwrap();
+        let tool = counted_tool(&dir, "tool 0.160.0");
         let path_var = std::ffi::OsString::from("/usr/bin:/bin");
         let ahead = VersionAhead::installed(Some(tool.clone()), path_var.clone(), "tool");
         let asked = installed_version(Some(&ahead), Some(tool.clone()), &path_var, "tool").await;

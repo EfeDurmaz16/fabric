@@ -26,6 +26,8 @@ pub mod denylist;
 pub(crate) mod departure;
 pub(crate) mod durable;
 mod error;
+#[cfg(test)]
+mod fake_tool;
 mod harness;
 pub(crate) mod jsontext;
 pub mod manifest;
