@@ -149,24 +149,34 @@ dropped. A platform with no baselines only reports its times.
 
 A baseline is the anchor's time, so it never goes up: a slower op is a bug
 to fix (Performance rule), and a baseline raised once per pull request
-would compound. `scripts/check-budget.sh` fails a change that raises or
-removes a baseline, raises the ratio or the grace, or lowers the
-percentile or the runs per batch. To change the budget otherwise, as for a
-faster op or a new process count:
+would compound. A process count is the same rule measured without the
+load, so it never goes up either. `scripts/check-budget.sh` fails a change
+that raises or removes a baseline, raises the ratio or the grace, lowers
+the percentile or the runs per batch, raises a process count of a program
+the base counted, makes an op start a counted program it did not start,
+removes an op's counts, or takes a program off the `counted` list, the
+programs the warm-up runs count, which `budget.rs` checks against its own.
+A program counted for the first time, and a new op, bring their counts. To
+change the budget otherwise, as for a faster op or fewer processes:
 
-1. Say in the PR why, with the table before and after; for a new process
-   count, with the A/B run that shows the op is not slower than the anchor.
-2. Lower the op's baseline in `budget.toml`, or set its counts.
+1. Say in the PR why, with the table before and after.
+2. Lower the op's baseline in `budget.toml`, or its counts.
 3. Add a `[[change]]` entry at the end of `budget.toml`, with
    `date = "YYYY-MM-DD"` and a `why` that names the PR. Entries are never
    edited or removed. `scripts/check-budget.sh` fails a change to the
    budget without a new one.
 
 The one time a baseline may rise is when the anchor itself was timed
-again, as when CI moves to another runner: build `176622e`, time it, set
-the baselines from those runs, and say so in the new entry with
-`anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"` beside its date and
-why.
+again on CI, as when CI moves to another runner: run `176622e`'s code on
+it at least three times, set the baselines from those runs as below, and
+say so in the new entry with
+`anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"` and the runs,
+`runs = "<id> <id> <id>"`, beside its date and why. The check reads each
+run with `gh`: it must be a finished run of `.github/workflows/ci.yml` on
+a commit whose crates, Cargo files and toolchain are the anchor's, and
+every raised baseline must be the one `scripts/budget-baselines.sh` gives
+from the runs' logs. Without `gh`, or with runs it cannot read, the check
+fails.
 
 To give a platform its baselines, run the anchor's code on it at least
 three times and take each op's median 25th percentile. For a CI runner,

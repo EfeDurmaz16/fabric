@@ -323,6 +323,23 @@ impl Budget {
             }
         }
         let counted = counted();
+        // scripts/check-budget.sh reads which programs are counted from
+        // the budget, so the list must be the one counted here.
+        let listed: Vec<&str> = key("counted")?
+            .as_array()
+            .ok_or("budget.toml: counted is not a list")?
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .ok_or("budget.toml: counted names a program by a string")
+            })
+            .collect::<Result<_, _>>()?;
+        if listed != counted {
+            return Err(format!(
+                "budget.toml: counted must name the programs the warm-up runs count, in their order: {counted:?}"
+            )
+            .into());
+        }
         let mut processes = BTreeMap::new();
         for (op, counts) in key("processes")?
             .as_table()
@@ -872,6 +889,29 @@ fn the_budget_file_holds_every_op() -> Fallible {
     Ok(())
 }
 
+/// The budget names the programs the warm-up runs count, which
+/// scripts/check-budget.sh reads to hold each one's counts at the base:
+/// a list that leaves one out, or names one the runs do not count, fails
+/// to parse.
+#[test]
+fn the_budget_names_the_programs_it_counts() -> Fallible {
+    Budget::parse(BUDGET, &platform())?;
+    let mut fewer = counted();
+    fewer.pop();
+    let mut more = counted();
+    more.push("sh");
+    for list in [fewer, more] {
+        let text = BUDGET.replacen(
+            &format!("counted = {:?}", counted()),
+            &format!("counted = {list:?}"),
+            1,
+        );
+        assert_ne!(text, BUDGET, "the budget holds no counted list to replace");
+        assert!(Budget::parse(&text, &platform()).is_err(), "{list:?}");
+    }
+    Ok(())
+}
+
 /// Every op has a baseline on both platforms the budget holds times on:
 /// CI's Linux runner, where CI enforces them, and the Mac of the macOS
 /// baselines. An op with none there is only reported, so a slower one
@@ -955,9 +995,10 @@ fn the_counter_counts_a_fake_and_puts_it_back() -> Fallible {
 #[test]
 fn the_verdicts_follow_the_rules() -> Fallible {
     let ms = Duration::from_millis;
-    let mut text = String::from(
-        "ratio = 1.3\ngrace_ms = 50\nreps = 7\npercentile = 25\n\
+    let mut text = format!(
+        "ratio = 1.3\ngrace_ms = 50\nreps = 7\npercentile = 25\ncounted = {:?}\n\
          [baseline.test]\n\"acp suspend\" = 1000\n\"cold start\" = 100\n[processes]\n",
+        counted()
     );
     for op in ops() {
         writeln!(text, "\"{op}\" = {{ git = [1, 2], ps = [0, 0] }}")?;
