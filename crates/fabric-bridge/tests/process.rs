@@ -480,6 +480,15 @@ async fn the_in_flight_limit_refuses_before_the_journal_and_shutdown_lists_the_r
         "{refused:?}"
     );
     assert_eq!(status(&journal, 25), None);
+    // So is an attach, though it only reads: of a create the shutdown left
+    // unknown with no locator, the one kind of operation it reaches.
+    let attach = bridge
+        .attach(&mut journal, OperationId::from_bytes([20; 16]), 1000)
+        .await;
+    assert!(
+        matches!(attach, Err(BridgeError::ShuttingDown)),
+        "{attach:?}"
+    );
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
 
