@@ -85,6 +85,8 @@ Paths these commits touch, none of them timed here:
 - `close` and the end of a worker's output: after the worker is reaped, one `kill(-pgid, 0)` finds its group empty; a group with leftovers is polled every 10 ms up to the kill grace.
 - `bench.rs` and `scripts/bench-bridge.sh` run unchanged; the journal paths there now go through `LogThread`.
 
-## Open for Capsule
+## Open for Capsule (closed in `m3-reconcile`)
 
 The specification now says a worker keeps out of its process group every process whose end would end or abort a provider effect. Capsule's Docker profile leaves its `docker create`, `start` and `rm` clients to finish because killing one could abort the daemon's work, but starts them in the worker's group: when Fabric ends a lost worker's group, such a client gets the kill grace (2 s by default) and then SIGKILL. The operation in flight is `unknown` in Fabric's journal either way and is found again by observe or its labels, so Fabric's records stay true; starting those clients in a group of their own (`detached: true` in Node's `spawn`) makes them finish as the Capsule worker intends.
+
+Capsule `b333df7` and `16d97ed` do this, and both CI jobs now pin Capsule `a4d597a`, which holds them; see [`../m3-reconcile`](../m3-reconcile/README.md).
