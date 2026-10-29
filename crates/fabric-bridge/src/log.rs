@@ -411,7 +411,8 @@ fn cleanup_rule(
     Ok((create.scope, locator.clone()))
 }
 
-/// An in-memory log with the journal's rules but no fencing and no
+/// An in-memory log with the journal's key, id and status rules but no
+/// fencing, no create guard, no cleanup checks at `begin` and no
 /// durability: for tests and the bench, never for a node. It touches only
 /// memory, so it records in place.
 #[derive(Debug, Default)]
