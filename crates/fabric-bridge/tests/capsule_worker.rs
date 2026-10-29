@@ -1224,6 +1224,27 @@ fn docker_exec(
     )
 }
 
+/// The `docker exec` clients on this host attached to `container`: a
+/// worker runs one for each exec it waits on.
+fn exec_clients(container: &str) -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "command="])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| {
+            let mut words = line.split_whitespace();
+            words
+                .next()
+                .is_some_and(|program| program.ends_with("docker"))
+                && line.contains(" exec ")
+                && line.contains(container)
+        })
+        .count()
+}
+
 /// Lines of `docker top` whose command is exactly `command`.
 fn running(container: &str, command: &str) -> usize {
     docker(&["top", container])
@@ -1447,6 +1468,7 @@ async fn the_docker_profile_on_the_local_engine() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert_eq!(exec_clients(&cid), 1, "the worker waits on one exec client");
     bridge.kill().await;
     let outcome = flight.finish(&mut journal).await.unwrap();
     assert!(
@@ -1463,6 +1485,17 @@ async fn the_docker_profile_on_the_local_engine() {
         "true",
         "worker loss is not cancellation: the container runs on"
     );
+    // The worker's group ends with it: its exec client goes within the
+    // kill grace, and the command the engine runs for it does not.
+    let killed = Instant::now();
+    while exec_clients(&cid) > 0 {
+        assert!(
+            killed.elapsed() < Duration::from_secs(10),
+            "the exec client outlived the worker"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(running(&cid, "sleep 20"), 1, "the exec runs on");
     let state = journal.job(scope.job).unwrap().unwrap();
     assert_eq!(state.job.generation, Generation::FIRST);
     drop(bridge);
