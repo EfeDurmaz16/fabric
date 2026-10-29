@@ -149,7 +149,7 @@ Recorded on 2026-10-28 when the integrator cherry-picked the seven deferred-work
 
 ## Disposition after the PR #31 review
 
-Recorded on 2026-10-29. A review of `31577c4` found five defects; each was reproduced with a test that failed before its fix and is fixed on this branch (`docs/evidence/m2-review-pr31/README.md`). Two of them finish M2-15 and M2-25 above.
+Recorded on 2026-10-29. A review of `31577c4` found five defects; each was reproduced with a test that failed before its fix and is fixed on this branch (`docs/evidence/m2-review-pr31/README.md`). Two of them finish M2-15 and M2-25 above. The last row is a flake the PR had left as a note, reproduced and fixed the same day.
 
 | Finding | Status | Fix | Test, and what it read before the fix |
 |---|---|---|---|
@@ -158,6 +158,7 @@ Recorded on 2026-10-29. A review of `31577c4` found five defects; each was repro
 | M2-15's per-peer request bound was bypassed: the transports read each waiting request off the wire before the room gate | fixed | `cdb1c43`, `f8742a2` | `rpc::tests::request_bytes_read_off_the_wire_for_a_peer_are_bounded` (50,339,502 bytes before, 17,305,038 after), `quic::tests::a_peer_can_leave_at_most_the_connection_window_unread`, `mux::tests::a_stream_the_peer_opened_gets_credit_only_for_what_its_reader_asks`, `pipe::tests::credit_on_demand_is_what_a_read_asked_for_and_no_more` |
 | M2-25's `check-budget.sh` compared no process count, and an `anchor` line let every baseline rise unchecked | fixed | `0381081`, `13f29d1` | `scripts/test-check-budget.sh`, 60 cases; the review's two cases passed the old script and fail now |
 | A headless ACP turn gathered its whole answer with no bound | fixed | `fc73523` | `acp::tests::a_drained_turn_keeps_at_most_max_answer_bytes_of_answer` (held 25,165,824 bytes before), `an_answer_is_cut_at_a_character_and_stays_a_prefix` |
+| `codex::tests::the_version_is_asked_in_the_workspace_codex_starts_in` failed once in an owner run: the harness tests' fakes first ran inside a version probe, and macOS's check of a new executable can outlast its 15 s timeout under load | fixed | `3c6dbd0`: every fake runs once when it is written | `fake_tool::tests::a_written_fake_has_run_once_and_the_guard_kept_its_body_from_running`; six runs of the crate's tests at once failed 12 of 12 before (up to 11 codex, 8 claude, 1 process and 1 version test each) and pass 12 of 12 after |
 
 ## Candidates the audit rejected, rechecked
 
