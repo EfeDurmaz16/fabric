@@ -20,6 +20,9 @@
 //!   deadline. A caller that stops waiting cannot leave part of a frame
 //!   behind, and a worker that stops reading its input is lost and
 //!   terminated at the deadline instead of holding the bridge forever.
+//! - No request or observe is written after `shutdown`. A request admitted
+//!   before it whose frame was not queued yet is recorded `rejected`
+//!   (`unavailable`, `shutting_down`) and never sent.
 
 use std::collections::{HashMap, VecDeque};
 use std::process::{ExitStatus, Stdio};
@@ -677,7 +680,18 @@ impl Bridge {
         action: Option<&str>,
         kind: Kind,
     ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
-        let mut state = self.shared.lock();
+        self.admit(&mut self.shared.lock(), id, operation, action, kind)
+    }
+
+    /// `register` under a lock the caller holds.
+    fn admit(
+        &self,
+        state: &mut State,
+        id: &str,
+        operation: Option<OperationId>,
+        action: Option<&str>,
+        kind: Kind,
+    ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
         // A shutdown ends with the worker's exit, which the reader marks
         // lost when it reads the end of the worker's output, so new work
         // is refused as shutting down both before and after that read.
@@ -753,20 +767,29 @@ impl Bridge {
         })
     }
 
-    /// `register` and `reserve` together; nothing is left registered when
-    /// the queue refuses.
+    /// `register` and `reserve` together, then `write` queued, all under
+    /// the one lock `shutdown` sets its flag and queues its frame under:
+    /// an observe admitted before a shutdown is written before it, and
+    /// nothing is left registered when the queue refuses.
     fn enlist(
         &self,
         id: &str,
         operation: Option<OperationId>,
         action: Option<&str>,
         kind: Kind,
-    ) -> Result<(mpsc::Receiver<Incoming>, mpsc::Permit<'_, Write>), BridgeError> {
-        let rx = self.register(id, operation, action, kind)?;
-        match self.reserve() {
-            Ok(permit) => Ok((rx, permit)),
+        write: Write,
+    ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
+        // Taken before the lock: a queue that refuses reads `lost`.
+        let reserved = self.reserve();
+        let mut state = self.shared.lock();
+        let rx = self.admit(&mut state, id, operation, action, kind)?;
+        match reserved {
+            Ok(permit) => {
+                permit.send(write);
+                Ok(rx)
+            }
             Err(e) => {
-                self.unregister(id);
+                state.waiters.remove(id);
                 Err(e)
             }
         }
@@ -781,7 +804,11 @@ impl Bridge {
     /// refuses with `Log(Used)` and nothing is sent. Then the frame is
     /// queued for the writer, which writes it whole by the request's
     /// deadline. A worker that is gone, busy or shutting down refuses
-    /// before the log is touched.
+    /// before the log is touched. A request admitted before a `shutdown`
+    /// whose frame was not queued yet when the shutdown's was is never
+    /// written after it: it is recorded `rejected` (`unavailable`,
+    /// `shutting_down`), as a draining worker answers a request it reads
+    /// after a shutdown, and refused as `RefusedLocally`.
     ///
     /// It waits on the log, never on the worker. Recording the operation
     /// and queueing its frame are one call on the log's thread, queued
@@ -859,11 +886,35 @@ impl Bridge {
         let begun = slot.run(move |log| {
             if let Err(e) = log.begin(&dispatch, None) {
                 shared.lock().waiters.remove(&id);
-                return Err(e);
+                return Err(BridgeError::Log(e));
             }
-            let deadline = Instant::now() + wait;
-            permit.send(Write { frame, deadline });
-            Ok(deadline)
+            // Queued under the lock `shutdown` sets its flag and queues its
+            // frame under. A shutdown that came while this request waited
+            // on the log is on the wire already: written now, the request
+            // would be read after it, or never once the worker exited, and
+            // settle `unknown` though nothing read it.
+            let mut state = shared.lock();
+            if !state.shutting_down {
+                let deadline = Instant::now() + wait;
+                permit.send(Write { frame, deadline });
+                return Ok(deadline);
+            }
+            state.waiters.remove(&id);
+            drop(state);
+            let refusal = Refusal {
+                code: "unavailable",
+                reason: "shutting_down",
+                detail: "the bridge queued a shutdown before this request".into(),
+            };
+            match log.record(
+                dispatch.operation,
+                ProviderStatus::Rejected,
+                &rejected(&refusal),
+                None,
+            ) {
+                Ok(()) => Err(BridgeError::RefusedLocally(refusal)),
+                Err(e) => Err(BridgeError::Log(e)),
+            }
         });
         flight.deadline = begun.await??;
         Ok(flight)
@@ -932,14 +983,14 @@ impl Bridge {
                 detail: fault.to_string(),
             })
         })?;
-        let (rx, permit) = self.enlist(
+        let deadline = Instant::now() + Duration::from_millis(wait_ms) + self.config.grace;
+        let rx = self.enlist(
             &observe.request_id,
             Some(operation),
             Some(&observe.action),
             Kind::Observe,
+            Write { frame, deadline },
         )?;
-        let deadline = Instant::now() + Duration::from_millis(wait_ms) + self.config.grace;
-        permit.send(Write { frame, deadline });
         Ok(InFlight {
             request_id: observe.request_id,
             operation,
@@ -986,9 +1037,14 @@ impl Bridge {
             cap_of(self.limits.max_request_bytes),
         )
         .map_err(BridgeError::Frame)?;
-        let (rx, permit) = self.enlist(&cancel.request_id, Some(operation), None, Kind::Control)?;
         let deadline = Instant::now() + self.config.grace;
-        permit.send(Write { frame, deadline });
+        let rx = self.enlist(
+            &cancel.request_id,
+            Some(operation),
+            None,
+            Kind::Control,
+            Write { frame, deadline },
+        )?;
         Ok(Control::Sent(Pending {
             request_id: cancel.request_id,
             rx,
@@ -1001,14 +1057,14 @@ impl Bridge {
     /// Asks the worker to drain for at most `drain_ms` and exit. New
     /// requests are refused from now on with
     /// [`BridgeError::ShuttingDown`], before the log is touched, and still
-    /// after the worker has exited. The outstanding requests still answer
-    /// on their own.
+    /// after the worker has exited. A request admitted before this whose
+    /// frame is not queued yet is never written after the shutdown's
+    /// (`request`). The outstanding requests still answer on their own.
     #[allow(
         clippy::unused_async,
         reason = "async like the rest of the client; it queues its frame, so it completes without waiting"
     )]
     pub async fn shutdown(&self, drain_ms: u64) -> Result<Pending<Vec<Unresolved>>, BridgeError> {
-        self.shared.lock().shutting_down = true;
         let request_id = self.request_id();
         let frame = frames::encode(
             &ToWorker::Shutdown {
@@ -1017,11 +1073,25 @@ impl Bridge {
             }
             .to_value(),
             cap_of(self.limits.max_request_bytes),
-        )
-        .map_err(BridgeError::Frame)?;
-        let (rx, permit) = self.enlist(&request_id, None, None, Kind::Control)?;
+        );
         let deadline = Instant::now() + Duration::from_millis(drain_ms) + self.config.grace;
-        permit.send(Write { frame, deadline });
+        // Taken before the lock: a queue that refuses reads `lost`.
+        let reserved = self.reserve();
+        // The flag is set and the frame queued under one lock, the one a
+        // request's or an observe's frame is queued under once the flag
+        // was read, so no such frame is ever written after this one.
+        let mut state = self.shared.lock();
+        state.shutting_down = true;
+        let frame = frame.map_err(BridgeError::Frame)?;
+        let rx = self.admit(&mut state, &request_id, None, None, Kind::Control)?;
+        match reserved {
+            Ok(permit) => permit.send(Write { frame, deadline }),
+            Err(e) => {
+                state.waiters.remove(&request_id);
+                return Err(e);
+            }
+        }
+        drop(state);
         Ok(Pending {
             request_id,
             rx,
@@ -1344,11 +1414,7 @@ async fn refuse<L: Recorder>(
     dispatch: ProviderDispatch,
     refusal: Refusal,
 ) -> BridgeError {
-    let answer = ProviderAnswer {
-        code: Some(refusal.code.to_owned()),
-        reason: Some(refusal.reason.to_owned()),
-        effect: Some("none".to_owned()),
-    };
+    let answer = rejected(&refusal);
     let recorded = match log.reserve().await {
         Ok(slot) => slot
             .run(move |log| log.begin(&dispatch, Some(&answer)))
@@ -1359,6 +1425,16 @@ async fn refuse<L: Recorder>(
     match recorded {
         Ok(()) => BridgeError::RefusedLocally(refusal),
         Err(e) => BridgeError::Log(e),
+    }
+}
+
+/// What the log keeps of `refusal`, found before anything was written:
+/// its code and reason, with no effect.
+fn rejected(refusal: &Refusal) -> ProviderAnswer {
+    ProviderAnswer {
+        code: Some(refusal.code.to_owned()),
+        reason: Some(refusal.reason.to_owned()),
+        effect: Some("none".to_owned()),
     }
 }
 

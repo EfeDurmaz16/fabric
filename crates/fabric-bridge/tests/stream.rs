@@ -1,7 +1,7 @@
-//! The client's writes against an in-process worker over a small pipe:
-//! a caller that gives up on a request whose frame does not fit the pipe
-//! leaves no part of a frame behind, so the worker reads every frame
-//! whole and in order.
+//! The client's writes against an in-process worker: a caller that gives
+//! up on a request whose frame does not fit the pipe leaves no part of a
+//! frame behind, so the worker reads every frame whole and in order, and
+//! a request admitted before a shutdown is never written after it.
 
 #![allow(
     clippy::unwrap_used,
@@ -12,13 +12,19 @@
 
 mod common;
 
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
-use common::create;
+use common::{create, operation};
 use fabric_bridge::wire::Action;
-use fabric_bridge::{Bridge, Config, MemoryLog, frames};
-use fabric_journal::ProviderStatus;
+use fabric_bridge::{
+    Bridge, BridgeError, Config, Entry, LogError, LogThread, MemoryLog, OperationLog, frames,
+};
+use fabric_core::managed::OperationId;
+use fabric_journal::{ProviderAnswer, ProviderDispatch, ProviderStatus};
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 
 const PROFILE: &str = include_str!("../../../protocol/bridge/v1/profiles/fixture.json");
 
@@ -115,4 +121,114 @@ async fn a_caller_that_gives_up_leaves_no_partial_frame() {
     let (ids, _reader, _writer) = script.await.unwrap();
     assert_eq!(ids, ["r-1", "r-2"]);
     assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// A log whose first `begin` says it started, then waits for the test to
+/// let it through: a request held on the log's thread between its
+/// admission and its frame, as behind other journal calls and their
+/// fsyncs.
+struct Gated {
+    log: MemoryLog,
+    started: Option<oneshot::Sender<()>>,
+    open: std_mpsc::Receiver<()>,
+}
+
+impl OperationLog for Gated {
+    fn begin(
+        &mut self,
+        dispatch: &ProviderDispatch,
+        refusal: Option<&ProviderAnswer>,
+    ) -> Result<(), LogError> {
+        if let Some(started) = self.started.take() {
+            started.send(()).unwrap();
+            self.open.recv().unwrap();
+        }
+        self.log.begin(dispatch, refusal)
+    }
+
+    fn record(
+        &mut self,
+        operation: OperationId,
+        status: ProviderStatus,
+        answer: &ProviderAnswer,
+        locator: Option<&str>,
+    ) -> Result<(), LogError> {
+        self.log.record(operation, status, answer, locator)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+        self.log.locate(operation, locator)
+    }
+
+    fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
+        self.log.entry(operation)
+    }
+}
+
+/// A request is admitted, then held on the log's thread while a shutdown
+/// is sent and acknowledged by a worker that, with nothing in flight,
+/// closes its output. Written now, behind the shutdown, the request would
+/// never be read by the worker yet settle `unknown`, and a create with no
+/// locator cannot be observed. It is recorded `rejected` as a draining
+/// worker answers a request read after a shutdown, and the worker reads
+/// only the shutdown. The order is the same on every run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_admitted_before_a_shutdown_is_never_written_after_it() {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        // Every frame until Fabric closes the worker's input.
+        let mut read = Vec::new();
+        while let Some(frame) = frames::read(&mut reader, 1 << 20).await.unwrap() {
+            let (kind, id) = (&frame["type"], &frame["request_id"]);
+            read.push(format!(
+                "{}:{}",
+                kind.as_str().unwrap(),
+                id.as_str().unwrap()
+            ));
+            if kind == "shutdown" {
+                let ack = json!({"type": "shutdown_ack", "request_id": id, "unresolved": []});
+                let frame = frames::encode(&ack, 1 << 20).unwrap();
+                frames::write(&mut writer, &frame).await.unwrap();
+                writer.shutdown().await.unwrap();
+            }
+        }
+        read
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let (started, held) = oneshot::channel();
+    let (open, gate) = std_mpsc::channel();
+    let mut log = LogThread::spawn(Gated {
+        log: MemoryLog::new(),
+        started: Some(started),
+        open: gate,
+    })
+    .unwrap();
+    let request = bridge.request(&mut log, create(1, "fixture/ok"));
+    let shutdown = async {
+        held.await.unwrap();
+        let unresolved = bridge.shutdown(1000).await.unwrap().wait().await.unwrap();
+        open.send(()).unwrap();
+        unresolved
+    };
+    let (result, unresolved) = tokio::join!(request, shutdown);
+    assert!(
+        matches!(
+            &result,
+            Err(BridgeError::RefusedLocally(r)) if (r.code, r.reason) == ("unavailable", "shutting_down")
+        ),
+        "{result:?}"
+    );
+    assert_eq!(unresolved, []);
+    let id = operation(1).id;
+    let entry = log.call(move |log| log.entry(id)).await.unwrap().unwrap();
+    assert_eq!(entry.map(|e| e.status), Some(ProviderStatus::Rejected));
+    assert_eq!(bridge.close().await, None);
+    assert_eq!(script.await.unwrap(), ["shutdown:r-2"]);
 }
