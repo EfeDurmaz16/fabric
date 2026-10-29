@@ -70,6 +70,14 @@ the machine's load is not an explanation: the bench gives both builds of a
 pair the same load. A correctness check is never removed or weakened to
 win time; find a cheaper way to do the same check.
 
+The rule gates the release build, the one a node runs (Efe, 2026-10-29):
+the A/B run that must show no op slower and no daemon or CLI larger than
+the anchor is `scripts/bench-ab.sh --release`. The test profile is
+tracked, not gated: its runs stay in the record, but an unoptimized binary
+keeps more code pages resident than the anchor's, so its resident size is
+not held to the anchor's. CI's time budget below is a separate, coarse
+guard and still runs in the test profile.
+
 `scripts/bench-ab.sh` is the evidence. It builds the anchor once into a
 cache, builds this working tree (or `--candidate <commit>`), and runs the
 ignored test `ab::paired` in `crates/fabric/tests/e2e/ab.rs`, which drives
