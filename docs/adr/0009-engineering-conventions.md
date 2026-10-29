@@ -4,6 +4,8 @@ Status: accepted, 2026-10-19
 
 Amended 2026-10-28: adds the performance rule Efe set on 2026-10-27 (no regression against a fixed anchor, replacing a tolerance per pull request), and lists the CI gates as CI runs them, where the body still said they were to be added. Found while closing M2-25, the time budget that only reported in CI.
 
+Amended 2026-10-29: the performance rule gates the release build only, as Efe ruled on 2026-10-29; the test profile is tracked, not gated. Asked in PR #31, where the release build was smaller than the anchor on every measure and the test profile's resident size was not, from the clean code pages of an unoptimized binary 8% larger than the anchor's.
+
 ## Context
 
 Fabric is small, Rust-only, and will be written fast by several people and agents in parallel. The failure mode of that setup is slop: placeholder modules, narrating comments, stubs that pretend, tests that test the compiler. These conventions exist so a reviewer can reject work on a stated rule rather than taste.
@@ -58,6 +60,7 @@ The cargo commands must pass locally before every push, and their summary lines 
 ### Performance
 
 - The bar is no regression against a fixed anchor: `main` at `176622e`, before the durable job campaign. A tolerance per pull request compounds (1.5 times per PR is 5 times after four), so every change is compared with the same anchor, on time and on memory, and the aim is to be faster and smaller than it.
+- The rule gates the release build, the one a node runs: the A/B run in the release profile is the one that must show no op slower and no daemon or CLI larger. The test profile is tracked, not gated; its runs stay in the record (amended 2026-10-29).
 - A slowdown measured on a hot path is a bug to fix, not a trade-off to document, and machine load is not an explanation. A correctness check is never removed or weakened to win time; a cheaper way to make the same check is.
 - The evidence is `scripts/bench-ab.sh`: anchor and candidate built once each, run in the same session in alternating order, at least 15 pairs, the median ratio with a 95% bootstrap interval, and counters that do not depend on load (processes started, file flushes, bytes, allocations, resident size). A busy machine takes only counters (`--pairs 0`, `FABRIC_BUDGET=count`); times come from a quiet one.
 - CI's guard is the time budget in `crates/fabric/tests/e2e/budget.toml`: on Linux each op is held to the anchor's time on that runner, and on every runner each op's process starts are held to exact counts, by program. A baseline is the anchor's time and never rises; `scripts/check-budget.sh` refuses a change that raises one or loosens the ratio, the grace, the percentile or the runs.

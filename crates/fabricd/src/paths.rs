@@ -256,11 +256,19 @@ impl JobDir {
     }
 
     /// Where a fork repair keeps the ledger this node held before it took
-    /// the chain the fork rule picked, named by the last record the two
-    /// chains share (ADR 0003, Forks): the whole file, nothing cut.
+    /// the chain the fork rule picked (ADR 0003, Forks): the whole file,
+    /// nothing cut, named by the last record the two chains share and by
+    /// that ledger's head. A record's hash covers every record before it,
+    /// so one name only ever holds one ledger's bytes, and a second repair
+    /// at the same fork point, which holds another chain by then, keeps it
+    /// beside the first instead of over it.
     #[must_use]
-    pub fn forked_ledger(&self, fork_point: fabric_core::id::RecordHash) -> PathBuf {
-        self.dir.join(format!("ledger.forked-{fork_point}"))
+    pub fn forked_ledger(
+        &self,
+        fork_point: fabric_core::id::RecordHash,
+        head: fabric_core::id::RecordHash,
+    ) -> PathBuf {
+        self.dir.join(format!("ledger.forked-{fork_point}-{head}"))
     }
 }
 

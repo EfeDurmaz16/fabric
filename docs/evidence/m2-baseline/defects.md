@@ -4,7 +4,7 @@ Revalidated on 2026-10-27 against `176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5` (or
 
 Status is `confirmed` when the current source still has the cause at the anchor given, `invalid` when it does not. No finding was found invalid: the source has not changed since the audit. Two candidates the audit itself rejected are listed at the end with the evidence.
 
-Scope says whether M2 fixes it (`M2`), or whether it is recorded here and handed to a later campaign (`M3` to `M6`, or `later` for hardening with no campaign yet). A deferred finding keeps an owner group so its files stay disjoint from the M2 work.
+Scope says which campaign fixes it. Amended 2026-10-29: every finding is now M2 scope. The first version of this register handed some to a later campaign; on 2026-10-28 each of those was given to an M2 group, and each is fixed on `m2/durable-job-foundations` with a test that failed first ("Disposition after the integration" below). Their scope cells say `M2 (moved in 2026-10-28)`, and git history keeps the first wording. Each finding keeps the owner group whose files it touches.
 
 An expected-failure test is `#[ignore = "<ID>: expected failure until fixed"]`. It states the intended behavior and fails on the current source; the owner removes the `ignore` in the commit that fixes it. Run them all with `cargo test --workspace --locked -- --ignored <name>`; each was run on this branch and failed at its intended assertion (see `expected-failures.md`).
 
@@ -48,24 +48,24 @@ Shared file rules: `crates/fabric-core/src/lib.rs` takes one module line from G1
 | M2-11 | `git_bundle: null` is refused by the Rust client and accepted by the TypeScript SDK | confirmed: `crates/fabric-client/src/api.rs:2005-2006` (`#[serde(default)]` without `null_as_default`), `sdk/typescript/src/schema.ts:510` | `api.rs`, `protocol/fixtures/tolerated/*` | G3 | M2 | `crates/fabric-client/tests/null_fields.rs::a_null_git_bundle_reads_as_absent` |
 | M2-12 | No operation id or idempotency key on any mutating client call | confirmed: no key field in `crates/fabric-client/src/api.rs` `Request` ops | G1, G2, G3 per `docs/managed-jobs.md` | G3 | M2 (design delivered; managed ops only) | covered by the M2 acceptance tests in `docs/managed-jobs.md` |
 | R1 | No exactly-one-running guarantee after a forced steal during a partition | confirmed release boundary: `crates/fabricd/src/catchup.rs:220-257` warns and does not refuse | ADR 0020 for managed jobs; standalone unchanged | G3 | M2 for managed jobs (no automatic failover, generation fencing); standalone stays documented | none (design limit, not a bug) |
-| R3 | A frozen fork and an orphan have no repair or export command | confirmed release boundary: `catchup.rs:262-344`, `ops.rs:2418-2461` | `ops.rs`, `catchup.rs` | B | M5 | none |
-| M2-13 | A facts probe buffers all its output before the size check | confirmed: `crates/fabricd/src/facts.rs:586-607` uses `Command::output()` and checks `MAX_FACT_VALUE` after exit | `facts.rs` | B | later | none |
-| M2-14 | The control socket's event channel is unbounded for a client that stops reading | confirmed: `crates/fabricd/src/control.rs:111` `unbounded_channel` | `control.rs` | G3 | M3 (with resumable operation results) | none |
-| M2-15 | No per-peer bound on queued request bytes across connections | confirmed: `crates/fabric-net/src/rpc.rs:956-968` caps work permits per peer, not queued frames | `rpc.rs` | B | later (before multi-user) | none |
+| R3 | A frozen fork and an orphan have no repair or export command | confirmed release boundary: `catchup.rs:262-344`, `ops.rs:2418-2461` | `ops.rs`, `catchup.rs` | B | M2 (moved in 2026-10-28) | none |
+| M2-13 | A facts probe buffers all its output before the size check | confirmed: `crates/fabricd/src/facts.rs:586-607` uses `Command::output()` and checks `MAX_FACT_VALUE` after exit | `facts.rs` | B | M2 (moved in 2026-10-28) | none |
+| M2-14 | The control socket's event channel is unbounded for a client that stops reading | confirmed: `crates/fabricd/src/control.rs:111` `unbounded_channel` | `control.rs` | G3 | M2 (moved in 2026-10-28) | none |
+| M2-15 | No per-peer bound on queued request bytes across connections | confirmed: `crates/fabric-net/src/rpc.rs:956-968` caps work permits per peer, not queued frames | `rpc.rs` | B | M2 (moved in 2026-10-28) | none |
 | M2-16 | `docs/net.md` still says the layer is only a library and names `fabric node pair` | confirmed: `docs/net.md:8-11`, `:37` | `docs/net.md` | B | M2 | none (docs) |
 | M2-17 | README says "Secrets stay behind" and "never leave"; tracked and stashed secrets travel by design | confirmed: `README.md:3`, `:54` against `crates/fabric-store/src/capture.rs:12-13` and ADR 0014 | `README.md` | C | M2 | none (docs) |
-| M2-18 | Every replication pushes the whole ledger, and each received record is checked by a linear scan | confirmed: `crates/fabricd/src/ops.rs:1238-1267`, `crates/fabricd/src/job.rs:161` | `ops.rs`, `job.rs`, `fabric-core/src/ledger.rs` | B | later (benchmark first) | none (performance) |
-| M2-19 | One store mutex covers whole captures and restores | confirmed: `crates/fabricd/src/node.rs:73`, `transfer.rs:40-51` | `transfer.rs`, `fabric-store` | G3 | later | none (performance) |
-| M2-20 | A complete venv carried without uv is called runnable on a target that may lack its interpreter | confirmed: `crates/fabricd/src/carry.rs:410-417` | `carry.rs` | E | M5 | none |
-| M2-21 | A Codex sandbox profile is reduced to a mode on restore | confirmed: `crates/fabric-harness/src/codex/rollout.rs:512-527` keeps only the sandbox type | `codex/rollout.rs` | A | M5 (fidelity, draft P04) | none |
-| M2-22 | The CLI's headless session queue and line reader are unbounded | confirmed: `crates/fabric/src/lib.rs:1073` `unbounded_channel`, line reads after it | `fabric/src/lib.rs` | A | later | none |
-| M2-23 | ACP updates are bounded by count (1024) not bytes, with 16 MiB lines | confirmed: `crates/fabric-harness/src/acp/client.rs:48`, `:56` | `acp/client.rs` | A | later | none |
+| M2-18 | Every replication pushes the whole ledger, and each received record is checked by a linear scan | confirmed: `crates/fabricd/src/ops.rs:1238-1267`, `crates/fabricd/src/job.rs:161` | `ops.rs`, `job.rs`, `fabric-core/src/ledger.rs` | B | M2 (moved in 2026-10-28; benchmark first) | none (performance) |
+| M2-19 | One store mutex covers whole captures and restores | confirmed: `crates/fabricd/src/node.rs:73`, `transfer.rs:40-51` | `transfer.rs`, `fabric-store` | G3 | M2 (moved in 2026-10-28) | none (performance) |
+| M2-20 | A complete venv carried without uv is called runnable on a target that may lack its interpreter | confirmed: `crates/fabricd/src/carry.rs:410-417` | `carry.rs` | E | M2 (moved in 2026-10-28) | none |
+| M2-21 | A Codex sandbox profile is reduced to a mode on restore | confirmed: `crates/fabric-harness/src/codex/rollout.rs:512-527` keeps only the sandbox type | `codex/rollout.rs` | A | M2 (moved in 2026-10-28) | none |
+| M2-22 | The CLI's headless session queue and line reader are unbounded | confirmed: `crates/fabric/src/lib.rs:1073` `unbounded_channel`, line reads after it | `fabric/src/lib.rs` | A | M2 (moved in 2026-10-28) | none |
+| M2-23 | ACP updates are bounded by count (1024) not bytes, with 16 MiB lines | confirmed: `crates/fabric-harness/src/acp/client.rs:48`, `:56` | `acp/client.rs` | A | M2 (moved in 2026-10-28) | none |
 | M2-24 | The e2e helper `finish` waits without a deadline after killing the CLI | confirmed: `crates/fabric/tests/e2e/world.rs:778-790` unbounded `waited.recv()` | `world.rs` | H | M2 | none: the fix is in the test helper itself |
-| M2-25 | Wall-time budgets only report in CI, and Linux has no baselines | confirmed: `.github/workflows/ci.yml` sets `FABRIC_BUDGET: report`; `budget.toml` `[baseline.linux-x86_64]` is empty | `ci.yml`, `budget.toml` | H | later (needs CI baselines) | none |
+| M2-25 | Wall-time budgets only report in CI, and Linux has no baselines | confirmed: `.github/workflows/ci.yml` sets `FABRIC_BUDGET: report`; `budget.toml` `[baseline.linux-x86_64]` is empty | `ci.yml`, `budget.toml` | H | M2 (moved in 2026-10-28) | none |
 
 ## Disposition after M2
 
-Recorded on 2026-10-27 on `m2/durable-job-foundations` after the owner branches were integrated. `fixed` means the fix and its test are on the branch and the test passes in `docs/evidence/m2-integration/gates/test.log`; `deferred` means the scope column above hands it to a later campaign, with no ignored test left for it.
+Recorded on 2026-10-27 on `m2/durable-job-foundations` after the owner branches were integrated. `fixed` means the fix and its test are on the branch and the test passes in `docs/evidence/m2-integration/gates/test.log`. Amended 2026-10-29: the rows this table first handed to a later campaign were moved into M2 on 2026-10-28 and are fixed on this branch; they now point to "Disposition after the integration", which names each fix and its test.
 
 | ID | Status | Fix and proof |
 |---|---|---|
@@ -89,40 +89,40 @@ Recorded on 2026-10-27 on `m2/durable-job-foundations` after the owner branches 
 | M2-11 | fixed | `8e253f2`: `git_bundle` reads `null` as left out; fixture `protocol/fixtures/tolerated/git_bundle_written_as_null.json` read by both SDKs. Test: `null_fields::a_null_git_bundle_reads_as_absent` |
 | M2-12 | fixed | managed ops carry an operation key (`docs/managed-jobs.md`). Tests: `fabric-journal` `tests::a_duplicate_command_gets_the_same_identity_and_bytes_before_and_after_a_restart`, `crash_tests::a_command_killed_after_its_commit_answers_its_retry_with_the_same_identity`, e2e `managed::e2e_a_managed_job_keeps_identity_and_progress_across_a_daemon_kill`. Standalone ops keep no key by design |
 | R1 | fixed for managed jobs | ADR 0020: generation fencing, no automatic failover, `UNIQUE(job_id, generation)`. Tests: `fabric-core/tests/managed_rules.rs`, journal recovery tests. Standalone jobs keep the documented release boundary |
-| R3 | deferred (M5) | release boundary, no test |
-| M2-13 | deferred (later) | no test |
-| M2-14 | deferred (M3) | no test |
-| M2-15 | deferred (later) | no test |
+| R3 | fixed after the integration | `4b708e7`, `c0f0a72`, `2dad2d1`; see "Disposition after the integration" |
+| M2-13 | fixed after the integration | `ebfa2f5`; see "Disposition after the integration" |
+| M2-14 | fixed after the integration | `e823af3`, `4e6c443`; see "Disposition after the integration" |
+| M2-15 | fixed after the integration | `d8cedec`, then `cdb1c43` and `f8742a2` from the PR #31 review; see "Disposition after the integration" and "Disposition after the PR #31 review" |
 | M2-16 | fixed | `3e53359`, `a840c89`: `docs/net.md` and the peer book's module doc name `fabric node add` |
 | M2-17 | fixed | `ea05c56`: the README says which secrets stay and which travel |
-| M2-18 | deferred (later) | benchmark first |
-| M2-19 | deferred (later) | no test |
-| M2-20 | deferred (M5) | no test |
-| M2-21 | deferred (M5) | no test |
-| M2-22 | deferred (later) | no test |
-| M2-23 | deferred (later) | no test |
+| M2-18 | fixed after the integration | `d7c1e15`, `ba51198`, after the benchmark `bd76d69`; see "Disposition after the integration" |
+| M2-19 | fixed after the integration | `676426f`, `360dd46`; see "Disposition after the integration" |
+| M2-20 | fixed after the integration | `bb0c3f1`; see "Disposition after the integration" |
+| M2-21 | fixed after the integration | `7a23746`; see "Disposition after the integration" |
+| M2-22 | fixed after the integration | `01c7ee9`; see "Disposition after the integration" |
+| M2-23 | fixed after the integration | `608e14b`, `863b927`; see "Disposition after the integration" |
 | M2-24 | fixed | `b957ab2`: `finish` waits at most ten seconds for a killed command's output. Test: `world::a_killed_command_whose_child_keeps_its_pipes_fails_in_time` (fails in 40 s with the old wait) |
-| M2-25 | deferred (later) | needs CI baselines |
-| M2-26 | new, deferred (later) | Found while fixing M2-02: `NodeFacts::to_wire` in `crates/fabricd/src/facts.rs` answers no facts at all when a node has more than `MAX_FACTS` (64), through `unwrap_or_default`. About 43 fixed names exist today, and setup-step programs add one each, so a spec with many setup programs can reach it. A peer then sees every fact missing and refuses the move, so it fails closed, but with a misleading reason. Owner B |
+| M2-25 | fixed after the integration | `29aa540`, `c620d9f`, `b2763b4`, `acc3146`, then `0381081` and `13f29d1` from the PR #31 review; see "Disposition after the integration" |
+| M2-26 | new, fixed after the integration (`fd41b9e`; see "Disposition after the integration") | Found while fixing M2-02: `NodeFacts::to_wire` in `crates/fabricd/src/facts.rs` answers no facts at all when a node has more than `MAX_FACTS` (64), through `unwrap_or_default`. About 43 fixed names exist today, and setup-step programs add one each, so a spec with many setup programs can reach it. A peer then sees every fact missing and refuses the move, so it fails closed, but with a misleading reason. Owner B |
 
-## Disposition after the deferred work
+## Disposition on the group branches
 
-Recorded on 2026-10-28 by the budget and CI group, after "later" stopped being a disposition: every finding deferred above was given to a group, which fixes it with a test that fails first. M2-25 is this group's and is on its branch. The others are on their groups' branches, not yet on `m2/durable-job-foundations`; this table says where each fix is so the integration can check it, and each group reports its own disposition. All of them merged without a conflict into one integration, on which the budget's count mode and the counted A/B runs of `docs/evidence/perf-ab/README.md` ran.
+Recorded on 2026-10-28 by the budget and CI group, once a later campaign stopped being a disposition: every finding the table above had not given to M2 was given to a group, which fixes it with a test that fails first. M2-25 is this group's and is on its branch. The others are on their groups' branches, not yet on `m2/durable-job-foundations`; this table says where each fix was so the integration could check it; "Disposition after the integration" names each fix's commit on this branch. All of them merged without a conflict into one integration, on which the budget's count mode and the counted A/B runs of `docs/evidence/perf-ab/README.md` ran.
 
 | ID | Status | Fix and proof |
 |---|---|---|
 | M2-25 | fixed | `pd/wip-budget-ci-evidence`. `188fb32`: `linux-x86_64` baselines, the anchor's times on CI's `ubuntu-latest` runner (median of three CI runs of `176622e`'s code, `scripts/budget-baselines.sh` from `ef43373`). `3ba7b21`: CI runs the budget with `FABRIC_BUDGET=enforce`; the macOS runner, whose runs of one commit differ by up to 1.34 times, names a platform with no baselines and holds only process counts. `c5a12e4`: `scripts/check-budget.sh` refuses a raised or removed baseline and a looser ratio, grace, percentile or run count, so a baseline stays the anchor's. `6792db6`: a time over its limit no longer tells to raise the baseline. Tests: `budget::every_op_has_a_baseline_on_linux_and_macos` and `budget::ci_enforces_the_budget` (each failed before), 12 new cases of `scripts/test-check-budget.sh` that failed against the old script, and the message case of `budget::the_verdicts_follow_the_rules` |
-| M2-13 | fix on `pd/wip-facts-net-carry` | `32fe4bd`. Tests: `a_probe_stops_reading_once_its_output_passes_what_a_fact_holds`, `an_endless_output_is_read_only_until_it_cannot_be_a_fact`, `a_fact_read_as_it_arrives_is_the_fact_read_whole` |
-| M2-14 | fix on `pd/wip-node-runtime` | `28227da`, `266ce9b`, `922522c`, ADR note `a495cb6`. Test: `a_client_that_stops_reading_holds_a_bounded_backlog_and_gets_the_answer` (`8947330`, first) |
-| M2-15 | fix on `pd/wip-facts-net-carry` | `c20483f`. Test: `request_bytes_held_for_a_peer_are_bounded_over_its_sessions` |
-| M2-18 | fix on `pd/wip-cli-protocol-ops` | `e56c6bf`, `1ecc017`, after the benchmark `9fa6324`. Tests: `the_hash_index_finds_every_record_and_nothing_else`, `a_push_sends_what_the_peer_lacks_and_the_whole_ledger_to_a_peer_that_lost_it` |
-| M2-19 | fix on `pd/wip-node-runtime` | `8b6f90a`, `15e36b8`, after the benchmark `c344206`. Tests: `a_short_store_call_runs_beside_a_long_one` (`6007c13`, first), `captures_restores_and_reads_on_handles_at_once_leave_a_clean_store`, `gc_and_forget_are_refused_while_another_handle_lives` |
-| M2-20 | fix on `pd/wip-facts-net-carry` | `86fedc8`. Test: `a_finished_venv_without_its_installer_travels_only_to_its_interpreter` |
-| M2-21 | fix on `pd/wip-launch-hold` | `f2857db`. Tests: `the_session_s_sandbox_travels_whole`, `a_turn_s_writable_roots_and_network_access_are_read`, and four more in that commit |
-| M2-22 | fix on `pd/wip-cli-protocol-ops` | `c2aea4c`. Tests: `named_sessions_wait_in_order_and_in_bounds`, `a_line_past_the_bound_is_dropped_without_holding_it` |
-| M2-23 | fix on `pd/wip-launch-hold` | `cba3776`, ADR note `14c2d0f`. Tests: `updates_are_bounded_by_bytes_as_well_as_by_count`, `a_queue_full_of_bytes_drops_the_newest_and_counts_it` |
-| M2-26 | fix on `pd/wip-facts-net-carry` | `af473fe`. Tests: `an_answer_with_no_room_for_every_fact_keeps_the_measured_ones_and_names_the_rest`, `a_peer_answer_that_left_facts_out_names_that_cause` |
-| R3 | fix on `pd/wip-cli-protocol-ops` | `f733771`, `9f4fab6`. Tests: `a_frozen_owner_exports_its_orphan_and_takes_the_chain_the_fork_rule_picks`, e2e `e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork` |
+| M2-13 | fixed, on `pd/wip-facts-net-carry` then; integrated since | `32fe4bd`. Tests: `a_probe_stops_reading_once_its_output_passes_what_a_fact_holds`, `an_endless_output_is_read_only_until_it_cannot_be_a_fact`, `a_fact_read_as_it_arrives_is_the_fact_read_whole` |
+| M2-14 | fixed, on `pd/wip-node-runtime` then; integrated since | `28227da`, `266ce9b`, `922522c`, ADR note `a495cb6`. Test: `a_client_that_stops_reading_holds_a_bounded_backlog_and_gets_the_answer` (`8947330`, first) |
+| M2-15 | fixed, on `pd/wip-facts-net-carry` then; integrated since | `c20483f`. Test: `request_bytes_held_for_a_peer_are_bounded_over_its_sessions` |
+| M2-18 | fixed, on `pd/wip-cli-protocol-ops` then; integrated since | `e56c6bf`, `1ecc017`, after the benchmark `9fa6324`. Tests: `the_hash_index_finds_every_record_and_nothing_else`, `a_push_sends_what_the_peer_lacks_and_the_whole_ledger_to_a_peer_that_lost_it` |
+| M2-19 | fixed, on `pd/wip-node-runtime` then; integrated since | `8b6f90a`, `15e36b8`, after the benchmark `c344206`. Tests: `a_short_store_call_runs_beside_a_long_one` (`6007c13`, first), `captures_restores_and_reads_on_handles_at_once_leave_a_clean_store`, `gc_and_forget_are_refused_while_another_handle_lives` |
+| M2-20 | fixed, on `pd/wip-facts-net-carry` then; integrated since | `86fedc8`. Test: `a_finished_venv_without_its_installer_travels_only_to_its_interpreter` |
+| M2-21 | fixed, on `pd/wip-launch-hold` then; integrated since | `f2857db`. Tests: `the_session_s_sandbox_travels_whole`, `a_turn_s_writable_roots_and_network_access_are_read`, and four more in that commit |
+| M2-22 | fixed, on `pd/wip-cli-protocol-ops` then; integrated since | `c2aea4c`. Tests: `named_sessions_wait_in_order_and_in_bounds`, `a_line_past_the_bound_is_dropped_without_holding_it` |
+| M2-23 | fixed, on `pd/wip-launch-hold` then; integrated since | `cba3776`, ADR note `14c2d0f`. Tests: `updates_are_bounded_by_bytes_as_well_as_by_count`, `a_queue_full_of_bytes_drops_the_newest_and_counts_it` |
+| M2-26 | fixed, on `pd/wip-facts-net-carry` then; integrated since | `af473fe`. Tests: `an_answer_with_no_room_for_every_fact_keeps_the_measured_ones_and_names_the_rest`, `a_peer_answer_that_left_facts_out_names_that_cause` |
+| R3 | fixed, on `pd/wip-cli-protocol-ops` then; integrated since | `f733771`, `9f4fab6`. Tests: `a_frozen_owner_exports_its_orphan_and_takes_the_chain_the_fork_rule_picks`, e2e `e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork` |
 
 The time budget now also counts every probe and harness each op starts (`c6840ca`), and `FABRIC_BUDGET=count` checks the counts without timing (`7989b66`). Its counts are those of the integration; two count runs agreed, and a third after `pd/wip-store-git` gained `7939faa`. On a branch alone the counts of the other branches' changes fail it: they hold only once every branch is in.
 
@@ -146,6 +146,19 @@ Recorded on 2026-10-28 when the integrator cherry-picked the seven deferred-work
 | M2-25 | fixed | `29aa540` (`188fb32`), `c620d9f` (`3ba7b21`), `b2763b4` (`c5a12e4`), `acc3146` (`6792db6`) | `budget::every_op_has_a_baseline_on_linux_and_macos`, `budget::ci_enforces_the_budget`, `budget::the_verdicts_follow_the_rules`, `scripts/test-check-budget.sh` |
 | M2-26 | fixed | `fd41b9e` (`af473fe`) | `an_answer_with_no_room_for_every_fact_keeps_the_measured_ones_and_names_the_rest`, `a_peer_answer_that_left_facts_out_names_that_cause` |
 | R3 | fixed | `4b708e7` (`f733771`), CLI `c0f0a72` (`9f4fab6`), ADRs `2dad2d1` (`b41ec48`) | `catchup::fork_tests`, `a_frozen_owner_exports_its_orphan_and_takes_the_chain_the_fork_rule_picks`, e2e `e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork` |
+
+## Disposition after the PR #31 review
+
+Recorded on 2026-10-29. A review of `31577c4` found five defects; each was reproduced with a test that failed before its fix and is fixed on this branch (`docs/evidence/m2-review-pr31/README.md`). Two of them finish M2-15 and M2-25 above. The last row is a flake the PR had left as a note, reproduced and fixed the same day.
+
+| Finding | Status | Fix | Test, and what it read before the fix |
+|---|---|---|---|
+| A restore could evict another job's bundle cache between that job's reuse and its copies | fixed | `0c4f287` | `restore::tests::a_cache_another_restore_evicts_after_reuse_costs_a_replay_not_the_restore` (failed with `NotFound`) |
+| A second fork repair at one fork point wrote over the ledger the first repair kept | fixed | `346f932` | `ops::tests::a_second_repair_at_one_fork_point_keeps_the_first_kept_ledger`, `job::tests::adopt_never_replaces_another_kept_ledger` |
+| M2-15's per-peer request bound was bypassed: the transports read each waiting request off the wire before the room gate | fixed | `cdb1c43`, `f8742a2` | `rpc::tests::request_bytes_read_off_the_wire_for_a_peer_are_bounded` (50,339,502 bytes before, 17,305,038 after), `quic::tests::a_peer_can_leave_at_most_the_connection_window_unread`, `mux::tests::a_stream_the_peer_opened_gets_credit_only_for_what_its_reader_asks`, `pipe::tests::credit_on_demand_is_what_a_read_asked_for_and_no_more` |
+| M2-25's `check-budget.sh` compared no process count, and an `anchor` line let every baseline rise unchecked | fixed | `0381081`, `13f29d1` | `scripts/test-check-budget.sh`, 60 cases; the review's two cases passed the old script and fail now |
+| A headless ACP turn gathered its whole answer with no bound | fixed | `fc73523` | `acp::tests::a_drained_turn_keeps_at_most_max_answer_bytes_of_answer` (held 25,165,824 bytes before), `an_answer_is_cut_at_a_character_and_stays_a_prefix` |
+| `codex::tests::the_version_is_asked_in_the_workspace_codex_starts_in` failed once in an owner run: the harness tests' fakes first ran inside a version probe, and macOS's check of a new executable can outlast its 15 s timeout under load | fixed | `3c6dbd0`: every fake runs once when it is written | `fake_tool::tests::a_written_fake_has_run_once_and_the_guard_kept_its_body_from_running`; six runs of the crate's tests at once failed 12 of 12 before (up to 11 codex, 8 claude, 1 process and 1 version test each) and pass 12 of 12 after |
 
 ## Candidates the audit rejected, rechecked
 

@@ -494,6 +494,13 @@ impl Running {
     }
 }
 
+/// The most bytes of a turn's answer a report holds: the longest line a
+/// headless Claude or Codex run prints its answer on, which the CLI reads
+/// whole or not at all. An ACP agent's answer arrives in chunks, of any
+/// number, so its driver keeps the first `MAX_ANSWER` bytes and counts
+/// the rest in `TurnReport::answer_left_out`.
+pub const MAX_ANSWER: usize = 16 * 1024 * 1024;
+
 /// What a headless run printed about its turn, as its adapter reads it
 /// line by line (`ClaudeCode::read_headless_line`,
 /// `Codex::read_headless_line`).
@@ -501,8 +508,11 @@ impl Running {
 pub struct TurnReport {
     /// The session the harness says the turn ran in.
     pub session: Option<SessionId>,
-    /// The last answer of the turn.
+    /// The last answer of the turn, at most `MAX_ANSWER` bytes.
     pub answer: Option<String>,
+    /// Bytes of the answer left out after its first `MAX_ANSWER`, which
+    /// only an ACP agent's driver counts; zero when nothing was.
+    pub answer_left_out: u64,
     /// Why the turn failed, when the harness says it did.
     pub failure: Option<String>,
 }

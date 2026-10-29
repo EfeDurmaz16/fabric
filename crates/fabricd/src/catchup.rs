@@ -419,7 +419,9 @@ impl Node {
                         matches!(r.event().kind, fabric_core::ledger::EventKind::SnapshotPublished { snapshot: s, .. } if s == *snapshot)
                     }))
                     .collect();
-                let kept = job.dir().forked_ledger(ours[at].hash());
+                let kept = job
+                    .dir()
+                    .forked_ledger(ours[at].hash(), job.ledger().head());
                 let mut pins = Vec::with_capacity(orphans.len());
                 for snapshot in &orphans {
                     pins.push(crate::local::Pin {

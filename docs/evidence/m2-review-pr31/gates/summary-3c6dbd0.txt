@@ -1,0 +1,15 @@
+Gates on e454dc9, whose code is 3c6dbd0's (the last commit that changes code, here test code only), run one after another in the worktree of m2/durable-job-foundations on 2026-10-29, after the release A/B of ab-vs-anchor-release/ had ended.
+
+cargo fmt --all --check: ok
+cargo clippy --workspace --all-targets --locked -- -D warnings: ok
+cargo clippy -p fabric-harness --all-targets --locked --no-default-features, with no features and with acp, claude and codex each alone: ok
+cargo test --workspace --locked -- --skip e2e_: 1152 passed, 0 failed, 10 ignored
+cargo test -p fabric --test e2e --locked: 70 passed, 0 failed, 5 ignored
+FABRIC_BUDGET=count budget::hot_paths: ok, every process count equals budget.toml
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked: ok
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+scripts/test-check-hygiene.sh, scripts/check-hygiene.sh origin/main: ok
+scripts/test-check-fixtures.sh, scripts/check-fixtures.sh origin/main: ok
+scripts/test-check-budget.sh (60 cases), scripts/check-budget.sh origin/main: ok
+shellcheck scripts/*.sh: ok
+sdk/typescript: bun install --frozen-lockfile, bun run typecheck, bun run build, bun test with FABRIC_BIN set: ok, 62 passed, 0 failed

@@ -113,9 +113,11 @@ here for the integrator to run on a quiet machine.
 
 ## Notes
 
-- Items 3 and 12 were approved on 2026-10-27; ADR 0002 records them
-  (`6d57d63`). Item 16 and the restore keep every guarantee at the return
-  of the call that ends them.
+- Items 3 and 12 were approved by Efe on 2026-10-29; ADR 0002 records
+  them (`6d57d63`, corrected on 2026-10-29: this note and the ADR first
+  said 2026-10-27, which was written before Efe had decided). Item 16 and
+  the restore keep every guarantee at the return of the call that ends
+  them.
 - `Records::write_pending` in `crates/fabric-harness/src/departure.rs` is
   written between the staged files and the state manifest with a durable
   atomic write, so a capture of a harness with rewritable files makes one

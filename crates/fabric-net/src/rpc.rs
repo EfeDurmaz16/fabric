@@ -86,8 +86,13 @@ pub const MAX_CHUNK_RUNS: usize = 4;
 /// A request takes its payload's length of this room once its header is
 /// read and before its payload is, and gives it back once it is answered,
 /// or, for per-job work that outlives its budget, once the work ends. A
-/// request with no room waits for it, its payload unread at the peer, for
-/// at most `REQUEST_READ_TIMEOUT`.
+/// request with no room waits for it for at most `REQUEST_READ_TIMEOUT`,
+/// its payload unread at the peer past what the transport takes before
+/// anyone reads: on TCP the multiplexer gives a stream the peer opens its
+/// first 16 KiB of credit and more only as the request is read, and QUIC
+/// holds at most the connection's receive window, about 6 MB, of a peer's
+/// unread bytes. So a peer's requests cost this node this room, and at
+/// most that much more on each of its connections.
 pub const MAX_REQUEST_BYTES: usize = MAX_JOB_WORK * MAX_CONTROL_FRAME;
 
 const _: () = assert!(
@@ -1855,6 +1860,144 @@ mod tests {
             "{read} request bytes were read for one peer"
         );
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
+    }
+
+    /// A byte stream whose reads are counted: the bytes one side read off
+    /// the wire, before its multiplexer buffers them.
+    struct CountedWire<T> {
+        inner: T,
+        read: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for CountedWire<T> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            let n = buf.filled().len() - before;
+            self.read.fetch_add(n, Ordering::SeqCst);
+            polled
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for CountedWire<T> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A serving pair over the TCP multiplexer whose serving side counts
+    /// every byte it reads off the wire into `read`.
+    async fn serving_pair_on_a_counted_wire(
+        service: Arc<Nothing>,
+        limits: Arc<ServeLimits>,
+        read: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Session, tokio::task::JoinHandle<RpcError>) {
+        use crate::mux::{Mux, Side};
+
+        let (dialer_id, acceptor_id) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let dialer: Arc<dyn Connection> = Arc::new(Mux::spawn(a, Side::Dialer, acceptor_id, addr));
+        let wire = CountedWire { inner: b, read };
+        let acceptor: Arc<dyn Connection> =
+            Arc::new(Mux::spawn(wire, Side::Acceptor, dialer_id, addr));
+        let version = VersionText::truncated("test");
+        let (dialer_session, acceptor_session) = tokio::join!(
+            Session::connect(dialer, dialer_id, version.clone(), IDLE * 10),
+            Session::accept(acceptor, acceptor_id, version, IDLE * 10),
+        );
+        let accepted = acceptor_session.unwrap();
+        let serving = tokio::spawn(async move { accepted.serve(service, paired(), &limits).await });
+        (dialer_session.unwrap(), serving)
+    }
+
+    /// Review of PR #31: M2-15 counted a request's bytes against the
+    /// peer's room before its payload was read, but on TCP the multiplexer
+    /// gave each stream a whole buffer of credit up front, so it read about
+    /// 1 MiB of every waiting request off the wire anyway: 50 MB for the
+    /// 48 requests of two sessions, where the room holds 16. A stream the
+    /// peer opens now starts with `OPEN_CREDIT`, and gets more only once
+    /// the request holds room and its reader asks, so a waiting request
+    /// costs this node at most that much.
+    #[tokio::test(start_paused = true)]
+    async fn request_bytes_read_off_the_wire_for_a_peer_are_bounded() {
+        use crate::mux::OPEN_CREDIT;
+        use crate::wire::{JobRequest, RecordBytes, RecordPage};
+
+        const REQUESTS: usize = 24;
+        let service = Nothing::hanging();
+        let limits = Arc::new(ServeLimits::new());
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token = FencingToken {
+            job_id: fabric_core::id::JobId::from_bytes([1; 16]),
+            epoch: Epoch::FIRST,
+        };
+        let page = RecordPage::new(
+            RecordBytes::new(vec![7; fabric_core::ledger::MAX_RECORD_LEN]).unwrap(),
+        );
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (session, serving) = serving_pair_on_a_counted_wire(
+                Arc::clone(&service),
+                Arc::clone(&limits),
+                Arc::clone(&read),
+            )
+            .await;
+            for n in 0..REQUESTS {
+                let request = Request {
+                    id: RequestId(u64::try_from(n).unwrap() + 1),
+                    budget_ms: 600_000,
+                    body: RequestBody::Job {
+                        token,
+                        body: JobRequest::Append {
+                            records: page.clone(),
+                        },
+                    },
+                };
+                let connection = Arc::clone(&session.connection);
+                held.push(tokio::spawn(async move {
+                    let _answer = send_request(connection.as_ref(), &request).await;
+                    std::future::pending::<()>().await;
+                }));
+            }
+            held.push(tokio::spawn(async move {
+                let _keep = (session, serving);
+                std::future::pending::<()>().await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
+        let read = read.load(Ordering::SeqCst);
+        let waiting = 2 * REQUESTS - MAX_JOB_WORK;
+        // The multiplexer's frame headers, the hellos and the credit frames.
+        let framing = 64 << 10;
+        assert!(
+            read <= MAX_REQUEST_BYTES + waiting * OPEN_CREDIT + framing,
+            "{read} bytes of one peer's requests were read off the wire and held, past \
+             MAX_REQUEST_BYTES {MAX_REQUEST_BYTES} and {waiting} waiting requests of {OPEN_CREDIT}"
+        );
     }
 
     /// A peer that asks for chunks and reads none holds at most

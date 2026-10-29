@@ -21,6 +21,11 @@ jobs:
     name: hygiene
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The budget check reads the CI runs an entry names when it raises
+    # baselines to the anchor's times again.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,12 +77,16 @@ jobs:
         run: scripts/test-check-budget.sh
 
       # The time budget changes only with a new [[change]] entry that says
-      # why. The base is the one the hygiene step uses; a push that created
-      # main has none, and nothing is checked.
+      # why, and never loosens: baselines and process counts only go down,
+      # but for baselines timed again from the anchor in the CI runs the
+      # entry names, which gh reads. The base is the one the hygiene step
+      # uses; a push that created main has none, and nothing is checked.
       - name: The time budget changes only with a reason
         env:
           BASE_REF: ${{ github.base_ref }}
           BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if [ -n "$BASE_REF" ]; then
             scripts/check-budget.sh "origin/$BASE_REF"

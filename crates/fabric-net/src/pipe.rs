@@ -12,6 +12,13 @@
 //! which is the credit the multiplexer hands back to the peer, and reports
 //! the reader's drop at once, so the multiplexer can stop the peer's sender
 //! without waiting for it to send again.
+//!
+//! A pipe made `on_demand` gives credit only for what its reader asks for:
+//! `push` takes no more than the credit given, and `Drained` reports, as
+//! the credit to hand the peer, what a read that found the pipe empty asked
+//! for past the credit already given, never what the reader merely took. So
+//! bytes no read asked for wait at the peer, past the credit the pipe
+//! opened with.
 
 use std::collections::VecDeque;
 use std::io;
@@ -39,6 +46,12 @@ struct State {
     reader_gone: bool,
     /// Bytes the reader took that `Drained` has not reported yet.
     taken: usize,
+    /// For a pipe made `on_demand`, the bytes `push` may still put in: the
+    /// credit given and not yet used. `None` for one whose credit is what
+    /// its reader takes.
+    credit: Option<usize>,
+    /// The bytes the last read that found the pipe empty asked for.
+    wanted: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
     drained_waker: Option<Waker>,
@@ -69,12 +82,24 @@ pub(crate) struct PipeWriter {
 
 /// Makes a pipe that buffers at most `capacity` bytes.
 pub(crate) fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
+    new_pipe(capacity, None)
+}
+
+/// Makes a pipe that buffers at most `capacity` bytes and takes the first
+/// `opening` of them, and after them only what its reader asks for.
+pub(crate) fn on_demand(capacity: usize, opening: usize) -> (PipeWriter, PipeReader) {
+    new_pipe(capacity, Some(opening.min(capacity)))
+}
+
+fn new_pipe(capacity: usize, credit: Option<usize>) -> (PipeWriter, PipeReader) {
     let state = Arc::new(Mutex::new(State {
         buf: VecDeque::new(),
         capacity,
         writer: Writer::Open,
         reader_gone: false,
         taken: 0,
+        credit,
+        wanted: 0,
         read_waker: None,
         write_waker: None,
         drained_waker: None,
@@ -146,8 +171,16 @@ impl AsyncRead for PipeReader {
                 return Poll::Ready(Ok(()));
             }
             state.read_waker = Some(cx.waker().clone());
+            if state.credit.is_some() {
+                // What a credit on demand hands out: the multiplexer grants it.
+                state.wanted = buf.remaining();
+                if let Some(waker) = state.drained_waker.take() {
+                    waker.wake();
+                }
+            }
             return Poll::Pending;
         }
+        state.wanted = 0;
         let n = buf.remaining().min(state.buf.len());
         let (front, back) = state.buf.as_slices();
         let from_front = n.min(front.len());
@@ -197,8 +230,13 @@ pub(crate) enum Report {
 pub(crate) struct Drained(Arc<Mutex<State>>);
 
 impl Drained {
-    /// Waits until the reader took at least `at_least` bytes since the last
-    /// report, the writer ended, or the reader is gone, and says which.
+    /// Waits until there is credit to hand the peer, the writer ended, or
+    /// the reader is gone, and says which.
+    ///
+    /// The credit is what the reader took, once it is at least `at_least`
+    /// bytes since the last report; for a pipe made `on_demand`, it is what
+    /// a read that found the pipe empty asked for past the credit already
+    /// given, which the pipe then counts as given.
     pub(crate) fn poll_report(&self, cx: &mut Context<'_>, at_least: usize) -> Poll<Report> {
         let mut state = lock(&self.0);
         if state.writer != Writer::Open {
@@ -207,7 +245,17 @@ impl Drained {
         if state.reader_gone {
             return Poll::Ready(Report::ReaderGone);
         }
-        if state.taken >= at_least {
+        if let Some(credit) = state.credit {
+            // Bytes that arrived since the read asked count toward it.
+            let have = state.buf.len() + credit;
+            let room = state.capacity.saturating_sub(have);
+            let grant = state.wanted.saturating_sub(have).min(room);
+            if grant > 0 {
+                state.credit = Some(credit + grant);
+                state.wanted = 0;
+                return Poll::Ready(Report::Took(grant));
+            }
+        } else if state.taken >= at_least {
             return Poll::Ready(Report::Took(std::mem::take(&mut state.taken)));
         }
         state.drained_waker = Some(cx.waker().clone());
@@ -224,6 +272,9 @@ impl PipeWriter {
         }
         if data.len() > state.capacity.saturating_sub(state.buf.len()) {
             return Err(Refused::Full);
+        }
+        if let Some(credit) = state.credit {
+            state.credit = Some(credit.checked_sub(data.len()).ok_or(Refused::Full)?);
         }
         state.buf.extend(data);
         if let Some(waker) = state.read_waker.take() {
@@ -369,5 +420,39 @@ mod tests {
             r.read_to_end(&mut out).await.unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
+    }
+
+    /// A pipe made `on_demand` takes no more than the credit given, and
+    /// grants what an empty read asked for past what it holds and what
+    /// the peer may still send, so bytes that arrive between the read and
+    /// the grant are not asked for twice.
+    #[test]
+    fn credit_on_demand_is_what_a_read_asked_for_and_no_more() {
+        use std::task::Waker;
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let (w, mut r) = on_demand(100, 20);
+        let drained = w.drained();
+        w.push(&[1; 10]).unwrap();
+        let mut got = [0u8; 10];
+        let mut buf = ReadBuf::new(&mut got);
+        assert!(Pin::new(&mut r).poll_read(&mut cx, &mut buf).is_ready());
+        assert!(
+            drained.poll_report(&mut cx, 1).is_pending(),
+            "nothing was asked for"
+        );
+
+        let mut wanted = [0u8; 50];
+        let mut buf = ReadBuf::new(&mut wanted);
+        assert!(Pin::new(&mut r).poll_read(&mut cx, &mut buf).is_pending());
+        // Ten bytes the peer still had credit for arrive before the grant.
+        w.push(&[2; 10]).unwrap();
+        assert_eq!(
+            drained.poll_report(&mut cx, 1),
+            Poll::Ready(Report::Took(40))
+        );
+        assert!(drained.poll_report(&mut cx, 1).is_pending());
+        assert_eq!(w.push(&[3; 41]), Err(Refused::Full), "past the credit");
+        w.push(&[3; 40]).unwrap();
     }
 }

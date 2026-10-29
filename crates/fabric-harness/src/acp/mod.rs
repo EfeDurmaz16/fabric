@@ -38,7 +38,7 @@ use tracing::{info, warn};
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::HarnessError;
 use crate::harness::{
-    Harness, Installed, Launch, Restored, Running, TurnEvent, TurnFeed, TurnReport,
+    Harness, Installed, Launch, MAX_ANSWER, Restored, Running, TurnEvent, TurnFeed, TurnReport,
 };
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
@@ -542,7 +542,11 @@ impl Driver {
         // The receiver may be gone, as when the caller never asked; the turn runs on.
         let _ = events.send(TurnEvent::Session(session.clone())).await;
         let (answer, outcome) = turn(&client, &session, &prompt).await;
-        report.answer = (!answer.is_empty()).then_some(answer);
+        if answer.left_out > 0 {
+            warn!(agent = %program, left_out = answer.left_out, "acp: the answer ran past {MAX_ANSWER} bytes; the rest was left out");
+        }
+        report.answer_left_out = answer.left_out;
+        report.answer = (!answer.text.is_empty()).then_some(answer.text);
         report.failure = match outcome {
             Ok(StopReason::EndTurn) => {
                 info!(agent = %program, "acp: turn ended");
@@ -571,15 +575,43 @@ impl Driver {
     }
 }
 
+/// The answer a turn gathers: the first `MAX_ANSWER` bytes of its text,
+/// and how many bytes came after them.
+#[derive(Debug, Default)]
+struct Answer {
+    text: String,
+    left_out: u64,
+}
+
+impl Answer {
+    /// Appends `text`, as much of it as fits in `max` bytes of answer, cut
+    /// at a character; once a piece is cut, every later one is left out,
+    /// so the answer is always the turn's first bytes.
+    fn keep(&mut self, text: &str, max: usize) {
+        let room = max.saturating_sub(self.text.len());
+        if self.left_out == 0 && text.len() <= room {
+            self.text.push_str(text);
+            return;
+        }
+        let kept = if self.left_out == 0 {
+            text.floor_char_boundary(room)
+        } else {
+            0
+        };
+        self.text.push_str(&text[..kept]);
+        self.left_out += (text.len() - kept) as u64;
+    }
+}
+
 /// Sends `prompt` in `session` and gathers the text of the agent's
-/// message chunks for that session until the turn ends; returns the text
-/// and how the turn ended.
+/// message chunks for that session until the turn ends, at most
+/// `MAX_ANSWER` bytes of it; returns the answer and how the turn ended.
 async fn turn(
     client: &AcpClient,
     session: &SessionId,
     prompt: &str,
-) -> (String, Result<StopReason, AcpError>) {
-    let mut answer = String::new();
+) -> (Answer, Result<StopReason, AcpError>) {
+    let mut answer = Answer::default();
     let asked = client.prompt(session, prompt);
     tokio::pin!(asked);
     let outcome = loop {
@@ -604,9 +636,10 @@ async fn turn(
     (answer, outcome)
 }
 
-/// Appends the text of an `agent_message_chunk` update to `answer`;
-/// leaves out every other update and content that is not text.
-fn note_chunk(answer: &mut String, update: &Value) {
+/// Appends the text of an `agent_message_chunk` update to `answer`, as
+/// far as `MAX_ANSWER` allows; leaves out every other update and content
+/// that is not text.
+fn note_chunk(answer: &mut Answer, update: &Value) {
     if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
         return;
     }
@@ -614,7 +647,7 @@ fn note_chunk(answer: &mut String, update: &Value) {
     if content.and_then(|c| c.get("type")).and_then(Value::as_str) == Some("text")
         && let Some(text) = content.and_then(|c| c.get("text")).and_then(Value::as_str)
     {
-        answer.push_str(text);
+        answer.keep(text, MAX_ANSWER);
     }
 }
 
@@ -705,5 +738,95 @@ mod tests {
             adapter(&["ab"]).departure(&session),
             "argument boundaries count"
         );
+    }
+
+    /// The lines of an agent that answers the prompt, request 1 of its
+    /// client, after `chunks` `agent_message_chunk` updates of `text`.
+    fn chunking_agent(dir: &Path, chunks: usize, text: &str) -> tokio::process::Child {
+        let mut line = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text }
+                }
+            }
+        }))
+        .unwrap();
+        line.push('\n');
+        let update = dir.join("update.jsonl");
+        std::fs::write(&update, &line).unwrap();
+        let answer = r#"{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}"#;
+        let script = format!(
+            "read -r prompt; i=0; while [ $i -lt {chunks} ]; do cat \"$0\"; i=$((i+1)); done; echo '{answer}'; read -r rest"
+        );
+        tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&update)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    /// Review of PR #31: M2-23 bounds the updates nobody reads, but a
+    /// headless turn reads them as they come and gathered every chunk's
+    /// text into one answer, so an agent that streams a long turn made
+    /// the command hold all of it. The answer keeps its first
+    /// `MAX_ANSWER` bytes and counts the rest, as a Claude or Codex
+    /// answer is bounded by the line it comes on.
+    #[tokio::test]
+    async fn a_drained_turn_keeps_at_most_max_answer_bytes_of_answer() {
+        const CHUNKS: usize = 24;
+        const CHUNK: usize = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = chunking_agent(dir.path(), CHUNKS, &"a".repeat(CHUNK));
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let client = AcpClient::attach(stdin, stdout, PermissionPolicy::Deny);
+        let session = SessionId::parse("s1").unwrap();
+        let (answer, outcome) =
+            tokio::time::timeout(Duration::from_mins(1), turn(&client, &session, "hi"))
+                .await
+                .expect("the turn did not end");
+        assert!(matches!(outcome, Ok(StopReason::EndTurn)), "{outcome:?}");
+        assert!(
+            answer.text.len() <= MAX_ANSWER,
+            "the turn held {} bytes of answer, {CHUNKS} chunks of {CHUNK} bytes",
+            answer.text.len()
+        );
+        // An update the queue dropped never reached the turn; the rest did.
+        let dropped = usize::try_from(client.dropped_updates()).unwrap();
+        assert_eq!(
+            answer.text.len() as u64 + answer.left_out,
+            ((CHUNKS - dropped) * CHUNK) as u64
+        );
+        if dropped == 0 {
+            assert_eq!(answer.text.len(), MAX_ANSWER);
+        }
+        drop(client);
+        child.kill().await.unwrap();
+    }
+
+    /// The answer is always the turn's first bytes: a piece that does not
+    /// fit is cut at a character, and every later piece is left out, even
+    /// one short enough for the bytes the cut left free.
+    #[test]
+    fn an_answer_is_cut_at_a_character_and_stays_a_prefix() {
+        let mut answer = Answer::default();
+        answer.keep("abc", 7);
+        answer.keep("d\u{e9}\u{e9}", 7);
+        assert_eq!((answer.text.as_str(), answer.left_out), ("abcd\u{e9}", 2));
+        answer.keep("x", 7);
+        assert_eq!((answer.text.as_str(), answer.left_out), ("abcd\u{e9}", 3));
+
+        let mut whole = Answer::default();
+        whole.keep("abc", 3);
+        whole.keep("", 3);
+        assert_eq!((whole.text.as_str(), whole.left_out), ("abc", 0));
     }
 }

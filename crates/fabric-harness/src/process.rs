@@ -1150,30 +1150,6 @@ pub(crate) fn holding(files: &[PathBuf]) -> Result<Vec<u32>, HarnessError> {
 mod tests {
     use super::*;
 
-    /// Writes `contents` to `path` with mode `0755` through a short `sh`,
-    /// so this process never holds the file open for writing. Linux
-    /// refuses to run a file open for writing (`ETXTBSY`), and a child
-    /// another test forked while this process held it open would keep it
-    /// open until that child ran its own program. A temporary file renamed
-    /// into place would not help: the descriptor follows the file.
-    fn write_executable(path: &Path, contents: &[u8]) {
-        use std::io::Write;
-        let mut writer = std::process::Command::new("/bin/sh")
-            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // The pipe closes at the end of the statement, so `cat` sees the end.
-        writer.stdin.take().unwrap().write_all(contents).unwrap();
-        let status = writer.wait().unwrap();
-        assert!(
-            status.success(),
-            "writing {} failed: {status}",
-            path.display()
-        );
-    }
-
     #[test]
     fn find_on_path_needs_an_executable_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1226,7 +1202,7 @@ mod tests {
             None => {
                 let dir = tempfile::tempdir().unwrap();
                 let claude = dir.path().join("claude");
-                write_executable(
+                crate::fake_tool::write_unrun(
                     &claude,
                     &std::fs::read(std::env::current_exe().unwrap()).unwrap(),
                 );
@@ -1248,7 +1224,7 @@ mod tests {
     async fn a_version_probe_does_not_pass_parent_session_markers() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        write_executable(&binary, b"#!/bin/sh\n/usr/bin/env\n");
+        crate::fake_tool::write(&binary, b"#!/bin/sh\n/usr/bin/env\n");
         let env: Vec<(EnvVarName, String)> = [("CLAUDECODE", "1"), ("FABRIC_PROBE_KEPT", "1")]
             .into_iter()
             .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.to_owned()))
@@ -1262,7 +1238,7 @@ mod tests {
     async fn a_version_probe_that_exits_with_a_failure_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        write_executable(&binary, b"#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n");
+        crate::fake_tool::write(&binary, b"#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n");
         let err = detect(Some(binary.clone()), OsStr::new("/usr/bin:/bin"))
             .await
             .unwrap_err();
@@ -1277,9 +1253,9 @@ mod tests {
     async fn a_version_probe_finds_an_interpreter_on_the_configured_path() {
         let dir = tempfile::tempdir().unwrap();
         let interp = dir.path().join("fabric-test-interp");
-        write_executable(&interp, b"#!/bin/sh\necho 'tool 4.5.6'\n");
+        crate::fake_tool::write(&interp, b"#!/bin/sh\necho 'tool 4.5.6'\n");
         let binary = dir.path().join("tool");
-        write_executable(&binary, b"#!/usr/bin/env fabric-test-interp\n");
+        crate::fake_tool::write(&binary, b"#!/usr/bin/env fabric-test-interp\n");
         let path_var =
             std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         let installed = detect(Some(binary), &path_var).await.unwrap().unwrap();

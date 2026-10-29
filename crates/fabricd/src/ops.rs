@@ -7189,6 +7189,109 @@ pub(crate) mod tests {
         );
     }
 
+    /// `node` stopped, `lost` run on its files, and a node started again
+    /// over its state, as after a power loss.
+    fn restarted(dir: &Path, node: Arc<Node>, lost: impl FnOnce()) -> Arc<Node> {
+        assert_eq!(Arc::strong_count(&node), 1, "a task still holds the node");
+        drop(node);
+        lost();
+        let root = std::fs::canonicalize(dir).unwrap();
+        node_at(&root.join("home"), &root.join("state"), ToolEnv::current())
+    }
+
+    /// ADR 0016, approved by Efe on 2026-10-29: the record of a harness
+    /// whose group is gone is removed without a flush of the job's
+    /// directory, so a power loss can bring it back. A node started over
+    /// such a record reads the process it names as gone: the job's status
+    /// says no harness runs, a new harness registers, and a suspend stops
+    /// nothing and removes the record.
+    #[tokio::test]
+    async fn a_gone_harness_record_a_power_loss_brings_back_blocks_nothing() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let record = node.cfg.state.job(id).harness();
+        let exited = async |node: &Arc<Node>| {
+            let mut harness = sleeper();
+            register(node, id, pid(&harness)).await.unwrap();
+            let written = std::fs::read(&record).unwrap();
+            harness.kill().unwrap();
+            harness.wait().unwrap();
+            node.harness_exited(id, pid(&harness)).await.unwrap();
+            assert!(!record.exists(), "the gone harness kept its record");
+            written
+        };
+
+        let written = exited(&node).await;
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&record, &written).unwrap();
+        });
+        let status = node.job_status(id).await.unwrap();
+        assert!(
+            matches!(status.process, Process::NotRunning),
+            "{:?}",
+            status.process
+        );
+        // A launch is not refused as if the record's harness still ran.
+        let written = exited(&node).await;
+
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&record, &written).unwrap();
+        });
+        let out = &mut Out::default();
+        node.suspend(id, &locking_codex(dir.path()), out)
+            .await
+            .unwrap();
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::StoppingHarness { .. })),
+            "{:?}",
+            out.events
+        );
+        assert!(
+            !record.exists(),
+            "the suspend kept the gone harness's record"
+        );
+    }
+
+    /// ADR 0002, approved by Efe on 2026-10-29: the manifest written after
+    /// an append has no full flush of its own, so a power loss can leave it
+    /// behind the ledger, never ahead. A node started over a manifest a
+    /// record behind writes it again from the ledger before it serves the
+    /// job, and the job goes on from the ledger's head.
+    #[tokio::test]
+    async fn a_manifest_a_power_loss_left_behind_is_written_again_at_start() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let manifest = node.cfg.state.job(id).manifest();
+        let behind = std::fs::read(&manifest).unwrap();
+        node.job_decide(id, Decision::Approve, "").await.unwrap();
+        let current = std::fs::read(&manifest).unwrap();
+        assert_ne!(behind, current);
+        let head =
+            async |node: &Arc<Node>| node.job(id).await.unwrap().lock().await.ledger().head();
+        let before = head(&node).await;
+
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&manifest, &behind).unwrap();
+        });
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            current,
+            "the manifest behind the ledger was not written again"
+        );
+        assert_eq!(head(&node).await, before);
+        node.job_decide(id, Decision::Approve, "again")
+            .await
+            .unwrap();
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            job.ledger().manifest().encode().unwrap()
+        );
+    }
+
     /// A goal past the ledger's record bound still fits in a control
     /// message, so it reaches the node. The node must refuse it before it
     /// clones: once the record fails, no job and no id point at the clone.
@@ -8995,6 +9098,89 @@ pub(crate) mod tests {
             head(&*loser.job(id).await.unwrap().lock().await)
         );
         assert_eq!(winner.lease(id).await.unwrap().owner, winner.id);
+    }
+
+    /// Review of PR #31: the ledger a repair keeps was named by the fork
+    /// point alone, so a second repair at the same point wrote over the
+    /// first one's. `a` works on at epoch one after `b` and `c` copied
+    /// the job, the higher thief steals and `a` takes its chain, then the
+    /// lower thief steals from the same point and `a` takes that one: the
+    /// first kept ledger, the only one that publishes `a`'s own snapshot,
+    /// must still be whole, and the pin of that snapshot must name it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_repair_at_one_fork_point_keeps_the_first_kept_ledger() {
+        let (_dirs, [a, b, c], id) = three_with_a_job().await;
+        let env = ToolEnv::current();
+        let out = &mut Out::default();
+        let root = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .marker()
+            .unwrap()
+            .unwrap()
+            .root;
+        std::fs::write(root.join("after-the-copies.txt"), "a's work\n").unwrap();
+        let lost = a.suspend(id, &env, out).await.unwrap();
+        let ledger_of = |node: &Arc<Node>| {
+            let node = Arc::clone(node);
+            async move {
+                let job = node.job(id).await.unwrap();
+                let job = job.lock().await;
+                std::fs::read(job.dir().ledger()).unwrap()
+            }
+        };
+        let own = ledger_of(&a).await;
+        let (lower, higher) = if b.id.to_bytes() < c.id.to_bytes() {
+            (&b, &c)
+        } else {
+            (&c, &b)
+        };
+
+        // The higher thief steals; its push freezes a, which takes its chain.
+        higher
+            .job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+        let first = a.job_repair(id, out).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            kept: first_kept,
+            orphans,
+            ..
+        } = first.outcome
+        else {
+            panic!("{first:?}");
+        };
+        assert_eq!((first.peer, orphans), (higher.id, vec![lost]));
+        let taken = ledger_of(&a).await;
+
+        // The lower thief steals from the same point; equal epochs, the lower id wins.
+        lower
+            .job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+        let second = a.job_repair(id, out).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            kept: second_kept, ..
+        } = second.outcome
+        else {
+            panic!("{second:?}");
+        };
+        assert_eq!(second.peer, lower.id);
+        assert_ne!(second_kept, first_kept, "both repairs kept to one path");
+        assert_eq!(
+            std::fs::read(&first_kept).unwrap(),
+            own,
+            "the ledger that published {lost} is gone"
+        );
+        assert_eq!(std::fs::read(&second_kept).unwrap(), taken);
+        let pins = a.job(id).await.unwrap().lock().await.pins().unwrap();
+        let pin = pins.iter().find(|pin| pin.snapshot == lost).unwrap();
+        assert_eq!(pin.why, crate::local::PinWhy::ForkLost { kept: first_kept });
     }
 
     /// Item 19: a preflight that measures only `preflight_probes` stops a

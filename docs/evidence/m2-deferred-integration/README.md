@@ -66,8 +66,10 @@ has the A/B runs against the anchor `176622e` and against the M2 head
 taken alone on the machine. In short: no op is slower than the anchor in
 either profile, and 23 of 26 are faster in both (restart 0.13 to 0.19, a new
 job 0.37 to 0.45, a resume 0.43 to 0.55, a move 0.63 to 0.67); in release
-both daemons and every CLI use less memory than the anchor's. Left for Efe
-to rule on: in the test profile, which builds no optimized code, daemon a's
-resident size is 1.047 of the anchor's and some CLI peaks are up to 656 KiB
-higher, from the code pages of an unoptimized binary 8% larger; the
-physical footprint is not larger.
+both daemons and every CLI use less memory than the anchor's. In the test
+profile, which builds no optimized code, daemon a's resident size is 1.047
+of the anchor's and some CLI peaks are up to 656 KiB higher, from the code
+pages of an unoptimized binary 8% larger; the physical footprint is not
+larger. This was left for Efe to rule on, and he ruled on 2026-10-29 that
+the performance rule gates the release build only: the test profile is
+tracked, not gated.
