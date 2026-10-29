@@ -433,7 +433,7 @@ CI builds the worker from a pinned Capsule commit and runs these tests on Linux 
 
 ## Reconciliation (M4)
 
-Status: proposed with ADR 0022, 2026-10-29, as additions to v1 (Versioning). The journal side, the reconciliation state machine, the replacement barrier and the cleanup flow are in docs/managed-jobs.md, section "Reconciliation and cleanup (M4)".
+Status: proposed with ADR 0022, 2026-10-29, as additions to v1 (Versioning); Fabric's side is implemented (`Bridge::attach`, `Bridge::cleanup`), the Capsule worker's is pending. The journal side, the reconciliation state machine, the replacement barrier and the cleanup flow are in docs/managed-jobs.md, section "Reconciliation and cleanup (M4)".
 
 v1 already carried most of what reconciliation needs: the journal's operation id and key on every request, the locator on every effect, `pending` and `unknown` as distinct answers, `observe` by original identity, owner and operation labels on created resources and a per-profile `dedupe` statement. One case had no way back: a create whose answer never reached Fabric, so that Fabric holds no locator to observe it by. `attach` closes it. Reconciliation only reads: Fabric never sends an operation's `request` again, whatever the profile's `dedupe`, and nothing in this section mutates a provider.
 

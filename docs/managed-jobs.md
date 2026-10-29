@@ -1,6 +1,6 @@
 # Managed jobs: identity, journal v1, operation states and replay
 
-Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and is a specification ahead of its code: there the text is the authority until the M4 implementation lands.
+Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; its "As built (M4)" notes record where the code differs.
 
 ## Identity
 
@@ -399,7 +399,7 @@ As built, the core change also touched, each in one place: `crates/fabricd/src/o
 
 ## Reconciliation and cleanup (M4)
 
-Status: proposed with ADR 0022, 2026-10-29. Types and signatures only; method bodies are the implementation's. The wire side (the `attach` message, its answers and fixtures) is in docs/bridge-protocol.md, section "Reconciliation (M4)".
+Status: proposed with ADR 0022, 2026-10-29; implemented in Fabric the same day (`crates/fabric-journal/src/provider.rs`, `crates/fabric-bridge`), with the Capsule worker's `attach` pending. The wire side (the `attach` message, its answers and fixtures) is in docs/bridge-protocol.md, section "Reconciliation (M4)".
 
 Acceptance (roadmap M4): a lost response or a worker restart never triggers a blind duplicate creation; unknown remains explicit; a stop failure blocks an unsafe replacement.
 
@@ -796,6 +796,17 @@ pub enum BridgeError {
 ```
 
 `LogError` carries the journal's `CreateUnresolved` and `Cleanup` refusals as `Fenced` with their reason, as it does for M3's fencing refusals.
+
+### As built (M4)
+
+- The barrier is evaluated by `provider::accept`, which `Journal::submit` calls in the command's transaction; a `StartAttempt` it refuses is stored `rejected` with `ReplacementBlocked`, and fabricd reports it through the client API as `managed_refused` with refusal `replacement_blocked`.
+- `Journal::provider_destroys(resource)` lists the destroys of one resource with their status (the `by_target` index); the journal's `OperationLog::cleanup_target` reads it to refuse a cleanup before anything is written, and `provider_begin` checks the same rules again in its transaction.
+- A cleanup whose target is not the create's locator, whose scope is not the create's, or that is not a destroy is refused `NotACreate`.
+- An action outside the negotiated profile, which Fabric refuses before sending, is recorded with effect class `mutate`: it neither names a new resource nor removes one.
+- An observe of an operation found after a loss (`unknown`, `attached`) that answers a `result` `accepted` or `running` records `observed`, as a `pending` does.
+- `Journal::open` refuses a version 2 journal whose `provider_operations` table is the draft that unreleased M3 builds wrote (`OpenError::DraftSchema`) instead of failing later on a missing column.
+- Locator text is written straight from the locator in key order (`wire::locator_record`), one buffer and one blake3 per locator, so an exec or a destroy costs no extra JSON tree on its hot path. The dispatch stays one committed write and the settle one read and one write (`tests/off_runtime.rs`, unchanged).
+- The test double attaches `fx-<key>` by the operation that made it and keeps what it made in `FABRIC_BRIDGE_DOUBLE_PROVIDER`, so `tests/process.rs` runs a lost create through a worker and an authority restart without Capsule.
 
 ### M4 acceptance mapped to tests
 
