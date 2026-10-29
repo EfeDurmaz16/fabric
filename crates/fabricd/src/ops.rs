@@ -7189,6 +7189,109 @@ pub(crate) mod tests {
         );
     }
 
+    /// `node` stopped, `lost` run on its files, and a node started again
+    /// over its state, as after a power loss.
+    fn restarted(dir: &Path, node: Arc<Node>, lost: impl FnOnce()) -> Arc<Node> {
+        assert_eq!(Arc::strong_count(&node), 1, "a task still holds the node");
+        drop(node);
+        lost();
+        let root = std::fs::canonicalize(dir).unwrap();
+        node_at(&root.join("home"), &root.join("state"), ToolEnv::current())
+    }
+
+    /// ADR 0016, approved by Efe on 2026-10-29: the record of a harness
+    /// whose group is gone is removed without a flush of the job's
+    /// directory, so a power loss can bring it back. A node started over
+    /// such a record reads the process it names as gone: the job's status
+    /// says no harness runs, a new harness registers, and a suspend stops
+    /// nothing and removes the record.
+    #[tokio::test]
+    async fn a_gone_harness_record_a_power_loss_brings_back_blocks_nothing() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let record = node.cfg.state.job(id).harness();
+        let exited = async |node: &Arc<Node>| {
+            let mut harness = sleeper();
+            register(node, id, pid(&harness)).await.unwrap();
+            let written = std::fs::read(&record).unwrap();
+            harness.kill().unwrap();
+            harness.wait().unwrap();
+            node.harness_exited(id, pid(&harness)).await.unwrap();
+            assert!(!record.exists(), "the gone harness kept its record");
+            written
+        };
+
+        let written = exited(&node).await;
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&record, &written).unwrap();
+        });
+        let status = node.job_status(id).await.unwrap();
+        assert!(
+            matches!(status.process, Process::NotRunning),
+            "{:?}",
+            status.process
+        );
+        // A launch is not refused as if the record's harness still ran.
+        let written = exited(&node).await;
+
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&record, &written).unwrap();
+        });
+        let out = &mut Out::default();
+        node.suspend(id, &locking_codex(dir.path()), out)
+            .await
+            .unwrap();
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::StoppingHarness { .. })),
+            "{:?}",
+            out.events
+        );
+        assert!(
+            !record.exists(),
+            "the suspend kept the gone harness's record"
+        );
+    }
+
+    /// ADR 0002, approved by Efe on 2026-10-29: the manifest written after
+    /// an append has no full flush of its own, so a power loss can leave it
+    /// behind the ledger, never ahead. A node started over a manifest a
+    /// record behind writes it again from the ledger before it serves the
+    /// job, and the job goes on from the ledger's head.
+    #[tokio::test]
+    async fn a_manifest_a_power_loss_left_behind_is_written_again_at_start() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let manifest = node.cfg.state.job(id).manifest();
+        let behind = std::fs::read(&manifest).unwrap();
+        node.job_decide(id, Decision::Approve, "").await.unwrap();
+        let current = std::fs::read(&manifest).unwrap();
+        assert_ne!(behind, current);
+        let head =
+            async |node: &Arc<Node>| node.job(id).await.unwrap().lock().await.ledger().head();
+        let before = head(&node).await;
+
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&manifest, &behind).unwrap();
+        });
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            current,
+            "the manifest behind the ledger was not written again"
+        );
+        assert_eq!(head(&node).await, before);
+        node.job_decide(id, Decision::Approve, "again")
+            .await
+            .unwrap();
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            job.ledger().manifest().encode().unwrap()
+        );
+    }
+
     /// A goal past the ledger's record bound still fits in a control
     /// message, so it reaches the node. The node must refuse it before it
     /// clones: once the record fails, no job and no id point at the clone.
