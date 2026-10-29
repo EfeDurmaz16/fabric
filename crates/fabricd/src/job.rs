@@ -535,15 +535,34 @@ impl Job {
     /// Replaces this job's ledger with `chain`, the whole chain of the job
     /// a fork repair took over this node's own, and lifts the freeze.
     ///
-    /// Nothing is cut: the old ledger is first copied whole to `kept`.
-    /// The derived manifest is removed before the new ledger is renamed
-    /// into place, so a crash at any step leaves the old ledger with no
-    /// manifest, which a start rewrites, or the new one, and a repair run
-    /// again converges: the chains then no longer fork. The fork record
-    /// goes last, so a crash before it leaves the job frozen.
+    /// Nothing is cut: the old ledger is first copied whole to `kept`,
+    /// which never replaces another ledger kept there: a file at `kept`
+    /// that holds other bytes fails the repair and stays as it is
+    /// (`StateDir::forked_ledger` names one ledger per path). The derived
+    /// manifest is removed before the new ledger is renamed into place,
+    /// so a crash at any step leaves the old ledger with no manifest,
+    /// which a start rewrites, or the new one, and a repair run again
+    /// converges: the chains then no longer fork, and a copy the crash
+    /// left at `kept` holds the bytes it would write again. The fork
+    /// record goes last, so a crash before it leaves the job frozen.
     pub fn adopt(&mut self, chain: &Ledger, kept: &Path) -> Result<(), NodeError> {
         let old = fs::read(self.dir.ledger()).map_err(|e| NodeError::io(self.dir.ledger(), e))?;
-        crate::durable::write_atomic(kept, &old).map_err(|e| NodeError::io(kept, e))?;
+        match fs::read(kept) {
+            Ok(held) if held == old => {}
+            Ok(_) => {
+                return Err(NodeError::io(
+                    kept,
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "it keeps another ledger, which a repair never replaces",
+                    ),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::durable::write_atomic(kept, &old).map_err(|e| NodeError::io(kept, e))?;
+            }
+            Err(e) => return Err(NodeError::io(kept, e)),
+        }
         local::remove(&self.dir.manifest())?;
         let bytes: Vec<u8> = chain
             .records()
@@ -617,6 +636,43 @@ mod tests {
 
     use super::*;
     use crate::paths::StateDir;
+
+    /// Review of PR #31: a repair never writes its kept ledger over a
+    /// file that keeps another one. The repair fails and leaves both the
+    /// kept file and the job's ledger as they were; a copy of the same
+    /// ledger, as a crash after the copy leaves, lets it run on.
+    #[test]
+    fn adopt_never_replaces_another_kept_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let mut job = Job::create(id, state.job(id), &created).unwrap();
+        let head = job.ledger().head();
+        let kept = state.job(id).forked_ledger(head, head);
+        let own = fs::read(state.job(id).ledger()).unwrap();
+        fs::write(&kept, b"another tenure's ledger").unwrap();
+        let chain = job.ledger().clone();
+        let refused = job.adopt(&chain, &kept);
+        assert!(
+            matches!(&refused, Err(NodeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists),
+            "{refused:?}"
+        );
+        assert_eq!(fs::read(&kept).unwrap(), b"another tenure's ledger");
+        assert_eq!(fs::read(state.job(id).ledger()).unwrap(), own);
+
+        fs::write(&kept, &own).unwrap();
+        job.adopt(&chain, &kept).unwrap();
+        assert_eq!(fs::read(&kept).unwrap(), own);
+    }
 
     #[test]
     fn a_created_record_for_another_job_leaves_no_files() {

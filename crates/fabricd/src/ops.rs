@@ -8997,6 +8997,89 @@ pub(crate) mod tests {
         assert_eq!(winner.lease(id).await.unwrap().owner, winner.id);
     }
 
+    /// Review of PR #31: the ledger a repair keeps was named by the fork
+    /// point alone, so a second repair at the same point wrote over the
+    /// first one's. `a` works on at epoch one after `b` and `c` copied
+    /// the job, the higher thief steals and `a` takes its chain, then the
+    /// lower thief steals from the same point and `a` takes that one: the
+    /// first kept ledger, the only one that publishes `a`'s own snapshot,
+    /// must still be whole, and the pin of that snapshot must name it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_repair_at_one_fork_point_keeps_the_first_kept_ledger() {
+        let (_dirs, [a, b, c], id) = three_with_a_job().await;
+        let env = ToolEnv::current();
+        let out = &mut Out::default();
+        let root = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .marker()
+            .unwrap()
+            .unwrap()
+            .root;
+        std::fs::write(root.join("after-the-copies.txt"), "a's work\n").unwrap();
+        let lost = a.suspend(id, &env, out).await.unwrap();
+        let ledger_of = |node: &Arc<Node>| {
+            let node = Arc::clone(node);
+            async move {
+                let job = node.job(id).await.unwrap();
+                let job = job.lock().await;
+                std::fs::read(job.dir().ledger()).unwrap()
+            }
+        };
+        let own = ledger_of(&a).await;
+        let (lower, higher) = if b.id.to_bytes() < c.id.to_bytes() {
+            (&b, &c)
+        } else {
+            (&c, &b)
+        };
+
+        // The higher thief steals; its push freezes a, which takes its chain.
+        higher
+            .job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+        let first = a.job_repair(id, out).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            kept: first_kept,
+            orphans,
+            ..
+        } = first.outcome
+        else {
+            panic!("{first:?}");
+        };
+        assert_eq!((first.peer, orphans), (higher.id, vec![lost]));
+        let taken = ledger_of(&a).await;
+
+        // The lower thief steals from the same point; equal epochs, the lower id wins.
+        lower
+            .job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+        let second = a.job_repair(id, out).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            kept: second_kept, ..
+        } = second.outcome
+        else {
+            panic!("{second:?}");
+        };
+        assert_eq!(second.peer, lower.id);
+        assert_ne!(second_kept, first_kept, "both repairs kept to one path");
+        assert_eq!(
+            std::fs::read(&first_kept).unwrap(),
+            own,
+            "the ledger that published {lost} is gone"
+        );
+        assert_eq!(std::fs::read(&second_kept).unwrap(), taken);
+        let pins = a.job(id).await.unwrap().lock().await.pins().unwrap();
+        let pin = pins.iter().find(|pin| pin.snapshot == lost).unwrap();
+        assert_eq!(pin.why, crate::local::PinWhy::ForkLost { kept: first_kept });
+    }
+
     /// Item 19: a preflight that measures only `preflight_probes` stops a
     /// move or a pull exactly where one that measured every tool on both
     /// nodes stops it, and every row it reports reads as that one's. The
