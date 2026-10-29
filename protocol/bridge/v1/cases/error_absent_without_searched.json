@@ -1,0 +1,23 @@
+{
+  "case": "error_absent_without_searched",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "missing_field"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-20",
+    "operation_id": "01K8W3A0000000000000000P30",
+    "error": {
+      "code": "unknown",
+      "reason": "absent",
+      "message": "unknown: absent",
+      "effect": "unknown",
+      "observations": 5,
+      "deadline_ms": 5000
+    }
+  }
+}

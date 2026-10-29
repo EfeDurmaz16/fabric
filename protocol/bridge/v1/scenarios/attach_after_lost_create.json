@@ -1,0 +1,120 @@
+{
+  "scenario": "attach_after_lost_create",
+  "summary": "Fabric's journal holds a create unknown with no locator, as an authority restart leaves one whose answer was never read; the provider holds the sandbox that create made, labelled with its operation. An attach by the original operation finds it and settles the create; nothing is created again.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-attach-1",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A0000000000000000P30",
+        "status": "ready"
+      }
+    ],
+    "script": []
+  },
+  "journal_state": {
+    "provider_operations": [
+      {
+        "operation_id": "01K8W3A0000000000000000P30",
+        "key": "key-attach-1",
+        "digest": "3232323232323232323232323232323232323232323232323232323232323232",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "target": null,
+        "status": "unknown",
+        "locator": null
+      }
+    ]
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "attach",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P30",
+        "key": "key-attach-1",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P30",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-1"
+        },
+        "output": {
+          "status": "ready"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P30",
+        "status": "succeeded"
+      }
+    }
+  ]
+}

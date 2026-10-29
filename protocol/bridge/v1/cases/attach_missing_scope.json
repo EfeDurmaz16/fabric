@@ -1,0 +1,18 @@
+{
+  "case": "attach_missing_scope",
+  "direction": "fabric_to_worker",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "invalid",
+    "reason": "missing_field"
+  },
+  "message": {
+    "type": "attach",
+    "request_id": "r-20",
+    "operation_id": "01K8W3A0000000000000000P30",
+    "key": "key-attach-1",
+    "action": "sandbox.create",
+    "wait_ms": 5000
+  }
+}

@@ -1,0 +1,187 @@
+{
+  "scenario": "attach_then_observe_until_ready",
+  "summary": "The attach finds the sandbox of a lost create still starting: pending with its locator, recorded attached. Once it is ready, an observe by that locator settles the create.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-attach-3",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A0000000000000000P32",
+        "status": "starting"
+      }
+    ],
+    "script": []
+  },
+  "journal_state": {
+    "provider_operations": [
+      {
+        "operation_id": "01K8W3A0000000000000000P32",
+        "key": "key-attach-3",
+        "digest": "3434343434343434343434343434343434343434343434343434343434343434",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "target": null,
+        "status": "unknown",
+        "locator": null
+      }
+    ]
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "attach",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P32",
+        "key": "key-attach-3",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "wait_ms": 2000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P32",
+        "error": {
+          "code": "pending",
+          "reason": "observation_deadline",
+          "message": "pending: observation_deadline",
+          "effect": "pending",
+          "resource": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox",
+            "native_id": "fx-key-attach-3"
+          },
+          "state": "starting",
+          "observations": 2,
+          "deadline_ms": 2000
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P32",
+        "status": "attached"
+      }
+    },
+    {
+      "advance": "settle"
+    },
+    {
+      "send": {
+        "type": "observe",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A0000000000000000P32",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-3"
+        },
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A0000000000000000P32",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-3"
+        },
+        "output": {
+          "status": "ready"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P32",
+        "status": "succeeded"
+      }
+    },
+    {
+      "sandbox": {
+        "native_id": "fx-key-attach-3",
+        "status": "ready"
+      }
+    }
+  ]
+}

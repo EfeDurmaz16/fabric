@@ -1,0 +1,40 @@
+{
+  "case": "error_absent_with_resource",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "unknown_field"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-20",
+    "operation_id": "01K8W3A0000000000000000P30",
+    "error": {
+      "code": "unknown",
+      "reason": "absent",
+      "message": "unknown: absent",
+      "effect": "unknown",
+      "resource": {
+        "provider": "fixture",
+        "scope": {
+          "account": "acct-a",
+          "project": "proj-1"
+        },
+        "kind": "sandbox",
+        "native_id": "fx-key-attach-1"
+      },
+      "observations": 5,
+      "deadline_ms": 5000,
+      "searched": {
+        "provider": "fixture",
+        "scope": {
+          "account": "acct-a",
+          "project": "proj-1"
+        },
+        "kind": "sandbox"
+      }
+    }
+  }
+}
