@@ -226,9 +226,10 @@ jobs:
         with:
           repository: EfeDurmaz16/capsule
           # The head of Capsule's m3/bridge-worker: the worker after its
-          # review fixes and the merges of M1, which docs/evidence/m3-pr ran
+          # review fixes and the merges of M1, with the v1 fixtures that
+          # refuse an exec bound of 0, which docs/evidence/m3-decisions ran
           # against.
-          ref: 1e2e1cf2db7d95996f121c4f5ed9ae1b1a9367fb
+          ref: 95cbbcf3edfc9463d25f6d5123f5588d9b46f207
           path: capsule
           persist-credentials: false
 
