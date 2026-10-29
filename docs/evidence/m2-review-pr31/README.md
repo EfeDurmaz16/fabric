@@ -54,3 +54,50 @@ more. No code this round changed runs on that path: a job is made by a
 clone and ledger writes. A build of the M2 head with only the
 QUIC window change (`ab-quic-window-only/`) reads 1.004 (0.984 to 1.035).
 The anchor is the bar, and against it `acp new` is 0.488 (0.471 to 0.533).
+
+## The release build against the anchor
+
+On 2026-10-29 Efe ruled that the performance rule gates the release build
+only; the test profile is tracked, not gated. `ab-vs-anchor-release/` is
+the gated run: `scripts/bench-ab.sh --release --pairs 20`, the working
+tree at `8a3b1f9` (the code of `f8742a2`) against `176622e`, 20 timed
+pairs in alternating order and 3 counted runs, under a load average of 8
+to 10 from other work, which reaches both builds of a pair alike.
+
+- Time: no op is slower. 24 of 26 are faster with the interval below 1;
+  Claude launch 0.968 (0.938 to 1.011) and `cli version` 0.953 (0.849 to
+  1.104) hold 1, both with medians below 1. A new job 0.43 to 0.46, a
+  resume 0.39 to 0.57, a pull 0.51 to 0.61, a move 0.62 to 0.63, a
+  restart 0.142 (0.127 to 0.184).
+- Memory: daemon resident size 0.874 and 0.887 after the timed runs,
+  0.892 and 0.889 after the counted ops; physical footprint 0.928 and
+  0.892 timed, 0.964 and 0.953 counted. Every CLI's peak resident size is
+  below the anchor's, `cli version` 3168 to 2992 KiB and `acp launch` 6912
+  to 5968. The binary is 15443120 bytes against 19773920.
+- Counters that do not depend on load: processes started and full
+  flushes are equal or fewer on every op, and allocations fewer on every
+  op but `cli version`, 189 to 244 for the larger command tree. Plain `fsync`s rise on suspend,
+  resume and pull (resume 51 to 61) where they replace full flushes (24 to
+  13), the split of ADR 0002, amendment item 3. Bytes read from the store
+  rise on resume and pull (resume 16142 to 21702): the node bundle cache
+  reads each cached pack to check its digest before it uses it, in the
+  fabric process, where the anchor ran `git bundle unbundle` processes the
+  counters do not see (8 fewer per resume). Suspend and restart read 2 to
+  3% more of the store; they are not traced further, and both are faster
+  (0.68 to 0.79, and 0.142).
+
+## The durability decisions of 2026-10-29
+
+Efe approved items 3, 12 and 17 of `docs/evidence/perf-ab/README.md` on
+2026-10-29; ADR 0002 and ADR 0016 had said 2026-10-27, written before he
+decided, and now give the right date (`fd67bba`). Two of them let a power
+loss leave state that it could not leave before, so `5135ddc` adds a test
+that writes that state back over a stopped node's files and starts a node
+over it:
+
+- `ops::tests::a_manifest_a_power_loss_left_behind_is_written_again_at_start`
+  (item 12). Red when `Job::open` does not write a manifest behind its
+  ledger again.
+- `ops::tests::a_gone_harness_record_a_power_loss_brings_back_blocks_nothing`
+  (item 17). Red when the registration, the status or the suspend treats
+  the record of a gone harness as running, each mutation on its own.
