@@ -103,7 +103,7 @@ fn every_profile_parses_and_writes_back_the_same_document() {
 #[test]
 fn every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged() {
     let cases = dir("cases");
-    assert_eq!(cases.len(), 46, "the v1 case set");
+    assert_eq!(cases.len(), 48, "the v1 case set");
     for (name, case) in cases {
         let direction = case["direction"].as_str().unwrap();
         let at = phase(case["phase"].as_str().unwrap());

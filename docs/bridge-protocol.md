@@ -1,6 +1,6 @@
 # Bridge protocol v1: Fabric and a Capsule provider worker
 
-Status: proposed, 2026-10-27 (ADR 0021). This document is the single source of truth for bridge protocol version 1. The golden fixtures in [`protocol/bridge/v1`](../protocol/bridge/v1) are part of it: where this text and a fixture disagree, that is a bug in one of them, and both implementations must fail their fixture tests until it is fixed. Capsule keeps a byte-identical copy of the fixtures and a short pointer to this file.
+Status: proposed, 2026-10-27 (ADR 0021). Amended 2026-10-29: an exec `timeout_ms` or `max_output_bytes` of 0 is invalid (decided by Efe that day), and v1 takes corrections until it first ships (Versioning). This document is the single source of truth for bridge protocol version 1. The golden fixtures in [`protocol/bridge/v1`](../protocol/bridge/v1) are part of it: where this text and a fixture disagree, that is a bug in one of them, and both implementations must fail their fixture tests until it is fixed. Capsule keeps a byte-identical copy of the fixtures and a short pointer to this file.
 
 ## What the bridge is
 
@@ -167,10 +167,12 @@ After the handshake Fabric may have up to `max_in_flight` requests and observes 
 | Action | `target` | `params` | `result.output` |
 | --- | --- | --- | --- |
 | `sandbox.create` | absent | `image` (string), `env` (object, plain non-secret values), `secret_names` (array of names), `labels` (object) | `{ "status": "ready" }` |
-| `sandbox.exec` | required | `argv` (1 to `max_argv` strings), `stdin` (string or null, at most `max_stdin_bytes`), `cwd` (string or null), `timeout_ms`, `max_output_bytes` (at most the profile's), `secret_names` | `{ "exit_code": int or null, "stdout": stream, "stderr": stream }` |
+| `sandbox.exec` | required | `argv` (1 to `max_argv` strings), `stdin` (string or null, at most `max_stdin_bytes`), `cwd` (string or null), `timeout_ms` (at least 1), `max_output_bytes` (1 to the profile's), `secret_names` | `{ "exit_code": int or null, "stdout": stream, "stderr": stream }` |
 | `sandbox.destroy` | required | `{}` | `{ "status": "destroyed" }` |
 
 A stream is `{ "text": string, "captured_bytes": int, "truncated": bool, "lossy": bool }`: the captured bytes decoded as UTF-8 with invalid sequences replaced (then `lossy` is true), capped while reading, not after. A nonzero exit is a `completed` result, not an error, and the sandbox stays. `exit_code` is `null` only when no exit was observed, as after a cancel.
+
+An exec `timeout_ms` or `max_output_bytes` of 0 is refused as `invalid`/`limit` with `effect: "none"` (cases `request_exec_timeout_zero` and `request_exec_output_bytes_zero`). A 0 asks for no time or no output, which no command can meet, and neither side guesses another bound for it. Fabric refuses it before sending, as it does every value the worker would refuse on reading.
 
 The worker labels every resource it creates with the operation id, the job, the attempt and the generation, so that a later `observe` can find it and an action on a resource another job created is refused (`denied`/`owner_mismatch`).
 
@@ -345,6 +347,8 @@ Then update the pinned manifest digest in `crates/fabric-client/tests/bridge_fix
 
 Bridge protocol v1 is independent of the client API version (ADR 0018). Within v1, fixtures only grow: a new action, a new profile or a new optional field arrives with new fixtures and keeps every existing fixture byte-identical. A changed or removed fixture, a new `reject` case for a value v1 accepted, a new error code, or a raised limit is v2. `hello_refused` and its fixtures never change. A profile's own `version` moves when its action table changes meaning.
 
+These rules bind from the first release of v1. Until then v1 exists only on draft pull requests, no Fabric or worker that speaks it has shipped, and an additive or corrective change goes into v1 itself, not into a v2 (decided by Efe on 2026-10-29): it arrives with its fixtures, the regenerated manifest and both repositories' pins in linked pull requests, and both implementations change with it. The first such change made 0 an invalid exec `timeout_ms` and `max_output_bytes`.
+
 ## Fabric's client as built (M3)
 
 `crates/fabric-bridge` is Fabric's side: `wire` (every message, its parser and its encoder), `frames` (the framing above), and `Bridge`, the client. It records into the managed journal through `OperationLog`; schema version 2 adds `provider_operations` for this (docs/managed-jobs.md). The failure rules above become these behaviors, each pinned by a test in `crates/fabric-bridge/tests`.
@@ -354,7 +358,7 @@ Bridge protocol v1 is independent of the client API version (ADR 0018). Within v
 | Check | When it fails | Journal |
 | --- | --- | --- |
 | Worker gone, bridge shutting down, `max_in_flight` reached | `Lost`, `ShuttingDown`, `Busy` | nothing; the operation may be sent later |
-| Anything the worker would refuse on reading it, checked with the worker-side parser under the negotiated profile: an action not in the profile, a limit over the profile's (deadline, argv, stdin, output), a target that does not fit the profile, any encoding fault such as a NUL in an argument; and a frame over `max_request_bytes` | `RefusedLocally` with the code and reason the worker would answer | `rejected`, nothing written |
+| Anything the worker would refuse on reading it, checked with the worker-side parser under the negotiated profile: an action not in the profile, a limit over the profile's (deadline, argv, stdin, output), a target that does not fit the profile, any encoding fault such as a NUL in an argument or an exec `timeout_ms` or `max_output_bytes` of 0; and a frame over `max_request_bytes` | `RefusedLocally` with the code and reason the worker would answer | `rejected`, nothing written |
 | The journal already holds the key or the id | `Log(Used)` | unchanged; nothing is ever sent twice |
 | The attempt is not the job's current live grant at its generation, or the job is closed | `Log(Fenced)` | nothing |
 | Otherwise | the operation is committed `dispatched` with its action and its `target` locator, then the frame is written | `dispatched`, naming its target from the start |
@@ -414,8 +418,6 @@ CAPSULE_BRIDGE_WORKER=<capsule>/packages/bridge-worker/dist/bin.js \
 | the Docker profile | with `CAPSULE_BRIDGE_DOCKER_IMAGE` naming an image the engine already holds: refusals leave no container, a missing image is a definite failure and is not pulled, the container carries the four `fabric.*` labels and the engine scope, an artifact is written and read back within `max_output_bytes`, a worker killed mid-exec leaves the container running and the exec running once after a restart, and destroy needs its own grant and is observed gone |
 
 CI builds the worker from a pinned Capsule commit and runs these tests on Linux (job `bridge-interop`). The Docker test skips there: no image is on the runner and nothing pulls one. `scripts/bench-bridge.sh` measures the same worker when `CAPSULE_BRIDGE_WORKER` is set.
-
-Two behaviors are not ruled by this text yet. The worker refuses `timeout_ms` and `max_output_bytes` of 0 as `invalid`/`limit`, while Fabric's parser accepts them, so Fabric sends such a request and records the worker's refusal as `rejected`; both are refusals before effect. Until the text rules on 0, Fabric does not refuse it locally.
 
 ## Forward compatibility with reconciliation (draft P11)
 
