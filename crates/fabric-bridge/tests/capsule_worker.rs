@@ -390,8 +390,8 @@ async fn replay(name: &str, dir: &Path) -> Tally {
 /// matches the fixture exactly (bar `message` strings) and parses with
 /// Fabric's own parser. Steps that read the in-process provider
 /// (`provider_calls`, `sandbox`, `advance`) or Fabric's journal are the
-/// other runs' to check; `pending_destroy_with_locator` stops at its
-/// `advance`.
+/// other runs' to check; `exec_observed_until_exit` and
+/// `pending_destroy_with_locator` stop at their `advance`.
 #[tokio::test]
 #[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
 async fn every_shared_scenario_over_the_workers_stdio() {
@@ -408,7 +408,7 @@ async fn every_shared_scenario_over_the_workers_stdio() {
         })
         .collect();
     names.sort();
-    assert_eq!(names.len(), 15, "the v1 scenario set");
+    assert_eq!(names.len(), 18, "the v1 scenario set");
     let mut stopped = Vec::new();
     for name in &names {
         let tally = replay(name, dir.path()).await;
@@ -421,7 +421,10 @@ async fn every_shared_scenario_over_the_workers_stdio() {
             stopped.push(name.clone());
         }
     }
-    assert_eq!(stopped, ["pending_destroy_with_locator"]);
+    assert_eq!(
+        stopped,
+        ["exec_observed_until_exit", "pending_destroy_with_locator"]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -445,19 +448,30 @@ fn fx_in(project: &str, native_id: &str) -> Locator {
     .unwrap()
 }
 
+/// The operation that made seed `n`: like a container's
+/// `fabric.operation` label, every seed that names a job names it too.
+fn seed_op(n: u8) -> String {
+    OperationId::from_bytes([0xa0 + n; 16]).to_string()
+}
+
 /// The fixture provider every client test starts from: a policy, grants
 /// the worker resolves by ref, sandboxes of this job, of another job and
-/// of another project, and scripted faults.
-fn fixture_config(extra_sandboxes: &[&str]) -> Value {
+/// of another project, and scripted faults. Each extra sandbox is this
+/// job's, made by the operation named with it.
+fn fixture_config(extra_sandboxes: &[(&str, OperationId)]) -> Value {
     let mut sandboxes = vec![
-        json!({"native_id": "fx-seed", "project": "proj-1", "owner_job": JOB, "status": "ready"}),
-        json!({"native_id": "fx-long", "project": "proj-1", "owner_job": JOB, "status": "ready"}),
-        json!({"native_id": "fx-other-job", "project": "proj-1", "owner_job": OTHER_JOB, "status": "ready"}),
+        json!({"native_id": "fx-seed", "project": "proj-1", "owner_job": JOB, "operation": seed_op(1), "status": "ready"}),
+        json!({"native_id": "fx-long", "project": "proj-1", "owner_job": JOB, "operation": seed_op(2), "status": "ready"}),
+        json!({"native_id": "fx-other-job", "project": "proj-1", "owner_job": OTHER_JOB, "operation": seed_op(3), "status": "ready"}),
     ];
-    for native_id in extra_sandboxes {
-        sandboxes.push(
-            json!({"native_id": native_id, "project": "proj-1", "owner_job": JOB, "status": "ready"}),
-        );
+    for (native_id, operation) in extra_sandboxes {
+        sandboxes.push(json!({
+            "native_id": native_id,
+            "project": "proj-1",
+            "owner_job": JOB,
+            "operation": operation.to_string(),
+            "status": "ready",
+        }));
     }
     json!({
         "binding": {"account": "acct-a", "project": "proj-1"},
@@ -831,12 +845,18 @@ async fn denied_and_unsupported_requests_fail_before_any_effect() {
     assert_eq!(entry31.status, ProviderStatus::Rejected);
     assert_eq!(entry31.answer.effect.as_deref(), Some("none"));
     let observe = bridge
-        .observe(&mut journal, id(27), "sandbox.exec", fx("fx-seed"), 1_000)
+        .observe(
+            &mut journal,
+            id(27),
+            "sandbox.snapshot",
+            fx("fx-seed"),
+            1_000,
+        )
         .await;
     let Err(BridgeError::RefusedLocally(r)) = observe else {
         panic!("{observe:?}")
     };
-    assert_eq!((r.code, r.reason), ("unsupported", "observe"));
+    assert_eq!((r.code, r.reason), ("unsupported", "action"));
 
     // The worker is still serving after every refusal.
     let ok = bridge
@@ -946,21 +966,36 @@ async fn a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice() {
     drop(bridge);
 
     // A restarted worker is a new connection. The operation is never sent
-    // again, and the profile does not observe an exec: it stays unknown.
+    // again. It observes the exec by its original id, but holds no record
+    // of an exec the lost worker ran: unknown stays explicit.
     let bridge = spawn("fixture", &path).await;
     let again = bridge.request(&mut journal, sleeping).await;
     assert!(
         matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
         "{again:?}"
     );
-    let observe = bridge
+    let observed = bridge
         .observe(&mut journal, id(50), "sandbox.exec", long.clone(), 1_000)
-        .await;
-    assert!(
-        matches!(&observe, Err(BridgeError::RefusedLocally(r)) if r.reason == "observe"),
-        "{observe:?}"
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    let Answer::Error(e) = &observed.answer else {
+        panic!("{:?}", observed.answer)
+    };
+    assert_eq!(
+        (e.error.code, e.error.reason.as_str()),
+        (ErrorCode::Unknown, "observation_failed")
     );
-    assert_eq!(entry(&journal, id(50)), lost, "unknown stays explicit");
+    assert_eq!(e.error.resource.as_ref(), Some(&long));
+    let still_lost = entry(&journal, id(50));
+    assert_eq!(
+        still_lost.status,
+        ProviderStatus::Unknown,
+        "unknown stays explicit"
+    );
+    assert_eq!(still_lost.locator, lost.locator);
     // The resource identity did not change with the worker.
     let still = bridge
         .request(
@@ -994,7 +1029,7 @@ async fn a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice() {
     let seeded = write_config(
         dir.path(),
         "restarted.json",
-        &fixture_config(&["fx-key-51"]),
+        &fixture_config(&[("fx-key-51", id(51))]),
     );
     let bridge = spawn("fixture", &seeded).await;
     let again = bridge.request(&mut journal, create(51, "fixture/ok")).await;
@@ -1039,7 +1074,7 @@ async fn a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice() {
 async fn observe_reads_only_the_operations_own_resource() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = journal(dir.path());
-    let mut worker = fixture_config(&["fx-a", "fx-b"]);
+    let mut worker = fixture_config(&[("fx-a", id(0xa8)), ("fx-b", id(0xa9))]);
     for native_id in ["fx-a", "fx-b"] {
         worker["approvals"].as_array_mut().unwrap().push(json!({
             "ref": format!("apr-destroy-{native_id}"),
@@ -1452,6 +1487,38 @@ async fn the_docker_profile_on_the_local_engine() {
         .unwrap();
     assert_eq!(nonzero.status, ProviderStatus::Succeeded);
     assert_eq!(result(&nonzero).output["exit_code"], 7);
+
+    // An exec still running at its deadline is answered running and stays
+    // dispatched; observe by its original id reads how it ended.
+    let mut slow = run(12, &["sh", "-c", "sleep 2; echo done"], 1024);
+    slow.deadline_ms = 500;
+    let slow_id = slow.operation.id;
+    let answered = bridge
+        .request(&mut journal, slow)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(result(&answered).state, ResultState::Running);
+    assert_eq!(answered.status, ProviderStatus::Dispatched);
+    let observed = bridge
+        .observe(
+            &mut journal,
+            slow_id,
+            "sandbox.exec",
+            container.clone(),
+            10_000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
+    assert_eq!(result(&observed).output["exit_code"], 0);
+    assert_eq!(stream(result(&observed), "stdout")["text"], "done\n");
+    assert_eq!(entry(&journal, slow_id).status, ProviderStatus::Succeeded);
 
     // Kill the worker while an exec runs in the container.
     let sleeping = run(8, &["sleep", "20"], 1024);
