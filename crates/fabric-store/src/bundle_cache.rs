@@ -17,9 +17,16 @@
 //! links from where they part. The cache is never the only copy of
 //! anything; every file in it can be made again from the bundles in the
 //! store, so a file that is missing, changed or cut short costs only the
-//! replay of the links from that one on, and nothing here is flushed. The
-//! store's one-writer rule (ADR 0014) makes the restore that holds the
-//! store the cache's only writer.
+//! replay of the links from that one on, and nothing here is flushed.
+//! Only a restore of the job writes its cache, and a job's restores run
+//! one at a time under the node's lock of that job. Restores of other
+//! jobs run beside it, each on a store handle of its own, and the one
+//! that ends evicts other jobs' caches (`touch_and_evict`), so a file
+//! `reuse` checked may be gone, one file or the whole cache, by the time
+//! the restore copies it; that file costs the same replay
+//! (`restore::place_cached`). Another restore only removes files here,
+//! so a file that is there when it is copied holds the bytes `reuse`
+//! checked.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -108,6 +115,23 @@ impl BundleCache {
             self.truncate(held);
         }
         held
+    }
+
+    /// How many links the cache holds.
+    pub(crate) fn len(&self) -> usize {
+        self.links.len()
+    }
+
+    /// Drops the links from `index` on, once a restore found a file of
+    /// that link gone after `reuse` checked it: another job's restore
+    /// evicted the cache meanwhile, whole or in part. A cache whose record
+    /// is gone too holds no link any more.
+    pub(crate) fn lost_from(&mut self, index: usize) {
+        if self.dir.join(RECORD).exists() {
+            self.truncate(index);
+        } else {
+            self.links.clear();
+        }
     }
 
     /// True when the `index`th link has a bundle, which a restore counts.

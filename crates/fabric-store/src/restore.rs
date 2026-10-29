@@ -933,19 +933,14 @@ fn unbundle_chain(
     let mut cache = BundleCache::open(store.root(), manifest.job_id);
     let held = cache.reuse(&ids);
     let pack_dir = git_dir(root).join("objects").join("pack");
-    for index in 0..held {
-        for (name, from) in cache.files(index) {
-            let to = pack_dir.join(name);
-            bundle_cache::place(&from, &to).map_err(|e| io_err(&to, e))?;
-            if durability == Durability::PowerLoss {
-                let file = fs::File::open(&to).map_err(|e| io_err(&to, e))?;
-                rustix::fs::fsync(&file).map_err(|e| io_err(&to, e.into()))?;
-            }
-        }
+    let placed = place_cached(&mut cache, held, &pack_dir, durability)?;
+    for index in 0..placed {
         report.bundles_fetched += u32::from(cache.has_bundle(index));
     }
-    let mut caching = true;
-    for (index, id) in ids.iter().enumerate().skip(held) {
+    // A cache evicted whole under this restore holds no links below the
+    // next one, so the links unpacked now do not go into it.
+    let mut caching = cache.len() == placed;
+    for (index, id) in ids.iter().enumerate().skip(placed) {
         let decoded;
         let link = if *id == snapshot {
             manifest
@@ -978,6 +973,56 @@ fn unbundle_chain(
     }
     cache.touch_and_evict();
     Ok(())
+}
+
+/// Copies the files of the first `held` links of `cache`, the ones its
+/// `reuse` checked, into `pack_dir`, and returns how many links it put
+/// there whole.
+///
+/// A restore of another job runs beside this one and may evict this
+/// job's cache after `reuse` (`bundle_cache`), one file at a time, so a
+/// cached file can be gone when it is copied. That is a miss like a file
+/// gone before `reuse`: the files of its link already copied are removed
+/// again, so git never sees an index without its pack, the cache drops
+/// that link and the ones after it, and the caller unpacks them from the
+/// store. Any other failure fails the restore.
+fn place_cached(
+    cache: &mut BundleCache,
+    held: usize,
+    pack_dir: &Path,
+    durability: Durability,
+) -> Result<usize, RestoreError> {
+    for index in 0..held {
+        let mut copied = 0;
+        let mut lost = false;
+        for (name, from) in cache.files(index) {
+            let to = pack_dir.join(name);
+            match bundle_cache::place(&from, &to) {
+                Ok(()) => copied += 1,
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        && matches!(fs::symlink_metadata(&from), Err(gone) if gone.kind() == io::ErrorKind::NotFound) =>
+                {
+                    lost = true;
+                    break;
+                }
+                Err(e) => return Err(io_err(&to, e)),
+            }
+            if durability == Durability::PowerLoss {
+                let file = fs::File::open(&to).map_err(|e| io_err(&to, e))?;
+                rustix::fs::fsync(&file).map_err(|e| io_err(&to, e.into()))?;
+            }
+        }
+        if lost {
+            for (name, _) in cache.files(index).take(copied) {
+                let to = pack_dir.join(name);
+                fs::remove_file(&to).map_err(|e| io_err(&to, e))?;
+            }
+            cache.lost_from(index);
+            return Ok(index);
+        }
+    }
+    Ok(held)
 }
 
 /// The names of the files in a repository's `objects/pack`.
@@ -2067,5 +2112,97 @@ mod tests {
             ),
             "{outcome:?}"
         );
+    }
+
+    /// The snapshot of the `n`th link of a test chain.
+    fn link(n: u8) -> SnapshotId {
+        SnapshotId::from_bytes([n; 32])
+    }
+
+    /// Gives `job` a cache in the store at `root` with `links` links, each
+    /// with an index and a pack file, and its record last used 15 days
+    /// ago, past the 14 days a cache no restore uses is kept.
+    fn idle_cache(root: &Path, job: JobId, links: u8) {
+        let staged = root.join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        let mut cache = BundleCache::open(root, job);
+        for n in 0..links {
+            let files: Vec<PathBuf> = ["idx", "pack"]
+                .iter()
+                .map(|ext| {
+                    let file = staged.join(format!("pack-{n}.{ext}"));
+                    fs::write(&file, format!("link {n} {ext}")).unwrap();
+                    file
+                })
+                .collect();
+            cache.add(link(n), true, &files).unwrap();
+        }
+        let record = root
+            .join("bundle-cache")
+            .join(job.to_string())
+            .join("links");
+        let old = std::time::SystemTime::now() - Duration::from_hours(15 * 24);
+        fs::File::options()
+            .append(true)
+            .open(record)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// The names in `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Review of PR #31: restores of two jobs run at once since the store
+    /// lost its mutex, and a restore that ends evicts the caches of other
+    /// jobs, so a cache this restore's `reuse` checked can be gone before
+    /// its files are copied. A file gone then is a miss, as one gone
+    /// before `reuse` is: the restore takes the links from that one on
+    /// from the store, never fails on a cache path. The files of the link
+    /// it was copying come out of the repository again, so git never sees
+    /// an index without its pack, and the cache drops the links it lost.
+    #[test]
+    fn a_cache_another_restore_evicts_after_reuse_costs_a_replay_not_the_restore() {
+        let (b, a) = (JobId::from_bytes([7; 16]), JobId::from_bytes([8; 16]));
+        let chain = [link(0), link(1)];
+
+        // Job a's restore ends between b's reuse and b's copies, and evicts b's idle cache.
+        let dir = tempfile::tempdir().unwrap();
+        let (root, pack) = (dir.path(), dir.path().join("repo/objects/pack"));
+        fs::create_dir_all(&pack).unwrap();
+        idle_cache(root, b, 2);
+        let mut cache = BundleCache::open(root, b);
+        assert_eq!(cache.reuse(&chain), 2);
+        BundleCache::open(root, a).touch_and_evict();
+        let placed = place_cached(&mut cache, 2, &pack, Durability::PowerLoss).unwrap();
+        assert_eq!(placed, 0);
+        assert!(names_in(&pack).is_empty(), "{:?}", names_in(&pack));
+        assert_eq!(cache.len(), 0);
+
+        // The eviction removes files one at a time: link 1's pack is gone, its index is not.
+        let dir = tempfile::tempdir().unwrap();
+        let (root, pack) = (dir.path(), dir.path().join("repo/objects/pack"));
+        fs::create_dir_all(&pack).unwrap();
+        idle_cache(root, b, 2);
+        let mut cache = BundleCache::open(root, b);
+        assert_eq!(cache.reuse(&chain), 2);
+        fs::remove_file(
+            root.join("bundle-cache")
+                .join(b.to_string())
+                .join("pack-1.pack"),
+        )
+        .unwrap();
+        let placed = place_cached(&mut cache, 2, &pack, Durability::ProcessCrash).unwrap();
+        assert_eq!(placed, 1);
+        assert_eq!(names_in(&pack), ["pack-0.idx", "pack-0.pack"]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(BundleCache::open(root, b).reuse(&chain), 1);
     }
 }
