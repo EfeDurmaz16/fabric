@@ -131,9 +131,13 @@ impl<L: OperationLog + Send + 'static> Slot<'_, L> {
             Place::Here(log) => Ok(call(log)),
             Place::Queue(permit) => {
                 let (reply, result) = oneshot::channel();
-                permit.send(Message::Run(Box::new(move |log| {
+                permit.send(Message::Run(Box::new(move |log, served| {
+                    let value = call(log);
+                    // Counted before the caller can hear the result, so
+                    // a count read once a call returned takes it in.
+                    served.fetch_add(1, Ordering::Relaxed);
                     // A caller that stopped waiting has nothing to hear.
-                    let _ = reply.send(call(log));
+                    let _ = reply.send(value);
                 })));
                 Err(result)
             }
@@ -151,7 +155,9 @@ fn stopped() -> LogError {
     LogError::Storage("the log thread stopped".into())
 }
 
-type Job<L> = Box<dyn FnOnce(&mut L) + Send>;
+/// A queued call, given the log and the count of calls run, which it
+/// adds itself to before it answers its caller.
+type Job<L> = Box<dyn FnOnce(&mut L, &AtomicU64) + Send>;
 
 /// What a log thread is asked.
 enum Message<L> {
@@ -187,10 +193,7 @@ impl<L: OperationLog + Send + 'static> LogThread<L> {
                 let mut log = log;
                 while let Some(message) = queue.blocking_recv() {
                     match message {
-                        Message::Run(job) => {
-                            job(&mut log);
-                            count.fetch_add(1, Ordering::Relaxed);
-                        }
+                        Message::Run(job) => job(&mut log, &count),
                         Message::Stop(back) => {
                             let _ = back.send(log);
                             return;
@@ -211,7 +214,9 @@ impl<L: OperationLog + Send + 'static> LogThread<L> {
         Slot(Place::Queue(permit)).run(call).await
     }
 
-    /// How many calls the thread has run: each is two thread hops.
+    /// How many calls the thread has run: each is two thread hops. A call
+    /// is counted before its caller can hear its result, so a count read
+    /// once a call returned takes that call in.
     #[must_use]
     pub fn calls(&self) -> u64 {
         self.served.load(Ordering::Relaxed)

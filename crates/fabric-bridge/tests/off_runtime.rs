@@ -13,12 +13,14 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Wake, Waker};
 use std::time::Duration;
 
 use common::{create, double, journal_for, operation, scope};
 use fabric_bridge::wire::{Action, ExecParams, Locator};
 use fabric_bridge::{
-    Answer, Bridge, BridgeError, Config, Effect, Entry, LogError, LogThread, OperationLog,
+    Answer, Bridge, BridgeError, Config, Effect, Entry, LogError, LogThread, MemoryLog,
+    OperationLog,
 };
 use fabric_core::managed::OperationId;
 use fabric_journal::{Journal, ProviderAnswer, ProviderDispatch, ProviderStatus};
@@ -281,6 +283,47 @@ async fn every_log_call_runs_on_the_log_thread_and_each_step_makes_its_pinned_ca
         .unwrap();
     assert_eq!(row.status, ProviderStatus::Succeeded);
     assert!(bridge.close().await.is_some());
+}
+
+/// A waker that reads the log thread's count of calls when it is woken,
+/// which a log thread does as it hands a call's result over.
+struct CountOnWake {
+    log: Arc<LogThread<MemoryLog>>,
+    heard: Mutex<std::sync::mpsc::Sender<u64>>,
+}
+
+impl Wake for CountOnWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.heard.lock().unwrap().send(self.log.calls());
+    }
+}
+
+/// A call is counted before its caller can hear its result, so a count
+/// read once a call returned takes that call in, as the table above
+/// needs. The second call's waker reads the count at the moment its
+/// result is handed over; the first call holds the log thread until that
+/// waker is in place, so the order is the same on every run.
+#[test]
+fn a_call_is_counted_before_its_caller_hears_its_result() {
+    let log = Arc::new(LogThread::spawn(MemoryLog::new()).unwrap());
+    let (open, gate) = std::sync::mpsc::channel::<()>();
+    let mut held = Box::pin(log.call(move |_| gate.recv().unwrap()));
+    let mut idle = Context::from_waker(Waker::noop());
+    assert!(held.as_mut().poll(&mut idle).is_pending());
+    let (heard, count) = std::sync::mpsc::channel();
+    let waker = Waker::from(Arc::new(CountOnWake {
+        log: Arc::clone(&log),
+        heard: Mutex::new(heard),
+    }));
+    let mut second = Box::pin(log.call(|_| ()));
+    assert!(
+        second
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    open.send(()).unwrap();
+    assert_eq!(count.recv().unwrap(), 2);
 }
 
 /// The journal, with a `begin` that takes `delay` first, as a slow disk
