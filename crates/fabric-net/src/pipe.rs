@@ -246,8 +246,10 @@ impl Drained {
             return Poll::Ready(Report::ReaderGone);
         }
         if let Some(credit) = state.credit {
-            let room = state.capacity.saturating_sub(state.buf.len() + credit);
-            let grant = state.wanted.saturating_sub(credit).min(room);
+            // Bytes that arrived since the read asked count toward it.
+            let have = state.buf.len() + credit;
+            let room = state.capacity.saturating_sub(have);
+            let grant = state.wanted.saturating_sub(have).min(room);
             if grant > 0 {
                 state.credit = Some(credit + grant);
                 state.wanted = 0;
@@ -418,5 +420,39 @@ mod tests {
             r.read_to_end(&mut out).await.unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
+    }
+
+    /// A pipe made `on_demand` takes no more than the credit given, and
+    /// grants what an empty read asked for past what it holds and what
+    /// the peer may still send, so bytes that arrive between the read and
+    /// the grant are not asked for twice.
+    #[test]
+    fn credit_on_demand_is_what_a_read_asked_for_and_no_more() {
+        use std::task::Waker;
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let (w, mut r) = on_demand(100, 20);
+        let drained = w.drained();
+        w.push(&[1; 10]).unwrap();
+        let mut got = [0u8; 10];
+        let mut buf = ReadBuf::new(&mut got);
+        assert!(Pin::new(&mut r).poll_read(&mut cx, &mut buf).is_ready());
+        assert!(
+            drained.poll_report(&mut cx, 1).is_pending(),
+            "nothing was asked for"
+        );
+
+        let mut wanted = [0u8; 50];
+        let mut buf = ReadBuf::new(&mut wanted);
+        assert!(Pin::new(&mut r).poll_read(&mut cx, &mut buf).is_pending());
+        // Ten bytes the peer still had credit for arrive before the grant.
+        w.push(&[2; 10]).unwrap();
+        assert_eq!(
+            drained.poll_report(&mut cx, 1),
+            Poll::Ready(Report::Took(40))
+        );
+        assert!(drained.poll_report(&mut cx, 1).is_pending());
+        assert_eq!(w.push(&[3; 41]), Err(Refused::Full), "past the credit");
+        w.push(&[3; 40]).unwrap();
     }
 }
