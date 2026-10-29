@@ -22,17 +22,14 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{Cleanup, WORKER_VAR, capsule_worker, docker, docker_image, fresh, journal, scope};
+use common::{
+    Cleanup, WORKER_VAR, capsule_worker, docker, docker_image, double, fresh, journal, scope,
+};
 use fabric_bridge::wire::{Action, CreateParams, Digest, ExecParams, Locator, OperationRef, Scope};
 use fabric_bridge::{Bridge, Config, Effect, MemoryLog, Recorder};
 use fabric_core::id::JobId;
 use fabric_core::managed::{AttemptId, Generation, OperationId, OperationKey, TaskId};
 use fabric_journal::ProviderStatus;
-use tokio::process::Command;
-
-fn double() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_fabric-bridge-double"))
-}
 
 fn effect(n: u32) -> Effect {
     let mut id = [0x5a; 16];

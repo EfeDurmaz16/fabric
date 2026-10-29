@@ -15,7 +15,7 @@ mod common;
 use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
-use common::{create, journal, operation, scope};
+use common::{create, double, journal, operation, scope};
 use fabric_bridge::wire::{
     Action, CancelState, CreateParams, ErrorCode, ExecParams, Locator, ResultState, Versions,
 };
@@ -23,11 +23,6 @@ use fabric_bridge::{Answer, Bridge, BridgeError, Config, Control, Effect, Event,
 use fabric_core::managed::OperationId;
 use fabric_journal::{Journal, ProviderStatus};
 use rustix::process::Pid;
-use tokio::process::Command;
-
-fn double() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_fabric-bridge-double"))
-}
 
 fn config() -> Config {
     let mut config = Config::new("fixture");
@@ -56,6 +51,15 @@ fn fx(key: &str) -> Locator {
         "native_id": format!("fx-{key}"),
     }))
     .unwrap()
+}
+
+/// The double has run to its exit once before a test gets a command that
+/// starts it, so no timed handshake waits on macOS's first check of it.
+#[test]
+fn the_double_has_run_to_its_exit_before_a_test_can_start_it() {
+    let _command = double();
+    let warmed = common::double_warmed();
+    assert!(warmed.is_some_and(|s| s.success()), "{warmed:?}");
 }
 
 #[tokio::test]

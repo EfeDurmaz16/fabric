@@ -15,14 +15,13 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{create, journal_for, operation, scope};
+use common::{create, double, journal_for, operation, scope};
 use fabric_bridge::wire::{Action, ExecParams, Locator};
 use fabric_bridge::{
     Answer, Bridge, BridgeError, Config, Effect, Entry, LogError, LogThread, OperationLog,
 };
 use fabric_core::managed::OperationId;
 use fabric_journal::{Journal, ProviderAnswer, ProviderDispatch, ProviderStatus};
-use tokio::process::Command;
 
 /// What a [`Watched`] log saw: each call's kind and the thread it ran on.
 type Seen = Arc<Mutex<Vec<(&'static str, String)>>>;
@@ -70,10 +69,6 @@ impl OperationLog for Watched {
         self.note("entry");
         self.journal.entry(operation)
     }
-}
-
-fn double() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_fabric-bridge-double"))
 }
 
 fn config() -> Config {
