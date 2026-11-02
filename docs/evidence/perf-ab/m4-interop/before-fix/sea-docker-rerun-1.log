@@ -1,0 +1,41 @@
+
+running 13 tests
+docker server 29.4.0, context orbstack, image debian:bookworm-slim
+spawn and handshake: 6.059225292s
+attach_absent_stays_unknown: 2 wire steps, 3 checked elsewhere, 0 after advance
+test a_repeated_idempotency_key_is_never_sent_again ... ok
+attach_after_lost_create: 2 wire steps, 2 checked elsewhere, 0 after advance
+test the_handshake_negotiates_the_fixture_profile_and_refuses_another_version ... ok
+attach_checks_owner: 8 wire steps, 4 checked elsewhere, 0 after advance
+test a_create_whose_frame_never_left_stays_unknown_after_an_absent_attach_until_abandoned ... ok
+attach_then_observe_until_ready: 2 wire steps, 2 checked elsewhere, 6 after advance
+test a_create_lost_with_its_worker_is_attached_and_never_made_twice ... ok
+test create_exec_observe_destroy_keep_the_scoped_locator ... ok
+attach_unsupported: 6 wire steps, 3 checked elsewhere, 0 after advance
+test a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice ... ok
+test observe_reads_only_the_operations_own_resource ... ok
+bad_version_handshake: 3 wire steps, 1 checked elsewhere, 0 after advance
+test a_destroy_lost_with_its_worker_blocks_a_replacement_until_a_stop_is_confirmed ... ok
+test denied_and_unsupported_requests_fail_before_any_effect ... ok
+cancel_is_not_termination: 5 wire steps, 4 checked elsewhere, 0 after advance
+cleanup_after_attach_needs_fresh_approval: 8 wire steps, 9 checked elsewhere, 0 after advance
+create_exec_destroy: 6 wire steps, 6 checked elsewhere, 0 after advance
+denied_before_effect: 2 wire steps, 2 checked elsewhere, 0 after advance
+duplicate_idempotency_key: 6 wire steps, 3 checked elsewhere, 0 after advance
+exec_observe_after_worker_loss: 8 wire steps, 3 checked elsewhere, 0 after advance
+exec_observed_until_exit: 4 wire steps, 4 checked elsewhere, 5 after advance
+fresh_approval_required: 6 wire steps, 3 checked elsewhere, 0 after advance
+observe_checks_owner: 6 wire steps, 3 checked elsewhere, 0 after advance
+after the kill the engine holds 1 container(s) of the job
+pending_destroy_with_locator: 4 wire steps, 3 checked elsewhere, 5 after advance
+provider_failed: 2 wire steps, 2 checked elsewhere, 0 after advance
+receipt_failure_keeps_outcome: 2 wire steps, 2 checked elsewhere, 0 after advance
+scope_retained: 4 wire steps, 2 checked elsewhere, 0 after advance
+secrets_deny_all_and_intersection: 6 wire steps, 3 checked elsewhere, 0 after advance
+shutdown_reports_unresolved: 7 wire steps, 3 checked elsewhere, 0 after advance
+unknown_after_dispatch_with_locator: 4 wire steps, 4 checked elsewhere, 0 after advance
+unsupported_capability: 6 wire steps, 4 checked elsewhere, 0 after advance
+worker_loss_is_not_cancellation: 6 wire steps, 4 checked elsewhere, 0 after advance
+test every_shared_scenario_over_the_workers_stdio ... ok
+test a_docker_create_lost_with_its_worker_is_attached_and_never_made_twice ... ok
+/private/tmp/claude-501/-Users-efebarandurmaz/30688fe4-db80-4e61-9285-b847fc7ab612/scratchpad/repro-full.sh: line 13: 50443 Terminated: 15          env -i HOME=$HOME PATH="$P:/usr/bin:/bin" CAPSULE_BRIDGE_WORKER=$W/worker CAPSULE_BRIDGE_DOCKER_IMAGE=debian:bookworm-slim /tmp/fabric-wt/m4/target/debug/deps/capsule_worker-622f0fab75be1039 --ignored --nocapture
