@@ -23,7 +23,9 @@ use rustls::pki_types::CertificateDer;
 use tokio::io::AsyncWrite;
 
 use crate::accept::{Handshakes, Inbox};
+use crate::frame::MAX_CONTROL_FRAME;
 use crate::identity::NodeIdentity;
+use crate::rpc::MAX_CHUNK_RUNS;
 use crate::tls::{Credentials, Refusal, SERVER_NAME, TlsError, Trust, peer_of};
 use crate::transport::{
     Connection, DIAL_TIMEOUT, IDLE_TIMEOUT, KEEP_ALIVE, Stream, Transport, TransportError,
@@ -175,12 +177,30 @@ async fn accept_loop(endpoint: quinn::Endpoint, handshakes: Handshakes) {
     }
 }
 
+/// The bytes a peer may send on one stream before this node reads them:
+/// quinn's default, named here so `CONNECTION_WINDOW` can count it.
+const STREAM_WINDOW: u32 = 1_250_000;
+
+/// The bytes a peer may send on all the streams of one connection before
+/// this node reads them. quinn sets no such bound by default, so a paired
+/// peer's requests waiting for room to be read (`rpc`) could hold a whole
+/// `STREAM_WINDOW` on each of its 100 streams here, 125 MB a connection.
+/// It holds the `MAX_CHUNK_RUNS` chunk streams a peer sends this node at
+/// once at their whole window, and a request frame besides, so a fetch
+/// never waits on it.
+const CONNECTION_WINDOW: u64 =
+    MAX_CHUNK_RUNS as u64 * STREAM_WINDOW as u64 + MAX_CONTROL_FRAME as u64;
+
 fn transport_config() -> Result<quinn::TransportConfig, TransportError> {
     let mut config = quinn::TransportConfig::default();
     let idle =
         IdleTimeout::try_from(IDLE_TIMEOUT).map_err(|err| TransportError::Config(Box::new(err)))?;
     config.max_idle_timeout(Some(idle));
     config.keep_alive_interval(Some(KEEP_ALIVE));
+    config.stream_receive_window(VarInt::from_u32(STREAM_WINDOW));
+    config.receive_window(
+        VarInt::from_u64(CONNECTION_WINDOW).map_err(|err| TransportError::Config(Box::new(err)))?,
+    );
     // Requests ride bidirectional streams only. Nothing accepts a
     // unidirectional one, so a peer gets no credit to open any: one it
     // could open would sit buffered with no reader and no deadline.
@@ -395,5 +415,48 @@ mod tests {
             ),
             "{read:?}"
         );
+    }
+
+    /// Review of PR #31: quinn bounds no connection's unread bytes by
+    /// default, so a peer's requests waiting for room to be read could
+    /// hold a stream window on each of its streams here. Twelve streams of
+    /// 1 MiB, none read, get at most `CONNECTION_WINDOW` of their bytes
+    /// onto the wire, counted from the sender.
+    #[tokio::test]
+    async fn a_peer_can_leave_at_most_the_connection_window_unread() {
+        const STREAMS: usize = 12;
+        let (acceptor, _dialer, connection) = raw_pair().await;
+        let _accepted = acceptor.accept().await.unwrap();
+        let mut writers = Vec::new();
+        for _ in 0..STREAMS {
+            let (mut send, recv) = connection.open_bi().await.unwrap();
+            writers.push(tokio::spawn(async move {
+                let _held = recv;
+                let _written = send.write_all(&vec![7u8; 1 << 20]).await;
+                std::future::pending::<()>().await;
+            }));
+        }
+        // Wait until the sender stops sending: the window is spent. A burst
+        // over loopback loses datagrams, which are sent again, so what
+        // arrived is what was sent less what was lost.
+        let mut sent = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let stats = connection.stats();
+            let now = stats.udp_tx.bytes.saturating_sub(stats.path.lost_bytes);
+            if now == sent {
+                break;
+            }
+            sent = now;
+        }
+        // Packet headers, acks and the handshake take a few percent more.
+        let bound = CONNECTION_WINDOW + CONNECTION_WINDOW / 10 + (64 << 10);
+        assert!(
+            sent <= bound,
+            "{sent} bytes reached a connection that read none, past {CONNECTION_WINDOW}"
+        );
+        for writer in writers {
+            writer.abort();
+        }
     }
 }

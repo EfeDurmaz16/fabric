@@ -6,6 +6,8 @@
 //! nothing. The secrets include shapes that JSON escapes (a quoted value,
 //! an env line after a newline), so a check on raw bytes cannot pass.
 
+use std::fmt::Write as _;
+
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
 
@@ -192,6 +194,53 @@ fn strings_outside_signed(value: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// Writes `value` as JSON with the characters of its keys spelled as
+/// `\uXXXX` escapes wherever `escape` yields true, cycling through it. Every
+/// reader decodes the result to the same value, so the redaction must
+/// treat it as the canonical text.
+fn encode_with_escaped_keys(value: &Value, escape: &[bool]) -> String {
+    fn write(value: &Value, escape: &[bool], next: &mut usize, out: &mut String) {
+        match value {
+            Value::Object(map) => {
+                out.push('{');
+                for (i, (key, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('"');
+                    for c in key.chars() {
+                        let flip = !escape.is_empty() && escape[*next % escape.len()];
+                        *next += 1;
+                        if flip && c.is_ascii() {
+                            write!(out, "\\u{:04x}", u32::from(c)).unwrap();
+                        } else {
+                            let quoted = serde_json::to_string(&c.to_string()).unwrap();
+                            out.push_str(&quoted[1..quoted.len() - 1]);
+                        }
+                    }
+                    out.push_str("\":");
+                    write(v, escape, next, out);
+                }
+                out.push('}');
+            }
+            Value::Array(items) => {
+                out.push('[');
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(v, escape, next, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&serde_json::to_string(other).unwrap()),
+        }
+    }
+    let mut out = String::new();
+    write(value, escape, &mut 0, &mut out);
+    out
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -238,5 +287,28 @@ proptest! {
         let pretty = serde_json::to_string_pretty(&value).unwrap();
         let outcome = transform(&pretty, redactor()).unwrap();
         prop_assert!(outcome.text.is_none());
+    }
+
+    /// H1: a key spelled with escapes names the same field, so the
+    /// redaction drops the same signed blocks and leaves the same value as
+    /// it does for the canonical spelling.
+    #[test]
+    fn escaped_key_spellings_are_redacted_as_the_canonical_ones(
+        value in value_with_secrets_strategy(),
+        escape in prop::collection::vec(any::<bool>(), 1..8),
+    ) {
+        let canonical = serde_json::to_string(&value).unwrap();
+        let escaped = encode_with_escaped_keys(&value, &escape);
+        let reread: Value = serde_json::from_str(&escaped).expect("the spelling is JSON");
+        prop_assert_eq!(&reread, &value);
+
+        let plain = transform(&canonical, redactor()).unwrap();
+        let spelled = transform(&escaped, redactor()).unwrap();
+        prop_assert_eq!(plain.dropped_signed_blocks, spelled.dropped_signed_blocks);
+        let plain_after: Value =
+            serde_json::from_str(plain.text.as_deref().unwrap_or(&canonical)).unwrap();
+        let spelled_after: Value =
+            serde_json::from_str(spelled.text.as_deref().unwrap_or(&escaped)).unwrap();
+        prop_assert_eq!(plain_after, spelled_after);
     }
 }

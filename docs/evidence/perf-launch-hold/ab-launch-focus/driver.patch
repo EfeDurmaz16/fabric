@@ -1,0 +1,27 @@
+diff --git a/crates/fabric/tests/e2e/ab.rs b/crates/fabric/tests/e2e/ab.rs
+index b79b878..602177f 100644
+--- a/crates/fabric/tests/e2e/ab.rs
++++ b/crates/fabric/tests/e2e/ab.rs
+@@ -146,20 +146,11 @@ enum Op {
+ impl Op {
+     /// Every op of a run, in order.
+     fn all() -> Vec<Op> {
++        // Scratch: launch ops only, for a focused run with many pairs.
+         let mut ops = Vec::new();
+         for shape in 0..SHAPES.len() {
+-            ops.extend([Op::New(shape), Op::Launch(shape), Op::Approve(shape)]);
++            ops.extend([Op::New(shape), Op::Launch(shape)]);
+         }
+-        ops.extend([Op::LedgerAppend, Op::CliVersion, Op::CliLs]);
+-        for shape in 0..SHAPES.len() {
+-            ops.extend([
+-                Op::Suspend(shape),
+-                Op::Move(shape),
+-                Op::Resume(shape),
+-                Op::Pull(shape),
+-            ]);
+-        }
+-        ops.extend([Op::ColdStart, Op::Restart]);
+         ops
+     }
+ 

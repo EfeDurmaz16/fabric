@@ -246,6 +246,44 @@ impl JobDir {
     pub fn fallback_root(&self) -> PathBuf {
         self.dir.join("work")
     }
+
+    /// The snapshots this node keeps for the job although its ledger does
+    /// not name them: orphans an export or a fork repair published, each
+    /// with its whole bundle chain (ADR 0003, Orphans; ADR 0014).
+    #[must_use]
+    pub fn pins(&self) -> PathBuf {
+        self.dir.join("pins")
+    }
+
+    /// Where a fork repair keeps the ledger this node held before it took
+    /// the chain the fork rule picked (ADR 0003, Forks): the whole file,
+    /// nothing cut, named by the last record the two chains share and by
+    /// that ledger's head. A record's hash covers every record before it,
+    /// so one name only ever holds one ledger's bytes, and a second repair
+    /// at the same fork point, which holds another chain by then, keeps it
+    /// beside the first instead of over it.
+    #[must_use]
+    pub fn forked_ledger(
+        &self,
+        fork_point: fabric_core::id::RecordHash,
+        head: fabric_core::id::RecordHash,
+    ) -> PathBuf {
+        self.dir.join(format!("ledger.forked-{fork_point}-{head}"))
+    }
+}
+
+/// Whether `dir` is a workspace a restore set aside for the job whose root
+/// is `root`: a directory directly under `<root parent>/orphan/`
+/// (`orphan_copy`), which an export may capture.
+#[must_use]
+pub fn is_orphan_copy(root: &Path, dir: &Path) -> bool {
+    let Some(orphans) = root.parent().map(|parent| parent.join("orphan")) else {
+        return false;
+    };
+    dir.parent() == Some(orphans.as_path())
+        && dir
+            .file_name()
+            .is_some_and(|name| name != "." && name != "..")
 }
 
 /// The directory under `home` that holds every job's root and the copies
@@ -346,6 +384,9 @@ pub struct SyncedFolders {
     pub documents: bool,
 }
 
+/// The folders of the home iCloud Drive may sync, as `SyncedFolders` names them.
+const SYNCABLE: [&str; 2] = ["Desktop", "Documents"];
+
 /// Refuses a root inside a synced folder (ADR 0011, rule 4).
 ///
 /// `~/Library/Mobile Documents` is iCloud Drive itself and is refused on
@@ -360,13 +401,24 @@ pub fn check_root(root: &Path, home: &Path, synced: SyncedFolders) -> Result<(),
     if root.starts_with(&icloud) {
         return Err(refuse(icloud, "is iCloud Drive"));
     }
-    for (synced, name) in [(synced.desktop, "Desktop"), (synced.documents, "Documents")] {
+    for (synced, name) in [synced.desktop, synced.documents].into_iter().zip(SYNCABLE) {
         let folder = home.join(name);
         if synced && root.starts_with(&folder) {
             return Err(refuse(folder, "iCloud Drive syncs on this node"));
         }
     }
     Ok(())
+}
+
+/// Whether `check_root` reads `SyncedFolders` for `root`: only a root
+/// under a folder of `home` iCloud Drive may sync is judged by them, so
+/// for any other root the `defaults` reads that answer them are left out
+/// and `check_root` decides the same with `SyncedFolders::default()`.
+#[must_use]
+pub fn reads_synced_folders(root: &Path, home: &Path) -> bool {
+    SYNCABLE
+        .iter()
+        .any(|name| root.starts_with(home.join(name)))
 }
 
 #[cfg(test)]
@@ -420,6 +472,33 @@ mod tests {
         }
     }
 
+    /// The client API's fixture of a repair that took the peer's chain
+    /// shows the ledger kept where a repair keeps it, under the state
+    /// directory's job and with the name this node gives it, so a client
+    /// reading the contract never sees a name the node no longer writes.
+    #[test]
+    fn the_repair_fixture_keeps_the_ledger_where_a_repair_does() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../protocol/fixtures/reply/job_repair_adopted.json");
+        let reply: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+        let kept = reply.pointer("/outcome/kept").unwrap().as_str().unwrap();
+        let kept = Path::new(kept);
+        let name = kept.file_name().and_then(OsStr::to_str).unwrap();
+        let (fork_point, head) = name
+            .strip_prefix("ledger.forked-")
+            .and_then(|hashes| hashes.split_once('-'))
+            .unwrap_or_else(|| panic!("{name} does not name a fork point and a head"));
+        let dir = kept.parent().unwrap();
+        let job: JobId = dir.file_name().unwrap().to_str().unwrap().parse().unwrap();
+        let state = dir.parent().and_then(Path::parent).unwrap();
+        let state = StateDir::resolve(Some(state.as_os_str()), Path::new("/")).unwrap();
+        let written = state
+            .job(job)
+            .forked_ledger(fork_point.parse().unwrap(), head.parse().unwrap());
+        assert_eq!(written, kept);
+    }
+
     #[test]
     fn a_root_in_a_synced_folder_is_refused_only_where_it_syncs() {
         let home = Path::new("/Users/x");
@@ -438,5 +517,43 @@ mod tests {
             .is_err()
         );
         assert!(check_root(&job_root(home, JOB), home, synced).is_ok());
+    }
+
+    /// A root `reads_synced_folders` says is not judged by the synced
+    /// folders gets the same answer from `check_root` whatever they are,
+    /// so the reads that answer them can be left out for it.
+    #[test]
+    fn a_root_outside_the_syncable_folders_is_judged_without_them() {
+        let home = Path::new("/Users/x");
+        let every = [false, true].into_iter().flat_map(|desktop| {
+            [false, true].map(|documents| SyncedFolders { desktop, documents })
+        });
+        let every: Vec<SyncedFolders> = every.collect();
+        for root in [
+            job_root(home, JOB),
+            home.join("Desktop/w"),
+            home.join("Documents/w"),
+            home.join("Desktopper/w"),
+            home.join("Library/Mobile Documents/w"),
+            home.join("code/Desktop/w"),
+            PathBuf::from("/Volumes/x/Desktop/w"),
+        ] {
+            let answers: Vec<bool> = every
+                .iter()
+                .map(|synced| check_root(&root, home, *synced).is_ok())
+                .collect();
+            let unread = check_root(&root, home, SyncedFolders::default()).is_ok();
+            if !reads_synced_folders(&root, home) {
+                assert!(
+                    answers.iter().all(|ok| *ok == unread),
+                    "{}: {answers:?}",
+                    root.display()
+                );
+            }
+        }
+        assert!(reads_synced_folders(&home.join("Desktop/w"), home));
+        assert!(reads_synced_folders(&home.join("Documents"), home));
+        assert!(!reads_synced_folders(&job_root(home, JOB), home));
+        assert!(!reads_synced_folders(&home.join("Desktopper/w"), home));
     }
 }

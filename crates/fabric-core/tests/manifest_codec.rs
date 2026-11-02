@@ -1,6 +1,7 @@
 //! The snapshot manifest codec: round trip for arbitrary manifests and a
-//! pinned hash, so a change to the wire format is a failing test, not a
-//! surprise on the other machine.
+//! pinned hash per format version, so a change to the wire format is a
+//! failing test, not a surprise on the other machine, and a manifest an
+//! older build wrote keeps its id.
 
 use std::error::Error;
 
@@ -12,8 +13,8 @@ use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    HarnessState, LeaveReason, LeftBehind, MANIFEST_VERSION, ManifestError, Mode, Platform, Remake,
-    SnapshotManifest,
+    HarnessState, LEGACY_MANIFEST_VERSION, LeaveReason, LeftBehind, MANIFEST_VERSION,
+    ManifestError, Mode, PathMeta, Platform, Remake, SnapshotManifest,
 };
 use proptest::prelude::*;
 
@@ -33,6 +34,14 @@ fn abs_path() -> impl Strategy<Value = AbsPath> {
     proptest::collection::vec(component(), 0..4).prop_filter_map("valid absolute path", |parts| {
         AbsPath::parse(&format!("/{}", parts.join("/"))).ok()
     })
+}
+
+fn any_mode() -> impl Strategy<Value = Mode> {
+    (0u16..=0o777).prop_filter_map("mode", Mode::new)
+}
+
+fn path_meta() -> impl Strategy<Value = PathMeta> {
+    (any_mode(), any::<u64>()).prop_map(|(mode, mtime_ns)| PathMeta { mode, mtime_ns })
 }
 
 fn chunk() -> impl Strategy<Value = ChunkId> {
@@ -233,9 +242,10 @@ fn git_state() -> impl Strategy<Value = GitState> {
         ],
         oid(),
         oid(),
-        proptest::collection::vec((rel_path(), any::<u64>()), 0..3),
+        proptest::collection::vec((rel_path(), any::<u64>(), any_mode()), 0..3),
         proptest::collection::vec(config_entry(), 0..3),
         proptest::option::of(proptest::collection::vec(chunk(), 1..2)),
+        proptest::collection::vec(ref_name(), 0..2),
     )
         .prop_map(
             |(
@@ -245,19 +255,38 @@ fn git_state() -> impl Strategy<Value = GitState> {
                 head,
                 index_commit,
                 worktree_commit,
-                worktree_mtimes,
+                worktree,
                 config,
                 exclude,
-            )| GitState {
-                bundle,
-                bundle_base,
-                refs: sorted_unique(refs, |(name, _)| name.clone()),
-                head,
-                index_commit,
-                worktree_commit,
-                worktree_mtimes: sorted_unique(worktree_mtimes, |(path, _)| path.clone()),
-                config: sorted(config, |(key, _)| key.clone()),
-                exclude,
+                symbolic,
+            )| {
+                let refs = sorted_unique(refs, |(name, _)| name.clone());
+                // Each symbolic ref names a ref of `refs` and is not one.
+                let symbolic_refs = match refs.first() {
+                    Some((target, _)) => sorted_unique(
+                        symbolic
+                            .into_iter()
+                            .filter(|name| refs.iter().all(|(n, _)| n != name))
+                            .map(|name| (name, target.clone()))
+                            .collect(),
+                        |(name, _)| name.clone(),
+                    ),
+                    None => Vec::new(),
+                };
+                let worktree = sorted_unique(worktree, |(path, _, _)| path.clone());
+                GitState {
+                    bundle,
+                    bundle_base,
+                    refs,
+                    symbolic_refs,
+                    head,
+                    index_commit,
+                    worktree_commit,
+                    worktree_mtimes: worktree.iter().map(|(p, t, _)| (p.clone(), *t)).collect(),
+                    worktree_modes: worktree.into_iter().map(|(p, _, m)| (p, m)).collect(),
+                    config: sorted(config, |(key, _)| key.clone()),
+                    exclude,
+                }
             },
         )
 }
@@ -277,6 +306,8 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
         (
             proptest::collection::vec(cache_entry(), 0..3),
             left_behind(),
+            proptest::option::of(path_meta()),
+            proptest::option::of(path_meta()),
         ),
     )
         .prop_map(
@@ -291,30 +322,40 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
                 files,
                 harness,
                 env,
-                (caches, left_behind),
+                (caches, left_behind, root_meta, harness_root),
             )| {
                 let caches = sorted_unique(caches, |c| c.path.clone());
                 // A path is in `files` or in the working tree, never both,
                 // and the two nest only below a directory in `files`.
+                let apart = |path: &RelPath| {
+                    files.iter().all(|e| {
+                        !e.rel_path.starts_with(path)
+                            && (matches!(e.kind, EntryKind::Dir) || !path.starts_with(&e.rel_path))
+                    })
+                };
                 if let Some(git) = git.as_mut() {
-                    git.worktree_mtimes.retain(|(path, _)| {
-                        files.iter().all(|e| {
-                            !e.rel_path.starts_with(path)
-                                && (matches!(e.kind, EntryKind::Dir)
-                                    || !path.starts_with(&e.rel_path))
-                        })
-                    });
+                    git.worktree_mtimes.retain(|(path, _)| apart(path));
+                    git.worktree_modes.retain(|(path, _)| apart(path));
+                    // Format version 2 has no field for these.
+                    if root_meta.is_none() {
+                        git.symbolic_refs.clear();
+                        git.worktree_modes.clear();
+                    }
                 }
                 SnapshotManifest {
                     job_id: JobId::from_bytes(job),
                     root,
+                    root_meta,
                     parent: parent.map(SnapshotId::from_bytes),
                     created_at,
                     created_by: NodeId::from_bytes(by),
                     platform: Platform { os, arch },
                     git,
                     files,
-                    harness_state: HarnessState { entries: harness },
+                    harness_state: HarnessState {
+                        entries: harness,
+                        root: harness_root.filter(|_| root_meta.is_some()),
+                    },
                     env_spec: env.map(EnvSpecId::from_bytes),
                     caches,
                     left_behind,
@@ -356,10 +397,16 @@ proptest! {
             SnapshotManifest::decode(&version),
             Err(ManifestError::Codec(VersionedError::Codec(CodecError::NonCanonical)))
         ));
-        // created_at follows the version, the job id, the root and the parent.
+        // created_at follows the version, the job id, the root, in
+        // version 3 the root's mode and mtime, and the parent.
+        let root_meta = match m.root_meta {
+            Some(_) => postcard::to_stdvec(&m.root_meta).unwrap().len(),
+            None => 0,
+        };
         let start = 1
             + 16
             + postcard::to_stdvec(&m.root).unwrap().len()
+            + root_meta
             + postcard::to_stdvec(&m.parent).unwrap().len();
         let created_at = postcard::to_stdvec(&m.created_at).unwrap();
         let mut field = bytes[..start].to_vec();
@@ -380,6 +427,7 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
     Ok(SnapshotManifest {
         job_id: JobId::from_bytes([1; 16]),
         root: AbsPath::parse("/Users/me/fabric/jobs/x/work")?,
+        root_meta: None,
         parent: None,
         created_at: 1_760_000_000_000,
         created_by: NodeId::from_bytes([2; 32]),
@@ -394,10 +442,12 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
                 RefName::parse("refs/heads/main")?,
                 GitOid::parse(&"a".repeat(40))?,
             )],
+            symbolic_refs: Vec::new(),
             head: GitHead::Branch(BranchName::parse("main")?),
             index_commit: GitOid::parse(&"b".repeat(40))?,
             worktree_commit: GitOid::parse(&"c".repeat(40))?,
             worktree_mtimes: vec![(RelPath::parse("src/lib.rs")?, 7)],
+            worktree_modes: Vec::new(),
             config: vec![(
                 GitConfigKey::parse("push.default")?,
                 GitConfigValue::parse("simple")?,
@@ -423,6 +473,7 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
                 mode: mode(0o600)?,
                 mtime_ns: 11,
             }],
+            root: None,
         },
         env_spec: Some(EnvSpecId::of(b"spec")),
         caches: vec![CacheEntry {
@@ -457,14 +508,155 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
 /// hash and must come with a version bump, as version 2 did when the cache
 /// rows gained what a target decides them by (2026-10-21). `installed`
 /// joined `Remake::Setup` on 2026-10-22, before version 2 was merged or
-/// written by any released build, so it is part of version 2.
+/// written by any released build, so it is part of version 2. Since
+/// version 3 this is the hash of a manifest with no `root_meta`, which a
+/// version 2 writer made: the same hash proves such a snapshot keeps its id.
 #[test]
 fn format_version_two_hash_is_pinned() {
-    let id = fixed_manifest().unwrap().id().unwrap().to_string();
+    let m = fixed_manifest().unwrap();
+    assert_eq!(m.version(), LEGACY_MANIFEST_VERSION);
+    let id = m.id().unwrap().to_string();
     assert_eq!(
         id,
         "67d16a515a83e7bec72705376208b8f039045c5428e7f95bc862df7724b5c765"
     );
+}
+
+/// The fixed manifest as version 3 writes it: the workspace root and the
+/// harness-state root with their mode and mtime, a file of `W` with its
+/// bits and `refs/remotes/origin/HEAD` as a symbolic ref.
+fn fixed_manifest_v3() -> Result<SnapshotManifest, Box<dyn Error>> {
+    let mut m = fixed_manifest()?;
+    m.root_meta = Some(PathMeta {
+        mode: mode(0o700)?,
+        mtime_ns: 13,
+    });
+    m.harness_state.root = Some(PathMeta {
+        mode: mode(0o700)?,
+        mtime_ns: 17,
+    });
+    let git = m.git.as_mut().ok_or("git")?;
+    git.refs.push((
+        RefName::parse("refs/remotes/origin/main")?,
+        GitOid::parse(&"a".repeat(40))?,
+    ));
+    git.symbolic_refs = vec![(
+        RefName::parse("refs/remotes/origin/HEAD")?,
+        RefName::parse("refs/remotes/origin/main")?,
+    )];
+    git.worktree_modes = vec![(RelPath::parse("src/lib.rs")?, mode(0o600)?)];
+    Ok(m)
+}
+
+/// Pins format version 3 (M2-04, M2-05, M2-06), as the version 2 hash
+/// above pins version 2.
+#[test]
+fn format_version_three_hash_is_pinned() {
+    let m = fixed_manifest_v3().unwrap();
+    assert_eq!(m.version(), MANIFEST_VERSION);
+    let bytes = m.encode().unwrap();
+    assert_eq!(bytes[0], u8::try_from(MANIFEST_VERSION).unwrap());
+    assert_eq!(SnapshotManifest::decode(&bytes).unwrap(), m);
+    assert_eq!(
+        m.id().unwrap().to_string(),
+        "ea8a01366aea4bba6bd828f5f2a79459cfc83d56dc7ec72221f74d13bc8e6ca0"
+    );
+}
+
+/// Bytes a version 2 writer made decode, with none of what version 3
+/// added, and encode to the same bytes, so the snapshot keeps its id.
+#[test]
+fn a_version_two_manifest_decodes_and_keeps_its_bytes() {
+    let m = fixed_manifest().unwrap();
+    let bytes = m.encode().unwrap();
+    assert_eq!(bytes[0], u8::try_from(LEGACY_MANIFEST_VERSION).unwrap());
+    let back = SnapshotManifest::decode(&bytes).unwrap();
+    assert_eq!(back, m);
+    assert_eq!(back.root_meta, None);
+    assert_eq!(back.encode().unwrap(), bytes);
+    assert_eq!(back.id().unwrap(), SnapshotId::of(&bytes));
+}
+
+/// Clears every version 3 field of a manifest but one.
+type KeepOnly = fn(&mut SnapshotManifest);
+
+/// A manifest with no `root_meta` is written as version 2, which has no
+/// field for the rest of what version 3 added, so it holds none of it.
+#[test]
+fn a_manifest_without_root_meta_holds_no_version_three_field() {
+    let v3 = fixed_manifest_v3().unwrap();
+    let cases: [(&str, KeepOnly); 3] = [
+        ("harness_state.root", |m| {
+            m.git.as_mut().unwrap().symbolic_refs.clear();
+            m.git.as_mut().unwrap().worktree_modes.clear();
+        }),
+        ("symbolic_refs", |m| {
+            m.harness_state.root = None;
+            m.git.as_mut().unwrap().worktree_modes.clear();
+        }),
+        ("worktree_modes", |m| {
+            m.harness_state.root = None;
+            m.git.as_mut().unwrap().symbolic_refs.clear();
+        }),
+    ];
+    for (field, keep_only) in cases {
+        let mut m = v3.clone();
+        m.root_meta = None;
+        keep_only(&mut m);
+        assert!(
+            matches!(m.encode(), Err(ManifestError::NotInVersion2 { field: f }) if f == field),
+            "{field}"
+        );
+    }
+}
+
+/// Version 3 bytes always record the root; only version 2 leaves it out,
+/// so one manifest has one encoding.
+#[test]
+fn version_three_bytes_without_root_meta_do_not_decode() {
+    let m = fixed_manifest_v3().unwrap();
+    let bytes = m.encode().unwrap();
+    let at = 1 + 16 + postcard::to_stdvec(&m.root).unwrap().len();
+    let meta = postcard::to_stdvec(&m.root_meta).unwrap();
+    assert_eq!(&bytes[at..at + meta.len()], &meta[..]);
+    let mut patched = bytes[..at].to_vec();
+    patched.push(0);
+    patched.extend_from_slice(&bytes[at + meta.len()..]);
+    assert!(matches!(
+        SnapshotManifest::decode(&patched),
+        Err(ManifestError::MissingRootMeta)
+    ));
+}
+
+/// A symbolic ref points at a ref the bundle carries, and is not one.
+#[test]
+fn a_symbolic_ref_must_point_at_a_ref_and_not_be_one() {
+    let mut m = fixed_manifest_v3().unwrap();
+    m.git.as_mut().unwrap().symbolic_refs[0].1 =
+        RefName::parse("refs/remotes/origin/gone").unwrap();
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::SymbolicRefTargetMissing { name, target })
+            if name.as_str() == "refs/remotes/origin/HEAD"
+                && target.as_str() == "refs/remotes/origin/gone"
+    ));
+    let mut m = fixed_manifest_v3().unwrap();
+    m.git.as_mut().unwrap().symbolic_refs[0].0 = RefName::parse("refs/heads/main").unwrap();
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::SymbolicRefIsRef { name }) if name.as_str() == "refs/heads/main"
+    ));
+}
+
+/// A mode belongs to a file of the working-tree commit.
+#[test]
+fn a_mode_for_a_path_outside_the_working_tree_is_refused() {
+    let mut m = fixed_manifest_v3().unwrap();
+    m.git.as_mut().unwrap().worktree_modes[0].0 = RelPath::parse("src/main.rs").unwrap();
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::ModeOutsideWorktree { path }) if path.as_str() == "src/main.rs"
+    ));
 }
 
 fn dir(path: &str) -> Result<Entry, Box<dyn Error>> {
@@ -776,7 +968,7 @@ fn trailing_bytes_do_not_decode() {
 
 #[test]
 fn unknown_version_and_oversize_are_refused() {
-    let mut bytes = fixed_manifest().unwrap().encode().unwrap();
+    let mut bytes = fixed_manifest_v3().unwrap().encode().unwrap();
     assert_eq!(bytes[0], u8::try_from(MANIFEST_VERSION).unwrap());
     bytes[0] = 1;
     assert!(matches!(

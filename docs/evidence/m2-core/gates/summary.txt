@@ -1,0 +1,8 @@
+fmt exit 0
+clippy exit 0
+test exit 0
+deny exit 0
+hygiene exit 0
+fixtures exit 0
+budget-check exit 0
+sdk exit 0

@@ -45,6 +45,15 @@ pub enum NodeError {
     /// The control socket's path is longer than a Unix socket path may be.
     #[error("the control socket {0} is too long for a Unix socket; use a shorter FABRIC_HOME")]
     SocketPathTooLong(PathBuf),
+    /// The managed authority refused or failed a managed command, or a
+    /// standalone command named a managed job (ADR 0019).
+    #[error("{message}")]
+    Managed {
+        /// The typed reason.
+        reason: Box<Reason>,
+        /// What the CLI prints.
+        message: String,
+    },
     /// No job with this id is known on this node.
     #[error(
         "job {0} is not known on this node; run `fabric job resume {0} --on <node>` to pull it from the node that holds it"
@@ -230,6 +239,44 @@ pub enum NodeError {
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
+    /// A fork repair was asked for a job that is not frozen.
+    #[error("job {job} is not frozen here, so there is no fork to repair")]
+    NotFrozen {
+        /// The job.
+        job: JobId,
+    },
+    /// The fork rule picks this node's chain: the freeze stays until the
+    /// peer has taken it.
+    #[error(
+        "the fork rule of ADR 0003 picks this node's chain of job {job} over {peer}'s; run `fabric job repair {job}` on {peer}, which takes it, then here again"
+    )]
+    ForkWon {
+        /// The job.
+        job: JobId,
+        /// The peer whose chain loses.
+        peer: NodeId,
+        /// The highest epoch of the peer's chain.
+        epoch: Epoch,
+    },
+    /// The ledger changed while a repair read the peer's chain.
+    #[error(
+        "job {job} changed while the repair read the peer's chain; run `fabric job repair {job}` again"
+    )]
+    ChangedDuringRepair {
+        /// The job.
+        job: JobId,
+    },
+    /// An export was asked for a workspace that is not an orphan.
+    #[error(
+        "{} is job {job}'s own workspace on this node, not an orphan; `fabric job suspend {job}` snapshots it",
+        root.display()
+    )]
+    NotAnOrphan {
+        /// The job.
+        job: JobId,
+        /// The workspace.
+        root: PathBuf,
+    },
     /// The workspace is mid-suspend or mid-restore.
     #[error(
         "job {job}: {} did not finish; run `fabric job {} {job}` to finish it",
@@ -437,6 +484,7 @@ impl NodeError {
     fn reason(&self) -> Reason {
         match self {
             NodeError::UnknownJob(job) => Reason::UnknownJob { job: *job },
+            NodeError::Managed { reason, .. } => (**reason).clone(),
             NodeError::NotOwner { job, owner, epoch } => Reason::NotOwner {
                 job: *job,
                 owner: *owner,
@@ -468,11 +516,16 @@ impl NodeError {
                 move_id: *move_id,
                 target: *target,
             },
-            NodeError::Forked { job, peer, epoch } => Reason::Forked {
-                job: *job,
-                peer: *peer,
-                epoch: *epoch,
-            },
+            // A repair that the fork rule says this node's chain wins
+            // leaves the job frozen with the same peer; its sentence says
+            // to repair there first.
+            NodeError::Forked { job, peer, epoch } | NodeError::ForkWon { job, peer, epoch } => {
+                Reason::Forked {
+                    job: *job,
+                    peer: *peer,
+                    epoch: *epoch,
+                }
+            }
             NodeError::ForkBehind { job, peer, epoch } => Reason::ForkBehind {
                 job: *job,
                 peer: *peer,
@@ -540,7 +593,9 @@ impl NodeError {
                 job: *job,
                 root: root.clone(),
             },
-            NodeError::PlanOvertaken { job } => Reason::PlanOvertaken { job: *job },
+            NodeError::PlanOvertaken { job } | NodeError::ChangedDuringRepair { job } => {
+                Reason::PlanOvertaken { job: *job }
+            }
             NodeError::SessionMoved { job } => Reason::SessionMoved { job: *job },
             NodeError::StaleWorkspace { job, root, epoch } => Reason::StaleWorkspace {
                 job: *job,
@@ -548,6 +603,7 @@ impl NodeError {
                 left_at: *epoch,
             },
             NodeError::NoWorkspace(job) => Reason::NoWorkspace { job: *job },
+            NodeError::NotFrozen { .. } | NodeError::NotAnOrphan { .. } => Reason::BadRequest,
             NodeError::Unfinished { job, step } => Reason::Unfinished {
                 job: *job,
                 step: *step,

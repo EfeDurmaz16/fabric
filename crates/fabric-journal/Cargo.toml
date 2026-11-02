@@ -1,0 +1,21 @@
+[package]
+name = "fabric-journal"
+version = "0.1.0"
+description = "The managed authority's journal: a versioned SQLite record of managed jobs, their operations and their events"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fabric-core = { path = "../fabric-core" }
+# The workspace's existing SQLite binding, at the version and features
+# fabric-store uses (ADR 0020): no new crate enters the workspace.
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

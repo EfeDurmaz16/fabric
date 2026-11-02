@@ -1,0 +1,65 @@
+{
+  "kind": "managed_list",
+  "jobs": [
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "revision": "1",
+      "generation": "1",
+      "state": "active",
+      "goal": "fix the flaky test",
+      "harness": {
+        "kind": "codex"
+      },
+      "primary_task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+      "tasks": [
+        {
+          "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+          "state": "open"
+        }
+      ],
+      "attempts": []
+    },
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ1",
+      "revision": "9007199254740993",
+      "generation": "2",
+      "state": "cancelled",
+      "goal": "run the tests",
+      "harness": {
+        "kind": "acp",
+        "program": "my-agent",
+        "args": [
+          "--acp"
+        ]
+      },
+      "primary_task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+      "tasks": [
+        {
+          "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+          "state": "cancelled"
+        },
+        {
+          "task": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+          "parent": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+          "label": "tests",
+          "state": "succeeded"
+        }
+      ],
+      "attempts": [
+        {
+          "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+          "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+          "generation": "1",
+          "status": "lost"
+        },
+        {
+          "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+          "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+          "generation": "2",
+          "status": "checkpointed",
+          "snapshot": "abababababababababababababababababababababababababababababababab"
+        }
+      ]
+    }
+  ]
+}

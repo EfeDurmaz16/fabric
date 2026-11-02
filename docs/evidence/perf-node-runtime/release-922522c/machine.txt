@@ -1,0 +1,9 @@
+anchor: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
+candidate: working tree at 922522cb170994f934459977fab09692cb3b42a2, 1 changed paths
+driver: e2e test of the working tree at 922522cb170994f934459977fab09692cb3b42a2
+profile: release, pairs: 20, counted runs: 3
+binary bytes: anchor 19773920, candidate 20692336
+uname: Darwin 25.6.0 arm64
+cpu: Apple M5 Pro 18 cores
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+start: 2026-10-27T23:34:59Z, load: 15.50 18.38 18.86

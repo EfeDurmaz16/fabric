@@ -1,0 +1,27 @@
+Gates of CONTRIBUTING on the branch at 8739323 (2026-10-28), Apple M5 Pro,
+macOS arm64, rustc 1.97.1, load average 15 to 23 from other work:
+
+cargo fmt --all --check                                   ok
+cargo clippy --workspace --all-targets --locked -D warnings  ok
+clippy -p fabric-harness per feature ("", acp, claude, codex) ok
+cargo test --workspace --locked                           ok: 1099 passed, 0 failed, 9 ignored
+  (the M2-18 benchmark is the one new ignored test)
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps ok
+cargo deny check                                          ok
+scripts/check-hygiene.sh origin/main                      ok
+scripts/check-budget.sh origin/main                       ok
+scripts/check-fixtures.sh origin/main                     ok
+scripts/test-check-hygiene.sh, test-check-budget.sh,
+  test-check-fixtures.sh                                  ok
+shellcheck memory-diagnostic.sh                           ok
+sdk/typescript: bun install --frozen-lockfile, typecheck,
+  build, FABRIC_BIN=target/debug/fabric bun test          ok: 62 passed, 0 failed
+
+budget::hot_paths (ignored, report mode), budget-report.txt:
+  fails on process counts only, as expected: every resume and pull
+  starts ps once where budget.toml says three times (items 2 and 17).
+  budget.toml belongs to the budget-ci-evidence group; its new counts
+  and [[change]] entry are in this branch's notes. The times are over
+  the macos-aarch64 baselines under this load on every op, and report
+  only; the A/B runs in this directory are the comparison that holds
+  under load.

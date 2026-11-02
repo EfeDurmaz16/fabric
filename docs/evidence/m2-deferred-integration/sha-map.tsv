@@ -1,0 +1,95 @@
+group	branch commit	commit here	subject
+cli-protocol-ops	150ee4d	6b7978b	perf(fabricd): tell a group leader by getpgid instead of ps
+cli-protocol-ops	b83c221	bcd6cfe	perf(fabricd): read a gone harness's liveness without ps
+cli-protocol-ops	80cde73	a1c96e7	perf(fabricd): keep a job's marker, harness and fork records in memory
+cli-protocol-ops	d448c2c	ff0ce05	perf(fabricd): drop a gone harness's record without a directory flush
+cli-protocol-ops	af041ba	3ba9137	perf(fabricd): rewrite a job manifest at start only when missing or behind
+cli-protocol-ops	3e1ebba	6ef9cc3	perf(fabric): run client commands on a two-worker runtime
+cli-protocol-ops	c2aea4c	01c7ee9	fix(fabric): bound a headless turn's session queue and line reader
+cli-protocol-ops	ecb5b99	e8b29a9	perf(fabricd): ask the harness its version while a suspend measures the node
+cli-protocol-ops	55de9a9	03bfc80	feat(harness): ask a harness its version ahead of the step that reads it
+cli-protocol-ops	1dd8dbc	1447080	perf(fabricd): read the iCloud defaults only for a root they can refuse
+cli-protocol-ops	9cc0ab4	f3293d5	perf(fabricd): overlap a restore's probes with its root check and writes
+cli-protocol-ops	f05b03f	1e76c0b	perf(fabricd): leave another harness's probes out of a move and a pull
+cli-protocol-ops	9fa6324	bd76d69	test(fabricd): benchmark the replication of a long ledger
+cli-protocol-ops	e56c6bf	d7c1e15	perf(core): find a ledger record by its hash through a sorted index
+cli-protocol-ops	1ecc017	ba51198	perf(fabricd): push a peer only the records it has not accepted
+cli-protocol-ops	7bae3d0	df2f8a5	feat(client): add the session_to_continue event
+cli-protocol-ops	df27512	057179c	perf(fabricd): name the session a launch continues before the plan
+cli-protocol-ops	5f076b2	635a222	perf(fabric): start the resume guard's version when the node names the session
+cli-protocol-ops	8c2dd0c	5859bc9	feat(fabric): add the managed subcommands with operation keys
+cli-protocol-ops	f733771	4b708e7	feat(fabricd): repair a frozen fork by the fork rule and export orphans
+cli-protocol-ops	9f4fab6	c0f0a72	feat(fabric): add job repair and job export to the CLI
+cli-protocol-ops	b41ec48	2dad2d1	docs: record repair, export, the new event and the kept job files
+cli-protocol-ops	8739323	f05edd7	perf(fabricd): keep a job's absent records and peer heads in less memory
+cli-protocol-ops	bf14115	88bd00b	docs(evidence): record the A/B runs, gates and memory of cli-protocol-ops
+launch-hold	376148b	286f4e8	perf(harness): register a launch while its trampoline starts
+launch-hold	84828df	b3d7ae4	perf(harness): run the trampoline in dash where the system has it
+launch-hold	cba3776	608e14b	fix(acp): bound queued session updates by bytes as well as by count
+launch-hold	f2857db	7a23746	fix(codex): carry the session's writable roots and network access on resume
+launch-hold	14c2d0f	863b927	docs(adr): note the early release and the byte bound of ACP updates
+launch-hold	1091071	c73d2b6	docs(adr): name the dash trampoline in ADR 0006
+launch-hold	6586ef9	27d674c	docs(evidence): record the A/B runs of the launch hold
+store-git	8c28b1a	0cce465	test(store): share the logged git of the process-count test
+store-git	26a9475	8695ee1	perf(store): unbundle each link without a separate bundle verify
+store-git	26ec80b	69b488d	perf(store): restore the exclude file and config without asking git
+store-git	a4a72e4	fe5b1f0	perf(store): set symbolic refs and HEAD in the ref transaction
+store-git	6aa154f	bca7df3	perf(store): read a bundle's heads from its header, not list-heads
+store-git	b961153	bd2792d	perf(store): run the ignored listings beside work that does not need them
+store-git	da5844a	b060399	perf(store): keep a resume flat in the bundle chain with a node cache
+store-git	3a03e01	c25fe50	fix(store): remove bundle cache files no recorded link names
+store-git	e4e14f3	6542c3b	docs(adr): note in ADR 0004 where the restore now differs
+store-git	1685654	813bd17	test(store): time a restore at each length of a bundle chain
+store-git	02b7dc4	1489176	perf(store): check cached packs through one 64 KiB buffer
+store-git	7939faa	316a629	fix(store): copy bundle cache files, never hard-link them
+store-git	f345556	f3d98f2	docs(evidence): record the store-git counters against the anchor
+store-git	228a6cd	272eb08	test(store): cover interleaved subsections in the config writer's test
+store-git	c0ece10	044920a	fix(store): put HEAD on its branch with git init, not in the ref transaction
+store-git	1aad81b	2735e65	docs(evidence): record the HEAD fix and its red run in store-git
+durability	41526fc	ec060dd	perf(fabricd): order an atomic write with a barrier and flush the drive once
+durability	9f47c43	2abda92	perf(fabricd): write the job manifest ordered, without a full flush
+durability	923aac7	2ef9ee2	perf(fabric-harness): order an atomic write with a barrier and flush the drive once
+durability	3771de8	80983f4	perf(fabric-harness): stage a capture with plain fsyncs and flush the drive at its manifest
+durability	90d79de	c8f713b	perf(fabric-harness): share the directory flushes of the files a restore places
+durability	6d57d63	1623ec2	docs(adr): amend ADR 0002 for the barrier and the shared full flush
+durability	3904a60	97433e0	perf(fabricd): keep each ledger record once in memory
+durability	0b12238	16b48c3	docs(durability): drop flush timings taken on a loaded machine
+durability	7d8f2b9	c1c009e	docs(evidence): record the flush counts and red tests of the durability work
+node-runtime	6dfb0ec	f8fa4d1	test(fabricd): expect the authority's thread only with a journal or a managed command
+node-runtime	0392968	8d000ef	perf(fabricd): start the managed authority's thread only when it has work
+node-runtime	8947330	f44a039	test(fabricd): expect a bounded event backlog for a client that stops reading
+node-runtime	28227da	e823af3	fix(fabricd): bound the events that wait for a control client by bytes
+node-runtime	c344206	38558de	test(store): benchmark captures, restores and reads that share one store
+node-runtime	6007c13	964315a	test(fabricd): expect a short store call to run beside a long one
+node-runtime	8b6f90a	676426f	perf(store): let handles of one store capture, restore and read at once
+node-runtime	15e36b8	360dd46	perf(fabricd): run each store call on a handle of its own
+node-runtime	401d0db	6924616	docs(fabricd): reflow the managed authority's module doc
+node-runtime	a495cb6	fe193ec	docs(adr): say what a client that stops reading loses on the control socket
+node-runtime	266ce9b	a3835b6	perf(fabricd): frame every control answer in one function
+node-runtime	052ca5a	b37194f	revert: frame the final answer in the relay again
+node-runtime	50ad2b7	59636e1	perf(store): keep no root path in the store's shared parts
+node-runtime	440d56e	8a47db2	perf(fabricd): keep only the state directory in an idle authority
+node-runtime	922522c	4e6c443	perf(fabricd): frame events with the relay's own encoder
+node-runtime	50df18c	c7de002	docs(evidence): keep the node-runtime group's counters, not its timings
+facts-net-carry	32fe4bd	ebfa2f5	fix(fabricd): read a facts probe as it arrives and stop at the fact cap
+facts-net-carry	af473fe	fd41b9e	fix(fabricd): name the facts a peer's answer had no room for
+facts-net-carry	86fedc8	bb0c3f1	fix(fabricd): carry a venv without its installer only to its interpreter
+facts-net-carry	ceba4ce	d4e4e3c	perf(net): read a frame's payload after its version byte and never past its length
+facts-net-carry	c20483f	d8cedec	fix(net): bound the request bytes a node holds for one peer
+facts-net-carry	37cbe1b	07c67fa	perf(fabricd): open /dev/null once per facts measure and read probes in 512 bytes
+facts-net-carry	b0f25c0	c048ebd	docs(evidence): record the A/B runs of the facts, net and carry fixes
+facts-net-carry	e61f197	c519658	perf(fabricd): keep the command out of a probe's task and read in 256 bytes
+facts-net-carry	66d5a3b	05758a6	docs(evidence): record the footprint A/B runs and the fix they led to
+budget-ci-evidence	c5a12e4	b2763b4	fix(scripts): refuse a budget change that loosens a limit
+budget-ci-evidence	ef43373	b737c59	chore(scripts): derive budget baselines from CI logs
+budget-ci-evidence	188fb32	29aa540	fix(budget): give Linux the anchor's baselines from CI runs (M2-25)
+budget-ci-evidence	3ba7b21	c620d9f	ci: enforce the time budget, on Linux against the anchor's times (M2-25)
+budget-ci-evidence	4c175ce	6a0ae90	test(budget): count the git a capture and a restore no longer start
+budget-ci-evidence	6f67003	ae9f9b2	test(budget): count the ps a resume and a pull no longer start
+budget-ci-evidence	6792db6	acc3146	fix(budget): stop telling a slower op to raise its baseline
+budget-ci-evidence	7989b66	7521e55	feat(budget): check the process counts without timing anything
+budget-ci-evidence	c6840ca	a962cde	test(budget): count every probe and harness each op starts
+budget-ci-evidence	c8e25d6	bcde37f	feat(bench): report the daemons' memory from a run that only counts
+budget-ci-evidence	6ff36e9	099049e	docs(adr): amend ADR 0009 with the performance rule and CI as built
+budget-ci-evidence	838f0c7	12f6144	docs(evidence): count the integration of the deferred work against the anchor
+budget-ci-evidence	db83aec	b97622f	docs(evidence): record where each deferred finding was fixed

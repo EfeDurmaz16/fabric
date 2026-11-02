@@ -48,8 +48,8 @@ tracked file or in any commit message on the branch, from any directory in the
 repository. `scripts/test-check-hygiene.sh` proves it fires; CI runs it first.
 
 `scripts/check-budget.sh` fails when the time budget changed without a new
-`[[change]]` entry (see Time budget); `scripts/test-check-budget.sh` proves it
-fires.
+`[[change]]` entry, or when it loosens a limit (see Time budget);
+`scripts/test-check-budget.sh` proves it fires.
 
 `cargo deny check` needs `cargo install cargo-deny --locked`. CI also runs it
 once a week, so a new advisory against an unchanged `Cargo.lock` still shows
@@ -58,23 +58,81 @@ dependency must pass it, and the PR lists the crate, version, last release
 date, and license. Dependabot opens a weekly PR for a stale action pin or
 crate; it goes through the same gates.
 
+## Performance rule
+
+No hot path may be slower, or use more memory, than the anchor: `main`
+before the durable job campaign, commit `176622e`. A tolerance per pull
+request compounds (1.5 times per PR is 5 times after four), so every
+change is compared with the same fixed anchor, and the aim is to be faster
+and smaller than it, not only within a budget. A slowdown the A/B bench
+measures on a hot path is a bug to fix, never a trade-off to document, and
+the machine's load is not an explanation: the bench gives both builds of a
+pair the same load. A correctness check is never removed or weakened to
+win time; find a cheaper way to do the same check.
+
+The rule gates the release build, the one a node runs (Efe, 2026-10-29):
+the A/B run that must show no op slower and no daemon or CLI larger than
+the anchor is `scripts/bench-ab.sh --release`. The test profile is
+tracked, not gated: its runs stay in the record, but an unoptimized binary
+keeps more code pages resident than the anchor's, so its resident size is
+not held to the anchor's. CI's time budget below is a separate, coarse
+guard and still runs in the test profile.
+
+`scripts/bench-ab.sh` is the evidence. It builds the anchor once into a
+cache, builds this working tree (or `--candidate <commit>`), and runs the
+ignored test `ab::paired` in `crates/fabric/tests/e2e/ab.rs`, which drives
+both builds through the same fixture and ops, taking turns op by op:
+
+```sh
+scripts/bench-ab.sh docs/evidence/perf-ab/<name>            # test profile, 15 pairs
+scripts/bench-ab.sh --release --pairs 20 docs/evidence/perf-ab/<name>
+scripts/bench-ab.sh --pairs 0 docs/evidence/perf-ab/<name>  # counted phase only
+scripts/bench-ab.sh --analyze docs/evidence/perf-ab/<name>  # the report again
+```
+
+Its `report.md` gives each op's median ratio, candidate over anchor, with
+a 95% bootstrap interval from at least 15 pairs, and each daemon's
+resident size and physical footprint. The resident size, from `ps`, also
+counts the clean pages of the binary's code, which a larger build keeps
+resident; the physical footprint, from macOS's `footprint(1)`, counts only
+the pages the daemon dirtied. On macOS a counted phase also loads
+`scripts/perf-ab/counters.c` into every `fabric` process and reports what
+does not depend on load: processes started by command, file flushes by
+kind and file, bytes read and written, allocations, and each CLI's peak
+resident size and CPU time, and each daemon's resident size and
+physical footprint after every op. With `--pairs 0` only that counted
+phase runs: its numbers do not depend on load, so it is the run to make
+on a busy machine, and a timed
+run waits for a quiet one. A pull request that touches a hot path keeps
+its run under `docs/evidence/perf-ab/`. An interval above 1 is a
+regression; a median above 1 whose interval holds 1 is profiled before
+merge.
+
 ## Time budget
 
-A hot path that gets about 1.5 times slower is a bug (issue #26). The
-ignored test `budget::hot_paths` in `crates/fabric/tests/e2e/budget.rs`
+The time budget is CI's coarse guard; the performance rule above is the bar.
+The ignored test `budget::hot_paths` in `crates/fabric/tests/e2e/budget.rs`
 times the hot paths on the end-to-end fixture of two nodes over QUIC:
 suspend, move, resume and pull of a job under each harness (ACP, Claude,
 Codex), and a daemon's cold start and restart. Every program the node's
 facts probe, but git, is a fake that answers after 50 ms; git is the
-machine's own. It also counts the git, kill, lsof, pgrep and ps processes
-each op starts, the harness's own too: the end-to-end build turns on the
-`counted-tools` feature, which runs the harness's system tools from the
-test's `bin` (`FABRIC_SYSTEM_TOOLS`), where the budget counts them.
+machine's own. It also counts the processes each op starts, by program:
+git, every probed fake and every harness, and the kill, lsof, pgrep and ps
+the harness runs, which the end-to-end build's `counted-tools` feature
+takes from the test's `bin` (`FABRIC_SYSTEM_TOOLS`), where the budget
+counts them. Probes run in parallel, so a probe started once more hides
+in the time; its count shows it.
 `crates/fabric/tests/e2e/budget.toml` holds the limits: the ratio, the
 grace, the runs per batch, each platform's baselines, the exact process
-counts, and the `[[change]]` entries that record why the budget changed.
-CI runs it after the end-to-end step on both runners and writes its table
-to the step summary.
+counts, and the `[[change]]` entries that record why the budget changed. CI
+runs it after the end-to-end step on both runners with
+`FABRIC_BUDGET=enforce` and writes its table to the step summary. The Linux
+runner is held to the `linux-x86_64` baselines. The macOS runner is not the
+Mac of the `macos-aarch64` baselines, and runs of one commit there differ by
+up to 1.34 times, more than the ratio, so it sets
+`FABRIC_BUDGET_PLATFORM=macos-aarch64-github`, a platform with no
+baselines: its times only report, and its process counts are held as
+everywhere.
 
 Run it on a quiet machine, since it measures wall time. It takes a few
 minutes:
@@ -82,29 +140,63 @@ minutes:
 ```sh
 cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
 FABRIC_BUDGET=enforce cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+FABRIC_BUDGET=count cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
 ```
 
-The first command only reports times; the second fails on them. An op is
+The first command only reports times; the second fails on them. A third,
+with `FABRIC_BUDGET=count`, runs only the two warm-up runs and times
+nothing: the process counts do not depend on load, so it is the one to run
+on a busy machine, or to set the counts after a change. An op is
 over its limit when its 25th percentile of 7 runs is above both 1.3 times
 its baseline and its baseline plus 50 ms, and it fails when it is over
-again in a second batch of 7. A process count fails in both modes when it
+again in a second batch of 7. A process count fails in every mode when it
 differs from the budget, higher or lower: fewer starts can mean a check was
-dropped. A platform with no baselines, as `linux-x86_64` until CI produces
-numbers, only reports its times.
+dropped. A platform with no baselines only reports its times.
+`macos-aarch64` holds the times of an 18-core Apple silicon Mac and
+`linux-x86_64` those of CI's `ubuntu-latest` runner.
 
-To accept a slowdown, or a new process count:
+A baseline is the anchor's time, so it never goes up: a slower op is a bug
+to fix (Performance rule), and a baseline raised once per pull request
+would compound. A process count is the same rule measured without the
+load, so it never goes up either. `scripts/check-budget.sh` fails a change
+that raises or removes a baseline, raises the ratio or the grace, lowers
+the percentile or the runs per batch, raises a process count of a program
+the base counted, makes an op start a counted program it did not start,
+removes an op's counts, or takes a program off the `counted` list, the
+programs the warm-up runs count, which `budget.rs` checks against its own.
+A program counted for the first time, and a new op, bring their counts. To
+change the budget otherwise, as for a faster op or fewer processes:
 
-1. Say in the PR why the op must cost more, with the table before and after.
-2. Set the op's baseline in `budget.toml` to the new 25th percentile from the
-   table, or set its counts.
+1. Say in the PR why, with the table before and after.
+2. Lower the op's baseline in `budget.toml`, or its counts.
 3. Add a `[[change]]` entry at the end of `budget.toml`, with
    `date = "YYYY-MM-DD"` and a `why` that names the PR. Entries are never
    edited or removed. `scripts/check-budget.sh` fails a change to the
    budget without a new one.
 
-To give a platform its baselines, copy the 25th percentile column of a CI
-run on main from the step summary, with a `[[change]]` entry that names the
-run.
+The one time a baseline may rise is when the anchor itself was timed
+again on CI, as when CI moves to another runner: run `176622e`'s code on
+it at least three times, set the baselines from those runs as below, and
+say so in the new entry with
+`anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"` and the runs,
+`runs = "<id> <id> <id>"`, beside its date and why. The check reads each
+run with `gh`: it must be a finished run of `.github/workflows/ci.yml` on
+a commit whose crates, Cargo files and toolchain are the anchor's, and
+every raised baseline must be the one `scripts/budget-baselines.sh` gives
+from the runs' logs. Without `gh`, or with runs it cannot read, the check
+fails.
+
+To give a platform its baselines, run the anchor's code on it at least
+three times and take each op's median 25th percentile. For a CI runner,
+`scripts/budget-baselines.sh` does that from the runs' logs:
+
+```sh
+gh run view <run-id> --log > run-<run-id>.log   # once per run of the anchor's code
+scripts/budget-baselines.sh linux-x86_64 run-*.log
+```
+
+It prints the `[baseline.<platform>]` table; the `[[change]]` entry names
+the runs.
 
 ## Workspace rules
 

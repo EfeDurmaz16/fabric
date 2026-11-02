@@ -11,26 +11,35 @@
 //! workspace path and home of the capture (ADR 0011) and only files under
 //! the declared state directory whose path names the session. The adapter
 //! cannot tell whether a generic agent is writing a session while it
-//! restores one; the caller owns that guard, through the handle
-//! `launch_acp` returned. A launch whose handshake fails kills the agent's
-//! process group before it returns, so no agent runs without a handle.
+//! restores one; the caller owns that guard, through the handle the
+//! launch returned. The trait's launch returns the agent held, before its
+//! exec, and its driver sends the first message only once the caller
+//! releases it, so the node records the agent before it can act (issue
+//! #17). A handshake that fails kills the agent's process group, so no
+//! agent runs on without a session.
 
 pub mod client;
 
 use std::ffi::OsString;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::path::AbsPath;
 use fabric_core::session::SessionId;
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::HarnessError;
-use crate::harness::{Harness, Installed, Launch, Restored, Running};
+use crate::harness::{
+    Harness, Installed, Launch, MAX_ANSWER, Restored, Running, TurnEvent, TurnFeed, TurnReport,
+};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};
@@ -334,9 +343,45 @@ impl AcpHarness {
         process::detect(self.binary().ok(), &self.path_var).await
     }
 
+    /// Starts the agent held, before its exec, and attaches the protocol
+    /// client to its pipes. The client writes nothing until the handle is
+    /// released, and then first the line the agent's trampoline waits for.
+    async fn spawn_attached(
+        &self,
+        root: &AbsPath,
+        env: &[(EnvVarName, String)],
+    ) -> Result<(Running, AcpClient), HarnessError> {
+        let binary = self.binary()?;
+        let mut spawned = process::spawn(
+            &binary,
+            &self.args,
+            pipeline::fs_path(root),
+            env,
+            Wiring::Rpc,
+        )
+        .await?;
+        let (Some(stdin), Some(stdout)) = (spawned.child.stdin.take(), spawned.child.stdout.take())
+        else {
+            // Dropping the held handle kills its group.
+            drop(Running::new(None, spawned));
+            return Err(HarnessError::Spawn {
+                program: self.program.to_string(),
+                source: std::io::Error::other("agent started without stdio pipes"),
+            });
+        };
+        let client = match spawned.go.take() {
+            Some(go) => AcpClient::attach_held(stdin, stdout, self.policy, go),
+            None => AcpClient::attach(stdin, stdout, self.policy),
+        };
+        Ok((Running::new(None, spawned), client))
+    }
+
     /// Starts the agent, completes the handshake, continues `resume` or
-    /// creates a session, and returns the process with its protocol client.
-    /// A prompt is sent on a task of its own, whose handle is on the result.
+    /// creates a session, and returns the process with its protocol client,
+    /// for a caller that drives the session itself. The agent is released
+    /// at once, since no node records it first: a launch a node supervises
+    /// goes through `Harness::launch`, which returns the agent held. A
+    /// prompt is sent on a task of its own, whose handle is on the result.
     pub async fn launch_acp(
         &self,
         workspace: &Path,
@@ -345,26 +390,11 @@ impl AcpHarness {
         env: &[(EnvVarName, String)],
     ) -> Result<AcpRunning, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let binary = self.binary()?;
-        let mut spawned = process::spawn(
-            &binary,
-            &self.args,
-            pipeline::fs_path(&root),
-            env,
-            Wiring::Rpc,
-        )
-        .await?;
+        let (mut running, client) = self.spawn_attached(&root, env).await?;
+        running.release()?;
         // Until the session is open, an error or a dropped future kills the
-        // agent's group, so no agent is left running without a handle.
-        let guard = process::GroupGuard::new(spawned.pid);
-        let (Some(stdin), Some(stdout)) = (spawned.child.stdin.take(), spawned.child.stdout.take())
-        else {
-            return Err(HarnessError::Spawn {
-                program: self.program.to_string(),
-                source: std::io::Error::other("agent started without stdio pipes"),
-            });
-        };
-        let client = AcpClient::attach(stdin, stdout, self.policy);
+        // agent's group, so no agent is left running without a session.
+        let guard = process::GroupGuard::new(running.pid());
         let session = self.open_session(&client, &root, resume).await?;
         guard.disarm();
         let turn = prompt.map(|prompt| {
@@ -372,8 +402,9 @@ impl AcpHarness {
             let session = session.clone();
             tokio::spawn(async move { client.prompt(&session, &prompt).await })
         });
+        running.set_session(session);
         Ok(AcpRunning {
-            running: Running::new(Some(session), spawned),
+            running,
             client,
             turn,
         })
@@ -411,10 +442,17 @@ impl AcpHarness {
     }
 
     /// The trait's launch, headless only: an ACP agent has no terminal
-    /// mode, so `Launch::Interactive` is refused (`NeedsClient`). The
-    /// prompt turn runs on a task that owns the client and closes the
-    /// agent's stdin when the turn ends; updates the turn streams are
-    /// dropped once `client::UPDATE_BUFFER` wait unread.
+    /// mode, so `Launch::Interactive` is refused (`NeedsClient`). The agent
+    /// comes back held, with the session it continues, or none for a new
+    /// one, and its driver sends nothing before `Running::release` lets it
+    /// run, so a node records it before it can act (issue #17). The driver
+    /// then runs the handshake, opens or continues the session, sends the
+    /// prompt, gathers the agent's answer from the turn's updates, closes
+    /// the agent's stdin when the turn ends, and says each step on the
+    /// handle's turn feed (`Running::take_turn`). Updates past
+    /// `client::UPDATE_BUFFER`, or past `client::UPDATE_BUFFER_BYTES` of
+    /// their lines, unread are dropped, and the driver reads them as they
+    /// come.
     async fn launch_impl(
         &self,
         workspace: &Path,
@@ -426,27 +464,202 @@ impl AcpHarness {
                 program: self.program.to_string(),
             });
         };
-        let AcpRunning {
-            running,
+        let root = pipeline::physical_workspace(workspace)?;
+        let (running, client) = self.spawn_attached(&root, env).await?;
+        let (gate, released) = oneshot::channel();
+        let (events, feed) = TurnFeed::channel();
+        let driver = Driver {
+            adapter: self.clone(),
+            pid: running.pid(),
             client,
-            turn,
-        } = self
-            .launch_acp(workspace, resume, Some(prompt), env)
-            .await?;
-        let program = self.program.to_string();
-        tokio::spawn(async move {
-            let outcome = match turn {
-                Some(turn) => turn.await,
-                None => return,
-            };
-            match outcome {
-                Ok(Ok(reason)) => info!(agent = %program, ?reason, "acp: turn ended"),
-                Ok(Err(e)) => warn!(agent = %program, error = %e, "acp: turn failed"),
-                Err(e) => warn!(agent = %program, error = %e, "acp: turn task ended early"),
-            }
-            drop(client);
-        });
+            root,
+            resume: resume.clone(),
+            prompt,
+            events,
+        };
+        tokio::spawn(driver.run(released));
+        let mut running = running.with_driver(gate, feed);
+        if let Some(session) = resume {
+            running.set_session(session);
+        }
         Ok(running)
+    }
+}
+
+/// The turn the trait's launch of an ACP agent runs once the agent is
+/// released.
+struct Driver {
+    adapter: AcpHarness,
+    pid: NonZeroU32,
+    client: AcpClient,
+    root: AbsPath,
+    resume: Option<SessionId>,
+    prompt: String,
+    events: mpsc::Sender<TurnEvent>,
+}
+
+impl Driver {
+    /// Waits for `released`, then runs the turn. A handle dropped while
+    /// held killed the agent's group and drops the gate, so the driver
+    /// ends with nothing sent. A handshake that fails kills the group.
+    async fn run(self, released: oneshot::Receiver<()>) {
+        if released.await.is_err() {
+            return;
+        }
+        let Driver {
+            adapter,
+            pid,
+            client,
+            root,
+            resume,
+            prompt,
+            events,
+        } = self;
+        let program = adapter.program.to_string();
+        let mut report = TurnReport {
+            session: resume.clone(),
+            ..TurnReport::default()
+        };
+        // Until the session is open, an error, or the runtime dropping
+        // this task, kills the agent's group.
+        let guard = process::GroupGuard::new(pid);
+        let session = match adapter.open_session(&client, &root, resume).await {
+            Ok(session) => {
+                guard.disarm();
+                session
+            }
+            Err(e) => {
+                drop(guard);
+                warn!(agent = %program, error = %e, "acp: the session could not be opened, so the agent was stopped");
+                report.failure = Some(format!(
+                    "{program} could not open the session, so it was stopped: {e}"
+                ));
+                let _ = events.send(TurnEvent::Ended(report)).await;
+                return;
+            }
+        };
+        report.session = Some(session.clone());
+        // The receiver may be gone, as when the caller never asked; the turn runs on.
+        let _ = events.send(TurnEvent::Session(session.clone())).await;
+        let (answer, outcome) = turn(&client, &session, &prompt).await;
+        if answer.left_out > 0 {
+            warn!(agent = %program, left_out = answer.left_out, "acp: the answer ran past {MAX_ANSWER} bytes; the rest was left out");
+        }
+        report.answer_left_out = answer.left_out;
+        report.answer = (!answer.text.is_empty()).then_some(answer.text);
+        report.failure = match outcome {
+            Ok(StopReason::EndTurn) => {
+                info!(agent = %program, "acp: turn ended");
+                None
+            }
+            Ok(reason) => {
+                warn!(agent = %program, ?reason, "acp: turn stopped early");
+                Some(format!(
+                    "{program} stopped the turn: {}",
+                    stop_words(&reason)
+                ))
+            }
+            Err(e) => {
+                warn!(agent = %program, error = %e, "acp: turn failed");
+                Some(format!("{program} failed the turn: {e}"))
+            }
+        };
+        let dropped = client.dropped_updates();
+        if dropped > 0 {
+            warn!(agent = %program, dropped, "acp: updates were dropped, so the answer may be short");
+        }
+        let _ = events.send(TurnEvent::Ended(report)).await;
+        // The last handle on the client: dropping it closes the agent's
+        // stdin, so it exits.
+        drop(client);
+    }
+}
+
+/// The answer a turn gathers: the first `MAX_ANSWER` bytes of its text,
+/// and how many bytes came after them.
+#[derive(Debug, Default)]
+struct Answer {
+    text: String,
+    left_out: u64,
+}
+
+impl Answer {
+    /// Appends `text`, as much of it as fits in `max` bytes of answer, cut
+    /// at a character; once a piece is cut, every later one is left out,
+    /// so the answer is always the turn's first bytes.
+    fn keep(&mut self, text: &str, max: usize) {
+        let room = max.saturating_sub(self.text.len());
+        if self.left_out == 0 && text.len() <= room {
+            self.text.push_str(text);
+            return;
+        }
+        let kept = if self.left_out == 0 {
+            text.floor_char_boundary(room)
+        } else {
+            0
+        };
+        self.text.push_str(&text[..kept]);
+        self.left_out += (text.len() - kept) as u64;
+    }
+}
+
+/// Sends `prompt` in `session` and gathers the text of the agent's
+/// message chunks for that session until the turn ends, at most
+/// `MAX_ANSWER` bytes of it; returns the answer and how the turn ended.
+async fn turn(
+    client: &AcpClient,
+    session: &SessionId,
+    prompt: &str,
+) -> (Answer, Result<StopReason, AcpError>) {
+    let mut answer = Answer::default();
+    let asked = client.prompt(session, prompt);
+    tokio::pin!(asked);
+    let outcome = loop {
+        tokio::select! {
+            // Updates first: the agent sends them before its answer to the
+            // prompt, and the client queues them in that order.
+            biased;
+            update = client.next_update() => match update {
+                Some(update) if &update.session == session => note_chunk(&mut answer, &update.update),
+                Some(_) => {}
+                None => break (&mut asked).await,
+            },
+            outcome = &mut asked => break outcome,
+        }
+    };
+    // Updates queued before the answer, read while it was being taken.
+    while let Ok(Some(update)) = tokio::time::timeout(Duration::ZERO, client.next_update()).await {
+        if &update.session == session {
+            note_chunk(&mut answer, &update.update);
+        }
+    }
+    (answer, outcome)
+}
+
+/// Appends the text of an `agent_message_chunk` update to `answer`, as
+/// far as `MAX_ANSWER` allows; leaves out every other update and content
+/// that is not text.
+fn note_chunk(answer: &mut Answer, update: &Value) {
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
+        return;
+    }
+    let content = update.get("content");
+    if content.and_then(|c| c.get("type")).and_then(Value::as_str) == Some("text")
+        && let Some(text) = content.and_then(|c| c.get("text")).and_then(Value::as_str)
+    {
+        answer.keep(text, MAX_ANSWER);
+    }
+}
+
+/// A stop reason as the protocol names it.
+fn stop_words(reason: &StopReason) -> &str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::MaxTurnRequests => "max_turn_requests",
+        StopReason::Refusal => "refusal",
+        StopReason::Cancelled => "cancelled",
+        StopReason::Other(other) => other,
     }
 }
 
@@ -525,5 +738,95 @@ mod tests {
             adapter(&["ab"]).departure(&session),
             "argument boundaries count"
         );
+    }
+
+    /// The lines of an agent that answers the prompt, request 1 of its
+    /// client, after `chunks` `agent_message_chunk` updates of `text`.
+    fn chunking_agent(dir: &Path, chunks: usize, text: &str) -> tokio::process::Child {
+        let mut line = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text }
+                }
+            }
+        }))
+        .unwrap();
+        line.push('\n');
+        let update = dir.join("update.jsonl");
+        std::fs::write(&update, &line).unwrap();
+        let answer = r#"{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}"#;
+        let script = format!(
+            "read -r prompt; i=0; while [ $i -lt {chunks} ]; do cat \"$0\"; i=$((i+1)); done; echo '{answer}'; read -r rest"
+        );
+        tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&update)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    /// Review of PR #31: M2-23 bounds the updates nobody reads, but a
+    /// headless turn reads them as they come and gathered every chunk's
+    /// text into one answer, so an agent that streams a long turn made
+    /// the command hold all of it. The answer keeps its first
+    /// `MAX_ANSWER` bytes and counts the rest, as a Claude or Codex
+    /// answer is bounded by the line it comes on.
+    #[tokio::test]
+    async fn a_drained_turn_keeps_at_most_max_answer_bytes_of_answer() {
+        const CHUNKS: usize = 24;
+        const CHUNK: usize = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = chunking_agent(dir.path(), CHUNKS, &"a".repeat(CHUNK));
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let client = AcpClient::attach(stdin, stdout, PermissionPolicy::Deny);
+        let session = SessionId::parse("s1").unwrap();
+        let (answer, outcome) =
+            tokio::time::timeout(Duration::from_mins(1), turn(&client, &session, "hi"))
+                .await
+                .expect("the turn did not end");
+        assert!(matches!(outcome, Ok(StopReason::EndTurn)), "{outcome:?}");
+        assert!(
+            answer.text.len() <= MAX_ANSWER,
+            "the turn held {} bytes of answer, {CHUNKS} chunks of {CHUNK} bytes",
+            answer.text.len()
+        );
+        // An update the queue dropped never reached the turn; the rest did.
+        let dropped = usize::try_from(client.dropped_updates()).unwrap();
+        assert_eq!(
+            answer.text.len() as u64 + answer.left_out,
+            ((CHUNKS - dropped) * CHUNK) as u64
+        );
+        if dropped == 0 {
+            assert_eq!(answer.text.len(), MAX_ANSWER);
+        }
+        drop(client);
+        child.kill().await.unwrap();
+    }
+
+    /// The answer is always the turn's first bytes: a piece that does not
+    /// fit is cut at a character, and every later piece is left out, even
+    /// one short enough for the bytes the cut left free.
+    #[test]
+    fn an_answer_is_cut_at_a_character_and_stays_a_prefix() {
+        let mut answer = Answer::default();
+        answer.keep("abc", 7);
+        answer.keep("d\u{e9}\u{e9}", 7);
+        assert_eq!((answer.text.as_str(), answer.left_out), ("abcd\u{e9}", 2));
+        answer.keep("x", 7);
+        assert_eq!((answer.text.as_str(), answer.left_out), ("abcd\u{e9}", 3));
+
+        let mut whole = Answer::default();
+        whole.keep("abc", 3);
+        whole.keep("", 3);
+        assert_eq!((whole.text.as_str(), whole.left_out), ("abc", 0));
     }
 }

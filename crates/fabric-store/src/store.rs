@@ -4,11 +4,24 @@
 //! writes and flushes every object before it inserts a row, gc deletes a row
 //! before it deletes the file, and `check` can prove the rule holds. Exactly
 //! one process holds a store open at a time (ADR 0014, One writer).
+//!
+//! Inside that process, a [`Store`] is a handle, and [`Store::handle`] makes
+//! another on the same store, so captures, restores and reads run beside
+//! each other instead of one after another. Objects are immutable files
+//! under their hash, so writers of the same object agree; the catalog's
+//! connection is behind a lock held for one query or one transaction;
+//! publishes run one at a time, from their first look at the catalog to
+//! their commit, so two that name the same manifest make one row and a
+//! shard flush is never in flight while another publish decides it needs
+//! none. `forget` and `gc` need the store alone: they refuse while another
+//! handle exists, so a capture is never between its objects and its
+//! publish while gc runs, and no publish can name a base being forgotten.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -109,6 +122,12 @@ pub enum StoreError {
         /// The snapshot that cannot be forgotten yet.
         base: SnapshotId,
     },
+    /// Another handle on the store exists, and the call needs the store alone.
+    #[error("the store has other handles open; {call} needs it alone")]
+    Shared {
+        /// The call that was refused.
+        call: &'static str,
+    },
 }
 
 /// The object that holds a spec's bytes: an `EnvSpecId` and a `ChunkId`
@@ -146,6 +165,8 @@ pub struct GcReport {
     pub removed_orphans: u64,
     /// Files under `tmp/` removed.
     pub removed_tmp: u64,
+    /// Bundle caches of jobs the store holds no snapshot of any more, removed.
+    pub removed_caches: u64,
 }
 
 /// How deep `check` looks.
@@ -189,12 +210,30 @@ impl CheckReport {
     }
 }
 
-/// A store that this process holds open.
+/// A handle on a store that this process holds open.
+///
+/// Handles made with [`Store::handle`] share the store: each may capture,
+/// restore, read and publish beside the others.
 #[derive(Debug)]
 pub struct Store {
+    shared: Arc<Shared>,
+}
+
+/// What every handle on one store shares.
+#[derive(Debug)]
+struct Shared {
+    /// The store's directory.
+    root: PathBuf,
     objects: ObjectStore,
-    catalog: Catalog,
+    /// Held for one query or one transaction, never across object IO.
+    catalog: Mutex<Catalog>,
+    /// Held for a whole publish, so publishes run one at a time.
+    publishing: Mutex<()>,
     _lock: File,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// How long a busy store lock is retried before it counts as held.
@@ -239,11 +278,37 @@ impl Store {
         let objects = ObjectStore::new(root, params);
         objects.create_dirs()?;
         let catalog = Catalog::create(&catalog_path, &params)?;
-        Ok(Store {
-            objects,
-            catalog,
-            _lock: lock,
-        })
+        Ok(Store::new(root, objects, catalog, lock))
+    }
+
+    fn new(root: &Path, objects: ObjectStore, catalog: Catalog, lock: File) -> Store {
+        Store {
+            shared: Arc::new(Shared {
+                root: root.to_owned(),
+                objects,
+                catalog: Mutex::new(catalog),
+                publishing: Mutex::new(()),
+                _lock: lock,
+            }),
+        }
+    }
+
+    /// Another handle on this store, for work beside this one's. The store
+    /// stays open until the last handle is dropped.
+    #[must_use]
+    pub fn handle(&self) -> Store {
+        Store {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    fn catalog(&self) -> MutexGuard<'_, Catalog> {
+        locked(&self.shared.catalog)
+    }
+
+    /// The store's parts when this is its only handle, for a call that needs it alone.
+    fn alone(&mut self, call: &'static str) -> Result<&mut Shared, StoreError> {
+        Arc::get_mut(&mut self.shared).ok_or(StoreError::Shared { call })
     }
 
     /// Opens an existing store and clears its staging directory.
@@ -262,17 +327,18 @@ impl Store {
         if removed > 0 {
             tracing::info!(removed, "cleared staged files left by an earlier process");
         }
-        Ok(Store {
-            objects,
-            catalog,
-            _lock: lock,
-        })
+        Ok(Store::new(root, objects, catalog, lock))
+    }
+
+    /// The store's directory.
+    pub(crate) fn root(&self) -> &Path {
+        &self.shared.root
     }
 
     /// Returns the object files, for writing and reading content.
     #[must_use]
     pub fn objects(&self) -> &ObjectStore {
-        &self.objects
+        &self.shared.objects
     }
 
     /// Every object a manifest reaches, in list order, bundle and exclude
@@ -309,13 +375,13 @@ impl Store {
     /// spec's id, which a manifest names in `env_spec`.
     pub fn put_env_spec(&self, spec: &EnvSpec) -> Result<EnvSpecId, StoreError> {
         let bytes = spec.encode()?;
-        self.objects.put(&bytes)?;
+        self.objects().put(&bytes)?;
         Ok(EnvSpecId::of(&bytes))
     }
 
     /// Reads the environment spec stored under `id`.
     pub fn env_spec(&self, id: EnvSpecId) -> Result<EnvSpec, StoreError> {
-        let bytes = self.objects.read(spec_object(id))?;
+        let bytes = self.objects().read(spec_object(id))?;
         Ok(EnvSpec::decode(&bytes)?)
     }
 
@@ -329,16 +395,20 @@ impl Store {
     /// read back. A bundle base must be in the store and hold git state in
     /// the manifest's object format: restore unpacks the base's bundles into
     /// a repository of that format before this one's.
+    ///
+    /// Publishes of all handles run one at a time; captures, restores and
+    /// reads run beside one.
     pub fn publish(&mut self, manifest: &SnapshotManifest) -> Result<SnapshotId, StoreError> {
         let bytes = encode_manifest(manifest)?;
         let id = SnapshotId::of(&bytes);
-        if self.catalog.snapshot(id)?.is_some() {
+        let _publishing = locked(&self.shared.publishing);
+        if self.catalog().snapshot(id)?.is_some() {
             return Ok(id);
         }
         if let Some(git) = &manifest.git
             && let Some(base) = git.bundle_base
         {
-            if self.catalog.snapshot(base)?.is_none() {
+            if self.catalog().snapshot(base)?.is_none() {
                 return Err(StoreError::MissingBundleBase { base });
             }
             let sha256 = git.index_commit.is_sha256();
@@ -352,7 +422,7 @@ impl Store {
         }
         let mut data = Vec::new();
         for chunk in Self::data_chunks(manifest) {
-            let stored_len = match self.objects.stored_len(chunk) {
+            let stored_len = match self.objects().stored_len(chunk) {
                 Ok(len) => len,
                 Err(ObjectError::Missing { .. }) => {
                     return Err(StoreError::MissingChunk { chunk });
@@ -366,17 +436,17 @@ impl Store {
             });
         }
         self.check_sizes(manifest)?;
-        let stored = self.objects.put_bytes(&bytes)?;
+        let stored = self.objects().put_bytes(&bytes)?;
         let mut manifest_refs = Vec::with_capacity(stored.chunks.len());
         for chunk in stored.chunks {
             self.adopt_unpublished(chunk)?;
             manifest_refs.push(ChunkRef {
                 id: chunk,
-                stored_len: self.objects.stored_len(chunk)?,
+                stored_len: self.objects().stored_len(chunk)?,
             });
         }
         checkpoint::reached("publish.after_objects");
-        self.objects.flush_shards()?;
+        self.objects().flush_shards()?;
         checkpoint::reached("publish.after_fsync");
         let row = SnapshotRow {
             id,
@@ -386,7 +456,7 @@ impl Store {
             created_at: manifest.created_at,
             manifest_len: bytes.len() as u64,
         };
-        self.catalog
+        self.catalog()
             .insert_snapshot(&row, &manifest_refs, &data, || {
                 checkpoint::reached("publish.before_commit");
             })?;
@@ -414,7 +484,7 @@ impl Store {
                 let len = if let Some(len) = lens.get(chunk) {
                     *len
                 } else {
-                    let len = self.objects.content_len(*chunk)?;
+                    let len = self.objects().content_len(*chunk)?;
                     lens.insert(*chunk, len);
                     len
                 };
@@ -440,30 +510,30 @@ impl Store {
     /// file is removed so the next capture writes it again, and its shard is
     /// marked for the flush that comes before the row.
     fn adopt_unpublished(&self, chunk: ChunkId) -> Result<(), StoreError> {
-        if self.objects.is_fresh(chunk) || self.catalog.has_chunk(chunk)? {
+        if self.objects().is_fresh(chunk) || self.catalog().has_chunk(chunk)? {
             return Ok(());
         }
-        match self.objects.read(chunk) {
+        match self.objects().read(chunk) {
             Ok(_) => {}
             Err(ObjectError::Corrupt { id }) => {
-                self.objects.remove(id)?;
+                self.objects().remove(id)?;
                 return Err(StoreError::CorruptUnpublished { chunk: id });
             }
             Err(ObjectError::Missing { id }) => return Err(StoreError::MissingChunk { chunk: id }),
             Err(e) => return Err(e.into()),
         }
-        self.objects.mark_dirty(chunk);
+        self.objects().mark_dirty(chunk);
         Ok(())
     }
 
     /// Returns the catalog row of every snapshot, oldest first.
     pub fn snapshots(&self) -> Result<Vec<SnapshotRow>, StoreError> {
-        Ok(self.catalog.snapshots()?)
+        Ok(self.catalog().snapshots()?)
     }
 
     /// Returns the catalog row of a snapshot.
     pub fn snapshot(&self, id: SnapshotId) -> Result<SnapshotRow, StoreError> {
-        self.catalog
+        self.catalog()
             .snapshot(id)?
             .ok_or(StoreError::UnknownSnapshot(id))
     }
@@ -481,11 +551,12 @@ impl Store {
             return Err(ManifestError::TooLarge { len }.into());
         }
         let mut bytes = Vec::with_capacity(len);
-        for chunk in self.catalog.snapshot_chunks(id, Role::Manifest)? {
+        let chunks = self.catalog().snapshot_chunks(id, Role::Manifest)?;
+        for chunk in chunks {
             if bytes.len() >= len {
                 return Err(StoreError::ManifestMismatch(id));
             }
-            let part = self.objects.read(chunk.id)?;
+            let part = self.objects().read(chunk.id)?;
             if part.len() > len - bytes.len() {
                 return Err(StoreError::ManifestMismatch(id));
             }
@@ -504,7 +575,7 @@ impl Store {
     pub fn manifest_chunks(&self, id: SnapshotId) -> Result<(u64, Vec<ChunkId>), StoreError> {
         let row = self.snapshot(id)?;
         let ids = self
-            .catalog
+            .catalog()
             .snapshot_chunks(id, Role::Manifest)?
             .into_iter()
             .map(|chunk| chunk.id)
@@ -515,12 +586,19 @@ impl Store {
     /// Drops a snapshot from the catalog; its objects wait for gc.
     ///
     /// A snapshot whose refs a later bundle excludes is refused: every
-    /// restore of that later snapshot would need this one's bundle.
+    /// restore of that later snapshot would need this one's bundle. Refused
+    /// as `Shared` while another handle exists, since a publish there
+    /// could name the snapshot as its base.
     pub fn forget(&mut self, id: SnapshotId) -> Result<(), StoreError> {
-        if self.catalog.is_bundle_base(id)? {
+        let catalog = self
+            .alone("forget")?
+            .catalog
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        if catalog.is_bundle_base(id)? {
             return Err(StoreError::BaseInUse { base: id });
         }
-        if self.catalog.forget_snapshot(id)? {
+        if catalog.forget_snapshot(id)? {
             Ok(())
         } else {
             Err(StoreError::UnknownSnapshot(id))
@@ -537,55 +615,81 @@ impl Store {
     /// gc must not run between a capture and the publish of its manifest:
     /// capture can reuse an object that has no row without refreshing its
     /// mtime, so gc may remove it, and publish then fails with `MissingChunk`.
+    /// It is refused as `Shared` while another handle exists, so no
+    /// capture on another handle is in that window and no staged file of
+    /// one is cleared under it.
     pub fn gc(&mut self, now: SystemTime, grace: Duration) -> Result<GcReport, StoreError> {
+        let Shared {
+            root,
+            objects,
+            catalog,
+            ..
+        } = self.alone("gc")?;
+        let catalog = catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
         let mut report = GcReport {
-            removed_tmp: self.objects.clear_tmp()?,
+            removed_tmp: objects.clear_tmp()?,
             ..GcReport::default()
         };
         let now_ms = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis().try_into().unwrap_or(u64::MAX));
         let grace_ms = grace.as_millis().try_into().unwrap_or(u64::MAX);
-        report.marked = self.catalog.mark_unreferenced(now_ms)?;
-        let expired = self.catalog.expired(now_ms, grace_ms)?;
+        report.marked = catalog.mark_unreferenced(now_ms)?;
+        let expired = catalog.expired(now_ms, grace_ms)?;
         let ids: Vec<ChunkId> = expired.iter().map(|c| c.id).collect();
-        self.catalog.delete_unreferenced(&ids)?;
+        catalog.delete_unreferenced(&ids)?;
         for chunk in &expired {
-            self.objects.remove(chunk.id)?;
+            objects.remove(chunk.id)?;
             report.removed_chunks += 1;
             report.removed_bytes += chunk.stored_len;
         }
-        let known = self.catalog.chunk_ids()?;
-        for (id, mtime) in self.objects.scan()? {
+        let known = catalog.chunk_ids()?;
+        for (id, mtime) in objects.scan()? {
             let old = now.duration_since(mtime).is_ok_and(|age| age >= grace);
             if !known.contains(&id) && old {
-                self.objects.remove(id)?;
+                objects.remove(id)?;
                 report.removed_orphans += 1;
             }
         }
+        // A job with no snapshot left has no chain a restore could take
+        // from its bundle cache; its packs would wait for the cache's own
+        // eviction (bundle_cache::MAX_IDLE) otherwise.
+        let jobs = catalog
+            .snapshots()?
+            .into_iter()
+            .map(|row| row.job_id)
+            .collect();
+        report.removed_caches = crate::bundle_cache::remove_all_but(root, &jobs)
+            .map_err(|e| io_err(&root.join("bundle-cache"), e))?;
         tracing::info!(?report, "gc done");
         Ok(report)
     }
 
     /// Checks that every snapshot's objects are on disk, with `Hashes` that they verify, and that chains and counts agree.
     pub fn check(&self, depth: CheckDepth) -> Result<CheckReport, StoreError> {
+        // One guard per statement: a struct literal keeps its temporaries,
+        // and the catalog's lock is not reentrant.
+        let refcount_mismatches = self.catalog().refcount_mismatches()?;
+        let broken_chains = self.catalog().broken_chains()?;
         let mut report = CheckReport {
-            refcount_mismatches: self.catalog.refcount_mismatches()?,
-            broken_chains: self.catalog.broken_chains()?,
+            refcount_mismatches,
+            broken_chains,
             ..CheckReport::default()
         };
         let mut seen_ok: HashSet<ChunkId> = HashSet::new();
-        for row in self.catalog.snapshots()? {
+        let rows = self.catalog().snapshots()?;
+        for row in rows {
             report.snapshots += 1;
             let damaged = report.missing.len() + report.corrupt.len();
             for role in [Role::Manifest, Role::Data] {
-                for chunk in self.catalog.snapshot_chunks(row.id, role)? {
+                let chunks = self.catalog().snapshot_chunks(row.id, role)?;
+                for chunk in chunks {
                     if seen_ok.contains(&chunk.id) {
                         continue;
                     }
                     let outcome = match depth {
-                        CheckDepth::Presence => self.objects.stored_len(chunk.id).map(|_| ()),
-                        CheckDepth::Hashes => self.objects.read(chunk.id).map(|_| ()),
+                        CheckDepth::Presence => self.objects().stored_len(chunk.id).map(|_| ()),
+                        CheckDepth::Hashes => self.objects().read(chunk.id).map(|_| ()),
                     };
                     match outcome {
                         Ok(()) => {
@@ -617,7 +721,7 @@ impl Store {
             Err(e) => return Err(e),
         };
         let rows: Vec<ChunkId> = self
-            .catalog
+            .catalog()
             .snapshot_chunks(id, Role::Data)?
             .iter()
             .map(|chunk| chunk.id)

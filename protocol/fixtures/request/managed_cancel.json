@@ -1,0 +1,7 @@
+{
+  "op": "managed_cancel",
+  "operation_key": "cancel-1",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "expected_revision": "3",
+  "reason": "not needed any more"
+}

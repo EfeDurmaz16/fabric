@@ -140,7 +140,7 @@ fn run_in_terminal(env: &Env, node: &Node, args: &[&str], input: &[u8]) -> Falli
     // it is dropped as soon as the leader runs; otherwise the master never
     // reads the end of the terminal.
     let leader = {
-        let mut leader = env.command(&std::env::current_exe()?.to_string_lossy(), node.state());
+        let mut leader = env.command(std::env::current_exe()?, node.state());
         leader
             .args(["--exact", test, "--test-threads=1", "--nocapture"])
             .env(ROLE, "leader")

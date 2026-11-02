@@ -1,0 +1,8 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "standalone_job",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  },
+  "message": "job 01JABCDEFGHJKMNPQRSTVWXYZ0 is a standalone job; managed commands do not act on it"
+}

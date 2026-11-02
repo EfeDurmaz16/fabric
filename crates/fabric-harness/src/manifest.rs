@@ -376,7 +376,11 @@ impl StateManifest {
         Ok(Digest::from_hash(blake3::hash(&bytes)))
     }
 
-    /// Writes the manifest as `MANIFEST_FILE` under `out`.
+    /// Writes the manifest as `MANIFEST_FILE` under `out`, durable at
+    /// return. For a capture this is the commit point of the staged tree:
+    /// the barrier on its temporary orders every file staged before it
+    /// ahead of its name, and the full flush after its rename makes them
+    /// all durable.
     pub fn write(&self, out: &Path) -> Result<(), HarnessError> {
         let path = out.join(MANIFEST_FILE);
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| HarnessError::Malformed {

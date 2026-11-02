@@ -1,0 +1,9 @@
+{
+  "kind": "job_export",
+  "snapshot": "abababababababababababababababababababababababababababababababab",
+  "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+  "chain": [
+    "abababababababababababababababababababababababababababababababab",
+    "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+  ]
+}

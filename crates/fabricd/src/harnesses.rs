@@ -17,7 +17,7 @@ use fabric_core::path::{AbsPath, PathError};
 use fabric_core::version::HarnessVersion;
 use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
-use fabric_harness::claude::ClaudeCode;
+use fabric_harness::claude::{ClaudeCode, VersionAhead};
 use fabric_harness::codex::Codex;
 use serde::{Deserialize, Serialize};
 
@@ -279,6 +279,47 @@ pub fn adapter(
         }
         HarnessKind::Codex => Box::new(
             Codex::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
+        ),
+        HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
+    })
+}
+
+/// Starts asking the installed harness of `kind` its version, as a
+/// restore of its state asks it, so the probe runs beside the restore of
+/// the workspace (item 14 of docs/evidence/perf-ab/README.md); `None` for
+/// an ACP agent, whose restore asks nothing.
+#[must_use]
+pub fn ask_installed_ahead(kind: &HarnessKind, env: &HarnessEnv) -> Option<VersionAhead> {
+    match kind {
+        HarnessKind::ClaudeCode => {
+            Some(ClaudeCode::new(env.home.clone(), env.path_var.clone()).ask_installed_ahead())
+        }
+        HarnessKind::Codex => {
+            Some(Codex::new(env.home.clone(), env.path_var.clone()).ask_installed_ahead())
+        }
+        HarnessKind::Acp { .. } => None,
+    }
+}
+
+/// `adapter`, whose restore takes the installed version from `ahead`
+/// when it asked what the adapter would ask (`ask_installed_ahead`).
+pub fn adapter_with_installed(
+    kind: &HarnessKind,
+    env: &HarnessEnv,
+    known_writer: Option<HarnessVersion>,
+    ahead: Option<VersionAhead>,
+) -> Result<Box<dyn Harness>, HarnessConfigError> {
+    let Some(ahead) = ahead else {
+        return adapter(kind, env, known_writer);
+    };
+    Ok(match kind {
+        HarnessKind::ClaudeCode => Box::new(
+            ClaudeCode::new(env.home.clone(), env.path_var.clone()).with_installed_ahead(ahead),
+        ),
+        HarnessKind::Codex => Box::new(
+            Codex::new(env.home.clone(), env.path_var.clone())
+                .with_known_writer(known_writer)
+                .with_installed_ahead(ahead),
         ),
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
     })

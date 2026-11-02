@@ -22,6 +22,7 @@ import {
   HelloAnswer,
   JobId,
   type KnownEvent,
+  newOperationKey,
   NoDaemonError,
   RefusedError,
   SystemPath,
@@ -293,6 +294,28 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
     expect(cargoHome(await client.doctor())).toBe(join(home, ".cargo"));
     expect(cargoHome(await client.doctor({ env }))).toBe("/x/cargo");
     expect(cargoHome(await client.doctor())).toBe("/x/cargo");
+  });
+
+  test("managed_create answers the same operation for the same key, and conflicts for another command", async () => {
+    const { client, repo } = the();
+    const operationKey = newOperationKey();
+    const made = await client.managedCreate(SystemPath.parse(repo), GOAL, { kind: "codex" }, { operationKey });
+    expect(made).toMatchObject({ operation_key: operationKey, replayed: false });
+    expect(made.job).toMatchObject({ revision: "1", generation: "1", state: "active", goal: GOAL });
+    const again = await client.managedCreate(SystemPath.parse(repo), GOAL, { kind: "codex" }, { operationKey });
+    expect(again).toMatchObject({ operation: made.operation, replayed: true, job: { job: made.job.job } });
+    let refused: unknown;
+    try {
+      await client.managedCreate(SystemPath.parse(repo), "another goal", { kind: "codex" }, { operationKey });
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toMatchObject({ kind: "failed", reason: { code: "operation_conflict", operation_key: operationKey } });
+    const list = await client.managedList();
+    expect(list.jobs.map((job) => job.job)).toContain(made.job.job);
+    const cancelled = await client.managedCancel(made.job.job, "done", { expectedRevision: made.job.revision });
+    expect(cancelled.job).toMatchObject({ state: "cancelled", revision: "2" });
+    expect(await client.managedStatus(made.job.job)).toMatchObject({ kind: "managed_status", state: "cancelled" });
   });
 
   test("a hello of another api version is answered incompatible", async () => {

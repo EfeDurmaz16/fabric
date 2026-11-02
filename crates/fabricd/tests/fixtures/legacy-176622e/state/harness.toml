@@ -1,0 +1,2 @@
+[acp.fabric-fake-agent]
+state_dir = ".fake-agent"

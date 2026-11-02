@@ -1,0 +1,3 @@
+   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.98s
+  Executable tests/e2e/main.rs (target/debug/deps/e2e-5884a725b54d94a6)

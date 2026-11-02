@@ -406,6 +406,7 @@ dependencies = [
  "blake3",
  "fabric-core",
  "fabric-harness",
+ "nix",
  "proptest",
  "regex",
  "rustix",
@@ -417,6 +418,16 @@ dependencies = [
  "tracing",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "fabric-journal"
+version = "0.1.0"
+dependencies = [
+ "fabric-core",
+ "rusqlite",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -463,8 +474,10 @@ dependencies = [
  "fabric-core",
  "fabric-env",
  "fabric-harness",
+ "fabric-journal",
  "fabric-net",
  "fabric-store",
+ "nix",
  "rustix",
  "serde",
  "serde_json",

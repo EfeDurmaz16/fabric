@@ -3,36 +3,41 @@
 //! suspended, moved, resumed on the target and pulled back, run after
 //! run, and a daemon is started on an empty state directory and restarted
 //! on a full one. Each op's time is held to the baseline `budget.toml`
-//! records for this platform, and the git, kill, lsof, pgrep and ps
-//! processes it starts to the exact counts recorded there: those the
-//! daemon finds on its `PATH`, and those the harness runs from their
-//! system paths, which the `counted-tools` build takes from the test's
-//! `bin` (`FABRIC_SYSTEM_TOOLS`).
+//! records for this platform, and the processes it starts to the exact
+//! counts recorded there, by program: git and the kill, lsof, pgrep and ps
+//! the harness runs from their system paths, which the `counted-tools`
+//! build takes from the test's `bin` (`FABRIC_SYSTEM_TOOLS`), and every
+//! fake in that `bin`: each program the node's facts probe and each
+//! harness.
 //!
 //! Every program the node's facts probe, but git, is a fake that answers
-//! after a fixed 50 ms, so a probe costs about the same on every machine
-//! and a probe run once more than before shows. git is the machine's own,
-//! linked into the test's `bin`.
+//! after a fixed 50 ms, so a probe costs about the same on every machine.
+//! Probes run in parallel, so one run more than before can hide in the
+//! time; its count shows it. git is the machine's own, linked into the
+//! test's `bin`.
 //!
 //! Two warm-up runs come first, and they count processes: the counted
-//! programs are then wrappers that note each start, and plain links again
-//! for the timed runs, so the counting costs them nothing. The first run is each
-//! job's first move, which differs from the later ones; a count that
-//! grows from the first run to the second grows with the job's history.
+//! programs are then wrappers that note each start, and for the timed runs
+//! the programs themselves again, so the counting costs them nothing. The
+//! first run is each job's first move, which differs from the later ones;
+//! a count that grows from the first run to the second grows with the
+//! job's history.
 //! Then `reps` runs are timed, and an op whose time at `percentile` is
 //! over its limit is timed in `reps` more runs, and fails only when it is
 //! over again. `FABRIC_BUDGET=report`, the default, prints the times and
-//! fails on none of them; `FABRIC_BUDGET=enforce` fails on them. A process
-//! count that differs from the budget fails in both.
+//! fails on none of them; `FABRIC_BUDGET=enforce` fails on them;
+//! `FABRIC_BUDGET=count` runs only the warm-up runs and times nothing, so
+//! the counts can be checked on a machine too busy to time. A process
+//! count that differs from the budget fails in all three.
 //!
 //! It is ignored by default, since it takes minutes. CONTRIBUTING.md says
-//! how to run it and how to accept a slowdown.
+//! how to run it and when the budget may change.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,8 +49,20 @@ const BUDGET: &str = include_str!("budget.toml");
 /// How long every fake probed program waits before it answers, in seconds.
 const PROBE_DELAY: &str = "0.05";
 
-/// The programs counted: each is a wrapper while the warm-up runs.
-const COUNTED: [&str; 5] = ["git", "kill", "lsof", "pgrep", "ps"];
+/// The harnesses Fabric drives, each a fake in the test's `bin`: Claude,
+/// Codex and the ACP agent.
+const HARNESSES: [&str; 3] = ["claude", "codex", "fabric-fake-agent"];
+
+/// The programs counted, in the order the report lists them: git, the
+/// harness's system tools, the probed fakes and the harnesses. Each is a
+/// wrapper while the warm-up runs.
+fn counted() -> Vec<&'static str> {
+    let mut programs = vec!["git"];
+    programs.extend(SYSTEM.map(|(name, _)| name));
+    programs.extend(PROBED.map(|(name, _)| name));
+    programs.extend(HARNESSES);
+    programs
+}
 
 /// How many warm-up runs count processes.
 const COUNTED_RUNS: usize = 2;
@@ -92,6 +109,33 @@ const PROBED: [(&str, &str); 13] = [
     ("defaults", "exit 1"),
 ];
 
+/// Puts in the test's `bin` the fake Claude and Codex and a fake of every
+/// program the node's facts probe but git, each answering after
+/// `PROBE_DELAY`, as the fakes of the harnesses do too, and leaves Claude's
+/// session registry empty, so no claude writes the session. The budget,
+/// the bench and the A/B bench run on this.
+pub(crate) fn install_fakes(env: &Env) -> Fallible {
+    env.install_fake_claude()?;
+    env.install_fake_codex()?;
+    for (program, answer) in PROBED {
+        env.install(
+            program,
+            &format!("#!/bin/sh\nsleep {PROBE_DELAY}\n{answer}\n"),
+        )?;
+    }
+    for harness in ["claude", "codex"] {
+        let path = env.bin().join(harness);
+        let script = fs::read_to_string(&path)?;
+        let (shebang, rest) = script.split_once('\n').ok_or("an empty fake")?;
+        write_executable(
+            &path,
+            format!("{shebang}\nsleep {PROBE_DELAY}\n{rest}").as_bytes(),
+        )?;
+    }
+    fs::create_dir_all(env.home.join(".claude/sessions"))?;
+    Ok(())
+}
+
 /// A job shape: the harness its job runs under.
 struct Shape {
     /// Its name in the budget.
@@ -132,23 +176,38 @@ fn ops() -> Vec<String> {
     ops
 }
 
-/// What a time over its limit does.
+/// What a time over its limit does, or whether ops are timed at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// It is reported.
     Report,
     /// It fails the test.
     Enforce,
+    /// Nothing is timed: only the warm-up runs run, and their process
+    /// counts are checked.
+    Count,
 }
 
 impl Mode {
-    /// The mode `FABRIC_BUDGET` names: `report`, the default, or `enforce`.
+    /// The mode `FABRIC_BUDGET` names: `report`, the default, `enforce`
+    /// or `count`.
     fn from_env() -> Fallible<Self> {
         match std::env::var("FABRIC_BUDGET") {
             Err(std::env::VarError::NotPresent) => Ok(Mode::Report),
-            Ok(mode) if mode == "report" => Ok(Mode::Report),
-            Ok(mode) if mode == "enforce" => Ok(Mode::Enforce),
-            other => Err(format!("FABRIC_BUDGET must be report or enforce, not {other:?}").into()),
+            Ok(mode) => Self::named(&mode),
+            Err(e) => Err(format!("FABRIC_BUDGET: {e}").into()),
+        }
+    }
+
+    /// The mode called `name`.
+    fn named(name: &str) -> Fallible<Self> {
+        match name {
+            "report" => Ok(Mode::Report),
+            "enforce" => Ok(Mode::Enforce),
+            "count" => Ok(Mode::Count),
+            other => {
+                Err(format!("FABRIC_BUDGET must be report, enforce or count, not {other:?}").into())
+            }
         }
     }
 
@@ -156,13 +215,50 @@ impl Mode {
         match self {
             Mode::Report => "report",
             Mode::Enforce => "enforce",
+            Mode::Count => "count",
         }
     }
 }
 
-/// This platform as `budget.toml` names it, such as `macos-aarch64`.
+/// This platform as `budget.toml` names it: `FABRIC_BUDGET_PLATFORM` when
+/// it is set and not empty, else the OS and architecture, such as
+/// `macos-aarch64`. CI names its macOS runner `macos-aarch64-github`,
+/// which has no baselines, since it is not the Mac that timed those of
+/// `macos-aarch64`.
 fn platform() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    platform_named(std::env::var("FABRIC_BUDGET_PLATFORM").ok())
+}
+
+/// The platform `named`, or this machine's OS and architecture when it is
+/// unnamed or empty.
+fn platform_named(named: Option<String>) -> String {
+    named
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+/// The CPU and its core count, for the report: a CI runner of another
+/// kind explains a time no change of the code made.
+fn machine() -> String {
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
+    let linux = fs::read_to_string("/proc/cpuinfo").ok().and_then(|info| {
+        info.lines().find_map(|line| {
+            let (key, name) = line.split_once(':')?;
+            (key.trim() == "model name").then(|| name.trim().to_owned())
+        })
+    });
+    let cpu = linux
+        .or_else(|| {
+            let out = std::process::Command::new("sysctl")
+                .args(["-n", "machdep.cpu.brand_string"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        })
+        .filter(|cpu| !cpu.is_empty())
+        .unwrap_or_else(|| "an unknown CPU".to_owned());
+    format!("{cpu}, {cores} cores")
 }
 
 /// What `budget.toml` holds for this platform.
@@ -175,6 +271,7 @@ struct Budget {
     /// Each op's baseline on this platform; empty where it has none yet.
     baseline: BTreeMap<String, Duration>,
     /// Each op's exact count of starts by program, one per counted run.
+    /// A program the budget does not name for an op starts in no run.
     processes: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
 }
 
@@ -225,6 +322,24 @@ impl Budget {
                 baseline.insert(op.clone(), Duration::from_millis(ms));
             }
         }
+        let counted = counted();
+        // scripts/check-budget.sh reads which programs are counted from
+        // the budget, so the list must be the one counted here.
+        let listed: Vec<&str> = key("counted")?
+            .as_array()
+            .ok_or("budget.toml: counted is not a list")?
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .ok_or("budget.toml: counted names a program by a string")
+            })
+            .collect::<Result<_, _>>()?;
+        if listed != counted {
+            return Err(format!(
+                "budget.toml: counted must name the programs the warm-up runs count, in their order: {counted:?}"
+            )
+            .into());
+        }
         let mut processes = BTreeMap::new();
         for (op, counts) in key("processes")?
             .as_table()
@@ -238,7 +353,7 @@ impl Budget {
                 .ok_or_else(|| format!("budget.toml: processes of {op:?} is not a table"))?;
             let mut runs = BTreeMap::new();
             for (program, per_run) in counts {
-                if !COUNTED.contains(&program.as_str()) {
+                if !counted.contains(&program.as_str()) {
                     return Err(format!("budget.toml: {program} is not counted").into());
                 }
                 let what = format!("{op} {program}");
@@ -263,6 +378,15 @@ impl Budget {
             baseline,
             processes,
         })
+    }
+
+    /// How many times `op` may start `program` in each counted run.
+    fn allowed(&self, op: &str, program: &str) -> Vec<u64> {
+        self.processes
+            .get(op)
+            .and_then(|counts| counts.get(program))
+            .cloned()
+            .unwrap_or_else(|| vec![0; COUNTED_RUNS])
     }
 
     /// The time an op whose baseline is `base` may take.
@@ -295,33 +419,63 @@ fn percentile(samples: &[Duration], percentile: usize) -> Option<Duration> {
     sorted.get(last * percentile / 100).copied()
 }
 
-/// The counted programs in the test's `bin`: a link to the real program
-/// while timing, and while counting a wrapper that appends a byte to
+/// How the test's `bin` holds a counted program while nothing counts.
+enum Real {
+    /// A symbolic link to it: git, the system tools and the ACP agent,
+    /// which live outside `bin`.
+    Link(PathBuf),
+    /// A hard link to it, kept beside `bin`: a fake, which is then the same
+    /// file it was before the counter, at the same path.
+    Fake(PathBuf),
+}
+
+impl Real {
+    /// Where the program itself is.
+    fn path(&self) -> &Path {
+        match self {
+            Real::Link(path) | Real::Fake(path) => path,
+        }
+    }
+}
+
+/// The counted programs in the test's `bin`: the program itself while
+/// timing, and while counting a wrapper that appends a byte to
 /// `counts/<program>` and runs it.
 struct Counter {
     bin: PathBuf,
     dir: PathBuf,
-    real: Vec<(&'static str, PathBuf)>,
+    real: Vec<(&'static str, Real)>,
 }
 
 impl Counter {
+    /// Counts the programs of `env`'s `bin`, after `install_fakes` put the
+    /// fakes there: each fake moves to `fakes/` beside it.
     fn new(env: &Env) -> Fallible<Self> {
-        let mut real = vec![("git", fs::read_link(env.bin().join("git"))?)];
+        let bin = env.bin();
+        let mut real = vec![("git", Real::Link(fs::read_link(bin.join("git"))?))];
         for (name, candidates) in SYSTEM {
             let found = candidates
                 .iter()
                 .map(PathBuf::from)
                 .find(|path| path.is_file())
                 .ok_or_else(|| format!("no {name}"))?;
-            real.push((name, found));
+            real.push((name, Real::Link(found)));
+        }
+        let fakes = env.root.join("fakes");
+        fs::create_dir_all(&fakes)?;
+        for name in PROBED.map(|(name, _)| name).into_iter().chain(HARNESSES) {
+            let path = bin.join(name);
+            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                real.push((name, Real::Link(fs::read_link(&path)?)));
+            } else {
+                let kept = fakes.join(name);
+                fs::rename(&path, &kept)?;
+                real.push((name, Real::Fake(kept)));
+            }
         }
         let dir = env.root.join("counts");
         fs::create_dir_all(&dir)?;
-        let counter = Self {
-            bin: env.bin(),
-            dir,
-            real,
-        };
+        let counter = Self { bin, dir, real };
         counter.off()?;
         Ok(counter)
     }
@@ -332,7 +486,7 @@ impl Counter {
             let script = format!(
                 "#!/bin/sh\necho >> '{}'\nexec '{}' \"$@\"\n",
                 self.dir.join(name).display(),
-                real.display()
+                real.path().display()
             );
             let new = self.bin.join(format!(".{name}.new"));
             write_executable(&new, script.as_bytes())?;
@@ -341,7 +495,7 @@ impl Counter {
         Ok(())
     }
 
-    /// Puts the links in place, each by one rename.
+    /// Puts the programs themselves in place, each by one rename.
     fn off(&self) -> Fallible {
         for (name, real) in &self.real {
             let new = self.bin.join(format!(".{name}.new"));
@@ -349,7 +503,10 @@ impl Counter {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                 _ => {}
             }
-            std::os::unix::fs::symlink(real, &new)?;
+            match real {
+                Real::Link(path) => std::os::unix::fs::symlink(path, &new)?,
+                Real::Fake(path) => fs::hard_link(path, &new)?,
+            }
             fs::rename(&new, self.bin.join(name))?;
         }
         Ok(())
@@ -416,25 +573,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Fallible<Self> {
         let env = Env::new()?;
-        env.install_fake_claude()?;
-        env.install_fake_codex()?;
-        for (program, answer) in PROBED {
-            env.install(
-                program,
-                &format!("#!/bin/sh\nsleep {PROBE_DELAY}\n{answer}\n"),
-            )?;
-        }
-        for harness in ["claude", "codex"] {
-            let path = env.bin().join(harness);
-            let script = fs::read_to_string(&path)?;
-            let (shebang, rest) = script.split_once('\n').ok_or("an empty fake")?;
-            write_executable(
-                &path,
-                format!("{shebang}\nsleep {PROBE_DELAY}\n{rest}").as_bytes(),
-            )?;
-        }
-        // An empty session registry: no claude writes the session.
-        fs::create_dir_all(env.home.join(".claude/sessions"))?;
+        install_fakes(&env)?;
         let counter = Counter::new(&env)?;
         let mut a = Node::new(&env, "a", Wire::Quic)?;
         let mut b = Node::new(&env, "b", Wire::Quic)?;
@@ -537,17 +676,12 @@ struct Row {
 }
 
 /// Counts, one per run, as `53/59`.
-fn runs(counts: Option<&Vec<u64>>) -> String {
-    counts.map_or_else(
-        || "none".to_owned(),
-        |counts| {
-            counts
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join("/")
-        },
-    )
+fn runs(counts: &[u64]) -> String {
+    counts
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The report's rows and the failures, from the warm-up's counts and the
@@ -568,6 +702,7 @@ fn judge(
         let limit = baseline.map(|base| budget.limit(base));
         let again = second.and_then(|batch| budget.at(batch, &op));
         let verdict = match (at, limit) {
+            (None, _) if mode == Mode::Count => "counted only",
             (None, _) => {
                 failures.push(format!("{op}: not timed"));
                 "not timed"
@@ -579,8 +714,8 @@ fn judge(
                 Some(again) if again > limit => {
                     failures.push(format!(
                         "{op}: {} ms, then {} ms in a second batch, over its limit of {} ms \
-                         (baseline {} ms). If the slowdown is intended, raise the baseline in \
-                         budget.toml and say why in a new [[change]] entry",
+                         (baseline {} ms, the anchor's time). A slower op is a bug to fix, and \
+                         its baseline never rises (CONTRIBUTING.md, Performance rule)",
                         at.as_millis(),
                         again.as_millis(),
                         limit.as_millis(),
@@ -591,26 +726,39 @@ fn judge(
                 _ => "over once",
             },
         };
-        let counted = warm.counts.get(&op);
-        let allowed = budget.processes.get(&op);
         let mut processes = Vec::new();
-        for program in COUNTED {
-            let count = counted.and_then(|counts| counts.get(program));
-            let limit = allowed.and_then(|limits| limits.get(program));
-            if count == limit {
-                processes.push(format!("{program} {}", runs(count)));
-            } else {
-                processes.push(format!(
-                    "{program} {} (budget {})",
-                    runs(count),
-                    runs(limit)
-                ));
-                failures.push(format!(
-                    "{op}: started {program} {} times in the counted runs, budget.toml says {}. \
-                     Set the counts in budget.toml and say why in a new [[change]] entry",
-                    runs(count),
-                    runs(limit)
-                ));
+        match warm.counts.get(&op) {
+            None => {
+                failures.push(format!("{op}: not counted"));
+                processes.push("not counted".to_owned());
+            }
+            Some(started) => {
+                for program in counted() {
+                    let count = started
+                        .get(program)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0; COUNTED_RUNS]);
+                    let limit = budget.allowed(&op, program);
+                    if count != limit {
+                        processes.push(format!(
+                            "{program} {} (budget {})",
+                            runs(&count),
+                            runs(&limit)
+                        ));
+                        failures.push(format!(
+                            "{op}: started {program} {} times in the counted runs, budget.toml \
+                             says {}. Set the counts in budget.toml and say why in a new \
+                             [[change]] entry",
+                            runs(&count),
+                            runs(&limit)
+                        ));
+                    } else if count.iter().any(|n| *n > 0) {
+                        processes.push(format!("{program} {}", runs(&count)));
+                    }
+                }
+                if processes.is_empty() {
+                    processes.push("none".to_owned());
+                }
             }
         }
         rows.push(Row {
@@ -633,21 +781,28 @@ fn report(budget: &Budget, mode: Mode, rows: &[Row]) -> String {
     let platform = platform();
     let mut out = format!(
         "### Time budget, {platform}, {}\n\n\
-         Times in ms: the {}th percentile of {} timed runs, the median, and the {}th \
+         On {}. Times in ms: the {}th percentile of {} timed runs, the median, and the {}th \
          percentile of a second batch when the first was over the limit in enforce mode. \
          The limit is the larger of {} x baseline and baseline + {} ms. Processes are the \
-         starts of each counted program in each of the {COUNTED_RUNS} warm-up runs.\n\n",
+         starts of each counted program in each of the {COUNTED_RUNS} warm-up runs; a \
+         program not named started in none.\n\n",
         mode.name(),
+        machine(),
         budget.percentile,
         budget.reps,
         budget.percentile,
         budget.ratio,
         budget.grace.as_millis(),
     );
-    if budget.baseline.is_empty() {
+    if mode == Mode::Count {
         let _ = writeln!(
             out,
-            "budget.toml has no baselines for {platform} yet, so its times are only reported.\n"
+            "Count mode: only the warm-up runs ran, and no op was timed.\n"
+        );
+    } else if budget.baseline.is_empty() {
+        let _ = writeln!(
+            out,
+            "budget.toml has no baselines for {platform}, so its times are only reported.\n"
         );
     }
     let p = budget.percentile;
@@ -694,7 +849,11 @@ fn hot_paths() -> Fallible {
     let mode = Mode::from_env()?;
     let mut fixture = Fixture::new()?;
     let warm = fixture.warm_up()?;
-    let first = fixture.batch(budget.reps)?;
+    let first = if mode == Mode::Count {
+        Batch::default()
+    } else {
+        fixture.batch(budget.reps)?
+    };
     let second = if mode == Mode::Enforce && budget.any_over(&first) {
         Some(fixture.batch(budget.reps)?)
     } else {
@@ -708,8 +867,10 @@ fn hot_paths() -> Fallible {
     Ok(())
 }
 
-/// The budget the repository holds parses, names every op, and gives each
-/// op a count for every counted program.
+/// The budget the repository holds parses and names every op under
+/// `[processes]`, each with only the programs it starts: a program left
+/// out starts in no run, so a count of none written out would be a second
+/// spelling of the same budget.
 #[test]
 fn the_budget_file_holds_every_op() -> Fallible {
     let budget = Budget::parse(BUDGET, &platform())?;
@@ -718,10 +879,112 @@ fn the_budget_file_holds_every_op() -> Fallible {
             .processes
             .get(&op)
             .ok_or_else(|| format!("no process counts for {op}"))?;
-        for program in COUNTED {
-            assert!(counts.contains_key(program), "{op} has no {program} count");
+        for (program, runs) in counts {
+            assert!(
+                runs.iter().any(|n| *n > 0),
+                "{op} names {program}, which it never starts"
+            );
         }
     }
+    Ok(())
+}
+
+/// The budget names the programs the warm-up runs count, which
+/// scripts/check-budget.sh reads to hold each one's counts at the base:
+/// a list that leaves one out, or names one the runs do not count, fails
+/// to parse.
+#[test]
+fn the_budget_names_the_programs_it_counts() -> Fallible {
+    Budget::parse(BUDGET, &platform())?;
+    let mut fewer = counted();
+    fewer.pop();
+    let mut more = counted();
+    more.push("sh");
+    for list in [fewer, more] {
+        let text = BUDGET.replacen(
+            &format!("counted = {:?}", counted()),
+            &format!("counted = {list:?}"),
+            1,
+        );
+        assert_ne!(text, BUDGET, "the budget holds no counted list to replace");
+        assert!(Budget::parse(&text, &platform()).is_err(), "{list:?}");
+    }
+    Ok(())
+}
+
+/// Every op has a baseline on both platforms the budget holds times on:
+/// CI's Linux runner, where CI enforces them, and the Mac of the macOS
+/// baselines. An op with none there is only reported, so a slower one
+/// would pass (M2-25).
+#[test]
+fn every_op_has_a_baseline_on_linux_and_macos() -> Fallible {
+    for platform in ["linux-x86_64", "macos-aarch64"] {
+        let budget = Budget::parse(BUDGET, platform)?;
+        let missing: Vec<String> = ops()
+            .into_iter()
+            .filter(|op| !budget.baseline.contains_key(op))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{platform} has no baseline for {missing:?}"
+        );
+    }
+    Ok(())
+}
+
+/// CI holds every runner to the budget: the step that runs `hot_paths`
+/// enforces it, where it once only reported (M2-25). A runner with no
+/// baselines, as CI's macOS one, still only reports its times, and its
+/// process counts fail in both modes.
+#[test]
+fn ci_enforces_the_budget() -> Fallible {
+    let ci = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/ci.yml"
+    ))?;
+    let modes: Vec<&str> = ci
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("FABRIC_BUDGET:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(modes, ["enforce"], "the FABRIC_BUDGET of ci.yml");
+    Ok(())
+}
+
+/// `FABRIC_BUDGET_PLATFORM` names the platform when it is set and not empty.
+#[test]
+fn a_named_platform_replaces_this_machines() {
+    let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    assert_eq!(platform_named(None), here);
+    assert_eq!(platform_named(Some(String::new())), here);
+    assert_eq!(
+        platform_named(Some("macos-aarch64-github".to_owned())),
+        "macos-aarch64-github"
+    );
+}
+
+/// While the warm-up runs count, a fake in the test's `bin`, such as the
+/// probed `node`, is a wrapper that counts each start, so a probe run more
+/// often than the budget says fails even when the probes run in parallel
+/// and the time hides it; afterwards the fake itself is back.
+#[test]
+fn the_counter_counts_a_fake_and_puts_it_back() -> Fallible {
+    let env = Env::new()?;
+    install_fakes(&env)?;
+    let node = env.bin().join("node");
+    let fake = fs::read(&node)?;
+    let counter = Counter::new(&env)?;
+    counter.on()?;
+    for _ in 0..2 {
+        let out = std::process::Command::new(&node)
+            .arg("--version")
+            .output()?;
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8(out.stdout)?, "v22.23.2\n");
+    }
+    assert_eq!(counter.read()?.get("node"), Some(&2), "node started twice");
+    counter.off()?;
+    assert_eq!(fs::read(&node)?, fake, "the fake is back");
     Ok(())
 }
 
@@ -732,9 +995,10 @@ fn the_budget_file_holds_every_op() -> Fallible {
 #[test]
 fn the_verdicts_follow_the_rules() -> Fallible {
     let ms = Duration::from_millis;
-    let mut text = String::from(
-        "ratio = 1.3\ngrace_ms = 50\nreps = 7\npercentile = 25\n\
+    let mut text = format!(
+        "ratio = 1.3\ngrace_ms = 50\nreps = 7\npercentile = 25\ncounted = {:?}\n\
          [baseline.test]\n\"acp suspend\" = 1000\n\"cold start\" = 100\n[processes]\n",
+        counted()
     );
     for op in ops() {
         writeln!(text, "\"{op}\" = {{ git = [1, 2], ps = [0, 0] }}")?;
@@ -790,6 +1054,36 @@ fn the_verdicts_follow_the_rules() -> Fallible {
         failures[0].starts_with("acp suspend: 1400 ms"),
         "{failures:?}"
     );
+    // A baseline is the anchor's time and never rises, so the failure
+    // asks for the op to be made fast again, not for a higher baseline.
+    assert!(
+        failures[0].contains("Performance rule") && !failures[0].contains("raise the baseline"),
+        "{failures:?}"
+    );
+
+    // A program the budget does not name for an op starts in no run, so
+    // one start of it fails.
+    let mut probed = Batch::default();
+    probed.counts.clone_from(&warm.counts);
+    probed
+        .counts
+        .get_mut("codex move")
+        .unwrap()
+        .insert("node", vec![0, 1]);
+    let (_, failures) = judge(&budget, Mode::Report, &probed, &timed(&[]), None);
+    assert_eq!(
+        failures,
+        [
+            "codex move: started node 0/1 times in the counted runs, budget.toml says 0/0. \
+          Set the counts in budget.toml and say why in a new [[change]] entry"
+        ]
+    );
+
+    // A count run times nothing and fails on no time, only on counts.
+    assert_eq!(Mode::named("count")?, Mode::Count);
+    let (rows, failures) = judge(&budget, Mode::Count, &warm, &Batch::default(), None);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(verdict(&rows, "acp suspend"), "counted only");
 
     for counts in [vec![1, 3], vec![1, 1]] {
         let mut changed = Batch::default();
@@ -799,12 +1093,14 @@ fn the_verdicts_follow_the_rules() -> Fallible {
             .get_mut("codex resume")
             .unwrap()
             .insert("git", counts.clone());
-        let (_, failures) = judge(&budget, Mode::Report, &changed, &timed(&[]), None);
-        assert_eq!(failures.len(), 1, "{counts:?}: {failures:?}");
-        assert!(
-            failures[0].starts_with("codex resume: started git"),
-            "{failures:?}"
-        );
+        for (mode, times) in [(Mode::Report, timed(&[])), (Mode::Count, Batch::default())] {
+            let (_, failures) = judge(&budget, mode, &changed, &times, None);
+            assert_eq!(failures.len(), 1, "{mode:?} {counts:?}: {failures:?}");
+            assert!(
+                failures[0].starts_with("codex resume: started git"),
+                "{failures:?}"
+            );
+        }
     }
     Ok(())
 }

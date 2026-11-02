@@ -1,0 +1,43 @@
+run	op	side	command line
+1	acp new	candidate	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp new	candidate	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp new	candidate	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M5ZR26GCS95F0DBXMAS0KWR1/work
+1	acp new	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp new	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp new	anchor	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M5ZR26Z2Q1FVR3FZDQZ6DGAW/work
+1	acp launch	candidate	ps -o pgid= -p 34982
+1	acp launch	candidate	ps -o lstart= -p 34982
+1	acp launch	candidate	ps -o lstart= -p 34982
+1	acp launch	candidate	dash -c unset -f read && read -r go && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	acp launch	anchor	ps -o pgid= -p 35221
+1	acp launch	anchor	ps -o lstart= -p 35221
+1	acp launch	anchor	ps -o lstart= -p 35221
+1	acp launch	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	claude new	candidate	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude new	candidate	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude new	candidate	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M5ZR28VTMZF48RVTFP7AD4ZA/work
+1	claude new	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude new	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude new	anchor	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M5ZR29E9VV7DW1J9EXH27SFX/work
+1	claude launch	candidate	ps -o pgid= -p 36283
+1	claude launch	candidate	ps -o lstart= -p 36283
+1	claude launch	candidate	ps -o lstart= -p 36283
+1	claude launch	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/claude -p --output-format json --session-id 2816a746-960e-4ec3-aee1-fceb6e36eafc -- one
+1	claude launch	anchor	ps -o pgid= -p 36783
+1	claude launch	anchor	ps -o lstart= -p 36783
+1	claude launch	anchor	ps -o lstart= -p 36783
+1	claude launch	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/claude -p --output-format json --session-id 594d29ae-4ea2-4bf5-a999-d375ee7c5afa -- one
+1	codex new	candidate	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex new	candidate	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex new	candidate	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M5ZR2APA40DCCVVDVMZB9J4Z/work
+1	codex new	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex new	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex new	anchor	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M5ZR2B3GQ7EQGHAGGZN9J67T/work
+1	codex launch	candidate	ps -o pgid= -p 37613
+1	codex launch	candidate	ps -o lstart= -p 37613
+1	codex launch	candidate	ps -o lstart= -p 37613
+1	codex launch	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/codex exec --json -c projects."<root>/home/fabric/jobs/01M5ZR2APA40DCCVVDVMZB9J4Z/work".trust_level=trusted -- one
+1	codex launch	anchor	ps -o pgid= -p 37771
+1	codex launch	anchor	ps -o lstart= -p 37771
+1	codex launch	anchor	ps -o lstart= -p 37771
+1	codex launch	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/codex exec --json -c projects."<root>/home/fabric/jobs/01M5ZR2B3GQ7EQGHAGGZN9J67T/work".trust_level=trusted -- one

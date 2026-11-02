@@ -1,0 +1,1053 @@
+run	op	side	command line
+1	acp new	candidate	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M6084HN9F75QYCQ23G195672/work
+1	acp new	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp new	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp new	anchor	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M6084HXT8QX5C0VZ9KEDE1AX/work
+1	acp launch	candidate	ps -o lstart= -p 62887
+1	acp launch	candidate	dash -c unset -f read && read -r go && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	acp launch	anchor	ps -o pgid= -p 62916
+1	acp launch	anchor	ps -o lstart= -p 62916
+1	acp launch	anchor	ps -o lstart= -p 62916
+1	acp launch	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	claude new	candidate	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M6084K642VZYS7W4YJNJ6HQ0/work
+1	claude new	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude new	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude new	anchor	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M6084KE416WXM8RAQ2SCRQFX/work
+1	claude launch	candidate	ps -o lstart= -p 63061
+1	claude launch	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/claude -p --output-format json --session-id 7b0986eb-f92a-4104-856c-cca31fa7edf1 -- one
+1	claude launch	anchor	ps -o pgid= -p 63100
+1	claude launch	anchor	ps -o lstart= -p 63100
+1	claude launch	anchor	ps -o lstart= -p 63100
+1	claude launch	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/claude -p --output-format json --session-id fa71e5bc-177e-4d86-8718-f8bc3c0a5c33 -- one
+1	codex new	candidate	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M6084MTNB6MQZBA3R30XNGDT/work
+1	codex new	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex new	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex new	anchor	git clone --quiet -- <root>/repo <root>/home/fabric/jobs/01M6084N2NH3HWJ29T8P7ZRZZW/work
+1	codex launch	candidate	ps -o lstart= -p 63263
+1	codex launch	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/codex exec --json -c projects."<root>/home/fabric/jobs/01M6084MTNB6MQZBA3R30XNGDT/work".trust_level=trusted -- one
+1	codex launch	anchor	ps -o pgid= -p 63304
+1	codex launch	anchor	ps -o lstart= -p 63304
+1	codex launch	anchor	ps -o lstart= -p 63304
+1	codex launch	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/codex exec --json -c projects."<root>/home/fabric/jobs/01M6084N2NH3HWJ29T8P7ZRZZW/work".trust_level=trusted -- one
+1	acp suspend	candidate	fabric-fake-agent --version
+1	acp suspend	candidate	node -p process.versions.modules
+1	acp suspend	candidate	python3 -c import sys; print(sys.base_prefix)
+1	acp suspend	candidate	python3 --version
+1	acp suspend	candidate	node --version
+1	acp suspend	candidate	xcrun --find git
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-0-185144000.tmp ls-files -z -v --cached --others --exclude-standard
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-0-185144000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-3-234318000.tmp add -A --
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree c091b4e3b360b64a8df725a632d2e8ba3b4fdbac -m fabric worktree -p 8f9ffbcf02752505415c5d63e4c7700591043b73 -p eeecbca9cdb68fae71f096369604930a8380d01d
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 512c5482c536b3d6b68d1f2c5ac77b9b603ce823^{commit} 8f9ffbcf02752505415c5d63e4c7700591043b73^{commit} --
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/a/store/tmp/62794-4-288151000.tmp --all --not 512c5482c536b3d6b68d1f2c5ac77b9b603ce823 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/a/store/tmp/62794-4-288151000.tmp
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z c144ba6df93972a717d3d21d3d1e1df34dec0008
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-0-185144000.tmp ls-files --others --exclude-standard -z
+1	acp suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-0-185144000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp suspend	anchor	fabric-fake-agent --version
+1	acp suspend	anchor	python3 -c import sys; print(sys.base_prefix)
+1	acp suspend	anchor	python3 --version
+1	acp suspend	anchor	node --version
+1	acp suspend	anchor	node -p process.versions.modules
+1	acp suspend	anchor	xcrun --find git
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-0-764038000.tmp ls-files -z -v --cached --others --exclude-standard
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-3-815497000.tmp add -A --
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree c091b4e3b360b64a8df725a632d2e8ba3b4fdbac -m fabric worktree -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf -p cdb3d3b26b04c7afc9427fb1225a0452bc05ef96
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 6a1446575d7110538a85a5fefe40fbc25c9f62bf^{commit} e237dedddf8e1d665b354d0db680ef550b5b04e1^{commit} --
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/a/store/tmp/62765-4-868414000.tmp --all --not 6a1446575d7110538a85a5fefe40fbc25c9f62bf e237dedddf8e1d665b354d0db680ef550b5b04e1
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/a/store/tmp/62765-4-868414000.tmp
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle list-heads <root>/a/store/tmp/62765-4-868414000.tmp
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z ca3572d39f69f57ecfa47a77c67fcfe53f9bbd9b
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-0-764038000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-0-764038000.tmp ls-files --others --exclude-standard -z
+1	acp suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-0-764038000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp move	candidate	node --version
+1	acp move	candidate	git --version
+1	acp move	candidate	id -un
+1	acp move	candidate	node -p process.versions.modules
+1	acp move	candidate	git --version
+1	acp move	candidate	id -un
+1	acp move	candidate	node --version
+1	acp move	candidate	node -p process.versions.modules
+1	acp move	anchor	node -p process.versions.modules
+1	acp move	anchor	git --version
+1	acp move	anchor	claude --version
+1	acp move	anchor	python3 --version
+1	acp move	anchor	python3 -c import sys; print(sys.base_prefix)
+1	acp move	anchor	codex login status
+1	acp move	anchor	node --version
+1	acp move	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp move	anchor	claude auth status
+1	acp move	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp move	anchor	codex --version
+1	acp move	anchor	sw_vers -productVersion
+1	acp move	anchor	id -un
+1	acp move	anchor	pnpm --version
+1	acp move	anchor	pnpm store path
+1	acp move	anchor	bun --version
+1	acp move	anchor	yarn --version
+1	acp move	anchor	npm --version
+1	acp move	anchor	uv --version
+1	acp move	anchor	rustc -vV
+1	acp move	anchor	cargo --version
+1	acp move	anchor	xcrun --show-sdk-version
+1	acp move	anchor	claude --version
+1	acp move	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp move	anchor	codex --version
+1	acp move	anchor	python3 --version
+1	acp move	anchor	git --version
+1	acp move	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp move	anchor	python3 -c import sys; print(sys.base_prefix)
+1	acp move	anchor	node --version
+1	acp move	anchor	node -p process.versions.modules
+1	acp move	anchor	uv --version
+1	acp move	anchor	rustc -vV
+1	acp move	anchor	pnpm --version
+1	acp move	anchor	bun --version
+1	acp move	anchor	sw_vers -productVersion
+1	acp move	anchor	xcrun --show-sdk-version
+1	acp move	anchor	pnpm store path
+1	acp move	anchor	id -un
+1	acp move	anchor	cargo --version
+1	acp move	anchor	npm --version
+1	acp move	anchor	yarn --version
+1	acp resume	candidate	node --version
+1	acp resume	candidate	node -p process.versions.modules
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1 --initial-branch=main
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58734-51-47199000.tmp
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58734-52-81900000.tmp
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --no-deref --stdin
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree eeecbca9cdb68fae71f096369604930a8380d01d
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z c144ba6df93972a717d3d21d3d1e1df34dec0008
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z eeecbca9cdb68fae71f096369604930a8380d01d
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	acp resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	acp resume	candidate	ps -o lstart= -p 63904
+1	acp resume	candidate	dash -c unset -f read && read -r go && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	acp resume	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp resume	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp resume	anchor	node --version
+1	acp resume	anchor	node -p process.versions.modules
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync rev-parse --git-path info/exclude
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-51-630436000.tmp
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-51-630436000.tmp
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-52-668067000.tmp
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-52-668067000.tmp
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-53-716615000.tmp
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-53-716615000.tmp
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --stdin
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref HEAD refs/heads/main
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree cdb3d3b26b04c7afc9427fb1225a0452bc05ef96
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z ca3572d39f69f57ecfa47a77c67fcfe53f9bbd9b
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z cdb3d3b26b04c7afc9427fb1225a0452bc05ef96
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.url <root>/repo
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.fetch +refs/heads/*:refs/remotes/origin/*
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.remote origin
+1	acp resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.merge refs/heads/main
+1	acp resume	anchor	ps -o pgid= -p 64000
+1	acp resume	anchor	ps -o lstart= -p 64000
+1	acp resume	anchor	ps -o lstart= -p 64000
+1	acp resume	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	acp pull	candidate	id -un
+1	acp pull	candidate	node --version
+1	acp pull	candidate	node -p process.versions.modules
+1	acp pull	candidate	git --version
+1	acp pull	candidate	fabric-fake-agent --version
+1	acp pull	candidate	node -p process.versions.modules
+1	acp pull	candidate	node --version
+1	acp pull	candidate	python3 -c import sys; print(sys.base_prefix)
+1	acp pull	candidate	python3 --version
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-53-337160000.tmp ls-files -z -v --cached --others --exclude-standard
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-53-337160000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-56-389740000.tmp add -A --
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree d8934038f8074b4f9c6ad29f1c3804c6693408ba -m fabric worktree -p 8f9ffbcf02752505415c5d63e4c7700591043b73 -p a85e8d817ae2e3bd0b1619e677edf71911b5379f
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 8f9ffbcf02752505415c5d63e4c7700591043b73^{commit} c144ba6df93972a717d3d21d3d1e1df34dec0008^{commit} --
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/b/store/tmp/58734-57-442340000.tmp --all --not 8f9ffbcf02752505415c5d63e4c7700591043b73 c144ba6df93972a717d3d21d3d1e1df34dec0008
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/b/store/tmp/58734-57-442340000.tmp
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z 1cea02edb4084d05c7525132f3b2599b3cb63da1
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-53-337160000.tmp ls-files --others --exclude-standard -z
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-53-337160000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp pull	candidate	node -p process.versions.modules
+1	acp pull	candidate	node --version
+1	acp pull	candidate	git --version
+1	acp pull	candidate	id -un
+1	acp pull	candidate	node -p process.versions.modules
+1	acp pull	candidate	node --version
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1 --initial-branch=main
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62794-13-666564000.tmp
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62794-14-701739000.tmp
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --no-deref --stdin
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree a85e8d817ae2e3bd0b1619e677edf71911b5379f
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 1cea02edb4084d05c7525132f3b2599b3cb63da1
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z a85e8d817ae2e3bd0b1619e677edf71911b5379f
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	acp pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	acp pull	candidate	ps -o lstart= -p 64161
+1	acp pull	candidate	dash -c unset -f read && read -r go && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	acp pull	anchor	rustc -vV
+1	acp pull	anchor	claude --version
+1	acp pull	anchor	node -p process.versions.modules
+1	acp pull	anchor	git --version
+1	acp pull	anchor	sw_vers -productVersion
+1	acp pull	anchor	xcrun --show-sdk-version
+1	acp pull	anchor	npm --version
+1	acp pull	anchor	id -un
+1	acp pull	anchor	node --version
+1	acp pull	anchor	yarn --version
+1	acp pull	anchor	cargo --version
+1	acp pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	acp pull	anchor	pnpm store path
+1	acp pull	anchor	codex login status
+1	acp pull	anchor	bun --version
+1	acp pull	anchor	claude auth status
+1	acp pull	anchor	codex --version
+1	acp pull	anchor	uv --version
+1	acp pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp pull	anchor	python3 --version
+1	acp pull	anchor	pnpm --version
+1	acp pull	anchor	fabric-fake-agent --version
+1	acp pull	anchor	node -p process.versions.modules
+1	acp pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	acp pull	anchor	node --version
+1	acp pull	anchor	python3 --version
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-54-341706000.tmp ls-files -z -v --cached --others --exclude-standard
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-57-396804000.tmp add -A --
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree d8934038f8074b4f9c6ad29f1c3804c6693408ba -m fabric worktree -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf -p 0d4bb94728ad954807d391d926b6146313746d81
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 6a1446575d7110538a85a5fefe40fbc25c9f62bf^{commit} ca3572d39f69f57ecfa47a77c67fcfe53f9bbd9b^{commit} --
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/b/store/tmp/58290-58-448497000.tmp --all --not 6a1446575d7110538a85a5fefe40fbc25c9f62bf ca3572d39f69f57ecfa47a77c67fcfe53f9bbd9b
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/b/store/tmp/58290-58-448497000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle list-heads <root>/b/store/tmp/58290-58-448497000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z e1fb60aff999f3d558306cca9630e62544352235
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-54-341706000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-54-341706000.tmp ls-files --others --exclude-standard -z
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-54-341706000.tmp ls-files --others --ignored --exclude-standard -z
+1	acp pull	anchor	pnpm store path
+1	acp pull	anchor	id -un
+1	acp pull	anchor	yarn --version
+1	acp pull	anchor	node --version
+1	acp pull	anchor	bun --version
+1	acp pull	anchor	python3 --version
+1	acp pull	anchor	uv --version
+1	acp pull	anchor	rustc -vV
+1	acp pull	anchor	sw_vers -productVersion
+1	acp pull	anchor	cargo --version
+1	acp pull	anchor	claude --version
+1	acp pull	anchor	xcrun --show-sdk-version
+1	acp pull	anchor	npm --version
+1	acp pull	anchor	git --version
+1	acp pull	anchor	pnpm --version
+1	acp pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	acp pull	anchor	codex --version
+1	acp pull	anchor	node -p process.versions.modules
+1	acp pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	acp pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	acp pull	anchor	node --version
+1	acp pull	anchor	node -p process.versions.modules
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync rev-parse --git-path info/exclude
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-13-828580000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-13-828580000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-14-864244000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-14-864244000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-15-918998000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-15-918998000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-16-960892000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-16-960892000.tmp
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --stdin
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref HEAD refs/heads/main
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree 0d4bb94728ad954807d391d926b6146313746d81
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z e1fb60aff999f3d558306cca9630e62544352235
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 0d4bb94728ad954807d391d926b6146313746d81
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.url <root>/repo
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.fetch +refs/heads/*:refs/remotes/origin/*
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.remote origin
+1	acp pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.merge refs/heads/main
+1	acp pull	anchor	ps -o pgid= -p 64433
+1	acp pull	anchor	ps -o lstart= -p 64433
+1	acp pull	anchor	ps -o lstart= -p 64433
+1	acp pull	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/fabric-fake-agent
+1	claude suspend	candidate	claude --version
+1	claude suspend	candidate	python3 -c import sys; print(sys.base_prefix)
+1	claude suspend	candidate	node -p process.versions.modules
+1	claude suspend	candidate	python3 --version
+1	claude suspend	candidate	node --version
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-15-508061000.tmp ls-files -z -v --cached --others --exclude-standard
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-15-508061000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-18-562131000.tmp add -A --
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree c091b4e3b360b64a8df725a632d2e8ba3b4fdbac -m fabric worktree -p 8f9ffbcf02752505415c5d63e4c7700591043b73 -p cddaf2cb117dfccb3b66d8b1296e7be022544e4d
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 8f9ffbcf02752505415c5d63e4c7700591043b73^{commit} de4391cf807baed1bf535497e47dbf4df760184e^{commit} --
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/a/store/tmp/62794-19-616713000.tmp --all --not 8f9ffbcf02752505415c5d63e4c7700591043b73 de4391cf807baed1bf535497e47dbf4df760184e
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/a/store/tmp/62794-19-616713000.tmp
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z e357d083fe39af0782d6c58220da6161f9b04e62
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-15-508061000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-15-508061000.tmp ls-files --others --exclude-standard -z
+1	claude suspend	anchor	claude --version
+1	claude suspend	anchor	python3 --version
+1	claude suspend	anchor	node -p process.versions.modules
+1	claude suspend	anchor	node --version
+1	claude suspend	anchor	python3 -c import sys; print(sys.base_prefix)
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-17-161239000.tmp ls-files -z -v --cached --others --exclude-standard
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-20-216684000.tmp add -A --
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree c091b4e3b360b64a8df725a632d2e8ba3b4fdbac -m fabric worktree -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf -p 828dd6678f5d7f434bedf86040b23c5fe9b6f4d9
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 3be6e28a56d1f4e1bb4db5495466cf35b9b0d4d9^{commit} 6a1446575d7110538a85a5fefe40fbc25c9f62bf^{commit} --
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/a/store/tmp/62765-21-268667000.tmp --all --not 3be6e28a56d1f4e1bb4db5495466cf35b9b0d4d9 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/a/store/tmp/62765-21-268667000.tmp
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle list-heads <root>/a/store/tmp/62765-21-268667000.tmp
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z ae0cc1c23dc4fa1c9decc52d76ebdde81c0b39d7
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-17-161239000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-17-161239000.tmp ls-files --others --exclude-standard -z
+1	claude suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-17-161239000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude move	candidate	node --version
+1	claude move	candidate	id -un
+1	claude move	candidate	node -p process.versions.modules
+1	claude move	candidate	git --version
+1	claude move	candidate	claude --version
+1	claude move	candidate	claude auth status
+1	claude move	candidate	git --version
+1	claude move	candidate	id -un
+1	claude move	candidate	node -p process.versions.modules
+1	claude move	candidate	node --version
+1	claude move	candidate	claude --version
+1	claude move	anchor	id -un
+1	claude move	anchor	node -p process.versions.modules
+1	claude move	anchor	rustc -vV
+1	claude move	anchor	pnpm store path
+1	claude move	anchor	cargo --version
+1	claude move	anchor	git --version
+1	claude move	anchor	xcrun --show-sdk-version
+1	claude move	anchor	npm --version
+1	claude move	anchor	python3 --version
+1	claude move	anchor	sw_vers -productVersion
+1	claude move	anchor	codex --version
+1	claude move	anchor	pnpm --version
+1	claude move	anchor	claude --version
+1	claude move	anchor	yarn --version
+1	claude move	anchor	codex login status
+1	claude move	anchor	node --version
+1	claude move	anchor	bun --version
+1	claude move	anchor	python3 -c import sys; print(sys.base_prefix)
+1	claude move	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude move	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude move	anchor	uv --version
+1	claude move	anchor	claude auth status
+1	claude move	anchor	node --version
+1	claude move	anchor	git --version
+1	claude move	anchor	xcrun --show-sdk-version
+1	claude move	anchor	cargo --version
+1	claude move	anchor	python3 --version
+1	claude move	anchor	sw_vers -productVersion
+1	claude move	anchor	id -un
+1	claude move	anchor	pnpm store path
+1	claude move	anchor	npm --version
+1	claude move	anchor	python3 -c import sys; print(sys.base_prefix)
+1	claude move	anchor	rustc -vV
+1	claude move	anchor	bun --version
+1	claude move	anchor	uv --version
+1	claude move	anchor	claude --version
+1	claude move	anchor	node -p process.versions.modules
+1	claude move	anchor	pnpm --version
+1	claude move	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude move	anchor	yarn --version
+1	claude move	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude move	anchor	codex --version
+1	claude resume	candidate	node -p process.versions.modules
+1	claude resume	candidate	claude --version
+1	claude resume	candidate	node --version
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1 --initial-branch=main
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58734-66-423149000.tmp
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58734-67-460468000.tmp
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --no-deref --stdin
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree cddaf2cb117dfccb3b66d8b1296e7be022544e4d
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z e357d083fe39af0782d6c58220da6161f9b04e62
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z cddaf2cb117dfccb3b66d8b1296e7be022544e4d
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	claude resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	claude resume	candidate	ps -o lstart= -p 64876
+1	claude resume	candidate	claude --version
+1	claude resume	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/claude -p --output-format json --resume 8f7c545f-6ea6-493b-a29d-1f15d9c2a422 --model claude-opus-5-5 -- next
+1	claude resume	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude resume	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude resume	anchor	node --version
+1	claude resume	anchor	node -p process.versions.modules
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync rev-parse --git-path info/exclude
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-67-99357000.tmp
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-67-99357000.tmp
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-68-131980000.tmp
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-68-131980000.tmp
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-69-174404000.tmp
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-69-174404000.tmp
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --stdin
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref HEAD refs/heads/main
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree 828dd6678f5d7f434bedf86040b23c5fe9b6f4d9
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z ae0cc1c23dc4fa1c9decc52d76ebdde81c0b39d7
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 828dd6678f5d7f434bedf86040b23c5fe9b6f4d9
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.url <root>/repo
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.fetch +refs/heads/*:refs/remotes/origin/*
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.remote origin
+1	claude resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.merge refs/heads/main
+1	claude resume	anchor	claude --version
+1	claude resume	anchor	ps -o pgid= -p 64996
+1	claude resume	anchor	ps -o lstart= -p 64996
+1	claude resume	anchor	ps -o lstart= -p 64996
+1	claude resume	anchor	claude --version
+1	claude resume	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/claude -p --output-format json --resume 901a9c4a-0757-40af-8ec4-7ce7b9d9b23b --model claude-opus-5-5 -- next
+1	claude pull	candidate	id -un
+1	claude pull	candidate	git --version
+1	claude pull	candidate	node --version
+1	claude pull	candidate	node -p process.versions.modules
+1	claude pull	candidate	claude --version
+1	claude pull	candidate	claude --version
+1	claude pull	candidate	python3 -c import sys; print(sys.base_prefix)
+1	claude pull	candidate	node --version
+1	claude pull	candidate	node -p process.versions.modules
+1	claude pull	candidate	python3 --version
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-68-967058000.tmp ls-files -z -v --cached --others --exclude-standard
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-68-967058000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-71-20215000.tmp add -A --
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree d8934038f8074b4f9c6ad29f1c3804c6693408ba -m fabric worktree -p 8f9ffbcf02752505415c5d63e4c7700591043b73 -p ab85853617ecb65196b89078aea4cc02a1ca238f
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 8f9ffbcf02752505415c5d63e4c7700591043b73^{commit} e357d083fe39af0782d6c58220da6161f9b04e62^{commit} --
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/b/store/tmp/58734-72-71894000.tmp --all --not 8f9ffbcf02752505415c5d63e4c7700591043b73 e357d083fe39af0782d6c58220da6161f9b04e62
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/b/store/tmp/58734-72-71894000.tmp
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z c062bf64655bd144f9ff30c90ca3e25a8375de36
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-68-967058000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-68-967058000.tmp ls-files --others --exclude-standard -z
+1	claude pull	candidate	node --version
+1	claude pull	candidate	claude auth status
+1	claude pull	candidate	node -p process.versions.modules
+1	claude pull	candidate	claude --version
+1	claude pull	candidate	git --version
+1	claude pull	candidate	id -un
+1	claude pull	candidate	claude --version
+1	claude pull	candidate	node --version
+1	claude pull	candidate	node -p process.versions.modules
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1 --initial-branch=main
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62794-28-300081000.tmp
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62794-29-334863000.tmp
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --no-deref --stdin
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree ab85853617ecb65196b89078aea4cc02a1ca238f
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z c062bf64655bd144f9ff30c90ca3e25a8375de36
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z ab85853617ecb65196b89078aea4cc02a1ca238f
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	claude pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	claude pull	candidate	ps -o lstart= -p 65180
+1	claude pull	candidate	claude --version
+1	claude pull	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/claude -p --output-format json --resume 8f7c545f-6ea6-493b-a29d-1f15d9c2a422 --model claude-opus-5-5 -- back
+1	claude pull	anchor	npm --version
+1	claude pull	anchor	pnpm --version
+1	claude pull	anchor	pnpm store path
+1	claude pull	anchor	id -un
+1	claude pull	anchor	rustc -vV
+1	claude pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	claude pull	anchor	python3 --version
+1	claude pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude pull	anchor	uv --version
+1	claude pull	anchor	codex login status
+1	claude pull	anchor	claude auth status
+1	claude pull	anchor	node -p process.versions.modules
+1	claude pull	anchor	yarn --version
+1	claude pull	anchor	codex --version
+1	claude pull	anchor	cargo --version
+1	claude pull	anchor	bun --version
+1	claude pull	anchor	xcrun --show-sdk-version
+1	claude pull	anchor	git --version
+1	claude pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude pull	anchor	sw_vers -productVersion
+1	claude pull	anchor	claude --version
+1	claude pull	anchor	node --version
+1	claude pull	anchor	claude --version
+1	claude pull	anchor	python3 --version
+1	claude pull	anchor	node -p process.versions.modules
+1	claude pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	claude pull	anchor	node --version
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-70-152270000.tmp ls-files -z -v --cached --others --exclude-standard
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-73-209313000.tmp add -A --
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree d8934038f8074b4f9c6ad29f1c3804c6693408ba -m fabric worktree -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf -p 0cb7de067579b926bdbe6785754af962d3df92b0
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 6a1446575d7110538a85a5fefe40fbc25c9f62bf^{commit} ae0cc1c23dc4fa1c9decc52d76ebdde81c0b39d7^{commit} --
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/b/store/tmp/58290-74-261258000.tmp --all --not 6a1446575d7110538a85a5fefe40fbc25c9f62bf ae0cc1c23dc4fa1c9decc52d76ebdde81c0b39d7
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/b/store/tmp/58290-74-261258000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle list-heads <root>/b/store/tmp/58290-74-261258000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z c3e332c29c91d823e5efbf17be377d6394b96359
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-70-152270000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-70-152270000.tmp ls-files --others --exclude-standard -z
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-70-152270000.tmp ls-files --others --ignored --exclude-standard -z
+1	claude pull	anchor	uv --version
+1	claude pull	anchor	id -un
+1	claude pull	anchor	pnpm --version
+1	claude pull	anchor	git --version
+1	claude pull	anchor	python3 --version
+1	claude pull	anchor	bun --version
+1	claude pull	anchor	cargo --version
+1	claude pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude pull	anchor	rustc -vV
+1	claude pull	anchor	sw_vers -productVersion
+1	claude pull	anchor	xcrun --show-sdk-version
+1	claude pull	anchor	node --version
+1	claude pull	anchor	node -p process.versions.modules
+1	claude pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	claude pull	anchor	npm --version
+1	claude pull	anchor	claude auth status
+1	claude pull	anchor	codex --version
+1	claude pull	anchor	yarn --version
+1	claude pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude pull	anchor	pnpm store path
+1	claude pull	anchor	claude --version
+1	claude pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	claude pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	claude pull	anchor	node -p process.versions.modules
+1	claude pull	anchor	node --version
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync rev-parse --git-path info/exclude
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-30-657558000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-30-657558000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-31-692350000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-31-692350000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-32-736539000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-32-736539000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-33-776350000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-33-776350000.tmp
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --stdin
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref HEAD refs/heads/main
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree 0cb7de067579b926bdbe6785754af962d3df92b0
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z c3e332c29c91d823e5efbf17be377d6394b96359
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 0cb7de067579b926bdbe6785754af962d3df92b0
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.url <root>/repo
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.fetch +refs/heads/*:refs/remotes/origin/*
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.remote origin
+1	claude pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.merge refs/heads/main
+1	claude pull	anchor	claude --version
+1	claude pull	anchor	ps -o pgid= -p 65488
+1	claude pull	anchor	ps -o lstart= -p 65488
+1	claude pull	anchor	ps -o lstart= -p 65488
+1	claude pull	anchor	claude --version
+1	claude pull	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/claude -p --output-format json --resume 901a9c4a-0757-40af-8ec4-7ce7b9d9b23b --model claude-opus-5-5 -- back
+1	codex suspend	candidate	codex --version
+1	codex suspend	candidate	codex --version
+1	codex suspend	candidate	python3 --version
+1	codex suspend	candidate	node -p process.versions.modules
+1	codex suspend	candidate	python3 -c import sys; print(sys.base_prefix)
+1	codex suspend	candidate	node --version
+1	codex suspend	candidate	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-30-733660000.tmp ls-files -z -v --cached --others --exclude-standard
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-30-733660000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-33-779829000.tmp add -A --
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree c091b4e3b360b64a8df725a632d2e8ba3b4fdbac -m fabric worktree -p 8f9ffbcf02752505415c5d63e4c7700591043b73 -p 3dca060015885977b74cec6d4d2d04c910c8c147
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 1c6ebd24ffc78058b230a28cfecfe6e2f872b8c3^{commit} 8f9ffbcf02752505415c5d63e4c7700591043b73^{commit} --
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/a/store/tmp/62794-34-830645000.tmp --all --not 1c6ebd24ffc78058b230a28cfecfe6e2f872b8c3 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/a/store/tmp/62794-34-830645000.tmp
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z c0a4c96cbe4247907cb7152f35261182ff95ab0a
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-30-733660000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex suspend	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62794-30-733660000.tmp ls-files --others --exclude-standard -z
+1	codex suspend	anchor	codex --version
+1	codex suspend	anchor	codex --version
+1	codex suspend	anchor	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex suspend	anchor	node -p process.versions.modules
+1	codex suspend	anchor	python3 -c import sys; print(sys.base_prefix)
+1	codex suspend	anchor	python3 --version
+1	codex suspend	anchor	node --version
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-34-592472000.tmp ls-files -z -v --cached --others --exclude-standard
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-37-642467000.tmp add -A --
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree c091b4e3b360b64a8df725a632d2e8ba3b4fdbac -m fabric worktree -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf -p 8d16f19e4b1cd0e6620e540fb7797c059ce86a19
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 243ae5bca6ac44d7857f1b6e2926ffca60db7f5d^{commit} 6a1446575d7110538a85a5fefe40fbc25c9f62bf^{commit} --
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/a/store/tmp/62765-38-693799000.tmp --all --not 243ae5bca6ac44d7857f1b6e2926ffca60db7f5d 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/a/store/tmp/62765-38-693799000.tmp
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle list-heads <root>/a/store/tmp/62765-38-693799000.tmp
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z 434174d65c06ec4787dd5b76ec6aa9257da25b42
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-34-592472000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-34-592472000.tmp ls-files --others --exclude-standard -z
+1	codex suspend	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/a/store/tmp/62765-34-592472000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex move	candidate	node -p process.versions.modules
+1	codex move	candidate	git --version
+1	codex move	candidate	node --version
+1	codex move	candidate	codex --version
+1	codex move	candidate	id -un
+1	codex move	candidate	codex login status
+1	codex move	candidate	git --version
+1	codex move	candidate	node -p process.versions.modules
+1	codex move	candidate	node --version
+1	codex move	candidate	codex --version
+1	codex move	candidate	id -un
+1	codex move	anchor	id -un
+1	codex move	anchor	rustc -vV
+1	codex move	anchor	node -p process.versions.modules
+1	codex move	anchor	claude --version
+1	codex move	anchor	sw_vers -productVersion
+1	codex move	anchor	claude auth status
+1	codex move	anchor	git --version
+1	codex move	anchor	codex login status
+1	codex move	anchor	npm --version
+1	codex move	anchor	codex --version
+1	codex move	anchor	xcrun --show-sdk-version
+1	codex move	anchor	cargo --version
+1	codex move	anchor	pnpm store path
+1	codex move	anchor	yarn --version
+1	codex move	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex move	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex move	anchor	node --version
+1	codex move	anchor	python3 --version
+1	codex move	anchor	python3 -c import sys; print(sys.base_prefix)
+1	codex move	anchor	pnpm --version
+1	codex move	anchor	uv --version
+1	codex move	anchor	bun --version
+1	codex move	anchor	sw_vers -productVersion
+1	codex move	anchor	id -un
+1	codex move	anchor	bun --version
+1	codex move	anchor	git --version
+1	codex move	anchor	npm --version
+1	codex move	anchor	uv --version
+1	codex move	anchor	cargo --version
+1	codex move	anchor	rustc -vV
+1	codex move	anchor	node --version
+1	codex move	anchor	claude --version
+1	codex move	anchor	python3 --version
+1	codex move	anchor	python3 -c import sys; print(sys.base_prefix)
+1	codex move	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex move	anchor	pnpm store path
+1	codex move	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex move	anchor	yarn --version
+1	codex move	anchor	pnpm --version
+1	codex move	anchor	codex --version
+1	codex move	anchor	node -p process.versions.modules
+1	codex move	anchor	xcrun --show-sdk-version
+1	codex resume	candidate	codex --version
+1	codex resume	candidate	node --version
+1	codex resume	candidate	node -p process.versions.modules
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1 --initial-branch=main
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58734-81-879956000.tmp
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58734-82-915544000.tmp
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --no-deref --stdin
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree 3dca060015885977b74cec6d4d2d04c910c8c147
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z c0a4c96cbe4247907cb7152f35261182ff95ab0a
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 3dca060015885977b74cec6d4d2d04c910c8c147
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	codex resume	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	codex resume	candidate	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex resume	candidate	ps -o lstart= -p 65989
+1	codex resume	candidate	codex --version
+1	codex resume	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/codex exec resume 019f233e-bb33-7342-85fa-f2d33b14368a --json -c projects."<root>/home/fabric/jobs/01M6083P69VHVNEZ90FFK631NX/work".trust_level=trusted -c model="gpt-6-sol" -c model_reasoning_effort="xhigh" -c sandbox_mode="workspace-write" -- next
+1	codex resume	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex resume	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex resume	anchor	node -p process.versions.modules
+1	codex resume	anchor	node --version
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync rev-parse --git-path info/exclude
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-83-722004000.tmp
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-83-722004000.tmp
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-84-754738000.tmp
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-84-754738000.tmp
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/b/store/tmp/58290-85-798457000.tmp
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/b/store/tmp/58290-85-798457000.tmp
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --stdin
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref HEAD refs/heads/main
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree 8d16f19e4b1cd0e6620e540fb7797c059ce86a19
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 434174d65c06ec4787dd5b76ec6aa9257da25b42
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 8d16f19e4b1cd0e6620e540fb7797c059ce86a19
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.url <root>/repo
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.fetch +refs/heads/*:refs/remotes/origin/*
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.remote origin
+1	codex resume	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.merge refs/heads/main
+1	codex resume	anchor	codex --version
+1	codex resume	anchor	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex resume	anchor	ps -o pgid= -p 66128
+1	codex resume	anchor	ps -o lstart= -p 66128
+1	codex resume	anchor	ps -o lstart= -p 66128
+1	codex resume	anchor	codex --version
+1	codex resume	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/codex exec resume 019f233e-bb33-7342-85fa-f2d33b14368a --json -c projects."<root>/home/fabric/jobs/01M6083MQKVBCMP36SXC7C9H81/work".trust_level=trusted -c model="gpt-6-sol" -c model_reasoning_effort="xhigh" -c sandbox_mode="workspace-write" -- next
+1	codex pull	candidate	id -un
+1	codex pull	candidate	git --version
+1	codex pull	candidate	codex --version
+1	codex pull	candidate	node -p process.versions.modules
+1	codex pull	candidate	node --version
+1	codex pull	candidate	codex --version
+1	codex pull	candidate	codex --version
+1	codex pull	candidate	node -p process.versions.modules
+1	codex pull	candidate	python3 -c import sys; print(sys.base_prefix)
+1	codex pull	candidate	node --version
+1	codex pull	candidate	python3 --version
+1	codex pull	candidate	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-83-46737000.tmp ls-files -z -v --cached --others --exclude-standard
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-83-46737000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 8f9ffbcf02752505415c5d63e4c7700591043b73
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-86-93777000.tmp add -A --
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree d8934038f8074b4f9c6ad29f1c3804c6693408ba -m fabric worktree -p 8f9ffbcf02752505415c5d63e4c7700591043b73 -p eea5db5e40026c8568199d70dcf5b890440487d0
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 8f9ffbcf02752505415c5d63e4c7700591043b73^{commit} c0a4c96cbe4247907cb7152f35261182ff95ab0a^{commit} --
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/b/store/tmp/58734-87-145958000.tmp --all --not 8f9ffbcf02752505415c5d63e4c7700591043b73 c0a4c96cbe4247907cb7152f35261182ff95ab0a
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/b/store/tmp/58734-87-145958000.tmp
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z 0ea7d56c2aae39bcd8cec33fdd18f79a7a32f732
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-83-46737000.tmp ls-files --others --exclude-standard -z
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58734-83-46737000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex pull	candidate	git --version
+1	codex pull	candidate	node --version
+1	codex pull	candidate	codex login status
+1	codex pull	candidate	codex --version
+1	codex pull	candidate	node -p process.versions.modules
+1	codex pull	candidate	id -un
+1	codex pull	candidate	codex --version
+1	codex pull	candidate	node -p process.versions.modules
+1	codex pull	candidate	node --version
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1 --initial-branch=main
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62794-43-374760000.tmp
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62794-44-409479000.tmp
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --no-deref --stdin
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree eea5db5e40026c8568199d70dcf5b890440487d0
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 0ea7d56c2aae39bcd8cec33fdd18f79a7a32f732
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z eea5db5e40026c8568199d70dcf5b890440487d0
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	codex pull	candidate	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	codex pull	candidate	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex pull	candidate	ps -o lstart= -p 66352
+1	codex pull	candidate	codex --version
+1	codex pull	candidate	dash -c unset -f read && read -r go && exec "$@" </dev/null fabric-hold <root>/bin/codex exec resume 019f233e-bb33-7342-85fa-f2d33b14368a --json -c projects."<root>/home/fabric/jobs/01M6083P69VHVNEZ90FFK631NX/work".trust_level=trusted -c model="gpt-6-sol" -c model_reasoning_effort="xhigh" -c sandbox_mode="workspace-write" -- back
+1	codex pull	anchor	id -un
+1	codex pull	anchor	claude --version
+1	codex pull	anchor	node -p process.versions.modules
+1	codex pull	anchor	rustc -vV
+1	codex pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	codex pull	anchor	codex login status
+1	codex pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex pull	anchor	node --version
+1	codex pull	anchor	claude auth status
+1	codex pull	anchor	git --version
+1	codex pull	anchor	pnpm store path
+1	codex pull	anchor	python3 --version
+1	codex pull	anchor	cargo --version
+1	codex pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex pull	anchor	pnpm --version
+1	codex pull	anchor	uv --version
+1	codex pull	anchor	yarn --version
+1	codex pull	anchor	bun --version
+1	codex pull	anchor	xcrun --show-sdk-version
+1	codex pull	anchor	sw_vers -productVersion
+1	codex pull	anchor	codex --version
+1	codex pull	anchor	npm --version
+1	codex pull	anchor	codex --version
+1	codex pull	anchor	codex --version
+1	codex pull	anchor	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	codex pull	anchor	node -p process.versions.modules
+1	codex pull	anchor	node --version
+1	codex pull	anchor	python3 --version
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --git-path . --git-common-dir --is-shallow-repository --git-path rebase-merge --git-path rebase-apply --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD --git-path BISECT_LOG --git-path index --git-path info/exclude --git-path config --show-toplevel
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always config -z --list --show-scope --show-origin
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-86-589327000.tmp ls-files -z -v --cached --others --exclude-standard
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always status --porcelain=v2 -z --untracked-files=no --ignore-submodules=none
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse --verify -q HEAD
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -v -z
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -z --name-only 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b -m fabric index -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always read-tree 9131b255ba6b4e50f1685acc7ec2a1e902ae0a5b
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-89-638274000.tmp add -A --
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-files -s -z
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always check-attr -z --stdin filter ident working-tree-encoding text eol crlf
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always write-tree
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always commit-tree d8934038f8074b4f9c6ad29f1c3804c6693408ba -m fabric worktree -p 6a1446575d7110538a85a5fefe40fbc25c9f62bf -p 9587b541f86775730b04b7e0612f89d7405ee6de
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always update-ref --stdin
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-parse 434174d65c06ec4787dd5b76ec6aa9257da25b42^{commit} 6a1446575d7110538a85a5fefe40fbc25c9f62bf^{commit} --
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle create <root>/b/store/tmp/58290-90-692404000.tmp --all --not 434174d65c06ec4787dd5b76ec6aa9257da25b42 6a1446575d7110538a85a5fefe40fbc25c9f62bf
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle verify <root>/b/store/tmp/58290-90-692404000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always for-each-ref --format=%(refname) %(symref) %(objectname)
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always symbolic-ref -q HEAD
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always bundle list-heads <root>/b/store/tmp/58290-90-692404000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always rev-list --stdin -n1
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always ls-tree -r -t -z 704ef72af64b8f436357e91cf987a329eb8e615e
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-86-589327000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-86-589327000.tmp ls-files --others --exclude-standard -z
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.excludesFile=<root>/b/store/tmp/58290-86-589327000.tmp ls-files --others --ignored --exclude-standard -z
+1	codex pull	anchor	yarn --version
+1	codex pull	anchor	python3 -c import sys; print(sys.base_prefix)
+1	codex pull	anchor	npm --version
+1	codex pull	anchor	uv --version
+1	codex pull	anchor	id -un
+1	codex pull	anchor	claude --version
+1	codex pull	anchor	codex --version
+1	codex pull	anchor	bun --version
+1	codex pull	anchor	codex login status
+1	codex pull	anchor	node --version
+1	codex pull	anchor	cargo --version
+1	codex pull	anchor	sw_vers -productVersion
+1	codex pull	anchor	node -p process.versions.modules
+1	codex pull	anchor	pnpm --version
+1	codex pull	anchor	pnpm store path
+1	codex pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex pull	anchor	rustc -vV
+1	codex pull	anchor	git --version
+1	codex pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex pull	anchor	python3 --version
+1	codex pull	anchor	xcrun --show-sdk-version
+1	codex pull	anchor	defaults read com.apple.finder FXICloudDriveDesktop
+1	codex pull	anchor	defaults read com.apple.finder FXICloudDriveDocuments
+1	codex pull	anchor	node -p process.versions.modules
+1	codex pull	anchor	node --version
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync init -q --object-format=sha1
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync rev-parse --git-path info/exclude
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-47-73780000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-47-73780000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-48-106453000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-48-106453000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-49-149276000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-49-149276000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle verify <root>/a/store/tmp/62765-50-189204000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync bundle unbundle <root>/a/store/tmp/62765-50-189204000.tmp
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-ref --stdin
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync symbolic-ref HEAD refs/heads/main
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync read-tree 9587b541f86775730b04b7e0612f89d7405ee6de
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 704ef72af64b8f436357e91cf987a329eb8e615e
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync ls-tree -r -z 9587b541f86775730b04b7e0612f89d7405ee6de
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync cat-file --batch
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync update-index --refresh
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync hash-object --no-filters -- .gitignore README.md notes.txt package.json src/greet.txt staged.txt
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.url <root>/repo
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all remote.origin.fetch +refs/heads/*:refs/remotes/origin/*
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.remote origin
+1	codex pull	anchor	git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/usr/bin/false -c credential.helper= -c protocol.allow=never -c protocol.file.allow=always -c core.fsync=all -c core.fsyncMethod=fsync config --local --replace-all branch.main.merge refs/heads/main
+1	codex pull	anchor	codex --version
+1	codex pull	anchor	lsof -t -- <root>/home/.codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl
+1	codex pull	anchor	ps -o pgid= -p 66701
+1	codex pull	anchor	ps -o lstart= -p 66701
+1	codex pull	anchor	ps -o lstart= -p 66701
+1	codex pull	anchor	codex --version
+1	codex pull	anchor	sh -c unset -f kill && kill -STOP $$ && exec "$@" fabric-hold <root>/bin/codex exec resume 019f233e-bb33-7342-85fa-f2d33b14368a --json -c projects."<root>/home/fabric/jobs/01M6083MQKVBCMP36SXC7C9H81/work".trust_level=trusted -c model="gpt-6-sol" -c model_reasoning_effort="xhigh" -c sandbox_mode="workspace-write" -- back

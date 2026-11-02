@@ -1,0 +1,18 @@
+{
+  "schema": "event",
+  "value": {
+    "kind": "snapshot_published",
+    "snapshot": "abababababababababababababababababababababababababababababababab",
+    "files": 1,
+    "bytes": 1,
+    "new_objects": 1,
+    "git_bundle": null
+  },
+  "reads_as": {
+    "kind": "snapshot_published",
+    "snapshot": "abababababababababababababababababababababababababababababababab",
+    "files": 1,
+    "bytes": 1,
+    "new_objects": 1
+  }
+}

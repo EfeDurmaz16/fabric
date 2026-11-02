@@ -4,6 +4,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **ACP** (Agent Client Protocol). A JSON-RPC protocol for driving coding agents. Fabric uses it as the generic harness path. Methods Fabric cares about: `session/new`, `session/load`, `session/prompt`, `session/cancel`.
 
+**Attempt.** One execution of one task of a managed job on one resource, under one generation. A retry is a new attempt; an attempt that disappears is `lost`, never `cancelled` (ADR 0019).
+
 **Blob.** Bytes stored by hash. Chunks and manifests are both blobs.
 
 **Carry key.** The exact strings a cache depends on (Node major and package manager, `rustc -vV` and `CARGO_HOME`, Python version and home). Recorded per cache in the snapshot; the target compares them with its own before trusting the bytes.
@@ -23,6 +25,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Event.** One append-only record in a job's ledger. Events are never edited or deleted.
 
 **Fencing.** Refusing work from a stale epoch. The fencing token is `(job_id, epoch)`. The mechanism that keeps exactly one live copy among Fabric processes; native tombstones cover the harness's own writers.
+
+**Generation.** The fencing counter of a managed job's canonical execution domain. It increases by one with every new attempt the authority grants; work reported under an older generation is refused (ADR 0020). Not an epoch, which belongs to standalone jobs.
 
 **Harness.** The agent program that does the work: Claude Code, Codex, or any ACP agent.
 
@@ -52,6 +56,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Manifest.** A versioned description of a job (job manifest) or of a snapshot (snapshot manifest). Manifests are the only files whose format Fabric promises to keep readable across versions.
 
+**Managed job.** A job whose authority is the managed journal rather than an owner node's ledger: its commands carry operation keys and its progress is a work revision (ADR 0019, ADR 0020). A job made the existing way is a standalone job; the two modes never convert in M2.
+
 **Marker.** The node-local record under a job's directory that names a workspace root and says whether every managed byte in it is published (`Clean`), a harness has run since (`Dirty`), a suspend is in flight (`Suspending`), or a restore is in flight (`Restoring`). The guard on the only path where Fabric removes files. Never stored inside the workspace.
 
 **Materialize.** Run the EnvSpec setup steps on a node so that the job can run there.
@@ -64,7 +70,11 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Node id.** The ed25519 public key of a node. Also the TLS identity pinned on every connection.
 
-**Orphan snapshot.** A snapshot that is not on its job's chain, made by `fabric orphan export` from an orphan workspace and pinned in the store so gc keeps it.
+**Operation key.** The name a caller gives one command on a managed job. The authority keeps the first answer under it, so the same key and command sent again get the same answer and no second effect.
+
+**Orphan snapshot.** A snapshot that is not on its job's chain, made by `fabric job export` from an orphan workspace, or published by a chain a fork repair set aside, and pinned with its bundle chain in the job's `pins` file so no pass that forgets snapshots drops it.
+
+**Fork rule.** How two chains of one job that a steal forked are settled (ADR 0003, Forks): the higher epoch-bumping record wins, at equal epoch a `MoveImported` beats a `Stolen`, and between two steals the lower thief's node id. `fabric job repair` applies it on a frozen job.
 
 **Orphan workspace.** A workspace left on a node that lost the lease before it suspended. Kept in place forever until the user exports or removes it.
 
@@ -99,5 +109,7 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Unreferenced chunk.** A chunk or manifest that no live snapshot reaches. Invisible to readers; the only thing `fabric store gc` removes.
 
 **Warm cache.** A node already holds most chunks of a job's latest snapshot, so a resume there moves little data.
+
+**Work revision.** The count of accepted changes to one managed job, starting at 1. A command names the revision it expects and is refused if the job has moved on.
 
 **Workspace.** The checkout directory a harness works in. A snapshot captures it. A restore recreates it.

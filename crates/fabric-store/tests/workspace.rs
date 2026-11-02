@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use fabric_core::git::GitConfigKey;
+use fabric_core::git::{GitConfigKey, RefName};
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{
@@ -21,6 +21,7 @@ use fabric_store::capture::{
     BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, CarryKeys, IndexFlag,
     MAX_BUNDLE_CHAIN, UnmeasuredKeys, capture,
 };
+use fabric_store::git::GitError;
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
 use fabric_store::restore::{
@@ -32,7 +33,7 @@ use fabric_store::writer::WriteError;
 
 mod common;
 
-use common::TestGit;
+use common::{LoggedGit, TestGit};
 
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -2179,6 +2180,445 @@ fn a_restore_whose_bundle_base_is_gone_names_it() {
     );
 }
 
+/// The child half of `a_restore_writes_its_exclude_file_and_config_without_git`.
+#[test]
+fn restore_config_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    make_repo(&root).unwrap();
+    let g = git(&root);
+    for (key, value) in [
+        ("branch.main.remote", "origin"),
+        ("branch.main.merge", "refs/heads/main"),
+        ("push.default", "simple"),
+    ] {
+        g.run(&["config", key, value]).unwrap();
+    }
+    let mut store = store_in(&dir).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.join("restored");
+    let start = common::logged_git_calls().len();
+    restore_into(&store, snapshot, &target).unwrap();
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    assert!(
+        !ran.iter()
+            .any(|call| call.starts_with("rev-parse ") || call.starts_with("config ")),
+        "{}",
+        ran.join("\n")
+    );
+    assert_eq!(
+        fs::read_to_string(target.join(".git/info/exclude")).unwrap(),
+        "scratch/\n"
+    );
+    let carried = [
+        "config",
+        "--local",
+        "--get-regexp",
+        "^(remote|branch|push)[.]",
+    ];
+    assert_eq!(
+        git_text(&target, &carried).unwrap(),
+        "remote.origin.url https://example.com/x.git\n\
+         remote.origin.fetch +refs/heads/*:refs/remotes/origin/*\n\
+         branch.main.remote origin\n\
+         branch.main.merge refs/heads/main\n\
+         push.default simple"
+    );
+}
+
+/// A restore knows where the `git init` it ran keeps `info/exclude`, so it
+/// asks git for no path, and it appends the carried config's sections to
+/// the file `git init` wrote as `git config` would, so it runs no `git
+/// config` for them (`write_config`): one to five git processes fewer per
+/// resume and pull.
+#[test]
+fn a_restore_writes_its_exclude_file_and_config_without_git() {
+    common::run_with_logged_git("restore_config_child", LoggedGit::Plain).unwrap();
+}
+
+/// The child half of `a_capture_reads_the_bundle_heads_without_git`.
+#[test]
+fn capture_heads_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    make_repo(&root).unwrap();
+    let mut store = store_in(&dir).unwrap();
+    let policy = IgnorePolicy::default();
+    let start = common::logged_git_calls().len();
+    let first = capture(&store, &request(&root, &policy, None)).unwrap();
+    let s1 = store.publish(&first.manifest).unwrap();
+    fs::write(root.join("second.txt"), "second commit\n").unwrap();
+    git(&root).run(&["add", "second.txt"]).unwrap();
+    git(&root).run(&["commit", "-q", "-m", "two"]).unwrap();
+    let second = capture(&store, &request(&root, &policy, Some(s1))).unwrap();
+    assert_eq!(first.report.bundle, Some(BundleKind::Full));
+    assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    let bundle: Vec<&str> = (ran.iter())
+        .filter_map(|call| call.strip_prefix("bundle "))
+        .filter_map(|call| call.split(' ').next())
+        .collect();
+    assert_eq!(
+        bundle,
+        ["create", "verify", "create", "verify"],
+        "{}",
+        ran.join("\n")
+    );
+}
+
+/// A capture checks the refs a bundle lists against the refs it read
+/// (`confirm_bundle`). It reads them from the bundle's header, the text
+/// `git bundle list-heads` prints, so no `list-heads` runs: one git
+/// process fewer per suspend.
+#[test]
+fn a_capture_reads_the_bundle_heads_without_git() {
+    common::run_with_logged_git("capture_heads_child", LoggedGit::Plain).unwrap();
+}
+
+/// A chain of `links` snapshots of a one-commit repository at `root`, a
+/// full bundle and then incremental ones, each after one more commit; the
+/// snapshots and the commit each one added, oldest first.
+fn chain_of(store: &mut Store, root: &Path, links: u32) -> Fallible<Vec<(SnapshotId, String)>> {
+    one_commit_repo(root)?;
+    let mut chain: Vec<(SnapshotId, String)> = Vec::new();
+    for step in 0..links {
+        let parent = chain.last().map(|(id, _)| *id);
+        let (id, _) = commit_and_capture(store, root, step, parent)?;
+        chain.push((id, git_text(root, &["rev-parse", "HEAD"])?));
+    }
+    Ok(chain)
+}
+
+/// True when the repository at `root` holds the object `oid`.
+fn has_object(root: &Path, oid: &str) -> Fallible<bool> {
+    git(root).succeeds(&["cat-file", "-e", oid])
+}
+
+/// Restores `snapshot` into `target` as the node does, flushed for a power loss.
+fn restore_flushed(store: &Store, snapshot: SnapshotId, target: &Path) -> Fallible<RestoreReport> {
+    Ok(restore(
+        store,
+        &RestoreRequest {
+            snapshot,
+            target,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    )?)
+}
+
+/// The child half of `a_resume_unpacks_only_the_links_the_node_lacks`.
+#[test]
+fn resume_cache_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    let mut store = store_in(&dir).unwrap();
+    let chain = chain_of(&mut store, &root, 4).unwrap();
+    let unbundles = |name: &str, snapshot: SnapshotId, durable: bool| -> usize {
+        let start = common::logged_git_calls().len();
+        let target = dir.join(name);
+        if durable {
+            restore_flushed(&store, snapshot, &target).unwrap();
+        } else {
+            restore_into(&store, snapshot, &target).unwrap();
+        }
+        (common::git_commands(&common::logged_git_calls(), start).iter())
+            .filter(|call| call.starts_with("bundle unbundle "))
+            .count()
+    };
+    // Three links the node never unpacked, then the one it lacks, then none.
+    assert_eq!(unbundles("third", chain[2].0, false), 3);
+    assert_eq!(unbundles("fourth", chain[3].0, true), 1);
+    assert_eq!(git_difference(&root, &dir.join("fourth")).unwrap(), None);
+    assert_eq!(unbundles("fourth-again", chain[3].0, false), 0);
+    assert_eq!(
+        git_difference(&root, &dir.join("fourth-again")).unwrap(),
+        None
+    );
+    // An older snapshot of the chain gets only its own links' objects.
+    assert_eq!(unbundles("second", chain[1].0, false), 0);
+    let second = dir.join("second");
+    assert!(has_object(&second, &chain[1].1).unwrap());
+    assert!(!has_object(&second, &chain[2].1).unwrap());
+    assert!(git(&second).succeeds(&["fsck", "--no-dangling"]).unwrap());
+}
+
+/// A restore replayed every link of the chain, so a resume grew with the
+/// job's history, about 30 ms a link in the end-to-end fixture. The node's
+/// bundle cache keeps the pack files of the links it unpacked, and a
+/// restore unpacks only the links the cache lacks.
+#[test]
+fn a_resume_unpacks_only_the_links_the_node_lacks() {
+    common::run_with_logged_git("resume_cache_child", LoggedGit::Plain).unwrap();
+}
+
+/// A cached pack file that changed on disk, or is gone, is not used: the
+/// restore unpacks that link and the ones after it again, and the cache
+/// holds them whole afterwards.
+#[test]
+fn a_cached_pack_that_changed_is_not_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 3).unwrap();
+    let last = chain[2].0;
+    let report = restore_into(&store, last, &dir.path().join("first")).unwrap();
+    assert_eq!((report.bundles_fetched, report.bundles_unpacked), (3, 3));
+    let cache = dir.path().join("store/bundle-cache").join(JOB.to_string());
+    let mut packs: Vec<PathBuf> = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "pack"))
+        .collect();
+    packs.sort();
+    assert_eq!(packs.len(), 3);
+    for (n, damage) in ["changed", "removed"].into_iter().enumerate() {
+        let pack = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|e| e == "pack"))
+            .unwrap();
+        if damage == "changed" {
+            fs::set_permissions(&pack, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut bytes = fs::read(&pack).unwrap();
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0xff;
+            fs::write(&pack, bytes).unwrap();
+        } else {
+            fs::remove_file(&pack).unwrap();
+        }
+        let target = dir.path().join(format!("after-{damage}"));
+        let report = restore_into(&store, last, &target).unwrap();
+        assert!(report.bundles_unpacked >= 1, "{damage}");
+        assert_eq!(report.bundles_fetched, 3);
+        assert_eq!(git_difference(&root, &target).unwrap(), None, "{damage}");
+        assert!(git(&target).succeeds(&["fsck", "--no-dangling"]).unwrap());
+        let again = restore_into(&store, last, &dir.path().join(format!("again-{n}"))).unwrap();
+        assert_eq!(again.bundles_unpacked, 0, "{damage}");
+    }
+}
+
+/// gc removes the bundle cache of a job the store holds no snapshot of
+/// any more, and keeps the cache of a job it still holds: no restore can
+/// take a chain from it, and its packs would otherwise wait for the
+/// cache's own eviction, 14 days idle. An entry whose name is no job id
+/// is not the cache's, and stays.
+#[test]
+fn gc_removes_the_bundle_cache_of_a_job_with_no_snapshot_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 2).unwrap();
+    restore_into(&store, chain[1].0, &dir.path().join("restored")).unwrap();
+    let caches = dir.path().join("store/bundle-cache");
+    let cache = caches.join(JOB.to_string());
+    let stranger = caches.join("not-a-job");
+    fs::create_dir_all(&stranger).unwrap();
+    assert!(cache.join("links").is_file());
+
+    let kept = store
+        .gc(std::time::SystemTime::now(), Duration::from_hours(1))
+        .unwrap();
+    assert_eq!(kept.removed_caches, 0);
+    assert!(
+        cache.join("links").is_file(),
+        "a held job's cache was removed"
+    );
+
+    for (snapshot, _) in chain.iter().rev() {
+        store.forget(*snapshot).unwrap();
+    }
+    let report = store
+        .gc(std::time::SystemTime::now(), Duration::from_hours(1))
+        .unwrap();
+    assert_eq!(report.removed_caches, 1);
+    assert!(!cache.exists(), "a forgotten job's cache was kept");
+    assert!(stranger.is_dir());
+}
+
+/// Every file under `dir`, at any depth.
+fn files_below(dir: &Path) -> Fallible<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            found.extend(files_below(&path)?);
+        } else {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// No hard links from the store into a workspace (ADR 0014, Objects):
+/// a tool that rewrites a pack file of one restored repository in place
+/// leaves the bundle cache and every other restored repository as they
+/// were. Each cached file is a copy of the one git wrote, and each file a
+/// restore takes from the cache is a copy of the cached one.
+#[test]
+fn a_pack_rewritten_in_place_in_one_restore_leaves_the_cache_and_the_others_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 2).unwrap();
+    let last = chain[1].0;
+    let first = dir.path().join("first");
+    assert_eq!(
+        restore_into(&store, last, &first).unwrap().bundles_unpacked,
+        2
+    );
+    let second = dir.path().join("second");
+    assert_eq!(
+        restore_into(&store, last, &second)
+            .unwrap()
+            .bundles_unpacked,
+        0
+    );
+    let cache = dir.path().join("store/bundle-cache").join(JOB.to_string());
+    for repo in [&first, &second] {
+        let packs = files_below(&repo.join(".git/objects/pack")).unwrap();
+        let cached = files_below(&cache).unwrap();
+        assert_eq!(packs.len(), cached.len() - 1);
+        for file in packs.iter().chain(&cached) {
+            assert_eq!(fs::metadata(file).unwrap().nlink(), 1, "{}", file.display());
+        }
+    }
+
+    for pack in files_below(&second.join(".git/objects/pack")).unwrap() {
+        fs::set_permissions(&pack, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut bytes = fs::read(&pack).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        // `fs::write` truncates and writes the same inode: an in-place edit.
+        fs::write(&pack, bytes).unwrap();
+    }
+    assert!(git(&first).succeeds(&["fsck", "--no-dangling"]).unwrap());
+    let third = dir.path().join("third");
+    assert_eq!(
+        restore_into(&store, last, &third).unwrap().bundles_unpacked,
+        0
+    );
+    assert_eq!(git_difference(&root, &third).unwrap(), None);
+    assert!(git(&third).succeeds(&["fsck", "--no-dangling"]).unwrap());
+}
+
+/// A chain that parts from the cached one at a link drops the cached
+/// links from there: the restore holds only its own chain's objects, and
+/// the other chain's newer link is unpacked again when it comes back.
+#[test]
+fn a_chain_that_parts_from_the_cached_one_gets_only_its_own_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 3).unwrap();
+    restore_into(&store, chain[2].0, &dir.path().join("main")).unwrap();
+
+    git(&root)
+        .run(&["reset", "-q", "--hard", &chain[1].1])
+        .unwrap();
+    let (fork, _) = commit_and_capture(&mut store, &root, 9, Some(chain[1].0)).unwrap();
+    let forked = git_text(&root, &["rev-parse", "HEAD"]).unwrap();
+    let target = dir.path().join("fork");
+    let report = restore_into(&store, fork, &target).unwrap();
+    assert_eq!((report.bundles_fetched, report.bundles_unpacked), (3, 1));
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+    assert!(!has_object(&target, &chain[2].1).unwrap());
+
+    let target = dir.path().join("main-again");
+    let report = restore_into(&store, chain[2].0, &target).unwrap();
+    assert_eq!(report.bundles_unpacked, 1);
+    assert!(has_object(&target, &chain[2].1).unwrap());
+    assert!(!has_object(&target, &forked).unwrap());
+}
+
+/// The cache holds the second link, but a chain that skips it still fails
+/// on the third: the repository gets only the links of its own chain
+/// before a link is unpacked.
+#[test]
+fn a_link_whose_prerequisites_only_the_cache_holds_fails_the_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 3).unwrap();
+    restore_into(&store, chain[2].0, &dir.path().join("warm")).unwrap();
+    let mut skipped = store.manifest(chain[2].0).unwrap();
+    skipped.git.as_mut().unwrap().bundle_base = Some(chain[0].0);
+    let skipped = store.publish(&skipped).unwrap();
+    let target = dir.path().join("restored");
+    let err = restore_into(&store, skipped, &target).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::Git(GitError::Failed { command, stderr, .. })
+            if command.starts_with("bundle unbundle") && stderr.contains("prerequisite")),
+        "{err}"
+    );
+    assert!(!target.exists());
+}
+
+/// The child half of `a_restore_runs_bundle_unbundle_alone`.
+#[test]
+fn restore_unbundle_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(&dir).unwrap();
+    let (first, _) = commit_and_capture(&mut store, &root, 0, None).unwrap();
+    let (second, _) = commit_and_capture(&mut store, &root, 1, Some(first)).unwrap();
+    let start = common::logged_git_calls().len();
+    let report = restore_into(&store, second, &dir.join("restored")).unwrap();
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    let bundle: Vec<&str> = (ran.iter())
+        .filter_map(|call| call.strip_prefix("bundle "))
+        .filter_map(|call| call.split(' ').next())
+        .collect();
+    assert_eq!(bundle, ["unbundle", "unbundle"], "{}", ran.join("\n"));
+    assert_eq!(report.bundles_fetched, 2);
+}
+
+/// `git bundle unbundle` checks a bundle's prerequisites, as `git bundle
+/// verify` does, before it indexes the pack (git's `bundle.c`), so a
+/// restore runs it alone: one git process fewer per link of the chain.
+#[test]
+fn a_restore_runs_bundle_unbundle_alone() {
+    common::run_with_logged_git("restore_unbundle_child", LoggedGit::Plain).unwrap();
+}
+
+/// A link whose prerequisites the links below it do not hold fails the
+/// restore before anything is in place, now in `git bundle unbundle`.
+#[test]
+fn a_link_whose_prerequisites_the_chain_lacks_fails_the_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let (first, _) = commit_and_capture(&mut store, &root, 0, None).unwrap();
+    let (second, _) = commit_and_capture(&mut store, &root, 1, Some(first)).unwrap();
+    let (_, third) = commit_and_capture(&mut store, &root, 2, Some(second)).unwrap();
+    // The third link needs the second's commits; this chain skips them.
+    let mut skipped = third.manifest.clone();
+    skipped.git.as_mut().unwrap().bundle_base = Some(first);
+    let skipped = store.publish(&skipped).unwrap();
+    let target = dir.path().join("restored");
+    let err = restore_into(&store, skipped, &target).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::Git(GitError::Failed { command, stderr, .. })
+            if command.starts_with("bundle unbundle") && stderr.contains("prerequisite")),
+        "{err}"
+    );
+    assert!(!target.exists());
+}
+
 #[test]
 fn names_git_would_unquote_or_trim_verify_after_restore() {
     let dir = tempfile::tempdir().unwrap();
@@ -2519,47 +2959,20 @@ fn a_config_file_the_repository_includes_counts_but_does_not_travel() {
 /// The git processes a capture and a restore start. Each costs about 3 ms,
 /// and about 9 ms through the macOS `/usr/bin/git` stub; on 2026-10-24 a
 /// suspend ran 58 of them (issue #26). A change that adds one changes these.
+/// The restore's count is for git 2.46 and later; before, `HEAD` takes one
+/// `symbolic-ref` more, and the first restore of a process one refused
+/// transaction more (`a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again`).
 const GIT_RUNS: [(&str, usize); 3] = [
-    ("first capture", 33),
-    ("second capture", 35),
-    ("restore", 19),
+    ("first capture", 32),
+    ("second capture", 34),
+    ("restore", 13),
 ];
 
-/// Writes `contents` to `path` with mode `0755` through `sh`, so this
-/// process never holds an executable open for writing, which Linux would
-/// refuse to run (`ETXTBSY`) in a child forked meanwhile.
-fn write_executable(path: &Path, contents: &str) -> Fallible {
-    let mut writer = std::process::Command::new("/bin/sh")
-        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
-        .arg(path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-    std::io::Write::write_all(
-        &mut writer.stdin.take().ok_or("no pipe to the writer")?,
-        contents.as_bytes(),
-    )?;
-    if !writer.wait()?.success() {
-        return Err(format!("writing {} failed", path.display()).into());
-    }
-    Ok(())
-}
-
-/// The child half: runs with a `git` first on the `PATH` that appends each call to `FABRIC_GIT_LOG`.
+/// The child half: runs with a `git` first on the `PATH` that logs each call.
 #[test]
 fn git_processes_child() {
-    let (Ok(dir), Ok(log)) = (
-        std::env::var("FABRIC_GIT_COUNT_DIR"),
-        std::env::var("FABRIC_GIT_LOG"),
-    ) else {
+    let Some(dir) = common::logged_git_dir() else {
         return;
-    };
-    let dir = PathBuf::from(dir);
-    let calls = || -> Vec<String> {
-        fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
     };
     let root = dir.join("work");
     make_repo(&root).unwrap();
@@ -2567,57 +2980,461 @@ fn git_processes_child() {
     let policy = IgnorePolicy::default();
     let mut runs = Vec::new();
 
-    let start = calls().len();
+    let start = common::logged_git_calls().len();
     let first = capture(&store, &request(&root, &policy, None)).unwrap();
-    runs.push(calls().split_off(start));
+    runs.push(common::git_commands(&common::logged_git_calls(), start));
     let s1 = store.publish(&first.manifest).unwrap();
     fs::write(root.join("second.txt"), "second commit\n").unwrap();
     git(&root).run(&["add", "second.txt"]).unwrap();
     git(&root).run(&["commit", "-q", "-m", "two"]).unwrap();
 
-    let start = calls().len();
+    let start = common::logged_git_calls().len();
     let second = capture(&store, &request(&root, &policy, Some(s1))).unwrap();
-    runs.push(calls().split_off(start));
+    runs.push(common::git_commands(&common::logged_git_calls(), start));
     assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
     let s2 = store.publish(&second.manifest).unwrap();
 
-    let start = calls().len();
+    let start = common::logged_git_calls().len();
     restore_into(&store, s2, &dir.join("restored")).unwrap();
-    runs.push(calls().split_off(start));
+    runs.push(common::git_commands(&common::logged_git_calls(), start));
 
+    let before_2_46 = if git_takes_symref_update(&dir).unwrap() {
+        0
+    } else {
+        2
+    };
     for ((name, expected), ran) in GIT_RUNS.iter().zip(&runs) {
-        assert_eq!(ran.len(), *expected, "{name}:\n{}", ran.join("\n"));
+        let expected = expected + if *name == "restore" { before_2_46 } else { 0 };
+        assert_eq!(ran.len(), expected, "{name}:\n{}", ran.join("\n"));
     }
 }
 
 #[test]
 fn a_capture_and_a_restore_start_a_known_number_of_git_processes() {
+    common::run_with_logged_git("git_processes_child", LoggedGit::Plain).unwrap();
+}
+
+/// M2-03: untracked work whose name the store's old list denied, an env
+/// template and source files named like keys, travels in `W` and comes
+/// back; a `.env` beside them stays behind and is named.
+#[test]
+fn untracked_work_the_core_carries_comes_back() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = dir.path().join("bin");
-    fs::create_dir(&bin).unwrap();
-    let path = std::env::var_os("PATH").unwrap();
-    let real = std::env::split_paths(&path)
-        .map(|dir| dir.join("git"))
-        .find(|candidate| candidate.is_file())
-        .unwrap();
-    write_executable(
-        &bin.join("git"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FABRIC_GIT_LOG\"\nexec '{}' \"$@\"\n",
-            real.display()
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    let work = [".env.example", "src/id_test.go", "src/credentials.ts"];
+    for name in work {
+        fs::write(root.join(name), "work\n").unwrap();
+    }
+    fs::write(root.join(".env"), "TOKEN=x\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.denied_untracked,
+        vec![RelPath::parse(".env").unwrap()]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for name in work {
+        assert_eq!(
+            fs::read_to_string(target.join(name)).unwrap(),
+            "work\n",
+            "{name}"
+        );
+    }
+    assert!(!target.join(".env").exists());
+}
+
+/// M2-04 (issue #20): a git tree records only `100644` or `100755`, so a
+/// key committed by mistake at 0600 comes back readable by others and an
+/// untracked file loses its group write. Each file of `W` keeps its own
+/// permission bits.
+#[test]
+fn a_file_of_the_working_tree_keeps_its_permission_bits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join("deploy_key"), "key\n").unwrap();
+    fs::write(root.join("tool.sh"), "#!/bin/sh\n").unwrap();
+    let g = git(&root);
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "two"]).unwrap();
+    fs::write(root.join("shared.txt"), "untracked\n").unwrap();
+    let modes = [
+        ("deploy_key", 0o600),
+        ("tool.sh", 0o750),
+        ("shared.txt", 0o664),
+    ];
+    for (name, mode) in modes {
+        fs::set_permissions(root.join(name), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for (name, mode) in modes {
+        let restored = fs::metadata(target.join(name)).unwrap().mode() & 0o777;
+        assert_eq!(restored, mode, "{name}: {restored:o}");
+    }
+}
+
+/// M2-04: a recorded mode whose owner execute bit is not the tree's would
+/// leave the file changed against the index on the target, so a manifest
+/// that holds one, which no capture writes, is refused before restore
+/// writes the working tree.
+#[test]
+fn a_mode_that_disagrees_with_the_tree_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o644)).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { mut manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let git = manifest.git.as_mut().unwrap();
+    assert_eq!(
+        git.worktree_modes,
+        vec![(RelPath::parse("a").unwrap(), Mode::new(0o644).unwrap())]
+    );
+    git.worktree_modes[0].1 = Mode::new(0o744).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    assert!(matches!(
+        restore_into(&store, snapshot, &target),
+        Err(RestoreError::ModeDisagreesWithTree { path, .. }) if path.as_str() == "a"
+    ));
+}
+
+/// M2-05 (issue #21): no entry records the workspace root itself, so a
+/// root kept at 0700 comes back with the umask's mode and the time of
+/// the restore. It keeps its mode and mtime.
+#[test]
+fn the_workspace_root_keeps_its_mode_and_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    set_mtime(&root, 1_500_000_000, 7).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    let meta = fs::metadata(&target).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o700);
+    assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_500_000_000, 7));
+}
+
+/// M2-05: the harness-state root keeps its mode and mtime too, and a
+/// workspace root without owner write, which the rename into place needs,
+/// gets its exact mode once it is there.
+#[test]
+fn the_harness_state_root_and_a_read_only_root_keep_their_mode_and_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let state = dir.path().join("hstate");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("session.jsonl"), "{}\n").unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+    set_mtime(&state, 1_400_000_000, 9).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+    set_mtime(&root, 1_500_000_000, 7).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let mut req = request(&root, &policy, None);
+    req.harness_state = Some(&state);
+    let captured = capture(&store, &req);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let snapshot = store.publish(&captured.unwrap().manifest).unwrap();
+    let target = dir.path().join("restored");
+    let to = dir.path().join("hrestored");
+    let restored = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &target,
+            harness_state: Some(&to),
+            verify: Verify::All,
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    );
+    let meta = fs::metadata(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    restored.unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o500);
+    assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_500_000_000, 7));
+    let meta = fs::metadata(&to).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o750);
+    assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_400_000_000, 9));
+}
+
+/// A clone of a one-commit repository, whose `refs/remotes/origin/HEAD`
+/// is symbolic, captured and published; the store and the snapshot.
+fn clone_snapshot(dir: &Path) -> Fallible<(Store, SnapshotId)> {
+    one_commit_repo(&dir.join("upstream"))?;
+    git(dir).run(&["clone", "-q", "upstream", "work"])?;
+    let mut store = store_in(dir)?;
+    let policy = IgnorePolicy::default();
+    let captured = capture(&store, &request(&dir.join("work"), &policy, None))?;
+    let snapshot = store.publish(&captured.manifest)?;
+    Ok((store, snapshot))
+}
+
+/// Restores `snapshot` into `dir/<name>`, checks that both symbolic refs
+/// of `clone_snapshot` came back, and returns the `update-ref` and
+/// `symbolic-ref` calls the restore made.
+fn restore_symbolic(
+    store: &Store,
+    snapshot: SnapshotId,
+    dir: &Path,
+    name: &str,
+) -> Fallible<Vec<String>> {
+    let start = common::logged_git_calls().len();
+    let target = dir.join(name);
+    restore_into(store, snapshot, &target)?;
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    for (name, target_ref) in [
+        ("HEAD", "refs/heads/main"),
+        ("refs/remotes/origin/HEAD", "refs/remotes/origin/main"),
+    ] {
+        let found = git_text(&target, &["symbolic-ref", name])?;
+        if found != target_ref {
+            return Err(format!("{name} points at {found}").into());
+        }
+    }
+    Ok(ran
+        .into_iter()
+        .filter(|call| call.starts_with("update-ref ") || call.starts_with("symbolic-ref "))
+        .collect())
+}
+
+/// True when the git on the `PATH` takes `symref-update` in `update-ref --stdin` (2.46 and later).
+fn git_takes_symref_update(dir: &Path) -> Fallible<bool> {
+    let probe = dir.join("symref-probe");
+    fs::create_dir(&probe)?;
+    git(&probe).run(&["init", "-q"])?;
+    let mut child = std::process::Command::new("git")
+        .args(["update-ref", "--no-deref", "--stdin"])
+        .current_dir(&probe)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    std::io::Write::write_all(
+        &mut child.stdin.take().ok_or("no pipe to git")?,
+        b"symref-update HEAD refs/heads/probe\n",
+    )?;
+    Ok(child.wait()?.success())
+}
+
+/// The `update-ref` and `symbolic-ref` calls of a restore of `clone_snapshot`
+/// on git before 2.46; `HEAD` is on `main` from the restore's `git init`.
+const SYMREFS_ONE_BY_ONE: [&str; 2] = [
+    "update-ref --stdin",
+    "symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main",
+];
+
+/// The child half of `a_restore_sets_head_and_symbolic_refs_without_a_process_each`.
+#[test]
+fn symref_transaction_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let (store, snapshot) = clone_snapshot(&dir).unwrap();
+    let ran = restore_symbolic(&store, snapshot, &dir, "restored").unwrap();
+    if git_takes_symref_update(&dir).unwrap() {
+        assert_eq!(ran, ["update-ref --no-deref --stdin"]);
+    } else {
+        let mut expected = vec!["update-ref --no-deref --stdin"];
+        expected.extend(SYMREFS_ONE_BY_ONE);
+        assert_eq!(ran, expected);
+    }
+}
+
+/// On git 2.46 and later, a restore sets the symbolic refs with
+/// `symref-update` in the one `update-ref --stdin` transaction of the
+/// direct refs, and its `git init` puts `HEAD` on the snapshot's branch,
+/// instead of one `git symbolic-ref` each: two git processes fewer per
+/// resume and pull of a clone.
+#[test]
+fn a_restore_sets_head_and_symbolic_refs_without_a_process_each() {
+    common::run_with_logged_git("symref_transaction_child", LoggedGit::Plain).unwrap();
+}
+
+/// The child half of `a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again`.
+#[test]
+fn symref_fallback_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let (store, snapshot) = clone_snapshot(&dir).unwrap();
+    let mut first = vec!["update-ref --no-deref --stdin"];
+    first.extend(SYMREFS_ONE_BY_ONE);
+    assert_eq!(
+        restore_symbolic(&store, snapshot, &dir, "first").unwrap(),
+        first
+    );
+    assert_eq!(
+        restore_symbolic(&store, snapshot, &dir, "second").unwrap(),
+        SYMREFS_ONE_BY_ONE
+    );
+}
+
+/// git before 2.46 refuses the transaction at `symref-update` before it
+/// changes a ref; the restore then sets the refs as before, one
+/// `symbolic-ref` per symbolic ref, and this process does not ask that git
+/// again.
+#[test]
+fn a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again() {
+    common::run_with_logged_git("symref_fallback_child", LoggedGit::WithoutSymrefUpdate).unwrap();
+}
+
+/// The branch `HEAD` points at in `root`, or `None` when it is detached.
+fn head_branch(root: &Path) -> Fallible<Option<String>> {
+    let g = git(root);
+    Ok(if g.succeeds(&["symbolic-ref", "-q", "HEAD"])? {
+        Some(g.run_text(&["symbolic-ref", "HEAD"])?)
+    } else {
+        None
+    })
+}
+
+/// git refuses one `update-ref --stdin` transaction that updates `HEAD`
+/// and also the branch `HEAD` points at ("multiple updates for 'HEAD'
+/// (including one via its referent ...)"). The `HEAD` of a fresh `git
+/// init` points at `master` (`main` on git 3), so a repository with that
+/// branch failed to restore once `HEAD` joined the transaction of the
+/// refs; and a detached `HEAD` must not pick, in the restore's own
+/// repository, a branch the snapshot holds.
+#[test]
+fn a_repository_with_the_branch_git_init_names_restores() {
+    let scenarios: [(&str, &[&str]); 7] = [
+        ("master", &["checkout -q master"]),
+        ("main", &["branch master", "checkout -q main"]),
+        ("master", &["branch main", "checkout -q master"]),
+        ("main", &["branch master", "checkout -q --detach"]),
+        (
+            "main",
+            &[
+                "branch master",
+                "branch fabric-detached",
+                "checkout -q --detach",
+            ],
         ),
-    )
-    .unwrap();
-    let path =
-        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "git_processes_child"])
-        .env("FABRIC_GIT_COUNT_DIR", dir.path())
-        .env("FABRIC_GIT_LOG", dir.path().join("git.log"))
-        .env("PATH", path)
-        .output()
+        ("main", &["symbolic-ref refs/heads/master refs/heads/main"]),
+        (
+            "master",
+            &["symbolic-ref refs/heads/main refs/heads/master"],
+        ),
+    ];
+    for (n, (first, steps)) in scenarios.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), "a\n").unwrap();
+        let g = git(&root);
+        g.run(&["init", "-q", "-b", first]).unwrap();
+        g.run(&["add", "-A"]).unwrap();
+        g.run(&["commit", "-q", "-m", "one"]).unwrap();
+        for step in steps {
+            g.run(&step.split(' ').collect::<Vec<_>>()).unwrap();
+        }
+        let mut store = store_in(dir.path()).unwrap();
+        let policy = IgnorePolicy::default();
+        let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+        let snapshot = store.publish(&manifest).unwrap();
+        let target = dir.path().join("restored");
+        let restored = restore_into(&store, snapshot, &target);
+        assert!(restored.is_ok(), "scenario {n} {steps:?}: {restored:?}");
+        assert_eq!(
+            git_difference(&root, &target).unwrap(),
+            None,
+            "scenario {n}"
+        );
+        assert_eq!(
+            head_branch(&target).unwrap(),
+            head_branch(&root).unwrap(),
+            "scenario {n}"
+        );
+        for name in ["HEAD", "refs/heads/master", "refs/heads/main"] {
+            assert_eq!(
+                git(&target).run_text(&["symbolic-ref", "-q", name]).ok(),
+                git(&root).run_text(&["symbolic-ref", "-q", name]).ok(),
+                "scenario {n} {name}"
+            );
+        }
+        assert!(
+            !git_text(&target, &["for-each-ref", "--format=%(refname)"])
+                .unwrap()
+                .contains("fabric-detached")
+                || steps.contains(&"branch fabric-detached"),
+            "scenario {n}"
+        );
+    }
+}
+
+/// M2-06 (issue #22): a clone's `refs/remotes/origin/HEAD` is a symbolic
+/// ref; it comes back as one, not as a frozen commit.
+#[test]
+fn a_symbolic_ref_comes_back_symbolic() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = dir.path().join("upstream");
+    one_commit_repo(&upstream).unwrap();
+    let root = dir.path().join("work");
+    git(dir.path())
+        .run(&["clone", "-q", "upstream", "work"])
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("1 passed"), "{stdout}");
+    let origin_head = ["symbolic-ref", "refs/remotes/origin/HEAD"];
+    assert_eq!(
+        git_text(&root, &origin_head).unwrap().trim(),
+        "refs/remotes/origin/main"
+    );
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        manifest.git.as_ref().unwrap().symbolic_refs,
+        vec![(
+            RefName::parse("refs/remotes/origin/HEAD").unwrap(),
+            RefName::parse("refs/remotes/origin/main").unwrap()
+        )]
+    );
+    let first = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, first, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &origin_head).unwrap().trim(),
+        "refs/remotes/origin/main"
+    );
+    // The next snapshot's bundle is incremental, and the ref still travels
+    // as one when its target moved.
+    git(&root)
+        .run(&["commit", "-q", "--allow-empty", "-m", "two"])
+        .unwrap();
+    git(&root)
+        .run(&["update-ref", "refs/remotes/origin/main", "HEAD"])
+        .unwrap();
+    let Captured { manifest, report } =
+        capture(&store, &request(&root, &policy, Some(first))).unwrap();
+    assert_eq!(report.bundle, Some(BundleKind::Incremental));
+    let second = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored-2");
+    restore_into(&store, second, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &origin_head).unwrap().trim(),
+        "refs/remotes/origin/main"
+    );
+    assert_eq!(
+        git_text(&target, &["rev-parse", "refs/remotes/origin/HEAD"]).unwrap(),
+        git_text(&root, &["rev-parse", "HEAD"]).unwrap()
+    );
 }

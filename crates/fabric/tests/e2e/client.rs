@@ -208,10 +208,14 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
 /// printed every line up to the failing record. The node now reports each
 /// record that does not read in its place, and the CLI prints the lines
 /// before the first one and then fails with its sentence, exit 1, as it did.
+///
+/// The daemon is the one writer of these records and keeps each in memory
+/// once read, so a record is damaged here while it is stopped, and the
+/// daemon that starts next reads it.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status() {
     let env = Env::new().unwrap();
-    let (node, client) = started(&env).unwrap();
+    let (mut node, client) = started(&env).unwrap();
     let job = client
         .job_new(
             SystemPath::parse(env.repo.to_str().unwrap()).unwrap(),
@@ -224,7 +228,7 @@ async fn e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status() {
         .job;
     let id = job.to_string();
     let dir = node.state().join("jobs").join(&id);
-    let status = |printed: usize, record: &str| {
+    let status = |node: &Node, printed: usize, record: &str| {
         let output = node.run(&["job", "status", &id]).unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -238,15 +242,19 @@ async fn e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status() {
         );
     };
 
+    node.stop().unwrap().wait().unwrap();
     std::fs::write(dir.join("harness"), "not a record").unwrap();
-    status(7, "harness");
+    node.start(None).unwrap();
+    status(&node, 7, "harness");
     let read = client.job_status(job, |_| {}).await.unwrap();
     assert!(matches!(read.process, Process::Unreadable { .. }));
     assert_eq!(read.view, View::Owner);
     assert!(read.workspace.is_some());
 
+    node.stop().unwrap().wait().unwrap();
     std::fs::write(dir.join("marker"), "not a record").unwrap();
-    status(6, "marker");
+    node.start(None).unwrap();
+    status(&node, 6, "marker");
     let read = client.job_status(job, |_| {}).await.unwrap();
     assert!(read.workspace.is_none());
     assert!(
@@ -254,8 +262,10 @@ async fn e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status() {
             .is_some_and(|error| error.contains("marker"))
     );
 
+    node.stop().unwrap().wait().unwrap();
     std::fs::write(dir.join("forked"), "not a record").unwrap();
-    status(4, "forked");
+    node.start(None).unwrap();
+    status(&node, 4, "forked");
     let read = client.job_status(job, |_| {}).await.unwrap();
     assert!(matches!(read.view, View::Unreadable { .. }));
     assert_eq!(read.goal, "make the greeting louder");

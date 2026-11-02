@@ -7,7 +7,11 @@
 //! operation again converges. A
 //! process that dies between a rename and the directory fsync loses
 //! nothing, because the page cache outlives it, so that window needs a
-//! power cut, not a kill, and is not tested here.
+//! power cut, not a kill, and is not tested here. What a power cut may keep
+//! depends on the order of the flushes, which the unit tests of
+//! `durable.rs` and `pipeline.rs` pin call by call: the staged files are
+//! flushed to the drive only, and the manifest's barrier and full flush
+//! order them before its name and make the tree durable.
 
 #![allow(
     clippy::unwrap_used,

@@ -1,0 +1,48 @@
+{
+  "kind": "managed_cancel",
+  "operation": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+  "operation_key": "cancel-1",
+  "replayed": true,
+  "job": {
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ1",
+    "revision": "9007199254740993",
+    "generation": "2",
+    "state": "cancelled",
+    "goal": "run the tests",
+    "harness": {
+      "kind": "acp",
+      "program": "my-agent",
+      "args": [
+        "--acp"
+      ]
+    },
+    "primary_task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+    "tasks": [
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "state": "cancelled"
+      },
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+        "parent": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "label": "tests",
+        "state": "succeeded"
+      }
+    ],
+    "attempts": [
+      {
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "generation": "1",
+        "status": "lost"
+      },
+      {
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "generation": "2",
+        "status": "checkpointed",
+        "snapshot": "abababababababababababababababababababababababababababababababab"
+      }
+    ]
+  }
+}

@@ -13,7 +13,8 @@
 //! file whose digest does not match; then a file of the session on this
 //! node that the incoming state lacks, unless it is a rewritable file this
 //! node left untouched since the job left, which goes once the rest is
-//! placed. Only after all of that does it place files, all or nothing. An
+//! placed and only while it is still what was checked (M2-07). Only after
+//! all of that does it place files, all or nothing. An
 //! adapter supplies only what differs: its sources, and where a tree path
 //! lands on this node.
 
@@ -42,7 +43,7 @@ use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
 use crate::harness::Restored;
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
-use crate::place::{self, Placement};
+use crate::place::{self, Placement, Seen};
 use crate::redact::RedactionCounts;
 use crate::stage::{self, Source};
 
@@ -170,7 +171,13 @@ pub(crate) struct Capturer<'a> {
 
 /// Stages `sources` into `out`, records the rewritable ones as a pending
 /// departure and writes the manifest last, so a tree with a manifest is
-/// whole and its pending record exists.
+/// whole and its pending record exists. That holds after a power loss too:
+/// the staged files, and the pending record when it is on the same device,
+/// are flushed to the drive only, and the manifest's write is the commit
+/// point, whose barrier orders them before its name and whose full flush
+/// makes all of them durable. A capture flushes the drive's cache once
+/// there, instead of twice per file and once per new directory; a pending
+/// record on another device adds the one full flush its own write needs.
 pub(crate) fn capture(
     capturer: Capturer<'_>,
     sources: &[Source],
@@ -188,7 +195,7 @@ pub(crate) fn capture(
         &counts,
     )?;
     if let Some(records) = capturer.departure {
-        records.write_pending(&staged.replaceable, manifest.digest()?)?;
+        records.write_pending(&staged.replaceable, manifest.digest()?, out)?;
         crashpoint("capture-after-departure", 0);
     }
     manifest.write(out)?;
@@ -334,10 +341,34 @@ where
     };
     let dropped = dropped_files(&placements, held, &departure)?;
     let placed = place::place_all(&placements, &|dest| departure.unchanged(dest))?;
-    for path in &dropped {
-        durable::remove_durable(path)?;
-    }
+    remove_dropped(&dropped)?;
     Ok(Restored { manifest, placed })
+}
+
+/// A file of the session the job dropped, and what it was when restore
+/// found it still holding the bytes this node recorded at departure.
+#[derive(Debug)]
+struct Dropped {
+    path: PathBuf,
+    seen: Seen,
+}
+
+/// Removes each dropped file, checking first that it is still what was
+/// seen when it was found unchanged (M2-07).
+///
+/// Placement runs between that check and the removal, so a harness that
+/// started after the running-harness guard could edit the file there; the
+/// edit would be lost with the unlink. A file whose length, times or inode
+/// moved stops the restore with `StateChanged`, as a moved destination does
+/// in `place_all`, and stays with the edit. A write that lands between this
+/// check and the unlink is not caught; only a lock the harness itself
+/// honours could close that window.
+fn remove_dropped(dropped: &[Dropped]) -> Result<(), HarnessError> {
+    for file in dropped {
+        file.seen.still(&file.path)?;
+        durable::remove_durable(&file.path)?;
+    }
+    Ok(())
 }
 
 /// The files of the session on this node that the incoming state does not
@@ -354,7 +385,7 @@ fn dropped_files(
     placements: &[Placement],
     held: &[Source],
     departure: &Departure,
-) -> Result<Vec<PathBuf>, HarnessError> {
+) -> Result<Vec<Dropped>, HarnessError> {
     let folded = |path: &Path| path.to_string_lossy().to_lowercase();
     let placed: HashSet<String> = placements.iter().map(|p| folded(&p.dest)).collect();
     let mut dropped = Vec::new();
@@ -362,8 +393,14 @@ fn dropped_files(
         if placed.contains(&folded(&source.abs)) || denylist::check(source.rel.as_str()).is_some() {
             continue;
         }
+        // Read before the digest, so a write during the compare shows when
+        // the file is checked again just before its removal.
+        let seen = Seen::of(&source.abs)?;
         if source.mutability == Mutability::Replaceable && departure.unchanged(&source.abs)? {
-            dropped.push(source.abs.clone());
+            dropped.push(Dropped {
+                path: source.abs.clone(),
+                seen,
+            });
         } else {
             return Err(HarnessError::StateDiverged {
                 path: source.abs.clone(),
@@ -376,6 +413,194 @@ fn dropped_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::{Flush, record};
+    use crate::stage::Carry;
+
+    /// A capture of `files` under `home`, with no departure records, into `out`.
+    fn capture_files(home: &Path, out: &Path, files: &[&str]) -> StateManifest {
+        let session = SessionId::parse("7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d").unwrap();
+        let abs = AbsPath::parse(home.to_str().unwrap()).unwrap();
+        let sources: Vec<Source> = files
+            .iter()
+            .map(|name| {
+                let src = home.join(name);
+                std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+                std::fs::write(&src, format!("{name}\n")).unwrap();
+                Source {
+                    abs: src,
+                    rel: RelPath::parse(&format!("home/{name}")).unwrap(),
+                    carry: Carry::Text,
+                    mutability: Mutability::AppendOnly,
+                }
+            })
+            .collect();
+        capture(
+            Capturer {
+                kind: HarnessKind::ClaudeCode,
+                session: &session,
+                root: &abs,
+                home: &abs,
+                version: None,
+                departure: None,
+            },
+            &sources,
+            RedactionCounts::new(),
+            out,
+        )
+        .unwrap()
+    }
+
+    /// ADR 0014's method for a capture: each staged file and directory is
+    /// flushed to the drive only, and the manifest's write is the one
+    /// commit point, a barrier on its temporary that orders the tree before
+    /// its name and one full flush after its rename. Before, every staged
+    /// file was two full flushes and every new directory one.
+    #[test]
+    fn a_capture_flushes_the_drive_once_at_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("h");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let (manifest, log) =
+            record::flushes(|| capture_files(&home, &out, &["x/a.txt", "y/b.txt"]));
+        assert_eq!(manifest.files().len(), 2);
+        let plain = |at: &str| (Flush::Plain, at.to_owned());
+        assert_eq!(
+            record::shape(&log, dir.path()),
+            vec![
+                plain("out"),
+                plain("out/home"),
+                plain("tmp:out/home/x"),
+                plain("out/home/x"),
+                plain("out/home"),
+                plain("tmp:out/home/y"),
+                plain("out/home/y"),
+                (Flush::Barrier, "tmp:out".to_owned()),
+                (Flush::Full, "out".to_owned()),
+            ]
+        );
+    }
+
+    /// A capture that records a pending departure on the device of its
+    /// state tree flushes the drive's cache once, at the manifest: the
+    /// record keeps the barrier that keeps it whole and joins the batch,
+    /// so the manifest's barrier orders it before the manifest's name and
+    /// the manifest's full flush makes it durable. Before, the record's own
+    /// write flushed its directory through the drive's cache as well.
+    #[test]
+    fn a_pending_departure_on_the_trees_device_joins_its_one_full_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("h");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let session = SessionId::parse("7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d").unwrap();
+        let abs = AbsPath::parse(home.to_str().unwrap()).unwrap();
+        let memory = home.join("MEMORY.md");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&memory, "# memory\n").unwrap();
+        let sources = [Source {
+            abs: memory,
+            rel: RelPath::parse("home/MEMORY.md").unwrap(),
+            carry: Carry::Text,
+            mutability: Mutability::Replaceable,
+        }];
+        let records = Records::of(&home, "claude", &session);
+        let (captured, log) = record::flushes(|| {
+            capture(
+                Capturer {
+                    kind: HarnessKind::ClaudeCode,
+                    session: &session,
+                    root: &abs,
+                    home: &abs,
+                    version: None,
+                    departure: Some(&records),
+                },
+                &sources,
+                RedactionCounts::new(),
+                &out,
+            )
+        });
+        captured.unwrap();
+        let shape = record::shape(&log, dir.path());
+        let full: Vec<_> = shape
+            .iter()
+            .filter(|(how, _)| *how == Flush::Full)
+            .collect();
+        assert_eq!(full, vec![&(Flush::Full, "out".to_owned())], "{shape:?}");
+        assert_eq!(shape.last(), Some(&(Flush::Full, "out".to_owned())));
+        let departed = "h/.fabric/harness/departed/claude";
+        let record = shape
+            .iter()
+            .position(|entry| *entry == (Flush::Barrier, format!("tmp:{departed}")))
+            .unwrap_or_else(|| panic!("the record lost its barrier: {shape:?}"));
+        let manifest = shape
+            .iter()
+            .position(|entry| *entry == (Flush::Barrier, "tmp:out".to_owned()))
+            .unwrap();
+        assert!(record < manifest, "{shape:?}");
+        assert!(
+            shape[record..manifest].contains(&(Flush::Plain, departed.to_owned())),
+            "the record's directory was not flushed to the drive: {shape:?}"
+        );
+    }
+
+    /// A capture into a directory an earlier one used orders the removal of
+    /// the old manifest with a barrier before it writes a staged file, so a
+    /// power loss never leaves the old manifest over new bytes, and the
+    /// sweep of what the new capture does not carry is ordered by the new
+    /// manifest's barrier.
+    #[test]
+    fn a_capture_into_a_used_directory_orders_the_old_manifest_away_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("h");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        capture_files(&home, &out, &["x/a.txt", "y/b.txt"]);
+        let (_, log) = record::flushes(|| capture_files(&home, &out, &["x/a.txt"]));
+        let plain = |at: &str| (Flush::Plain, at.to_owned());
+        assert_eq!(
+            record::shape(&log, dir.path()),
+            vec![
+                (Flush::Barrier, "out".to_owned()),
+                plain("tmp:out/home/x"),
+                plain("out/home/x"),
+                plain("out/home"),
+                (Flush::Barrier, "tmp:out".to_owned()),
+                (Flush::Full, "out".to_owned()),
+            ]
+        );
+        assert!(!out.join("home/y").exists());
+    }
+
+    /// M2-07: a dropped file edited after it was found unchanged, while the
+    /// rest was placed, stays with the edit and stops the restore; one that
+    /// did not change goes.
+    #[test]
+    fn a_dropped_file_edited_before_its_removal_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("MEMORY.md");
+        let gone = dir.path().join("notes.md");
+        std::fs::write(&kept, b"recorded\n").unwrap();
+        std::fs::write(&gone, b"recorded\n").unwrap();
+        let dropped = [&gone, &kept].map(|path| Dropped {
+            path: path.clone(),
+            seen: Seen::of(path).unwrap(),
+        });
+        // Placement runs here; a harness appends to one of the files.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&kept)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"edited\n").unwrap();
+        drop(file);
+        let err = remove_dropped(&dropped).unwrap_err();
+        assert!(
+            matches!(err, HarnessError::StateChanged { ref path } if path == &kept),
+            "{err}"
+        );
+        assert!(!gone.exists());
+        assert_eq!(std::fs::read(&kept).unwrap(), b"recorded\nedited\n");
+    }
 
     #[test]
     fn walk_skips_temp_files_and_refuses_symlinks() {

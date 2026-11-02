@@ -137,6 +137,10 @@ pub enum SettingName {
     Effort,
     /// The sandbox commands run in.
     Sandbox,
+    /// What a sandbox lets commands write beyond the workspace.
+    WritableRoots,
+    /// Whether a sandbox lets commands reach the network.
+    NetworkAccess,
     /// When the harness asks before it runs a command.
     Approval,
     /// Who answers what the harness asks: the user, or a reviewer model.
@@ -150,6 +154,8 @@ impl std::fmt::Display for SettingName {
             SettingName::Provider => "model provider",
             SettingName::Effort => "effort",
             SettingName::Sandbox => "sandbox",
+            SettingName::WritableRoots => "writable roots",
+            SettingName::NetworkAccess => "network access",
             SettingName::Approval => "approval",
             SettingName::Reviewer => "approvals reviewer",
         })
@@ -252,19 +258,67 @@ pub struct LaunchSettings {
     pub not_carried: Vec<NotCarried>,
 }
 
+/// What an adapter that speaks to its harness over a protocol on its
+/// stdio says about the turn a launch started, as the turn goes on
+/// (`Running::take_turn`). An ACP agent is one: its standard output is
+/// the protocol, so the caller cannot read the turn from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEvent {
+    /// The session the turn runs in, once the harness has opened or
+    /// continued it. A new session is known only then, after `release`.
+    Session(SessionId),
+    /// The turn ended: its session, its answer, and why it failed when it
+    /// did. Nothing follows it.
+    Ended(TurnReport),
+}
+
+/// The events of the turn a launch started, in order (`TurnEvent`).
+#[derive(Debug)]
+pub struct TurnFeed {
+    events: tokio::sync::mpsc::Receiver<TurnEvent>,
+}
+
+impl TurnFeed {
+    /// A feed and the sender its adapter's driver writes to.
+    #[cfg(feature = "acp")]
+    pub(crate) fn channel() -> (tokio::sync::mpsc::Sender<TurnEvent>, Self) {
+        // A turn sends a session and an end, so the driver never waits here.
+        let (sender, events) = tokio::sync::mpsc::channel(4);
+        (sender, TurnFeed { events })
+    }
+
+    /// The next event; `None` once the driver is gone, after `Ended` or
+    /// when the handle was dropped before `release`.
+    pub async fn next(&mut self) -> Option<TurnEvent> {
+        self.events.recv().await
+    }
+}
+
 /// A harness process this node started, in a process group of its own.
 /// Only this crate builds one, from a child it spawned, so the pid is
 /// real and is also the process group id.
 ///
-/// A `Launch::Interactive` run whose standard input is a terminal starts
-/// held: a trampoline, stopped before it execs the harness, so the harness
-/// never touches the terminal before its group owns it. The caller makes
-/// the group the terminal's foreground group, then calls `release`.
+/// Every launch starts held: a trampoline, which waits before it execs
+/// the harness, so nothing of the harness runs before the caller has
+/// recorded it with the node (issue #17), and a harness wired to the
+/// user's terminal never touches it before its group owns it. The handle
+/// comes back while the trampoline still starts, so the caller records the
+/// pid meanwhile, makes the group the terminal's foreground group when
+/// `takes_terminal` says so, then calls `release`, which lets the harness
+/// start as soon as the trampoline is ready (`process::spawn`). Dropping a
+/// handle that is still held kills its group: nothing of the harness ran,
+/// and nothing else could let it go on. A handle whose trampoline the
+/// caller has reaped already signals nothing.
 pub struct Running {
     pid: NonZeroU32,
     session: Option<SessionId>,
     child: Child,
     held: bool,
+    terminal: bool,
+    /// The trampoline's hold, which `release` ends and which opens a
+    /// driver's gate once the harness may run.
+    hold: crate::process::Hold,
+    turn: Option<TurnFeed>,
     settings: LaunchSettings,
     version: Option<crate::version::HarnessVersion>,
 }
@@ -275,24 +329,69 @@ impl std::fmt::Debug for Running {
             .field("pid", &self.pid)
             .field("session", &self.session)
             .field("held", &self.held)
+            .field("terminal", &self.terminal)
+            .field("turn", &self.turn.is_some())
             .field("settings", &self.settings)
             .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
 
+impl Drop for Running {
+    fn drop(&mut self) {
+        // A trampoline its caller has reaped already led its group alone,
+        // since nothing of the harness ran, so the group went with it, and
+        // its id may name another process's group by now. `id` is `None`
+        // once the child has been waited for.
+        if self.held && self.child.id().is_some() {
+            crate::process::kill_held_group(self.pid);
+        }
+    }
+}
+
 impl Running {
-    /// Wraps a child that `process::spawn` started in a new process group.
+    /// Wraps a child that `process::spawn` started held in a new process
+    /// group.
     #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
     pub(crate) fn new(session: Option<SessionId>, spawned: crate::process::Spawned) -> Self {
         Running {
             pid: spawned.pid,
             session,
             child: spawned.child,
-            held: spawned.held,
+            held: true,
+            terminal: spawned.wiring == crate::process::Wiring::Terminal,
+            hold: spawned.hold,
+            turn: None,
             settings: LaunchSettings::default(),
             version: None,
         }
+    }
+
+    /// Opens `gate` once `release` lets the harness run, and hands `turn`
+    /// to the caller (`take_turn`). A hold that fails closes the gate
+    /// unopened.
+    #[cfg(feature = "acp")]
+    pub(crate) fn with_driver(
+        mut self,
+        gate: tokio::sync::oneshot::Sender<()>,
+        turn: TurnFeed,
+    ) -> Self {
+        self.hold.open_on_release(gate);
+        self.turn = Some(turn);
+        self
+    }
+
+    /// Waits until a trampoline held by a stop has stopped or its hold
+    /// failed; at once for any other.
+    #[cfg(all(test, any(feature = "acp", feature = "claude", feature = "codex")))]
+    pub(crate) async fn hold_settled(&self) {
+        self.hold.settled().await;
+    }
+
+    /// Names the session the process continues, once it is known.
+    #[cfg(feature = "acp")]
+    pub(crate) fn set_session(&mut self, session: SessionId) {
+        self.session = Some(session);
     }
 
     /// Records the version the launch asked of the binary it started.
@@ -327,22 +426,50 @@ impl Running {
         &self.settings
     }
 
-    /// True while the harness waits, stopped before its exec, for its
-    /// process group to be given the terminal.
+    /// True until `release`: the harness waits before its exec.
     #[must_use]
     pub fn is_held(&self) -> bool {
         self.held
     }
 
-    /// Lets a held harness start by continuing its process group; the
-    /// trampoline then execs the harness. Call it once the group is the
-    /// terminal's foreground group. A harness that is not held is left alone.
+    /// True when the harness is wired to the user's terminal
+    /// (`Launch::Interactive`), so the caller makes its group the
+    /// terminal's foreground group before `release`.
+    #[must_use]
+    pub fn takes_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// Lets the harness start; the trampoline then execs it. Call it once
+    /// the node has recorded the pid and, when `takes_terminal`, the group
+    /// is the terminal's foreground group. It may come before the
+    /// trampoline is ready: a headless or ACP harness's trampoline reads
+    /// the line this writes whenever its shell gets to it, and a terminal
+    /// harness's group is continued once its trampoline has stopped. A
+    /// harness released already is left alone.
+    ///
+    /// It fails when the trampoline is gone, ended before its stop, did not
+    /// stop within its deadline, or could not be continued; its group is
+    /// then killed and the harness never ran. A hold that fails after a
+    /// release that was kept kills the group the same way, and the caller
+    /// sees the trampoline's end where it would have seen the harness's.
+    ///
+    /// An ACP agent gets its first message only now: the adapter's driver
+    /// waits for this before the handshake, then opens or continues the
+    /// session and sends the prompt, and tells the caller through
+    /// `take_turn`.
     pub fn release(&mut self) -> Result<(), HarnessError> {
-        if self.held {
-            crate::process::continue_group(self.pid)?;
-            self.held = false;
-        }
+        self.hold.release()?;
+        self.held = false;
         Ok(())
+    }
+
+    /// The events of the turn the launch started, for an adapter that
+    /// drives its harness over a protocol (an ACP agent); `None` for one
+    /// whose turn its caller reads from the harness's own output, and
+    /// once taken.
+    pub fn take_turn(&mut self) -> Option<TurnFeed> {
+        self.turn.take()
     }
 
     /// The process id, which is also the id of the process group the
@@ -352,7 +479,8 @@ impl Running {
         self.pid
     }
 
-    /// The session the process continues, when known at launch.
+    /// The session the process continues: known at launch, except for a
+    /// new ACP session, which the turn's feed names once the agent runs.
     #[must_use]
     pub fn session(&self) -> Option<&SessionId> {
         self.session.as_ref()
@@ -366,6 +494,13 @@ impl Running {
     }
 }
 
+/// The most bytes of a turn's answer a report holds: the longest line a
+/// headless Claude or Codex run prints its answer on, which the CLI reads
+/// whole or not at all. An ACP agent's answer arrives in chunks, of any
+/// number, so its driver keeps the first `MAX_ANSWER` bytes and counts
+/// the rest in `TurnReport::answer_left_out`.
+pub const MAX_ANSWER: usize = 16 * 1024 * 1024;
+
 /// What a headless run printed about its turn, as its adapter reads it
 /// line by line (`ClaudeCode::read_headless_line`,
 /// `Codex::read_headless_line`).
@@ -373,8 +508,11 @@ impl Running {
 pub struct TurnReport {
     /// The session the harness says the turn ran in.
     pub session: Option<SessionId>,
-    /// The last answer of the turn.
+    /// The last answer of the turn, at most `MAX_ANSWER` bytes.
     pub answer: Option<String>,
+    /// Bytes of the answer left out after its first `MAX_ANSWER`, which
+    /// only an ACP agent's driver counts; zero when nothing was.
+    pub answer_left_out: u64,
     /// Why the turn failed, when the harness says it did.
     pub failure: Option<String>,
 }

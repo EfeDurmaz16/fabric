@@ -1,0 +1,7 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "managed_unavailable"
+  },
+  "message": "the managed authority is stopped: the journal is corrupt at job 01JABCDEFGHJKMNPQRSTVWXYZ0: event 7 does not link to the one before"
+}

@@ -214,14 +214,26 @@ pub struct StoredFile {
 }
 
 /// The object files of one store.
+///
+/// Every method takes `&self`, so threads that share the store write and
+/// read objects at once: an object is a file that reaches its name whole
+/// and is never rewritten, and two writers of the same bytes agree on it.
 #[derive(Debug)]
 pub struct ObjectStore {
     objects_dir: PathBuf,
     tmp_dir: PathBuf,
     params: ChunkParams,
-    dirty_shards: Mutex<HashSet<u8>>,
-    /// Objects this process linked since the last `flush_shards`; their bytes are the ones it hashed.
-    fresh: Mutex<HashSet<ChunkId>>,
+    pending: Mutex<Pending>,
+}
+
+/// What the next `flush_shards` owes, behind one lock, so an object is
+/// fresh only while its shard is still owed the flush.
+#[derive(Debug, Default)]
+struct Pending {
+    /// Shards with an entry not yet flushed.
+    dirty: HashSet<u8>,
+    /// Objects this process linked whose shard is in `dirty`; their bytes are the ones it hashed.
+    fresh: HashSet<ChunkId>,
 }
 
 impl ObjectStore {
@@ -230,9 +242,12 @@ impl ObjectStore {
             objects_dir: store_root.join("objects"),
             tmp_dir: store_root.join("tmp"),
             params,
-            dirty_shards: Mutex::new(HashSet::new()),
-            fresh: Mutex::new(HashSet::new()),
+            pending: Mutex::new(Pending::default()),
         }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Creates `objects/`, all 256 shard directories and `tmp/`, and flushes `objects/`.
@@ -296,13 +311,15 @@ impl ObjectStore {
             zstd::bulk::compress(bytes, self.params.zstd_level).map_err(|e| io_err(&path, e))?;
         let published = durable::publish_noclobber(&self.tmp_dir, &path, &compressed)
             .map_err(|e| io_err(&path, e))?;
-        if published == Published::New {
-            self.fresh
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(id);
+        {
+            // Marked and made fresh at once, so a flush that takes the
+            // shard takes the object with it.
+            let mut pending = self.pending();
+            pending.dirty.insert(shard_of(id));
+            if published == Published::New {
+                pending.fresh.insert(id);
+            }
         }
-        self.mark_dirty(id);
         Ok(StoredChunk {
             id,
             stored_len: compressed.len() as u64,
@@ -477,16 +494,13 @@ impl ObjectStore {
         }
     }
 
-    /// True when this process linked the object since the last `flush_shards`.
+    /// True when this process linked the object and its shard is still owed a flush.
     ///
-    /// Such an object holds the bytes `put` hashed, and its shard is already
-    /// marked. Any other object without a catalog row may have been linked
-    /// by a process that died before its flush.
+    /// Such an object holds the bytes `put` hashed, and the next flush
+    /// covers its shard. Any other object without a catalog row may have
+    /// been linked by a process that died before its flush.
     pub(crate) fn is_fresh(&self, id: ChunkId) -> bool {
-        self.fresh
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&id)
+        self.pending().fresh.contains(&id)
     }
 
     /// Records that the shard holding `id` has an entry the next `flush_shards` must flush.
@@ -496,39 +510,28 @@ impl ObjectStore {
     /// file may have been linked by a process that was killed before its
     /// flush, and only a catalog row proves a shard was flushed after it.
     pub(crate) fn mark_dirty(&self, id: ChunkId) {
-        self.mark_dirty_shard(id.to_bytes()[0]);
+        self.pending().dirty.insert(shard_of(id));
     }
 
     /// Flushes every shard directory marked dirty since the last call.
+    ///
+    /// It takes the owed shards and the fresh objects together, so an
+    /// object `put` on another thread meanwhile stays fresh and owed to
+    /// the next flush. The store runs one flush at a time.
     pub(crate) fn flush_shards(&self) -> Result<(), ObjectError> {
-        let shards: Vec<u8> = self
-            .dirty_shards
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain()
-            .collect();
+        let taken = std::mem::take(&mut *self.pending());
+        let shards: Vec<u8> = taken.dirty.iter().copied().collect();
         for (index, shard) in shards.iter().enumerate() {
             let dir = self.objects_dir.join(format!("{shard:02x}"));
             if let Err(e) = durable::fsync_dir(&dir) {
-                // These shards stay owed a flush, and their objects stay fresh.
-                for owed in &shards[index..] {
-                    self.mark_dirty_shard(*owed);
-                }
+                // These shards stay owed a flush, and the objects taken stay fresh.
+                let mut pending = self.pending();
+                pending.dirty.extend(&shards[index..]);
+                pending.fresh.extend(taken.fresh);
                 return Err(io_err(&dir, e));
             }
         }
-        self.fresh
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
         Ok(())
-    }
-
-    fn mark_dirty_shard(&self, shard: u8) {
-        self.dirty_shards
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(shard);
     }
 
     /// Removes an object file; a missing file is not an error.
@@ -574,6 +577,11 @@ impl ObjectStore {
         }
         Ok(found)
     }
+}
+
+/// The shard directory an object's name is in: its first byte.
+fn shard_of(id: ChunkId) -> u8 {
+    id.to_bytes()[0]
 }
 
 impl StoredFile {

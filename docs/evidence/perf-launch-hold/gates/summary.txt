@@ -1,0 +1,53 @@
+branch head: 1091071d090ce6ea9c792f4d49753fb76cbcb4ea (fmt, hygiene and the fabricd tests ran there; the rest on 14c2d0f, which differs from it by one ADR paragraph)
+== fmt: cargo fmt --all --check
+   rc=0 secs=1
+== clippy: cargo clippy --workspace --all-targets --locked -- -D warnings
+   rc=0 secs=7
+== clippy-feature-none: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features  -- -D warnings
+   rc=0 secs=0
+== clippy-feature-acp: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features acp -- -D warnings
+   rc=0 secs=1
+== clippy-feature-claude: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features claude -- -D warnings
+   rc=0 secs=0
+== clippy-feature-codex: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features codex -- -D warnings
+   rc=0 secs=3
+== doc: env RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked
+   rc=0 secs=6
+== deny: cargo deny check
+   rc=0 secs=1
+== hygiene: scripts/check-hygiene.sh origin/main
+   rc=0 secs=1
+== budgetcheck: scripts/check-budget.sh origin/main
+   rc=0 secs=0
+== fixtures: scripts/check-fixtures.sh origin/main
+   rc=0 secs=3
+== test: cargo test -p fabric-harness --locked (default features, three rounds)
+   rc=0
+== test-feature-acp: cargo test -p fabric-harness --no-default-features --features acp --locked
+   rc=0
+== test-feature-claude: cargo test -p fabric-harness --no-default-features --features claude --locked
+   rc=0
+== test-feature-codex: cargo test -p fabric-harness --no-default-features --features codex --locked
+   rc=0
+== test-fabricd: cargo test -p fabricd --locked
+   rc=0 secs=109
+== e2e: cargo test -p fabric --test e2e --locked
+   rc=0 secs=122
+== budget: FABRIC_BUDGET=report cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+   rc=0 secs=243
+== test-hygiene: scripts/test-check-hygiene.sh
+   rc=0 secs=8
+== test-budget-script: scripts/test-check-budget.sh
+   rc=0 secs=13
+== test-fixtures-script: scripts/test-check-fixtures.sh
+   rc=0 secs=47
+== build-fabric: cargo build -p fabric --locked
+   rc=0 secs=25
+== sdk-install: bun install --frozen-lockfile
+   rc=0 secs=1
+== sdk-typecheck: bun run typecheck
+   rc=0 secs=2
+== sdk-build: bun run build
+   rc=0 secs=2
+== sdk-test: env FABRIC_BIN=$PWD/../../target/debug/fabric bun test
+   rc=0 secs=9

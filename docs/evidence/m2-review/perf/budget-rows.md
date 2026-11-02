@@ -1,0 +1,42 @@
+run 1 | acp suspend | 345 | 348 | 342 | 444 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 1 | acp move | 139 | 143 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 1 | acp resume | 533 | 644 | 545 | 708 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 1 | acp pull | 966 | 1116 | 995 | 1293 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 1 | claude suspend | 405 | 408 | 407 | 529 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 1 | claude move | 140 | 146 | 145 | 195 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 1 | claude resume | 699 | 798 | 684 | 889 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 1 | claude pull | 1205 | 1362 | 1221 | 1587 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 1 | codex suspend | 603 | 625 | 550 | 715 | - | git 28/30, kill 0/0, lsof 1/1, pgrep 0/0, ps 0/0 | within |
+run 1 | codex move | 149 | 151 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 1 | codex resume | 915 | 1001 | 836 | 1086 | - | git 17/21, kill 0/0, lsof 1/1, pgrep 0/0, ps 3/3 | within |
+run 1 | codex pull | 1631 | 1724 | 1486 | 1931 | - | git 51/55, kill 0/0, lsof 2/2, pgrep 0/0, ps 3/3 | within |
+run 1 | cold start | 55 | 58 | 57 | 107 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 1 | restart | 72 | 74 | 78 | 128 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 2 | acp suspend | 346 | 351 | 342 | 444 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 2 | acp move | 141 | 142 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 2 | acp resume | 548 | 658 | 545 | 708 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 2 | acp pull | 988 | 1126 | 995 | 1293 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 2 | claude suspend | 404 | 413 | 407 | 529 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 2 | claude move | 141 | 142 | 145 | 195 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 2 | claude resume | 694 | 819 | 684 | 889 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 2 | claude pull | 1234 | 1350 | 1221 | 1587 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 2 | codex suspend | 601 | 613 | 550 | 715 | - | git 28/30, kill 0/0, lsof 1/1, pgrep 0/0, ps 0/0 | within |
+run 2 | codex move | 140 | 146 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 2 | codex resume | 896 | 1020 | 836 | 1086 | - | git 17/21, kill 0/0, lsof 1/1, pgrep 0/0, ps 3/3 | within |
+run 2 | codex pull | 1596 | 1737 | 1486 | 1931 | - | git 51/55, kill 0/0, lsof 2/2, pgrep 0/0, ps 3/3 | within |
+run 2 | cold start | 57 | 57 | 57 | 107 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 2 | restart | 75 | 86 | 78 | 128 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 3 | acp suspend | 335 | 344 | 342 | 444 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 3 | acp move | 140 | 143 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 3 | acp resume | 517 | 653 | 545 | 708 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 3 | acp pull | 945 | 1112 | 995 | 1293 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 3 | claude suspend | 394 | 411 | 407 | 529 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 3 | claude move | 142 | 142 | 145 | 195 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 3 | claude resume | 694 | 814 | 684 | 889 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 3 | claude pull | 1220 | 1348 | 1221 | 1587 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | within |
+run 3 | codex suspend | 600 | 606 | 550 | 715 | - | git 28/30, kill 0/0, lsof 1/1, pgrep 0/0, ps 0/0 | within |
+run 3 | codex move | 142 | 143 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 3 | codex resume | 904 | 1019 | 836 | 1086 | - | git 17/21, kill 0/0, lsof 1/1, pgrep 0/0, ps 3/3 | within |
+run 3 | codex pull | 1580 | 1770 | 1486 | 1931 | - | git 51/55, kill 0/0, lsof 2/2, pgrep 0/0, ps 3/3 | within |
+run 3 | cold start | 57 | 57 | 57 | 107 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |
+run 3 | restart | 71 | 87 | 78 | 128 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | within |

@@ -21,7 +21,11 @@
 //! record (gate finding F10a). Record shapes, read from the owner's
 //! rollouts on 2026-10-21 (key names and setting values only): every turn
 //! writes `{"type":"turn_context","payload":{"model","effort",
-//! "approval_policy","sandbox_policy":{"type",...},...}}`, and every file
+//! "approval_policy","sandbox_policy":{"type",...},...}}`, whose
+//! `workspace-write` policy also holds `network_access`,
+//! `exclude_tmpdir_env_var`, `exclude_slash_tmp` and, unless empty,
+//! `writable_roots` (read on 2026-10-28 from the owner's rollouts, field
+//! names and value types only), and every file
 //! starts with `{"type":"session_meta","payload":{"cli_version",
 //! "model_provider",...}}`; a `turn_context` names no provider. A
 //! thread a parent spawned holds the parent's `session_meta` as a second
@@ -63,7 +67,9 @@ use crate::jsontext;
 use crate::redact::Redactor;
 use crate::version::HarnessVersion;
 
-use super::overrides::{ApprovalPolicy, ApprovalsReviewer, Effort, ProviderId, SandboxMode};
+use super::overrides::{
+    ApprovalPolicy, ApprovalsReviewer, Effort, ProviderId, SandboxMode, WritableRoot, WritableRoots,
+};
 
 /// What a rollout file name says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +360,11 @@ pub(crate) struct RecordedSettings {
     pub(crate) reviewer: Recorded<ApprovalsReviewer>,
     /// The sandbox of the last turn, or of a change after it.
     pub(crate) sandbox: Recorded<SandboxMode>,
+    /// What that sandbox let commands write beyond the workspace, for a
+    /// `workspace-write` one (M2-21).
+    pub(crate) writable: Recorded<WritableRoots>,
+    /// Whether that sandbox let commands reach the network.
+    pub(crate) network: Recorded<bool>,
     /// The highest `cli_version` any `session_meta` line records: the
     /// newest Codex that created a file of the lineage.
     pub(crate) writer: Option<HarnessVersion>,
@@ -501,11 +512,118 @@ fn profile_writes_workspace(profile: &serde_json::Value, cwd: Option<&str>) -> b
     nearest.is_some_and(|(_, writes)| writes)
 }
 
-/// The last `turn_context` read so far: its sandbox, the permission
-/// profile it recorded beside it, and its working directory.
+/// Why a read-only sandbox's network access is not carried.
+const READ_ONLY_NETWORK: &str =
+    "codex 0.155.1 takes no network access for a read-only sandbox from its configuration";
+
+/// Why the writable roots of a permission profile set between turns are
+/// not carried.
+const PROFILE_ROOTS: &str =
+    "set between turns as a permission profile, whose writable roots Fabric does not read";
+
+/// A `sandbox_policy` field that is true or false; `None` when missing or
+/// `null`, and an error naming it when it is anything else.
+fn flag(policy: &serde_json::Value, name: &str) -> Result<Option<bool>, String> {
+    match policy.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(on)) => Ok(Some(*on)),
+        Some(other) => Err(format!("{name} {}", shown(other))),
+    }
+}
+
+/// What a `workspace-write` sandbox's record says it may write beyond the
+/// workspace: the roots, which a record omits when there are none, and
+/// the temporary folders it leaves out. Absent when the record holds
+/// none of these fields, as from a Codex that did not record them.
+fn writable(policy: &serde_json::Value) -> Recorded<WritableRoots> {
+    let fields = [
+        "writable_roots",
+        "network_access",
+        "exclude_tmpdir_env_var",
+        "exclude_slash_tmp",
+    ];
+    if !fields.iter().any(|name| policy.get(name).is_some()) {
+        return Recorded::Absent;
+    }
+    let not_carried = |value: String, reason: &str| Recorded::NotCarried {
+        value,
+        reason: reason.to_owned(),
+    };
+    let roots = match policy.get("writable_roots") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(roots)) => {
+            let mut parsed = Vec::with_capacity(roots.len());
+            for root in roots {
+                let Some(text) = root.as_str() else {
+                    return not_carried(shown(root), "a writable root that is not text");
+                };
+                match WritableRoot::parse(text) {
+                    Ok(root) => parsed.push(root),
+                    Err(why) => return not_carried(text.to_owned(), &format!("a root {why}")),
+                }
+            }
+            parsed
+        }
+        Some(other) => return not_carried(shown(other), "not a list of folders"),
+    };
+    let excludes = flag(policy, "exclude_tmpdir_env_var")
+        .and_then(|tmpdir| Ok((tmpdir, flag(policy, "exclude_slash_tmp")?)));
+    match excludes {
+        Ok((exclude_tmpdir_env_var, exclude_slash_tmp)) => Recorded::Carried(WritableRoots {
+            roots,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+        }),
+        Err(field) => not_carried(field, "not true or false"),
+    }
+}
+
+/// What a turn's `sandbox_policy` says beyond its mode: the writable roots
+/// of a `workspace-write` one, and its network access, which only a
+/// `workspace-write` one can carry.
+fn access(policy: Option<&serde_json::Value>) -> (Recorded<WritableRoots>, Recorded<bool>) {
+    let Some(policy) = policy.filter(|policy| policy.is_object()) else {
+        return (Recorded::Absent, Recorded::Absent);
+    };
+    let network = match flag(policy, "network_access") {
+        Ok(None) => Recorded::Absent,
+        Ok(Some(on)) => Recorded::Carried(on),
+        Err(field) => Recorded::NotCarried {
+            value: field,
+            reason: "not true or false".to_owned(),
+        },
+    };
+    match policy["type"].as_str() {
+        Some("workspace-write") => (writable(policy), network),
+        Some("read-only") if network == Recorded::Carried(true) => (
+            Recorded::Absent,
+            Recorded::NotCarried {
+                value: "on".to_owned(),
+                reason: READ_ONLY_NETWORK.to_owned(),
+            },
+        ),
+        _ => (Recorded::Absent, Recorded::Absent),
+    }
+}
+
+/// A permission profile's network access: `enabled` or `restricted`;
+/// `None` for anything else.
+fn profile_network(profile: &serde_json::Value) -> Option<bool> {
+    match profile["network"].as_str() {
+        Some("enabled") => Some(true),
+        Some("restricted") => Some(false),
+        _ => None,
+    }
+}
+
+/// The last `turn_context` read so far: its sandbox and what that allowed
+/// beyond the workspace, the permission profile it recorded beside it, and
+/// its working directory.
 #[derive(Default)]
 struct LastTurn {
     sandbox: Recorded<SandboxMode>,
+    writable: Recorded<WritableRoots>,
+    network: Recorded<bool>,
     profile: Option<serde_json::Value>,
     cwd: Option<String>,
 }
@@ -519,8 +637,11 @@ impl RecordedSettings {
         self.reviewer = reviewer(payload.get("approvals_reviewer"));
         let policy = payload.get("sandbox_policy");
         self.sandbox = sandbox(policy.and_then(|policy| policy.get("type")).or(policy));
+        (self.writable, self.network) = access(policy);
         *turn = LastTurn {
             sandbox: self.sandbox.clone(),
+            writable: self.writable.clone(),
+            network: self.network.clone(),
             profile: payload.get("permission_profile").cloned(),
             cwd: payload["cwd"].as_str().map(str::to_owned),
         };
@@ -535,7 +656,9 @@ impl RecordedSettings {
     /// turns is not widened back; otherwise not carried, a profile that
     /// writes only outside the workspace included, so it is never widened
     /// to the workspace. A snapshot with no profile leaves the sandbox as
-    /// it was.
+    /// it was. The writable roots and network access are the last turn's
+    /// with its profile; with another, the network access is the
+    /// profile's and its writable roots are not carried.
     fn take_snapshot(&mut self, settings: &serde_json::Value, turn: &LastTurn) {
         self.model = model(settings.get("model"));
         self.provider = provider(settings.get("model_provider_id"));
@@ -547,26 +670,45 @@ impl RecordedSettings {
             Some(profile) => profile,
         };
         let cwd = settings["cwd"].as_str().or(turn.cwd.as_deref());
-        self.sandbox = if turn.profile.as_ref() == Some(profile) {
-            turn.sandbox.clone()
-        } else {
-            match profile_writes(profile) {
-                Some(false) => Recorded::Carried(SandboxMode::ReadOnly),
-                Some(true)
-                    if turn.sandbox == Recorded::Carried(SandboxMode::WorkspaceWrite)
-                        && profile_writes_workspace(profile, cwd) =>
-                {
-                    Recorded::Carried(SandboxMode::WorkspaceWrite)
+        if turn.profile.as_ref() == Some(profile) {
+            self.sandbox = turn.sandbox.clone();
+            self.writable = turn.writable.clone();
+            self.network = turn.network.clone();
+            return;
+        }
+        self.writable = Recorded::Absent;
+        self.network = Recorded::Absent;
+        self.sandbox = match profile_writes(profile) {
+            Some(false) => {
+                if profile_network(profile) == Some(true) {
+                    self.network = Recorded::NotCarried {
+                        value: "on".to_owned(),
+                        reason: READ_ONLY_NETWORK.to_owned(),
+                    };
                 }
-                _ if profile["type"] == "disabled" => Recorded::NotCarried {
-                    value: "danger-full-access".to_owned(),
-                    reason: FULL_ACCESS.to_owned(),
-                },
-                _ => Recorded::NotCarried {
-                    value: shown(&profile["type"]),
-                    reason: PROFILE_UNNAMED.to_owned(),
-                },
+                Recorded::Carried(SandboxMode::ReadOnly)
             }
+            Some(true)
+                if turn.sandbox == Recorded::Carried(SandboxMode::WorkspaceWrite)
+                    && profile_writes_workspace(profile, cwd) =>
+            {
+                self.writable = Recorded::NotCarried {
+                    value: shown(&profile["type"]),
+                    reason: PROFILE_ROOTS.to_owned(),
+                };
+                if let Some(on) = profile_network(profile) {
+                    self.network = Recorded::Carried(on);
+                }
+                Recorded::Carried(SandboxMode::WorkspaceWrite)
+            }
+            _ if profile["type"] == "disabled" => Recorded::NotCarried {
+                value: "danger-full-access".to_owned(),
+                reason: FULL_ACCESS.to_owned(),
+            },
+            _ => Recorded::NotCarried {
+                value: shown(&profile["type"]),
+                reason: PROFILE_UNNAMED.to_owned(),
+            },
         };
     }
 }
@@ -829,6 +971,10 @@ mod tests {
                 approval: Recorded::Carried(ApprovalPolicy::OnRequest),
                 reviewer: Recorded::Carried(ApprovalsReviewer::AutoReview),
                 sandbox: Recorded::Carried(SandboxMode::WorkspaceWrite),
+                // The turn records its network access, so the roots it
+                // omits are none.
+                writable: Recorded::Carried(WritableRoots::default()),
+                network: Recorded::Carried(false),
                 writer: Some(HarnessVersion::parse("0.163.0-alpha.10.2").unwrap()),
             }
         );
@@ -870,6 +1016,145 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let suffix = format!("{}{}", meta("0.155.1", Some(THREAD)), records.concat());
         recorded(&lineage(dir.path(), &meta("0.155.1", None), &suffix)).unwrap()
+    }
+
+    /// A turn whose `sandbox_policy` is `json`.
+    fn turn_with_policy(json: &str) -> String {
+        format!(
+            "{{\"type\":\"turn_context\",\"payload\":{{\"cwd\":\"/w\",\"sandbox_policy\":{json}}}}}\n"
+        )
+    }
+
+    /// M2-21: a turn records what its sandbox allowed beyond the
+    /// workspace, and the read keeps it: the writable roots, which a
+    /// record omits when there are none, the temporary folders it leaves
+    /// out, and the network access. A record that holds none of them, from
+    /// a Codex that did not record them, says nothing; a root that is not
+    /// an absolute path, or a flag that is not true or false, is not
+    /// carried, and neither is a read-only sandbox's network access, which
+    /// Codex takes from no configuration.
+    #[test]
+    fn a_turn_s_writable_roots_and_network_access_are_read() {
+        let read = read_suffix(&[turn_with_policy(
+            r#"{"type":"workspace-write","writable_roots":["/w/extra","/tmp/a \"b\""],"network_access":true,"exclude_tmpdir_env_var":true,"exclude_slash_tmp":false}"#,
+        )]);
+        assert_eq!(
+            read.writable,
+            Recorded::Carried(WritableRoots {
+                roots: vec![
+                    WritableRoot::parse("/w/extra").unwrap(),
+                    WritableRoot::parse("/tmp/a \"b\"").unwrap(),
+                ],
+                exclude_tmpdir_env_var: Some(true),
+                exclude_slash_tmp: Some(false),
+            })
+        );
+        assert_eq!(read.network, Recorded::Carried(true));
+
+        let read = read_suffix(&[turn_with_policy(
+            r#"{"type":"workspace-write","network_access":false,"exclude_tmpdir_env_var":false,"exclude_slash_tmp":false}"#,
+        )]);
+        assert_eq!(
+            read.writable,
+            Recorded::Carried(WritableRoots {
+                roots: Vec::new(),
+                exclude_tmpdir_env_var: Some(false),
+                exclude_slash_tmp: Some(false),
+            })
+        );
+        assert_eq!(read.network, Recorded::Carried(false));
+
+        let read = read_suffix(&[turn_with_policy(r#"{"type":"workspace-write"}"#)]);
+        assert_eq!(
+            (read.writable, read.network),
+            (Recorded::Absent, Recorded::Absent)
+        );
+
+        let read = read_suffix(&[turn_with_policy(
+            r#"{"type":"workspace-write","writable_roots":["relative/dir"],"network_access":false}"#,
+        )]);
+        assert_eq!(
+            reason(&read.writable),
+            "relative/dir: a root not an absolute path"
+        );
+        assert_eq!(read.network, Recorded::Carried(false));
+
+        let read = read_suffix(&[turn_with_policy(
+            r#"{"type":"workspace-write","network_access":"yes","exclude_slash_tmp":1}"#,
+        )]);
+        assert_eq!(
+            reason(&read.network),
+            "network_access yes: not true or false"
+        );
+        assert_eq!(
+            reason(&read.writable),
+            "exclude_slash_tmp 1: not true or false"
+        );
+
+        let read = read_suffix(&[turn_with_policy(
+            r#"{"type":"read-only","network_access":true}"#,
+        )]);
+        assert_eq!(read.sandbox, Recorded::Carried(SandboxMode::ReadOnly));
+        assert_eq!(read.writable, Recorded::Absent);
+        assert_eq!(reason(&read.network), format!("on: {READ_ONLY_NETWORK}"));
+        let read = read_suffix(&[turn_with_policy(r#"{"type":"read-only"}"#)]);
+        assert_eq!(
+            (read.writable, read.network),
+            (Recorded::Absent, Recorded::Absent)
+        );
+        let read = read_suffix(&[turn_with_policy(r#"{"type":"danger-full-access"}"#)]);
+        assert_eq!(
+            (read.writable, read.network),
+            (Recorded::Absent, Recorded::Absent)
+        );
+    }
+
+    /// A settings change that keeps the last turn's permission profile
+    /// keeps what the turn's sandbox allowed; one that sets another profile
+    /// names the network access the profile records, but not its writable
+    /// roots, and a read-only profile that reaches the network is not
+    /// carried.
+    #[test]
+    fn a_profile_set_between_turns_keeps_or_reports_the_turn_s_access() {
+        let ww = profile(&["/w"]);
+        let full = r#"{"type":"workspace-write","writable_roots":["/w/extra"],"network_access":true,"exclude_tmpdir_env_var":false,"exclude_slash_tmp":false}"#;
+        let turn = format!(
+            "{{\"type\":\"turn_context\",\"payload\":{{\"cwd\":\"/w\",\"sandbox_policy\":{full},\"permission_profile\":{ww}}}}}\n"
+        );
+        let kept = read_suffix(&[
+            turn.clone(),
+            applied("gpt-6-sol", "high", "on-request", "user", &ww),
+        ]);
+        assert_eq!(kept.network, Recorded::Carried(true));
+        assert!(matches!(&kept.writable, Recorded::Carried(w) if w.roots.len() == 1));
+
+        let other = profile(&["/w", "/w/other"])
+            .replace("\"network\":\"restricted\"", "\"network\":\"enabled\"");
+        let changed = read_suffix(&[
+            turn.clone(),
+            applied("gpt-6-sol", "high", "on-request", "user", &other),
+        ]);
+        assert_eq!(
+            changed.sandbox,
+            Recorded::Carried(SandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            reason(&changed.writable),
+            format!("managed: {PROFILE_ROOTS}")
+        );
+        assert_eq!(changed.network, Recorded::Carried(true));
+
+        let reaches = profile(&[]).replace("\"network\":\"restricted\"", "\"network\":\"enabled\"");
+        let read_only = read_suffix(&[
+            turn,
+            applied("gpt-6-sol", "high", "on-request", "user", &reaches),
+        ]);
+        assert_eq!(read_only.sandbox, Recorded::Carried(SandboxMode::ReadOnly));
+        assert_eq!(read_only.writable, Recorded::Absent);
+        assert_eq!(
+            reason(&read_only.network),
+            format!("on: {READ_ONLY_NETWORK}")
+        );
     }
 
     /// The provider that served the model is the newest `session_meta`'s

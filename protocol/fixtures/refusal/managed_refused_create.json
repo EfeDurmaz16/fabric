@@ -1,0 +1,10 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "managed_refused",
+    "refusal": "bad_envelope",
+    "operation_key": "create-1",
+    "replayed": true
+  },
+  "message": "the envelope's job does not fit the command"
+}

@@ -3,7 +3,9 @@
 //! and restore.
 //!
 //! Invariant: nothing the catalog names is missing from disk, and nothing a
-//! restore writes lands outside the directory it was asked to create. Every
+//! restore writes lands outside the directory it was asked to create, but
+//! the store's own bundle cache, which holds only what the store's bundles
+//! can make again and is checked before each use. Every
 //! object is written to a temp file, flushed and linked into place under its
 //! blake3 name, never rewritten; the catalog gets its rows only after the
 //! shard directories are flushed; gc deletes a row before its file. Capture
@@ -17,6 +19,7 @@
 //! capture and records the snapshot in the ledger afterwards, so the ledger
 //! stays the commit point (ADR 0002).
 
+mod bundle_cache;
 pub mod capture;
 pub mod catalog;
 mod checkpoint;

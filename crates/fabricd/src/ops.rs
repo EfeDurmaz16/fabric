@@ -33,6 +33,7 @@ use fabric_core::snapshot::{LeaveReason, SnapshotManifest};
 use fabric_core::version::HarnessVersion;
 use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::HarnessError;
+use fabric_harness::claude::VersionAhead;
 use fabric_harness::codex::Codex;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_net::peers::HostPort;
@@ -54,7 +55,10 @@ use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, Probes, Tool, stayed_behind};
 use crate::faults::{self, Action, Point};
-use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
+use crate::harnesses::{
+    HarnessConfig, HarnessEnv, adapter, adapter_with_installed, ask_installed_ahead,
+    refuse_secret_kind,
+};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
@@ -85,6 +89,14 @@ const LIST_BUDGET: usize = fabric_client::frame::MAX_FRAME / 2;
 
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
+
+/// What a push sent: the whole ledger, or the records after the last one
+/// the peer accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pushed {
+    Whole,
+    Suffix,
+}
 
 /// One answer in the offer loop: to the offer itself, or to a later `MoveStatus`.
 #[derive(Debug)]
@@ -151,17 +163,24 @@ impl Node {
                 planned,
                 version,
             } => Reply::HarnessStarted(
-                self.harness_started(StartedHarness {
-                    job,
-                    epoch,
-                    pid,
-                    harness,
-                    session,
-                    planned,
-                    version,
-                })
+                self.harness_started(
+                    StartedHarness {
+                        job,
+                        epoch,
+                        pid,
+                        harness,
+                        session,
+                        planned,
+                        version,
+                    },
+                    out,
+                )
                 .await?,
             ),
+            request @ (Request::ManagedCreate { .. }
+            | Request::ManagedCancel { .. }
+            | Request::ManagedStatus { .. }
+            | Request::ManagedList) => self.managed(request).await?,
             Request::LaunchCheck {
                 job,
                 epoch,
@@ -218,6 +237,12 @@ impl Node {
                 Reply::Doctor {
                     report: self.doctor(peer, job, &env, out).await?,
                 }
+            }
+            Request::JobRepair { job } => Reply::JobRepair(self.job_repair(job, out).await?),
+            Request::JobExport { job, path, env } => {
+                let env = self.client_env(env.as_ref());
+                let path = path.map(|path| PathBuf::from(path.as_str()));
+                Reply::JobExport(self.job_export(job, path, &env, out).await?)
             }
         })
     }
@@ -335,7 +360,7 @@ impl Node {
         refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
-        let synced = self.synced_folders(&self.node_env()).await;
+        let synced = self.synced_folders(&root, &self.node_env()).await;
         check_root(&root, &self.cfg.home, synced)?;
         // Built before the clone: a goal past the record bound refuses
         // here, not after a clone that no job and no printed id names.
@@ -416,9 +441,9 @@ impl Node {
         for job in jobs {
             let job = job.lock().await;
             let manifest = job.ledger().manifest();
-            let standing = match job.forked() {
-                Ok(Some(_)) => Standing::Frozen,
-                Ok(None) => standing(&job.view(self.id)),
+            let standing = match job.is_frozen() {
+                Ok(true) => Standing::Frozen,
+                Ok(false) => standing(&job.view(self.id)),
                 Err(_) => Standing::Unreadable,
             };
             listed.push(Listed::Job(JobSummary {
@@ -606,6 +631,7 @@ impl Node {
                 pid: record.pid,
             });
         }
+        session_ahead(job.session()?, Some(job.harness()), &marker.root, out);
         plan(
             &job,
             token.epoch,
@@ -671,9 +697,17 @@ impl Node {
     /// leaves no version in it, and the capture's own version check runs
     /// from the daemon, where a version manager's shim can pick another
     /// Codex than the one the workspace pins.
+    ///
+    /// Once the record is durable it says so with `harness_recorded`, so a
+    /// CLI that holds a harness not wired to a terminal can let it start
+    /// while the rest of the registration is written. The job's lock is
+    /// held until the end, so no suspend or move sees the job in between,
+    /// and a registration that fails after the event still fails: the CLI
+    /// then kills the group, which ran only while it was recorded.
     pub(crate) async fn harness_started(
         &self,
         started: StartedHarness,
+        out: &mut Out,
     ) -> Result<Registered, NodeError> {
         let StartedHarness {
             job: id,
@@ -708,20 +742,22 @@ impl Node {
         // The setup steps ran after the CLI's check, and an earlier
         // headless turn may have named its session meanwhile.
         refuse_moved_session(&job, &harness, planned.as_ref())?;
-        if !local::leads_group(pid).await {
+        if !local::leads_group(pid) {
             return Err(NodeError::HarnessGone { pid });
         }
         let started = local::process_started(pid)
             .await
             .ok_or(NodeError::HarnessGone { pid })?;
-        local::write(
-            &job.dir().harness(),
-            &HarnessRecord {
-                epoch,
-                pid,
-                started,
-            },
-        )?;
+        job.set_harness_record(&HarnessRecord {
+            epoch,
+            pid,
+            started,
+        })?;
+        out.emit(Event::HarnessRecorded { pid });
+        // The writes below are synchronous, and the task that relays the
+        // event to the client was woken on this worker, where no other
+        // worker can take it: without a yield it would wait for them all.
+        tokio::task::yield_now().await;
         // The session is recorded as pending before `Resumed` and moved into
         // place after it, so a crash between the two does not leave a
         // `Resumed` whose session a later capture would miss.
@@ -816,9 +852,11 @@ impl Node {
             && record.pid == pid
         {
             // The record stands for the group: a background process the
-            // harness started keeps it, so a suspend still stops it.
+            // harness started keeps it, so a suspend still stops it. A
+            // record of a group that is gone needs no flushed removal: one a
+            // crash brings back names a process every reader finds gone.
             if record.liveness().await == Liveness::Gone {
-                local::remove(&job.dir().harness())?;
+                job.forget_gone_harness()?;
             } else {
                 tracing::info!(job = %id, pid, "the harness exited and its group still runs");
             }
@@ -895,7 +933,7 @@ impl Node {
                 out.emit(Event::StoppingHarness { pid: record.pid });
                 record.stop(STOP_GRACE).await?;
             }
-            local::remove(&job.dir().harness())?;
+            job.clear_harness_record()?;
         }
         faults::hit(Point::AfterQuiesce).await;
 
@@ -1099,6 +1137,12 @@ impl Node {
     }
 
     /// Captures the harness state and the workspace and publishes them as one snapshot.
+    ///
+    /// The harness's capture, which asks the harness its `--version` and
+    /// copies its state, and the workspace's detection with the node facts
+    /// it reads depend on nothing of each other, so they run at once; a
+    /// failure of the harness's capture is reported first, as when they
+    /// ran one after the other.
     async fn capture(
         &self,
         job: &Job,
@@ -1106,37 +1150,33 @@ impl Node {
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
-        let harness_state = self.capture_harness(job, root, env, out).await?;
-        // A workspace whose environment does not detect here would not
-        // materialize on the target either, so the snapshot is refused
-        // before it is published or moved.
-        // A pattern the job ever added stays: removing its line from
-        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets). The
-        // node that recorded it may be another one; the spec of the job's
-        // latest snapshot travels with the job and holds what it recorded.
-        let parent = job.latest();
-        let mut recorded: Vec<fabric_core::secret::SecretPattern> =
-            local::read(&job.dir().secret_patterns())?.unwrap_or_default();
-        if let Some(parent) = parent {
-            let travelled = with_store(&self.store, move |store| {
-                let manifest = store.manifest(parent)?;
-                Ok(manifest
-                    .env_spec
-                    .map(|spec| store.env_spec(spec))
-                    .transpose()?)
-            })
-            .await?;
-            if let Some(spec) = travelled {
-                recorded.extend(spec.secret_patterns);
-                recorded.sort();
-                recorded.dedup();
+        self.capture_from(job, root, (job.latest(), true), env, out)
+            .await
+    }
+
+    /// `capture` from `parent`, with the harness state of the job's session
+    /// when `with_session` says so: an export of a workspace a restore set
+    /// aside carries none, since the session record then names another
+    /// tenure's session.
+    async fn capture_from(
+        &self,
+        job: &Job,
+        root: &Path,
+        (parent, with_session): (Option<SnapshotId>, bool),
+        env: &ToolEnv,
+        out: &mut Out,
+    ) -> Result<SnapshotId, NodeError> {
+        let harness = async {
+            if with_session {
+                self.capture_harness(job, root, env, out).await
+            } else {
+                Ok(None)
             }
-        }
-        let detection = fabric_env::detect::detect(root, &recorded)?;
-        // Only what the keys read is measured: no login, and no tool of an
-        // ecosystem the workspace does not use (issue #26).
-        let probes = MeasuredKeys::probes(&detection);
-        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
+        };
+        let (harness_state, detected) =
+            tokio::join!(harness, self.detect_for_capture(job, root, parent, env),);
+        let harness_state = harness_state?;
+        let (detection, facts) = detected?;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
@@ -1218,6 +1258,131 @@ impl Node {
         Ok(snapshot)
     }
 
+    /// Captures an orphan workspace of job `id` into a snapshot the job's
+    /// ledger does not name, and pins it with its whole bundle chain
+    /// (`fabric job export`; ADR 0003, Orphans; ADR 0014).
+    ///
+    /// The workspace at the job's root is an orphan when the job is frozen
+    /// here, or when this node does not own the job at the tenure its
+    /// marker was written in: its harness state goes with it, as the
+    /// session record names its session. One a restore set aside under
+    /// `orphan/` beside the root is named by `path`, and goes without,
+    /// since the session record then names a later tenure's session.
+    /// Nothing is moved or deleted, and no ledger record is written.
+    async fn job_export(
+        &self,
+        id: JobId,
+        path: Option<PathBuf>,
+        env: &ToolEnv,
+        out: &mut Out,
+    ) -> Result<fabric_client::api::Exported, NodeError> {
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        let marker = job.marker()?;
+        let (root, with_session) = if let Some(dir) = path {
+            let roots = [
+                marker.as_ref().map(|m| m.root.clone()),
+                Some(paths::job_root(&self.cfg.home, id)),
+                Some(job.dir().fallback_root()),
+            ];
+            if !roots
+                .iter()
+                .flatten()
+                .any(|root| paths::is_orphan_copy(root, &dir))
+                || !dir.is_dir()
+            {
+                return Err(NodeError::NotAnOrphan { job: id, root: dir });
+            }
+            (dir, false)
+        } else {
+            let marker = marker.ok_or(NodeError::NoWorkspace(id))?;
+            let owns_it = match job.view(self.id) {
+                LeaseView::Owner(token) => marker.is_current(token.epoch, job.latest()).await,
+                _ => false,
+            };
+            if owns_it && !job.is_frozen()? {
+                return Err(NodeError::NotAnOrphan {
+                    job: id,
+                    root: marker.root,
+                });
+            }
+            (marker.root, true)
+        };
+        refuse_replaced_root(id, &root)?;
+        let _tree = self.lock_tree(id, &root).await?;
+        if with_session
+            && let Some(record) = job.harness_record()?
+            && record.liveness().await != Liveness::Gone
+        {
+            return Err(NodeError::AlreadyRunningHarness {
+                job: id,
+                pid: record.pid,
+            });
+        }
+        // The job's latest snapshot is the base an incremental bundle
+        // needs; without it here whole, the export bundles everything.
+        let parent = match job.latest() {
+            Some(latest) if is_complete(&self.store, latest).await? => Some(latest),
+            _ => None,
+        };
+        let snapshot = self
+            .capture_from(&job, &root, (parent, with_session), env, out)
+            .await?;
+        let chain = self.bundle_chain(snapshot).await?;
+        job.pin(vec![local::Pin {
+            snapshot,
+            chain: chain.clone(),
+            why: local::PinWhy::Exported { root: root.clone() },
+        }])?;
+        Ok(fabric_client::api::Exported {
+            snapshot,
+            root,
+            chain,
+        })
+    }
+
+    /// Detects the workspace's environment at `root` for a capture whose
+    /// parent is `parent`, and measures the node facts its keys read.
+    ///
+    /// A workspace whose environment does not detect here would not
+    /// materialize on the target either, so the snapshot is refused
+    /// before it is published or moved. A pattern the job ever added
+    /// stays: removing its line from `.fabric/env.toml` does not remove it
+    /// (ADR 0007, Secrets). The node that recorded it may be another one;
+    /// the spec of the job's latest snapshot travels with the job and
+    /// holds what it recorded.
+    async fn detect_for_capture(
+        &self,
+        job: &Job,
+        root: &Path,
+        parent: Option<SnapshotId>,
+        env: &ToolEnv,
+    ) -> Result<(fabric_env::detect::Detection, NodeFacts), NodeError> {
+        let mut recorded: Vec<fabric_core::secret::SecretPattern> =
+            local::read(&job.dir().secret_patterns())?.unwrap_or_default();
+        if let Some(parent) = parent {
+            let travelled = with_store(&self.store, move |store| {
+                let manifest = store.manifest(parent)?;
+                Ok(manifest
+                    .env_spec
+                    .map(|spec| store.env_spec(spec))
+                    .transpose()?)
+            })
+            .await?;
+            if let Some(spec) = travelled {
+                recorded.extend(spec.secret_patterns);
+                recorded.sort();
+                recorded.dedup();
+            }
+        }
+        let detection = fabric_env::detect::detect(root, &recorded)?;
+        // Only what the keys read is measured: no login, and no tool of an
+        // ecosystem the workspace does not use (issue #26).
+        let probes = MeasuredKeys::probes(&detection);
+        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
+        Ok((detection, facts))
+    }
+
     /// Pushes the ledger, and through it the latest snapshot, to every paired peer it can reach.
     pub(crate) async fn replicate(self: &Arc<Self>, id: JobId, out: &mut Out) {
         // A peer behind a NAT has no address here and is reached over the
@@ -1233,21 +1398,73 @@ impl Node {
         }
     }
 
-    /// Sends the whole ledger to `peer` page by page; the peer keeps what it lacks
+    /// Sends the ledger to `peer` page by page; the peer keeps what it lacks
     /// and fetches the latest snapshot before it answers the last page.
+    ///
+    /// Only the records after the last one `peer` accepted from this node
+    /// are sent, and at least the head (M2-18): the peer holds the rest,
+    /// since a record it accepted is durable there. A push that sent only
+    /// those and was not answered with an acceptance is sent again whole,
+    /// as one is the first time since this node started, so a peer that
+    /// lost the job converges as before.
     pub(crate) async fn push_records(
         self: &Arc<Self>,
         id: JobId,
         peer: NodeId,
     ) -> Result<(), NodeError> {
-        let (records, epoch) = {
-            let job = self.job(id).await?;
+        match self.push_unsent(id, peer).await {
+            Ok(_) => Ok(()),
+            Err((Pushed::Suffix, e)) if !matches!(e, NodeError::Unreachable { .. }) => {
+                tracing::info!(job = %id, %peer, error = %e, "a push of the new records failed; pushing the whole ledger");
+                match self.push_unsent(id, peer).await {
+                    Ok(_) => Ok(()),
+                    Err((_, e)) => Err(e),
+                }
+            }
+            Err((_, e)) => Err(e),
+        }
+    }
+
+    /// One push of what `peer` has not accepted; says whether it sent the
+    /// whole ledger, with or without its error. Any answer but an
+    /// acceptance forgets what the peer accepted, so the next push sends
+    /// the whole ledger.
+    async fn push_unsent(
+        self: &Arc<Self>,
+        id: JobId,
+        peer: NodeId,
+    ) -> Result<Pushed, (Pushed, NodeError)> {
+        let (records, epoch, pushed) = {
+            let job = self.job(id).await.map_err(|e| (Pushed::Whole, e))?;
             let job = job.lock().await;
-            (
-                job.ledger().records().to_vec(),
-                job.ledger().lease().epoch(),
-            )
+            let unsent = job.unsent(peer);
+            let pushed = if unsent.len() == job.ledger().records().len() {
+                Pushed::Whole
+            } else {
+                Pushed::Suffix
+            };
+            (unsent.to_vec(), job.ledger().lease().epoch(), pushed)
         };
+        let last = records.last().map(fabric_core::ledger::Record::hash);
+        let sent = self.send_pages(id, peer, epoch, records).await;
+        if let Ok(job) = self.job(id).await {
+            let mut job = job.lock().await;
+            match (&sent, last) {
+                (Ok(()), Some(last)) => job.acked_by(peer, last),
+                _ => job.forget_acked(peer),
+            }
+        }
+        sent.map(|()| pushed).map_err(|e| (pushed, e))
+    }
+
+    /// Sends `records` to `peer` in pages, at `epoch`.
+    async fn send_pages(
+        self: &Arc<Self>,
+        id: JobId,
+        peer: NodeId,
+        epoch: Epoch,
+        records: Vec<fabric_core::ledger::Record>,
+    ) -> Result<(), NodeError> {
         let token = FencingToken { job_id: id, epoch };
         let mut pages: Vec<RecordPage> = Vec::new();
         for record in records {
@@ -1359,7 +1576,7 @@ impl Node {
             ));
         }
         self.resolve_departing(id, out).await?;
-        let (harness, root, view, floor) = {
+        let (harness, root, view, floor, latest) = {
             let job = self.job(id).await?;
             let job = job.lock().await;
             let root = job
@@ -1370,6 +1587,7 @@ impl Node {
                 root,
                 job.view(self.id),
                 session_floor(&job)?,
+                job.latest(),
             )
         };
         match view {
@@ -1408,11 +1626,11 @@ impl Node {
                 });
             }
         }
-        let (here, theirs) = self
+        let mut measured = self
             .preflight(
                 to,
                 (&harness, &root, floor.as_ref()),
-                Target::Peer,
+                (Target::Peer, latest),
                 env,
                 force,
                 out,
@@ -1432,8 +1650,14 @@ impl Node {
         if let Some(snapshot) = snapshot {
             // Once MoveStarted is written, a refusal could only freeze the
             // job here; a move asked again after it goes on.
-            self.carry_for_move(to, snapshot, (&here, &theirs), owner.then_some(force), out)
-                .await?;
+            self.carry_for_move(
+                to,
+                snapshot,
+                &mut measured,
+                (owner.then_some(force), env),
+                out,
+            )
+            .await?;
         }
         self.push_records(id, to).await?;
         out.emit(Event::TargetHoldsCopy { target: to });
@@ -1458,14 +1682,19 @@ impl Node {
     /// and on such a program it lacks, unless `force` says so. With `force`
     /// absent nothing stops.
     async fn carry_for_move(
-        &self,
+        self: &Arc<Self>,
         to: NodeId,
         snapshot: SnapshotId,
-        (here, theirs): (&NodeFacts, &NodeFacts),
-        force: Option<bool>,
+        measured: &mut Measured,
+        (force, env): (Option<bool>, &ToolEnv),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
+        // The capture may name keys the preflight did not measure: it
+        // read the snapshot before, and a run may have filled a cache since.
+        self.measure_more(to, measured, carry_probes(&manifest, spec.as_ref()), env)
+            .await?;
+        let (here, theirs) = (&measured.here, &measured.theirs);
         let decisions = carry::decide_all(&manifest, theirs);
         if !decisions.is_empty() {
             out.emit(carry_decided(
@@ -1790,7 +2019,7 @@ impl Node {
     /// workspace stays where it is, since it may hold work the job lacks.
     pub(crate) async fn settle(&self, job: &mut Job, out: &mut Out) -> Result<(), NodeError> {
         let view = job.view(self.id);
-        let forked = job.forked()?.is_some();
+        let forked = job.is_frozen()?;
         if let Some(record) = job.harness_record()? {
             let owned =
                 !forked && matches!(view, LeaseView::Owner(token) if token.epoch == record.epoch);
@@ -1802,7 +2031,7 @@ impl Node {
                     });
                     record.stop(FENCE_GRACE).await?;
                 }
-                local::remove(&job.dir().harness())?;
+                job.clear_harness_record()?;
             }
         }
         if forked {
@@ -1875,12 +2104,12 @@ impl Node {
             if self.job(id).await.is_err() {
                 self.pull_records(id, holder).await?;
             }
-            let (kind, same) = {
+            let (kind, same, latest) = {
                 let job = self.job(id).await?;
                 let job = job.lock().await;
                 let kind = harness.clone().unwrap_or_else(|| job.harness().clone());
                 let same = &kind == job.harness();
-                (kind, same)
+                (kind, same, job.latest())
             };
             // The known writer is the holder's: a record this node kept
             // from an earlier tenure may be older than the holder's.
@@ -1890,11 +2119,11 @@ impl Node {
                 None
             };
             let root = paths::job_root(&self.cfg.home, id);
-            let (here, theirs) = self
+            let mut measured = self
                 .preflight(
                     holder,
                     (&kind, root.as_path(), floor.as_ref()),
-                    Target::Here,
+                    (Target::Here, latest),
                     env,
                     force,
                     out,
@@ -1903,14 +2132,15 @@ impl Node {
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
             let checked = harness.is_none().then_some(&kind);
-            self.pull(id, holder, (checked, force), (&here, &theirs), out)
+            self.pull(id, holder, (checked, force), (&mut measured, env), out)
                 .await?;
         }
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
+        let launching = harness.clone().unwrap_or_else(|| job.harness().clone());
         let root = self
-            .restore_if_needed(&mut job, token.epoch, env, out)
+            .restore_if_needed(&mut job, token.epoch, env, Some(&launching), out)
             .await?;
         if let Some(record) = job.harness_record()?
             && record.liveness().await != Liveness::Gone
@@ -1943,7 +2173,7 @@ impl Node {
         id: JobId,
         holder: NodeId,
         (checked, force): (Option<&HarnessKind>, bool),
-        (here, theirs): (&NodeFacts, &NodeFacts),
+        (measured, env): (&mut Measured, &ToolEnv),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         out.emit(Event::Pulling { job: id, holder });
@@ -1970,7 +2200,7 @@ impl Node {
         let refused = if force {
             None
         } else {
-            self.carry_refusal_here(id, (holder, here, theirs), out)
+            self.carry_refusal_here(id, (holder, measured, env), out)
                 .await?
         };
         faults::hit(Point::BeforeImport).await;
@@ -2033,9 +2263,9 @@ impl Node {
     /// program is refused, after reporting them. `theirs`, the holder's
     /// facts, fill the holder's side of the rows.
     async fn carry_refusal_here(
-        &self,
+        self: &Arc<Self>,
         id: JobId,
-        (holder, here, theirs): (NodeId, &NodeFacts, &NodeFacts),
+        (holder, measured, env): (NodeId, &mut Measured, &ToolEnv),
         out: &mut Out,
     ) -> Result<Option<NodeError>, NodeError> {
         let latest = {
@@ -2047,6 +2277,16 @@ impl Node {
             return Ok(None);
         };
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
+        // The holder captured after the preflight, which read the snapshot
+        // this node knew before; the capture may name keys it did not.
+        self.measure_more(
+            holder,
+            measured,
+            carry_probes(&manifest, spec.as_ref()),
+            env,
+        )
+        .await?;
+        let (here, theirs) = (&measured.here, &measured.theirs);
         let rows = setup_rows((&manifest, spec.as_ref()), here, theirs, Target::Here);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
@@ -2217,6 +2457,17 @@ impl Node {
         peer: NodeId,
         bytes: &[u8],
     ) -> Result<bool, NodeError> {
+        let known = self.jobs.lock().await.get(&id).cloned();
+        if let Some(job) = known {
+            let mut job = job.lock().await;
+            return job.accept(bytes, peer, self.id);
+        }
+        // A peer never makes a standalone job under an id the managed
+        // authority holds, or under any id when its ids cannot be read
+        // (ADR 0019: one id, one mode).
+        if let Some(refusal) = self.managed_only(id).await {
+            return Err(refusal);
+        }
         let mut jobs = self.jobs.lock().await;
         if let Some(job) = jobs.get(&id).cloned() {
             drop(jobs);
@@ -2264,11 +2515,17 @@ impl Node {
     /// A workspace an earlier tenure left is set aside first, with the
     /// session record it continued, so the job never continues from a tree
     /// or a session older than its latest snapshot.
+    ///
+    /// `launching` is the harness the plan this restore serves launches:
+    /// once the workspace is in place and the session it continues is
+    /// known, `session_to_continue` names them, so a client can start the
+    /// checks it runs before that launch (`session_ahead`).
     async fn restore_if_needed(
         &self,
         job: &mut Job,
         epoch: Epoch,
         env: &ToolEnv,
+        launching: Option<&HarnessKind>,
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
@@ -2280,6 +2537,7 @@ impl Node {
                 ..
             }) => {
                 out.emit(Event::WorkspaceInPlace { root: root.clone() });
+                session_ahead(job.session()?, launching, root, out);
                 return Ok(root.clone());
             }
             Some(Marker {
@@ -2301,23 +2559,22 @@ impl Node {
             id,
             job.dir(),
         );
-        out.emit(match &choice {
-            RootChoice::Same(root) => Event::RootChosen {
-                root: root.clone(),
-                recorded: None,
-            },
-            RootChoice::Fallback { root, captured } => Event::RootChosen {
-                root: root.clone(),
-                recorded: Some(captured.clone()),
-            },
-        });
+        out.emit(root_chosen(&choice));
         let root = choice.root().to_owned();
-        check_root(&root, &self.cfg.home, self.synced_folders(env).await)?;
         let resuming = matches!(
             &marker,
             Some(Marker { state: MarkerState::Restoring { snapshot: s }, .. }) if *s == snapshot
         );
-        let state = restore_state(&root)?;
+        let has_harness_state = !manifest.harness_state.entries.is_empty();
+        let ahead = has_harness_state
+            .then(|| self.installed_ahead(job.harness(), env))
+            .flatten();
+        let state = restore_state(&root);
+        let writes = !(resuming && matches!(state, Ok(RestoreState::Present)));
+        let facts = self
+            .check_root_measuring(&root, &manifest, writes, env)
+            .await?;
+        let state = state?;
         if !resuming {
             if state == RestoreState::Present {
                 return Err(NodeError::WorkspaceOccupied { root });
@@ -2348,11 +2605,10 @@ impl Node {
         if let Some(parent) = root.parent() {
             crate::durable::create_private_dir(parent).map_err(|e| NodeError::io(parent, e))?;
         }
-        let has_harness_state = !manifest.harness_state.entries.is_empty();
         let state_dir = job.dir().harness_state();
-        if !(resuming && state == RestoreState::Present) {
+        if let Some(facts) = facts {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            self.write_snapshot(snapshot, &manifest, &root, harness_dir, env, out)
+            self.write_snapshot(snapshot, &manifest, &root, harness_dir, &facts, out)
                 .await?;
         }
         // A cache written with holes that setup steps fill keeps no
@@ -2373,7 +2629,8 @@ impl Node {
             }
         }
         if has_harness_state {
-            self.restore_harness(job, &root, env, out).await?;
+            self.restore_harness(job, &root, env, (ahead, launching), out)
+                .await?;
         }
         let tree = TreeStamp::measure(&root).await;
         job.set_marker(&Marker {
@@ -2382,6 +2639,38 @@ impl Node {
             epoch,
         })?;
         Ok(root)
+    }
+
+    /// Starts asking the installed harness of `kind` its version, which a
+    /// restore of its state asks from the daemon's directory: the
+    /// workspace a restore writes first does not change the answer, so
+    /// asked as the restore begins, it runs beside it. `None` when the
+    /// harness's environment does not build, which the harness restore
+    /// then reports, or for an ACP agent, whose restore asks nothing.
+    fn installed_ahead(&self, kind: &HarnessKind, env: &ToolEnv) -> Option<VersionAhead> {
+        ask_installed_ahead(kind, &self.harness_env(env).ok()?)
+    }
+
+    /// Refuses a restore root in a folder a sync service rewrites, and,
+    /// when the restore `writes` the snapshot, returns the facts its carry
+    /// decisions read. The two are measured at once; the check still
+    /// decides before anything is written.
+    async fn check_root_measuring(
+        &self,
+        root: &Path,
+        manifest: &SnapshotManifest,
+        writes: bool,
+        env: &ToolEnv,
+    ) -> Result<Option<NodeFacts>, NodeError> {
+        let (synced, facts) = tokio::join!(self.synced_folders(root, env), async {
+            if writes {
+                Some(NodeFacts::measure(&self.cfg.home, env, carry::probes(manifest)).await)
+            } else {
+                None
+            }
+        });
+        check_root(root, &self.cfg.home, synced)?;
+        Ok(facts)
     }
 
     /// Whether the tree at `root` holds every file of `snapshot` outside
@@ -2467,11 +2756,10 @@ impl Node {
         manifest: &fabric_core::snapshot::SnapshotManifest,
         root: &Path,
         harness_dir: Option<PathBuf>,
-        env: &ToolEnv,
+        facts: &NodeFacts,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = NodeFacts::measure(&self.cfg.home, env, carry::probes(manifest)).await;
-        let decisions = carry::decide_all(manifest, &facts);
+        let decisions = carry::decide_all(manifest, facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
         }
@@ -2503,8 +2791,13 @@ impl Node {
     }
 
     /// Reads which folders iCloud Drive syncs on this node, as the
-    /// `defaults` of `env` answers; off everywhere it does not exist.
-    async fn synced_folders(&self, env: &ToolEnv) -> SyncedFolders {
+    /// `defaults` of `env` answers; off everywhere it does not exist. A
+    /// `root` that `check_root` judges without them reads none: the
+    /// `defaults` reads run only for a root under a folder iCloud may sync.
+    async fn synced_folders(&self, root: &Path, env: &ToolEnv) -> SyncedFolders {
+        if !paths::reads_synced_folders(root, &self.cfg.home) {
+            return SyncedFolders::default();
+        }
         let facts = NodeFacts::measure(&self.cfg.home, env, Probes::NONE.with(Tool::ICloud)).await;
         SyncedFolders {
             desktop: facts.syncs(crate::facts::name::ICLOUD_DESKTOP),
@@ -2541,16 +2834,30 @@ impl Node {
     }
 
     /// Places the captured harness state where its harness expects it and records the session.
+    ///
+    /// `ahead` is the installed version the restore asks, when it was
+    /// asked ahead (`ask_installed_ahead`); the adapter takes it only when
+    /// it asked what the adapter would ask. `launching` is the harness the
+    /// plan launches, for `session_to_continue`.
     async fn restore_harness(
         &self,
         job: &Job,
         root: &Path,
         env: &ToolEnv,
+        (ahead, launching): (Option<VersionAhead>, Option<&HarnessKind>),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
         let state = StateManifest::read(&state_dir)?;
-        let harness = adapter(state.kind(), &self.harness_env(env)?, None)?;
+        // The workspace is written and the session to continue known, so
+        // a client may start its own checks while this restore places it.
+        let continued = SessionRecord {
+            harness: state.kind().clone(),
+            session: state.session().clone(),
+            known_writer: None,
+        };
+        session_ahead(Some(continued), launching, root, out);
+        let harness = adapter_with_installed(state.kind(), &self.harness_env(env)?, None, ahead)?;
         harness.restore(root, &state_dir).await?;
         let previous = job
             .session()?
@@ -2709,7 +3016,12 @@ impl Node {
             }
             None => (None, None, None, None),
         };
-        // The doctor shows every fact as each tool answers now.
+        // The doctor shows every fact as each tool answers now, but those
+        // of another harness than a named job's, whose rows compare equal
+        // whatever they hold.
+        let peer_probes = harness
+            .as_ref()
+            .map_or(Probes::ALL, |harness| for_harness(Probes::ALL, harness));
         let (mut rows, here, theirs) = self
             .compare(
                 peer,
@@ -2719,7 +3031,7 @@ impl Node {
                     .map(|(harness, root)| (harness, root, floor.as_ref())),
                 Target::Peer,
                 env,
-                Probes::ALL,
+                (Probes::ALL, peer_probes),
             )
             .await?;
         let carry = match (job, latest) {
@@ -2810,31 +3122,108 @@ impl Node {
     }
 
     /// Compares this node's facts with `peer`'s, reports the rows, stops
-    /// on a refusal `force` does not waive, and returns this node's facts
-    /// and the peer's. A named job brings its harness, the root the target
-    /// restores into, and the newest version of its harness known to have
-    /// written its session; this node then measures only what the rows of
-    /// that job and the carry decision read (`doctor::probes`).
+    /// on a refusal `force` does not waive, and returns what each node
+    /// measured. A job brings its harness, the root the target restores
+    /// into, and the newest version of its harness known to have written
+    /// its session; with `latest`, its latest snapshot this node knows,
+    /// each node measures only the tools of the rows that can stop it and
+    /// of what that snapshot reads (`preflight_probes`), and the report
+    /// leaves out the rows of tools neither measured.
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
         job: (&HarnessKind, &Path, Option<&HarnessVersion>),
-        target: Target,
+        (target, latest): (Target, Option<SnapshotId>),
         env: &ToolEnv,
         force: bool,
         out: &mut Out,
-    ) -> Result<(NodeFacts, NodeFacts), NodeError> {
-        let probes = doctor::probes(job.0, target);
+    ) -> Result<Measured, NodeError> {
+        let carry = self.carry_probes_of(latest).await;
+        let synced = paths::reads_synced_folders(job.1, &self.cfg.home);
+        let probes = preflight_probes(job.0, target, synced, carry);
         let (rows, here, theirs) = self.compare(peer, Some(job), target, env, probes).await?;
+        let rows = doctor::measured_rows(rows, probes.0.union(probes.1));
         out.emit(Event::Preflight {
             peer,
             rows: rows.iter().map(doctor::Row::to_wire).collect(),
         });
         refuse_rows(&rows, force)?;
-        Ok((here, theirs))
+        Ok(Measured {
+            here,
+            theirs,
+            probes,
+            harness: job.0.clone(),
+        })
     }
 
-    /// Measures this node's `probes` while `peer` measures its own,
+    /// The tools of `snapshot`'s carry keys and setup steps
+    /// (`carry_probes`), which a preflight measures on both nodes. None
+    /// for a job with no snapshot, or one whose manifest this node cannot
+    /// read yet: the step that reads the snapshot measures what it lacks
+    /// then (`measure_more`).
+    async fn carry_probes_of(&self, snapshot: Option<SnapshotId>) -> Probes {
+        let Some(snapshot) = snapshot else {
+            return Probes::NONE;
+        };
+        match self.manifest_and_spec(snapshot).await {
+            Ok((manifest, spec)) => carry_probes(&manifest, spec.as_ref()),
+            Err(e) => {
+                tracing::debug!(%snapshot, error = %e, "the preflight measures no carry tool; the carry step will");
+                Probes::NONE
+            }
+        }
+    }
+
+    /// Measures on this node and asks `peer` for the tools of `need` the
+    /// preflight that made `measured` did not measure there, and adds what
+    /// they give. Nothing runs when it measured them all.
+    async fn measure_more(
+        self: &Arc<Self>,
+        peer: NodeId,
+        measured: &mut Measured,
+        need: Probes,
+        env: &ToolEnv,
+    ) -> Result<(), NodeError> {
+        let (here_more, peer_more) = (need.minus(measured.probes.0), need.minus(measured.probes.1));
+        if here_more.is_empty() && peer_more.is_empty() {
+            return Ok(());
+        }
+        let harness = &measured.harness;
+        let (here, theirs) = tokio::join!(
+            async {
+                if here_more.is_empty() {
+                    None
+                } else {
+                    Some(NodeFacts::measure(&self.cfg.home, env, here_more).await)
+                }
+            },
+            async {
+                if peer_more.is_empty() {
+                    return Ok(None);
+                }
+                self.call(peer, |session| async move {
+                    session
+                        .facts_for(harness, peer_more.to_wire(), SHORT_DEADLINE * 4)
+                        .await
+                })
+                .await
+                .map(Some)
+            },
+        );
+        if let Some(here) = here {
+            measured.here.absorb(here);
+        }
+        if let Some(theirs) = theirs? {
+            measured.theirs.absorb(NodeFacts::from_wire(&theirs));
+        }
+        measured.probes = (
+            measured.probes.0.union(here_more),
+            measured.probes.1.union(peer_more),
+        );
+        Ok(())
+    }
+
+    /// Measures this node's `probes.0` while `peer` measures `probes.1`,
     /// compares them row by row (ADR 0008), and returns the rows, this
     /// node's facts and the peer's.
     async fn compare(
@@ -2843,22 +3232,34 @@ impl Node {
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
-        probes: Probes,
+        probes: (Probes, Probes),
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
         // Both nodes measure at once (issue #26). A session the peer
         // opened is used too: a peer behind a NAT has no address here and
-        // is reachable only over the session it dialed.
+        // is reachable only over the session it dialed. A named job's
+        // harness goes with the question, so the peer also looks for an
+        // ACP job's agent, by which a push judges it (issue #16), and so
+        // do the tools it measures.
+        let harness = job.map(|(harness, _, _)| harness);
         let (mut here, theirs) = tokio::join!(
-            NodeFacts::measure(&self.cfg.home, env, probes),
+            NodeFacts::measure(&self.cfg.home, env, probes.0),
             self.call(peer, |session| async move {
-                let facts = session.facts(SHORT_DEADLINE * 4).await?;
+                let deadline = SHORT_DEADLINE * 4;
+                let facts = match harness {
+                    Some(harness) => {
+                        session
+                            .facts_for(harness, probes.1.to_wire(), deadline)
+                            .await?
+                    }
+                    None => session.facts(deadline).await?,
+                };
                 Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
             }),
         );
         let (theirs, clock_skew_ms, wire) = theirs?;
-        // The agent of an ACP job is named per job, so only the target of a
-        // pull, this node, can look for it.
-        if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
+        // The agent of an ACP job is named per job: the target of a pull,
+        // this node, looks for it here, and the peer looked on its side.
+        if let (Target::Here, Some(HarnessKind::Acp { program, .. })) = (target, harness) {
             here.measure_acp(program, &self.harness_env(env)?);
         }
         let theirs = NodeFacts::from_wire(&theirs);
@@ -2866,7 +3267,7 @@ impl Node {
             &here,
             &theirs,
             &Context {
-                harness: job.map(|(h, _, _)| h),
+                harness,
                 root: job.map(|(_, r, _)| r),
                 target,
                 clock_skew_ms: Some(clock_skew_ms),
@@ -2876,6 +3277,90 @@ impl Node {
         );
         Ok((rows, here, theirs))
     }
+}
+
+/// `probes` without the tools of a harness other than `harness`, the
+/// job's: for a job that names its harness, the version and login rows of
+/// another harness compare equal whatever they hold (`doctor::compare`),
+/// so a move or a pull measures them on neither node (item 19 of
+/// docs/evidence/perf-ab/README.md). A Codex job no longer waits for
+/// `claude --version`, a Node start, nor a Claude job for Codex's login.
+pub(crate) fn for_harness(probes: Probes, harness: &HarnessKind) -> Probes {
+    let others: &[Tool] = match harness {
+        HarnessKind::ClaudeCode => &[Tool::Codex, Tool::CodexLogin],
+        HarnessKind::Codex => &[Tool::Claude, Tool::ClaudeLogin],
+        HarnessKind::Acp { .. } => &[
+            Tool::Claude,
+            Tool::ClaudeLogin,
+            Tool::Codex,
+            Tool::CodexLogin,
+        ],
+    };
+    others
+        .iter()
+        .fold(probes, |probes, tool| probes.without(*tool))
+}
+
+/// What a move's or a pull's preflight measured: this node's facts and
+/// the peer's, and the tools each measure ran, so a later step that reads
+/// more measures only what is missing (`Node::measure_more`).
+pub(crate) struct Measured {
+    /// This node's facts.
+    here: NodeFacts,
+    /// The peer's facts.
+    theirs: NodeFacts,
+    /// The tools measured here and on the peer.
+    probes: (Probes, Probes),
+    /// The job's harness, which every question to the peer names.
+    harness: HarnessKind,
+}
+
+/// The tools a move's or a pull's preflight of a job under `harness`
+/// measures on this node and on the peer (item 19 of
+/// docs/evidence/perf-ab/README.md): those of the rows that can stop it,
+/// `user` and `git` on both, the version of the job's harness on both and
+/// its login on the target alone, iCloud Drive's folders only when the
+/// root lies in one (`synced`, `paths::reads_synced_folders`), and
+/// `carry`, what the job's snapshot reads (`carry_probes`), on both. Every
+/// other tool's row only warns or says a path is made again, which the
+/// carry lines already say per path, so a tool the job does not read is
+/// measured on neither node. Before, every move measured every tool on
+/// both nodes and waited for the slowest, such as `pnpm store path`.
+pub(crate) fn preflight_probes(
+    harness: &HarnessKind,
+    target: Target,
+    synced: bool,
+    carry: Probes,
+) -> (Probes, Probes) {
+    let (version, login) = match harness {
+        HarnessKind::ClaudeCode => (Some(Tool::Claude), Some(Tool::ClaudeLogin)),
+        HarnessKind::Codex => (Some(Tool::Codex), Some(Tool::CodexLogin)),
+        HarnessKind::Acp { .. } => (None, None),
+    };
+    let mut both = Probes::of(&[Tool::User, Tool::Git]).union(carry);
+    if let Some(version) = version {
+        both = both.with(version);
+    }
+    if synced {
+        both = both.with(Tool::ICloud);
+    }
+    let on_target = login.map_or(both, |login| both.with(login));
+    match target {
+        Target::Peer => (both, on_target),
+        Target::Here => (on_target, both),
+    }
+}
+
+/// The tools the carry decision and the setup rows read for the snapshot
+/// `manifest` describes, whose spec is `spec`: its carry keys' and its
+/// cache steps' (`carry::probes`), and the programs of the steps its spec
+/// runs on every resume (`doctor::setup_probes`).
+fn carry_probes(manifest: &SnapshotManifest, spec: Option<&EnvSpec>) -> Probes {
+    let carry = carry::probes(manifest);
+    if stayed_behind(&manifest.left_behind, OVERRIDE_FILE) {
+        return carry;
+    }
+    spec.map_or(carry, |spec| carry.union(doctor::setup_probes(spec)))
 }
 
 /// The move `holder` started toward this node at its request, or why it did not.
@@ -3579,6 +4064,43 @@ fn restored(snapshot: SnapshotId, report: &RestoreReport, git: bool) -> Event {
     }
 }
 
+/// Says that the launch of the plan about to be answered continues
+/// `continued`, when it is a session of `launching`, in the workspace at
+/// `root`, which is in place: a client starts the checks it runs before
+/// that launch then, the resume guard's `--version` among them (item 15
+/// of docs/evidence/perf-ab/README.md). Nothing is said for a launch that
+/// starts a new session, whose guard asks nothing.
+fn session_ahead(
+    continued: Option<SessionRecord>,
+    launching: Option<&HarnessKind>,
+    root: &Path,
+    out: &mut Out,
+) {
+    if let Some(record) = continued
+        && launching == Some(&record.harness)
+    {
+        out.emit(Event::SessionToContinue {
+            harness: record.harness,
+            session: record.session,
+            root: root.to_owned(),
+        });
+    }
+}
+
+/// The event that says where a restore writes the workspace.
+fn root_chosen(choice: &RootChoice) -> Event {
+    match choice {
+        RootChoice::Same(root) => Event::RootChosen {
+            root: root.clone(),
+            recorded: None,
+        },
+        RootChoice::Fallback { root, captured } => Event::RootChosen {
+            root: root.clone(),
+            recorded: Some(captured.clone()),
+        },
+    }
+}
+
 fn no_parent(root: &Path) -> NodeError {
     NodeError::io(root, std::io::Error::other("a root needs a parent"))
 }
@@ -3605,7 +4127,9 @@ fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
         return Ok(false);
     }
     let parent = dest.parent().ok_or_else(|| no_parent(dest))?;
-    crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+    // The full flush of `parent` after the rename makes its new name
+    // durable too; a barrier orders the name first.
+    crate::durable::create_dir_ordered(parent).map_err(|e| NodeError::io(parent, e))?;
     std::fs::rename(root, dest).map_err(|e| NodeError::io(root, e))?;
     crate::durable::sync_dir(parent).map_err(|e| NodeError::io(parent, e))?;
     if let Some(root_parent) = root.parent() {
@@ -3778,6 +4302,24 @@ pub(crate) mod tests {
         NodeFacts::measure(&node.cfg.home, env, Probes::ALL).await
     }
 
+    /// What a preflight of a Codex job that measured every tool on `node`
+    /// and nothing on the peer leaves: nothing is measured again.
+    async fn measured_all(node: &Node, env: &ToolEnv) -> Measured {
+        measured(facts_in(node, env).await, NodeFacts::default())
+    }
+
+    /// What a preflight of a Codex job that found `here` on this node and
+    /// `theirs` on the peer leaves, as if it measured every tool on both,
+    /// so nothing is measured again.
+    fn measured(here: NodeFacts, theirs: NodeFacts) -> Measured {
+        Measured {
+            here,
+            theirs,
+            probes: (Probes::ALL, Probes::ALL),
+            harness: HarnessKind::Codex,
+        }
+    }
+
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
     pub(crate) async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
         let repo = repo(dir);
@@ -3842,15 +4384,18 @@ pub(crate) mod tests {
     }
 
     async fn register(node: &Arc<Node>, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
-        node.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid,
-            harness: HarnessKind::Codex,
-            session: None,
-            planned: None,
-            version: None,
-        })
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid,
+                harness: HarnessKind::Codex,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .map(drop)
     }
@@ -3942,15 +4487,18 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let plan = node.job_run(id, out).await.unwrap();
         let mut harness = sleeper();
-        node.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid: pid(&harness),
-            harness: HarnessKind::Codex,
-            session: Some(session.clone()),
-            planned: plan.session,
-            version: None,
-        })
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: Some(session.clone()),
+                planned: plan.session,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .unwrap();
         harness.kill().unwrap();
@@ -4046,6 +4594,45 @@ pub(crate) mod tests {
         let job = node.job(id).await.unwrap();
         let record = job.lock().await.session().unwrap();
         assert_eq!(record.map(|record| record.session), Some(thread));
+    }
+
+    /// A registration says the harness is recorded once its record is
+    /// durable, before it answers, so a CLI may let a held harness start
+    /// then. The event comes once, names the pid, and the record it
+    /// announces is on disk when the answer arrives.
+    #[tokio::test]
+    async fn a_registration_says_the_harness_is_recorded_before_it_answers() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.job_run(id, &mut Out::default()).await.unwrap();
+        let mut harness = sleeper();
+        let out = &mut Out::default();
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            out,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&out.events[..], [Event::HarnessRecorded { pid: p }] if *p == pid(&harness)),
+            "{:?}",
+            out.events
+        );
+        let job = node.job(id).await.unwrap();
+        let recorded = job.lock().await.harness_record().unwrap();
+        assert_eq!(recorded.map(|r| r.pid), Some(pid(&harness)));
+        harness.kill().unwrap();
+        harness.wait().unwrap();
     }
 
     /// A Codex started with no thread to resume makes its thread only once
@@ -4166,7 +4753,7 @@ pub(crate) mod tests {
                     planned,
                     version,
                 };
-                let result = node.harness_started(started).await;
+                let result = node.harness_started(started, &mut Out::default()).await;
                 harness.kill().unwrap();
                 harness.wait().unwrap();
                 node.harness_exited(id, pid(&harness)).await.unwrap();
@@ -4281,7 +4868,7 @@ pub(crate) mod tests {
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
         let root = paths::job_root(&node.cfg.home, id);
-        node.restore_harness(&job, &root, &path, &mut Out::default())
+        node.restore_harness(&job, &root, &path, (None, None), &mut Out::default())
             .await
             .unwrap();
         assert_eq!(
@@ -4561,7 +5148,7 @@ pub(crate) mod tests {
         let thief_root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
-            b.restore_if_needed(&mut job, Epoch::new(2).unwrap(), &path, out)
+            b.restore_if_needed(&mut job, Epoch::new(2).unwrap(), &path, None, out)
                 .await
                 .unwrap()
         };
@@ -4572,7 +5159,7 @@ pub(crate) mod tests {
             id,
             b.id,
             (None, false),
-            (&facts_in(&a, &env()).await, &NodeFacts::default()),
+            (&mut measured_all(&a, &env()).await, &env()),
             out,
         )
         .await
@@ -4581,7 +5168,7 @@ pub(crate) mod tests {
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
         let root = a
-            .restore_if_needed(&mut job, epoch, &path, out)
+            .restore_if_needed(&mut job, epoch, &path, None, out)
             .await
             .unwrap();
         let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
@@ -4717,7 +5304,7 @@ pub(crate) mod tests {
             id,
             a.id,
             (None, false),
-            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            (&mut measured_all(&b, &env()).await, &env()),
             out,
         )
         .await
@@ -4728,7 +5315,7 @@ pub(crate) mod tests {
         let job = b.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, b.id).unwrap().epoch;
-        b.restore_if_needed(&mut job, epoch, &path, out)
+        b.restore_if_needed(&mut job, epoch, &path, None, out)
             .await
             .unwrap();
         assert!(!approved.exists(), "{:?}", out.said());
@@ -5288,15 +5875,18 @@ pub(crate) mod tests {
         let mut harness = sleeper();
         let session = SessionId::parse("new-session").unwrap();
         let failed = node
-            .harness_started(StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&harness),
-                harness: HarnessKind::Codex,
-                session: Some(session.clone()),
-                planned: None,
-                version: None,
-            })
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&harness),
+                    harness: HarnessKind::Codex,
+                    session: Some(session.clone()),
+                    planned: None,
+                    version: None,
+                },
+                &mut Out::default(),
+            )
             .await;
         harness.kill().unwrap();
         harness.wait().unwrap();
@@ -5796,15 +6386,18 @@ pub(crate) mod tests {
         );
         let mut sleeper = sleeper();
         let refused = node
-            .harness_started(StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&sleeper),
-                harness: secret,
-                session: None,
-                planned: None,
-                version: None,
-            })
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&sleeper),
+                    harness: secret,
+                    session: None,
+                    planned: None,
+                    version: None,
+                },
+                &mut Out::default(),
+            )
             .await;
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
@@ -5815,6 +6408,103 @@ pub(crate) mod tests {
         assert_eq!(node.jobs.lock().await.len(), 1);
         let job = node.job(id).await.unwrap();
         assert_eq!(job.lock().await.ledger().records().len(), 1);
+    }
+
+    /// A managed job, made through the node.
+    async fn managed_job(dir: &Path, node: &Arc<Node>) -> JobId {
+        let request = Request::ManagedCreate {
+            operation_key: fabric_core::managed::OperationKey::parse("create-1").unwrap(),
+            repo: fabric_client::api::SystemPath::parse(
+                dir.canonicalize().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+            goal: "goal".to_owned(),
+            harness: HarnessKind::Codex,
+        };
+        match node.managed(request).await.unwrap() {
+            Reply::ManagedCreate(made) => made.job.job,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_record_never_makes_a_standalone_job_under_a_managed_id() {
+        let (dir, node) = node();
+        let id = managed_job(dir.path(), &node).await;
+        let created = Ledger::created(
+            id,
+            "goal".to_owned(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([7; 32]),
+            clock::event_id(),
+            clock::now_ms(),
+        )
+        .unwrap();
+        let refused = node
+            .accept_record(id, NodeId::from_bytes([7; 32]), created.bytes())
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(!node.cfg.state.job(id).ledger().exists());
+        assert!(matches!(node.job(id).await, Err(NodeError::Managed { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_peer_record_makes_no_job_while_the_managed_ids_cannot_be_read() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let managed = root.join("state/managed");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("journal.sqlite"), b"not a journal").unwrap();
+        let node = node_at(&root.join("home"), &root.join("state"), ToolEnv::current());
+        let id = JobId::from_bytes([3; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".to_owned(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([7; 32]),
+            clock::event_id(),
+            clock::now_ms(),
+        )
+        .unwrap();
+        let refused = node
+            .accept_record(id, NodeId::from_bytes([7; 32]), created.bytes())
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(!node.cfg.state.job(id).ledger().exists());
+    }
+
+    #[tokio::test]
+    async fn a_managed_create_whose_harness_arguments_hold_a_secret_is_never_recorded() {
+        let (dir, node) = node();
+        let token = format!("sk-ant-{}", "a".repeat(24));
+        let request = Request::ManagedCreate {
+            operation_key: fabric_core::managed::OperationKey::parse("create-secret").unwrap(),
+            repo: fabric_client::api::SystemPath::parse(
+                dir.path().canonicalize().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+            goal: "goal".to_owned(),
+            harness: HarnessKind::Acp {
+                program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+                args: vec!["--api-key".to_owned(), token.clone()],
+            },
+        };
+        let refused = node.managed(request).await;
+        assert!(
+            matches!(refused, Err(NodeError::HarnessConfig(_))),
+            "{refused:?}"
+        );
+        let managed = crate::authority::managed_dir(&node.cfg.state);
+        for entry in std::fs::read_dir(&managed).into_iter().flatten() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            assert!(
+                !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                "the secret reached the journal"
+            );
+        }
     }
 
     /// A log longer than one control answer can carry still answers, with
@@ -5893,8 +6583,8 @@ pub(crate) mod tests {
             a.id,
             (None, false),
             (
-                &facts_in(&b, &ToolEnv::current()).await,
-                &NodeFacts::default(),
+                &mut measured_all(&b, &ToolEnv::current()).await,
+                &ToolEnv::current(),
             ),
             &mut Out::default(),
         )
@@ -6063,8 +6753,8 @@ pub(crate) mod tests {
                 a.id,
                 (None, false),
                 (
-                    &facts_in(&b, &ToolEnv::current()).await,
-                    &NodeFacts::default(),
+                    &mut measured_all(&b, &ToolEnv::current()).await,
+                    &ToolEnv::current(),
                 ),
                 &mut Out::default(),
             )
@@ -6432,7 +7122,7 @@ pub(crate) mod tests {
             id,
             a.id,
             (None, false),
-            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            (&mut measured_all(&b, &env()).await, &env()),
             out,
         )
         .await
@@ -6441,7 +7131,7 @@ pub(crate) mod tests {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
             let epoch = owner_token(&job, b.id).unwrap().epoch;
-            b.restore_if_needed(&mut job, epoch, &path, out)
+            b.restore_if_needed(&mut job, epoch, &path, None, out)
                 .await
                 .unwrap()
         };
@@ -6496,6 +7186,109 @@ pub(crate) mod tests {
                 .iter()
                 .any(|r| matches!(r.event().kind, EventKind::Resumed { .. })),
             "Resumed was appended for a harness nobody supervises"
+        );
+    }
+
+    /// `node` stopped, `lost` run on its files, and a node started again
+    /// over its state, as after a power loss.
+    fn restarted(dir: &Path, node: Arc<Node>, lost: impl FnOnce()) -> Arc<Node> {
+        assert_eq!(Arc::strong_count(&node), 1, "a task still holds the node");
+        drop(node);
+        lost();
+        let root = std::fs::canonicalize(dir).unwrap();
+        node_at(&root.join("home"), &root.join("state"), ToolEnv::current())
+    }
+
+    /// ADR 0016, approved by Efe on 2026-10-29: the record of a harness
+    /// whose group is gone is removed without a flush of the job's
+    /// directory, so a power loss can bring it back. A node started over
+    /// such a record reads the process it names as gone: the job's status
+    /// says no harness runs, a new harness registers, and a suspend stops
+    /// nothing and removes the record.
+    #[tokio::test]
+    async fn a_gone_harness_record_a_power_loss_brings_back_blocks_nothing() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let record = node.cfg.state.job(id).harness();
+        let exited = async |node: &Arc<Node>| {
+            let mut harness = sleeper();
+            register(node, id, pid(&harness)).await.unwrap();
+            let written = std::fs::read(&record).unwrap();
+            harness.kill().unwrap();
+            harness.wait().unwrap();
+            node.harness_exited(id, pid(&harness)).await.unwrap();
+            assert!(!record.exists(), "the gone harness kept its record");
+            written
+        };
+
+        let written = exited(&node).await;
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&record, &written).unwrap();
+        });
+        let status = node.job_status(id).await.unwrap();
+        assert!(
+            matches!(status.process, Process::NotRunning),
+            "{:?}",
+            status.process
+        );
+        // A launch is not refused as if the record's harness still ran.
+        let written = exited(&node).await;
+
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&record, &written).unwrap();
+        });
+        let out = &mut Out::default();
+        node.suspend(id, &locking_codex(dir.path()), out)
+            .await
+            .unwrap();
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::StoppingHarness { .. })),
+            "{:?}",
+            out.events
+        );
+        assert!(
+            !record.exists(),
+            "the suspend kept the gone harness's record"
+        );
+    }
+
+    /// ADR 0002, approved by Efe on 2026-10-29: the manifest written after
+    /// an append has no full flush of its own, so a power loss can leave it
+    /// behind the ledger, never ahead. A node started over a manifest a
+    /// record behind writes it again from the ledger before it serves the
+    /// job, and the job goes on from the ledger's head.
+    #[tokio::test]
+    async fn a_manifest_a_power_loss_left_behind_is_written_again_at_start() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let manifest = node.cfg.state.job(id).manifest();
+        let behind = std::fs::read(&manifest).unwrap();
+        node.job_decide(id, Decision::Approve, "").await.unwrap();
+        let current = std::fs::read(&manifest).unwrap();
+        assert_ne!(behind, current);
+        let head =
+            async |node: &Arc<Node>| node.job(id).await.unwrap().lock().await.ledger().head();
+        let before = head(&node).await;
+
+        let node = restarted(dir.path(), node, || {
+            std::fs::write(&manifest, &behind).unwrap();
+        });
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            current,
+            "the manifest behind the ledger was not written again"
+        );
+        assert_eq!(head(&node).await, before);
+        node.job_decide(id, Decision::Approve, "again")
+            .await
+            .unwrap();
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            job.ledger().manifest().encode().unwrap()
         );
     }
 
@@ -6653,15 +7446,18 @@ pub(crate) mod tests {
         let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
-        node.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid: pid(&harness),
-            harness: HarnessKind::ClaudeCode,
-            session: None,
-            planned: None,
-            version: None,
-        })
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::ClaudeCode,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .unwrap();
         let reaper = std::thread::spawn(move || {
@@ -6750,7 +7546,7 @@ pub(crate) mod tests {
 
         job.set_marker(&restoring).unwrap();
         let restored = node
-            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, None, &mut Out::default())
             .await;
         assert_eq!(
             restored.unwrap(),
@@ -6764,7 +7560,7 @@ pub(crate) mod tests {
         std::fs::write(root.join("README.md"), "not the job's\n").unwrap();
         job.set_marker(&restoring).unwrap();
         let refused = node
-            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, None, &mut Out::default())
             .await;
         assert!(
             matches!(&refused, Err(NodeError::WorkspaceOccupied { root: r }) if *r == root),
@@ -6964,15 +7760,18 @@ pub(crate) mod tests {
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
-        a.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid: pid(&harness),
-            harness: HarnessKind::ClaudeCode,
-            session: None,
-            planned: None,
-            version: None,
-        })
+        a.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::ClaudeCode,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .unwrap();
         let reaper = std::thread::spawn(move || {
@@ -6984,7 +7783,7 @@ pub(crate) mod tests {
                 id,
                 a.id,
                 (Some(&HarnessKind::Codex), false),
-                (&facts_in(&b, &env()).await, &NodeFacts::default()),
+                (&mut measured_all(&b, &env()).await, &env()),
                 &mut Out::default(),
             )
             .await;
@@ -7035,7 +7834,10 @@ pub(crate) mod tests {
                 id,
                 a.id,
                 (None, false),
-                (&facts_in(&b, &no_pnpm).await, &NodeFacts::default()),
+                (
+                    &mut measured(facts_in(&b, &no_pnpm).await, NodeFacts::default()),
+                    &no_pnpm,
+                ),
                 &mut out,
             )
             .await;
@@ -7092,8 +7894,8 @@ pub(crate) mod tests {
             .carry_for_move(
                 b.id,
                 snapshot,
-                (&uv(Some("uv 0.9.5")), &uv(None)),
-                Some(false),
+                &mut measured(uv(Some("uv 0.9.5")), uv(None)),
+                (Some(false), &env()),
                 &mut out,
             )
             .await;
@@ -7111,8 +7913,8 @@ pub(crate) mod tests {
         a.carry_for_move(
             b.id,
             snapshot,
-            (&uv(Some("uv 0.9.5")), &uv(Some("uv 0.9.5"))),
-            Some(false),
+            &mut measured(uv(Some("uv 0.9.5")), uv(Some("uv 0.9.5"))),
+            (Some(false), &env()),
             &mut Out::default(),
         )
         .await
@@ -7123,7 +7925,10 @@ pub(crate) mod tests {
                 id,
                 a.id,
                 (None, false),
-                (&facts_in(&b, &no_uv).await, &uv(Some("uv 0.9.5"))),
+                (
+                    &mut measured(facts_in(&b, &no_uv).await, uv(Some("uv 0.9.5"))),
+                    &no_uv,
+                ),
                 &mut Out::default(),
             )
             .await;
@@ -7172,8 +7977,8 @@ pub(crate) mod tests {
             .carry_for_move(
                 b.id,
                 snapshot,
-                (&uv(Some("uv 0.9.5")), &uv(None)),
-                Some(false),
+                &mut measured(uv(Some("uv 0.9.5")), uv(None)),
+                (Some(false), &env()),
                 &mut out,
             )
             .await;
@@ -7479,15 +8284,18 @@ pub(crate) mod tests {
         );
         let mut launched = sleeper();
         let refused = node
-            .harness_started(StartedHarness {
-                job: id,
-                epoch: next.epoch,
-                pid: pid(&launched),
-                harness: next.harness.clone(),
-                session: None,
-                planned: next.session.clone(),
-                version: None,
-            })
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: next.epoch,
+                    pid: pid(&launched),
+                    harness: next.harness.clone(),
+                    session: None,
+                    planned: next.session.clone(),
+                    version: None,
+                },
+                &mut Out::default(),
+            )
             .await;
         launched.kill().unwrap();
         launched.wait().unwrap();
@@ -7695,10 +8503,925 @@ pub(crate) mod tests {
         );
     }
 
+    /// A suspend asks the harness its `--version`, inside the harness's
+    /// capture, while it detects the workspace and measures the node facts
+    /// the keys read, which depend on nothing of it (item 13 of
+    /// docs/evidence/perf-ab/README.md). The fake `codex --version` and
+    /// `node --version` each wait up to five seconds for the other to
+    /// start and log whether it did, so one that ran only after the other
+    /// finished logs `alone`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suspend_asks_the_harness_its_version_while_it_measures_the_node() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let meet = dir.path().join("meet");
+        meeting_codex_and_node(&tools, &meet);
+        let (id, _) = npm_codex_job(dir.path(), &node).await;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(meet.join("log")).unwrap();
+        assert!(log.contains("codex together"), "{log}");
+        assert!(!log.contains("alone"), "{log}");
+    }
+
+    /// Writes fake `codex --version` and `node --version` into `tools`
+    /// that each wait up to five seconds for the other to start and log
+    /// to `meet/log` whether it did, so one that ran only after the other
+    /// finished logs `alone`.
+    fn meeting_codex_and_node(tools: &crate::facts::tests::CountingTools, meet: &Path) {
+        std::fs::create_dir_all(meet).unwrap();
+        let waits = |me: &str, other: &str, answer: &str| {
+            format!(
+                "touch '{mine}'\ni=0\nwhile [ ! -f '{theirs}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\nif [ -f '{theirs}' ]; then echo '{me} together' >> '{log}'; else echo '{me} alone' >> '{log}'; fi\n{answer}",
+                mine = meet.join(me).display(),
+                theirs = meet.join(other).display(),
+                log = meet.join("log").display(),
+            )
+        };
+        tools.install(
+            "node",
+            &format!(
+                "case \"$1\" in --version) {} ;; -p) echo 127 ;; esac",
+                waits("node", "codex", "echo v22.23.2")
+            ),
+        );
+        tools.install(
+            "codex",
+            &format!(
+                "case \"$1\" in --version) {} ;; esac",
+                waits("codex", "node", "echo 'codex-cli 0.155.1'")
+            ),
+        );
+    }
+
+    /// An npm job whose Codex session the job records.
+    async fn npm_codex_job(dir: &Path, node: &Arc<Node>) -> (JobId, PathBuf) {
+        let (id, root) = npm_job(dir, node).await;
+        let thread = codex_thread_in(node, id);
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        job.set_session(&SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread,
+            known_writer: None,
+        })
+        .unwrap();
+        (id, root)
+    }
+
+    /// A restore asks the installed harness its version as it begins, so
+    /// the probe runs while the node measures the facts its carry
+    /// decisions read and writes the workspace, and reads which folders
+    /// iCloud syncs only for a root under one of them, which a job's root
+    /// never is (item 14 of docs/evidence/perf-ab/README.md). A new job's
+    /// root is not under one either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restore_asks_the_harness_its_version_while_it_measures_the_node() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let meet = dir.path().join("meet");
+        meeting_codex_and_node(&tools, &meet);
+        let (id, root) = npm_codex_job(dir.path(), &node).await;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&meet).unwrap();
+        std::fs::create_dir_all(&meet).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        tools.ran();
+        let mut out = Out::default();
+        let resumed = node
+            .job_resume(id, None, None, false, &tools.env, &mut out)
+            .await;
+        assert!(resumed.is_ok(), "{resumed:?} {:?}", out.said());
+        assert!(
+            out.events
+                .iter()
+                .any(|event| matches!(event, Event::SessionRestored { .. })),
+            "{:?}",
+            out.said()
+        );
+        let log = std::fs::read_to_string(meet.join("log")).unwrap();
+        assert!(log.contains("codex together"), "{log}");
+        assert!(!log.contains("alone"), "{log}");
+        let ran = tools.ran();
+        assert!(
+            !ran.iter().any(|probe| probe.starts_with("defaults")),
+            "the restore read the iCloud defaults: {ran:?}"
+        );
+
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        job(&second, &node).await;
+        let ran = tools.ran();
+        assert!(
+            !ran.iter().any(|probe| probe.starts_with("defaults")),
+            "a new job read the iCloud defaults: {ran:?}"
+        );
+    }
+
+    /// M2-18's benchmark, run by hand before and after the change: a job
+    /// whose ledger holds `FABRIC_BENCH_RECORDS` records (1000 by default)
+    /// is pushed to a peer that holds it, once per new record, and the
+    /// median time of a push and the records it sends are printed.
+    ///
+    /// ```sh
+    /// cargo test -p fabricd --lib --release -- --ignored --nocapture bench_replicating_a_long_ledger
+    /// ```
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "M2-18 benchmark; run by hand"]
+    async fn bench_replicating_a_long_ledger() {
+        let records: usize = std::env::var("FABRIC_BENCH_RECORDS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1000);
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let note = |n: usize| EventKind::Note {
+            text: format!("note {n}: {}", "x".repeat(64)),
+        };
+        {
+            let job = a.job(id).await.unwrap();
+            let mut job = job.lock().await;
+            for n in 1..records {
+                job.append(a.id, note(n)).unwrap();
+            }
+        }
+        a.push_records(id, b.id).await.unwrap();
+        let mut times = Vec::new();
+        for n in 0..15 {
+            {
+                let job = a.job(id).await.unwrap();
+                let mut job = job.lock().await;
+                job.append(a.id, note(records + n)).unwrap();
+            }
+            let started = std::time::Instant::now();
+            a.push_records(id, b.id).await.unwrap();
+            times.push(started.elapsed());
+        }
+        times.sort();
+        let sent: usize = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .unsent(b.id)
+            .iter()
+            .map(|record| record.bytes().len())
+            .sum();
+        eprintln!("bench_replicating_a_long_ledger: a push now sends {sent} bytes");
+        let held = b
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .ledger()
+            .records()
+            .len();
+        let bytes: usize = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .ledger()
+            .records()
+            .iter()
+            .map(|record| record.bytes().len())
+            .sum();
+        eprintln!(
+            "bench_replicating_a_long_ledger: {held} records, {bytes} bytes; push of one new record: median {:?}, min {:?}, max {:?}",
+            times[times.len() / 2],
+            times[0],
+            times[times.len() - 1]
+        );
+    }
+
+    /// A push sends the records after the last one the peer accepted
+    /// from this node, and a peer that lost the job gets it whole again,
+    /// so replication converges as when every push sent the whole ledger
+    /// (M2-18).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_push_sends_what_the_peer_lacks_and_the_whole_ledger_to_a_peer_that_lost_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let noted = |text: &str| EventKind::Note {
+            text: text.to_owned(),
+        };
+        let unsent = |a: &Arc<Node>| {
+            let a = Arc::clone(a);
+            let peer = b.id;
+            async move { a.job(id).await.unwrap().lock().await.unsent(peer).len() }
+        };
+        let held = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .ledger()
+            .records()
+            .len();
+        assert_eq!(
+            unsent(&a).await,
+            held,
+            "a first push sends the whole ledger"
+        );
+        a.push_records(id, b.id).await.unwrap();
+        assert_eq!(
+            unsent(&a).await,
+            1,
+            "an accepted push leaves only the head to send"
+        );
+        for text in ["one", "two"] {
+            a.job(id)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .append(a.id, noted(text))
+                .unwrap();
+        }
+        assert_eq!(unsent(&a).await, 2);
+        a.push_records(id, b.id).await.unwrap();
+        let heads = |node: &Arc<Node>| {
+            let node = Arc::clone(node);
+            async move { node.job(id).await.unwrap().lock().await.ledger().head() }
+        };
+        assert_eq!(heads(&b).await, heads(&a).await);
+
+        // The peer loses the job: the push of the new record alone cannot
+        // make it there, so the whole ledger goes.
+        let dir = b.job(id).await.unwrap().lock().await.dir().dir().to_owned();
+        b.jobs.lock().await.remove(&id);
+        std::fs::remove_dir_all(&dir).unwrap();
+        a.job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .append(a.id, noted("three"))
+            .unwrap();
+        a.push_records(id, b.id).await.unwrap();
+        assert_eq!(heads(&b).await, heads(&a).await);
+        let records = |node: &Arc<Node>| {
+            let node = Arc::clone(node);
+            async move {
+                node.job(id)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .ledger()
+                    .records()
+                    .len()
+            }
+        };
+        assert_eq!(records(&b).await, records(&a).await);
+    }
+
+    /// A run and a resume that continue a session say so, with the
+    /// workspace's root, as soon as both are known: a resume that restores
+    /// the session says it before the harness state is placed, one whose
+    /// workspace is in place at once, and a run before its plan, so the
+    /// CLI can start its resume guard's `--version` then (item 15). A
+    /// launch under another harness, which starts a new session, says
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launch_that_continues_a_session_names_it_before_it_answers() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let (id, root) = npm_codex_job(dir.path(), &node).await;
+        let thread = node
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .session()
+            .unwrap()
+            .unwrap()
+            .session;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        let continues = |out: &Out| {
+            out.events.iter().position(|event| {
+                matches!(
+                    event,
+                    Event::SessionToContinue { harness: HarnessKind::Codex, session, root: at }
+                        if *session == thread && *at == root
+                )
+            })
+        };
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &tools.env, &mut out)
+            .await
+            .unwrap();
+        let restored = out
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::SessionRestored { .. }));
+        let named = continues(&out);
+        assert!(
+            named.is_some() && named < restored,
+            "{named:?} {restored:?} {:?}",
+            out.said()
+        );
+
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &tools.env, &mut out)
+            .await
+            .unwrap();
+        assert!(continues(&out).is_some(), "{:?}", out.said());
+
+        let mut out = Out::default();
+        node.job_run(id, &mut out).await.unwrap();
+        assert!(continues(&out).is_some(), "{:?}", out.said());
+
+        let mut out = Out::default();
+        node.job_resume(
+            id,
+            None,
+            Some(HarnessKind::ClaudeCode),
+            false,
+            &tools.env,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.events
+                .iter()
+                .any(|event| matches!(event, Event::SessionToContinue { .. })),
+            "{:?}",
+            out.said()
+        );
+    }
+
+    /// Three nodes paired with each other, a job on `a` suspended and
+    /// copied to `b` and `c` whole.
+    async fn three_with_a_job() -> ([tempfile::TempDir; 3], [Arc<Node>; 3], JobId) {
+        let (dir_a, a) = node();
+        let (dir_b, b) = node();
+        let (dir_c, c) = node();
+        for node in [&a, &b, &c] {
+            tokio::spawn(Arc::clone(node).run());
+        }
+        for (node, peer) in [(&a, &b), (&a, &c), (&b, &a), (&b, &c), (&c, &a), (&c, &b)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
+        }
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap();
+        for node in [&b, &c] {
+            node.pull_records(id, a.id).await.unwrap();
+            node.ensure_latest(id, a.id).await.unwrap();
+        }
+        ([dir_a, dir_b, dir_c], [a, b, c], id)
+    }
+
+    fn head(job: &Job) -> RecordHash {
+        job.ledger().head()
+    }
+
+    /// R3: a node frozen after a fork exports its orphan workspace into a
+    /// pinned snapshot the ledger does not name, and repairs by the fork
+    /// rule: the owner that kept working at epoch one after `c` stole the
+    /// job at epoch two, out of its reach, freezes when `b` brings it the
+    /// steal, takes that chain, keeps its own ledger whole beside it and
+    /// pins the snapshot only its chain published; `b`, which never froze,
+    /// has nothing to repair.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frozen_owner_exports_its_orphan_and_takes_the_chain_the_fork_rule_picks() {
+        let (_dirs, a, b, _c, id) = stolen_without_a().await;
+        let env = ToolEnv::current();
+        let root = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .marker()
+            .unwrap()
+            .unwrap()
+            .root;
+        let owned = a.job_export(id, None, &env, &mut Out::default()).await;
+        assert!(
+            matches!(owned, Err(NodeError::NotAnOrphan { .. })),
+            "{owned:?}"
+        );
+
+        // a, not knowing of the steal, keeps working and suspends at epoch one.
+        std::fs::write(root.join("after-the-steal.txt"), "a's work\n").unwrap();
+        let lost = a.suspend(id, &env, &mut Out::default()).await.unwrap();
+        b.push_records(id, a.id).await.unwrap_err();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+
+        // The orphan exports into a pinned snapshot; the ledger stays as it was.
+        let before = head(&*a.job(id).await.unwrap().lock().await);
+        let exported = a
+            .job_export(id, None, &env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(exported.root, root);
+        assert_eq!(exported.chain.first(), Some(&exported.snapshot));
+        {
+            let job = a.job(id).await.unwrap();
+            let job = job.lock().await;
+            assert_eq!(head(&job), before);
+            assert!(job.ledger().records().iter().all(|r| !matches!(
+                r.event().kind,
+                EventKind::SnapshotPublished { snapshot, .. } if snapshot == exported.snapshot
+            )));
+            let pins = job.pins().unwrap();
+            assert!(
+                pins.iter()
+                    .any(|pin| pin.snapshot == exported.snapshot && pin.chain == exported.chain)
+            );
+        }
+        for held in &exported.chain {
+            assert!(is_complete(&a.store, *held).await.unwrap());
+        }
+
+        let old = std::fs::read(a.job(id).await.unwrap().lock().await.dir().ledger()).unwrap();
+        let repaired = a.job_repair(id, &mut Out::default()).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            epoch,
+            kept,
+            orphans,
+        } = repaired.outcome
+        else {
+            panic!("{repaired:?}");
+        };
+        assert_eq!((repaired.peer, epoch), (b.id, Epoch::new(2).unwrap()));
+        assert_eq!(orphans, vec![lost]);
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            old,
+            "the old ledger was not kept whole"
+        );
+        let dir = {
+            let job = a.job(id).await.unwrap();
+            let job = job.lock().await;
+            assert!(!job.is_frozen().unwrap());
+            assert_eq!(head(&job), head(&*b.job(id).await.unwrap().lock().await));
+            assert!(job.pins().unwrap().iter().any(|pin| pin.snapshot == lost));
+            job.dir().clone()
+        };
+        // The chain taken opens again as a start opens it, with its manifest.
+        Job::open(id, dir).unwrap();
+
+        let none = b.job_repair(id, &mut Out::default()).await;
+        assert!(matches!(none, Err(NodeError::NotFrozen { .. })), "{none:?}");
+    }
+
+    /// R3: a workspace a restore set aside under `orphan/` beside the
+    /// job's root exports by its path, without the session the job holds
+    /// now, which belongs to a later tenure; any other directory is
+    /// refused.
+    #[tokio::test]
+    async fn a_set_aside_orphan_exports_by_its_path_and_no_other_directory_does() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let env = ToolEnv::current();
+        let root = node
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .marker()
+            .unwrap()
+            .unwrap()
+            .root;
+        let aside = paths::orphan_copy(&root, Epoch::FIRST).unwrap();
+        std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(&root)
+            .arg(&aside)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        std::fs::write(aside.join("left-behind.txt"), "orphan work\n").unwrap();
+        let mut out = Out::default();
+        let exported = node
+            .job_export(id, Some(aside.clone()), &env, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(exported.root, aside);
+        assert!(
+            !out.events
+                .iter()
+                .any(|event| matches!(event, Event::SessionCaptured { .. })),
+            "{:?}",
+            out.said()
+        );
+        for elsewhere in [root.clone(), dir.path().join("repo")] {
+            let refused = node
+                .job_export(id, Some(elsewhere), &env, &mut Out::default())
+                .await;
+            assert!(
+                matches!(refused, Err(NodeError::NotAnOrphan { .. })),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// R3: two steals at one epoch freeze both thieves. The fork rule
+    /// picks the lower thief's chain; a repair there refuses and keeps the
+    /// freeze until the other takes it, and then lifts it, the chains no
+    /// longer forking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_winner_of_a_fork_repairs_after_the_loser_took_its_chain() {
+        let (_dirs, [_a, b, c], id) = three_with_a_job().await;
+        let out = &mut Out::default();
+        b.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        c.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        b.push_records(id, c.id).await.unwrap_err();
+        c.push_records(id, b.id).await.unwrap_err();
+        for node in [&b, &c] {
+            assert!(
+                node.job(id)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .is_frozen()
+                    .unwrap()
+            );
+        }
+        let (winner, loser) = if b.id.to_bytes() < c.id.to_bytes() {
+            (&b, &c)
+        } else {
+            (&c, &b)
+        };
+        let early = winner.job_repair(id, out).await;
+        assert!(
+            matches!(&early, Err(NodeError::ForkWon { peer, .. }) if peer == &loser.id),
+            "{early:?}"
+        );
+        assert!(
+            winner
+                .job(id)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .is_frozen()
+                .unwrap()
+        );
+        let taken = loser.job_repair(id, out).await.unwrap();
+        assert!(matches!(
+            taken.outcome,
+            fabric_client::api::RepairOutcome::Adopted { .. }
+        ));
+        let lifted = winner.job_repair(id, out).await.unwrap();
+        assert_eq!(lifted.outcome, fabric_client::api::RepairOutcome::Unforked);
+        assert_eq!(
+            head(&*winner.job(id).await.unwrap().lock().await),
+            head(&*loser.job(id).await.unwrap().lock().await)
+        );
+        assert_eq!(winner.lease(id).await.unwrap().owner, winner.id);
+    }
+
+    /// Review of PR #31: the ledger a repair keeps was named by the fork
+    /// point alone, so a second repair at the same point wrote over the
+    /// first one's. `a` works on at epoch one after `b` and `c` copied
+    /// the job, the higher thief steals and `a` takes its chain, then the
+    /// lower thief steals from the same point and `a` takes that one: the
+    /// first kept ledger, the only one that publishes `a`'s own snapshot,
+    /// must still be whole, and the pin of that snapshot must name it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_repair_at_one_fork_point_keeps_the_first_kept_ledger() {
+        let (_dirs, [a, b, c], id) = three_with_a_job().await;
+        let env = ToolEnv::current();
+        let out = &mut Out::default();
+        let root = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .marker()
+            .unwrap()
+            .unwrap()
+            .root;
+        std::fs::write(root.join("after-the-copies.txt"), "a's work\n").unwrap();
+        let lost = a.suspend(id, &env, out).await.unwrap();
+        let ledger_of = |node: &Arc<Node>| {
+            let node = Arc::clone(node);
+            async move {
+                let job = node.job(id).await.unwrap();
+                let job = job.lock().await;
+                std::fs::read(job.dir().ledger()).unwrap()
+            }
+        };
+        let own = ledger_of(&a).await;
+        let (lower, higher) = if b.id.to_bytes() < c.id.to_bytes() {
+            (&b, &c)
+        } else {
+            (&c, &b)
+        };
+
+        // The higher thief steals; its push freezes a, which takes its chain.
+        higher
+            .job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+        let first = a.job_repair(id, out).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            kept: first_kept,
+            orphans,
+            ..
+        } = first.outcome
+        else {
+            panic!("{first:?}");
+        };
+        assert_eq!((first.peer, orphans), (higher.id, vec![lost]));
+        let taken = ledger_of(&a).await;
+
+        // The lower thief steals from the same point; equal epochs, the lower id wins.
+        lower
+            .job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+        let second = a.job_repair(id, out).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            kept: second_kept, ..
+        } = second.outcome
+        else {
+            panic!("{second:?}");
+        };
+        assert_eq!(second.peer, lower.id);
+        assert_ne!(second_kept, first_kept, "both repairs kept to one path");
+        assert_eq!(
+            std::fs::read(&first_kept).unwrap(),
+            own,
+            "the ledger that published {lost} is gone"
+        );
+        assert_eq!(std::fs::read(&second_kept).unwrap(), taken);
+        let pins = a.job(id).await.unwrap().lock().await.pins().unwrap();
+        let pin = pins.iter().find(|pin| pin.snapshot == lost).unwrap();
+        assert_eq!(pin.why, crate::local::PinWhy::ForkLost { kept: first_kept });
+    }
+
+    /// Item 19: a preflight that measures only `preflight_probes` stops a
+    /// move or a pull exactly where one that measured every tool on both
+    /// nodes stops it, and every row it reports reads as that one's. The
+    /// rows it leaves out are those of tools neither node measured, which
+    /// only warn or say a path is made again; the carry lines judge each
+    /// path themselves, with the tools the snapshot reads (`carry`), which
+    /// both nodes measure. Here every fact differs between the nodes, the
+    /// login of the target included.
+    #[test]
+    fn a_preflight_of_the_jobs_tools_stops_where_one_of_every_tool_does() {
+        let acp = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+            args: Vec::new(),
+        };
+        let node_tree = Probes::for_key(&fabric_core::snapshot::CarryKey::Node {
+            node_major: "22".to_owned(),
+            package_manager: "pnpm".to_owned(),
+            pm_major: "9".to_owned(),
+            pnpm_store_path: None,
+        });
+        let (one, two) = (differing_facts(true), differing_facts(false));
+        for (here, peer) in [(&one, &two), (&two, &one)] {
+            for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex, acp.clone()] {
+                for target in [Target::Peer, Target::Here] {
+                    for root in [
+                        "/Users/tester/Desktop/work",
+                        "/Users/tester/fabric/jobs/j/work",
+                    ] {
+                        for carry in [Probes::NONE, node_tree] {
+                            preflight_case((here, peer), &harness, target, Path::new(root), carry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Facts of a node that differ from `differing_facts(!first)` in every
+    /// tool, the login included.
+    fn differing_facts(first: bool) -> NodeFacts {
+        use crate::facts::name;
+        let (version, other, login, synced) = if first {
+            (
+                "1",
+                "v22 2.1.300 (Claude Code) codex-cli 0.160.0",
+                "yes",
+                "0",
+            )
+        } else {
+            (
+                "2",
+                "v24 2.1.200 (Claude Code) codex-cli 0.150.0",
+                "no",
+                "1",
+            )
+        };
+        NodeFacts::from_pairs([
+            (name::USER, "tester"),
+            (name::HOME, "/Users/tester"),
+            (name::GIT, version),
+            (name::MACOS, version),
+            (name::MACOS_SDK, version),
+            (name::NODE, other),
+            (name::NODE_ABI, version),
+            (name::PNPM, version),
+            (name::PNPM_STORE, version),
+            (name::RUSTC, version),
+            (name::PYTHON, version),
+            (name::CLAUDE, other),
+            (name::CLAUDE_LOGIN, login),
+            (name::CLAUDE_KEYCHAIN, "locked"),
+            (name::CODEX, other),
+            (name::CODEX_LOGIN, login),
+            (name::ICLOUD_DESKTOP, synced),
+            (name::ICLOUD_DOCUMENTS, "0"),
+        ])
+    }
+
+    /// One case of `a_preflight_of_the_jobs_tools_stops_where_one_of_every_tool_does`.
+    fn preflight_case(
+        (here, peer): (&NodeFacts, &NodeFacts),
+        harness: &HarnessKind,
+        target: Target,
+        root: &Path,
+        carry: Probes,
+    ) {
+        let ctx = Context {
+            harness: Some(harness),
+            root: Some(root),
+            target,
+            clock_skew_ms: Some(0),
+            wire: None,
+            floor: None,
+        };
+        let blocking = |rows: &[doctor::Row]| -> Vec<&str> {
+            doctor::blocking(rows, false)
+                .iter()
+                .map(|row| row.fact)
+                .collect()
+        };
+        let every = doctor::compare(here, peer, &ctx);
+        let probes = preflight_probes(
+            harness,
+            target,
+            paths::reads_synced_folders(root, Path::new("/Users/tester")),
+            carry,
+        );
+        let measured = doctor::measured_rows(
+            doctor::compare(&here.only(probes.0), &peer.only(probes.1), &ctx),
+            probes.0.union(probes.1),
+        );
+        let case = format!("{harness} {target:?} {} {carry:?}", root.display());
+        assert_eq!(blocking(&measured), blocking(&every), "{case}");
+        for row in &measured {
+            let full = every.iter().find(|full| full.fact == row.fact).unwrap();
+            assert_eq!(row.outcome, full.outcome, "{case} {}", row.fact);
+        }
+        assert!(measured.len() < every.len(), "{case}");
+        for tool in [Tool::Pnpm, Tool::Rustc, Tool::Macos, Tool::MacosSdk] {
+            assert_eq!(
+                probes.0.contains(tool) || probes.1.contains(tool),
+                carry.contains(tool),
+                "{case} {tool:?}"
+            );
+        }
+    }
+
+    /// A move of a Codex job asks neither node for Claude's version or
+    /// login, nor for a tool its snapshot does not read, and still asks the
+    /// target for its Codex login, which gates it (item 19).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_measures_only_the_tools_its_job_reads() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let tools_a = crate::facts::tests::CountingTools::new(&root.join("a"));
+        let tools_b = crate::facts::tests::CountingTools::new(&root.join("b"));
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let id = job(&root, &a).await;
+        tools_a.ran();
+        tools_b.ran();
+        let mut out = Out::default();
+        let moved = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
+        assert!(moved.is_ok(), "{moved:?} {:?}", out.said());
+        let (ran_a, ran_b) = (tools_a.ran(), tools_b.ran());
+        // The source also measures what its capture detects; the target
+        // measures only for the preflight and the carry decision.
+        assert_eq!(
+            ran_b,
+            ["codex --version", "codex login status", "id -un"],
+            "the target measured a tool the job does not read"
+        );
+        for ran in [&ran_a, &ran_b] {
+            assert!(
+                !ran.iter().any(|probe| probe.starts_with("claude")),
+                "a Codex move asked about Claude: {ran:?}"
+            );
+            for unread in [
+                "sw_vers", "xcrun", "pnpm", "yarn", "bun", "rustc", "cargo", "uv", "defaults",
+            ] {
+                assert!(
+                    !ran.iter()
+                        .any(|probe| probe.split(' ').next() == Some(unread)),
+                    "the move ran {unread}, which its job does not read: {ran:?}"
+                );
+            }
+        }
+        assert!(
+            ran_b.iter().any(|probe| probe == "codex login status"),
+            "{ran_b:?}"
+        );
+        assert!(
+            !ran_a.iter().any(|probe| probe == "codex login status"),
+            "the source's login gates nothing: {ran_a:?}"
+        );
+    }
+
+    /// A move whose capture names a carry key its preflight did not
+    /// measure, a tree the job made after its last snapshot, measures the
+    /// key's tools on the target then, before it decides the tree's path
+    /// (item 19): the preflight read the earlier snapshot, which had none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_that_names_more_than_the_preflight_measured_is_measured_then() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let tools_a = crate::facts::tests::CountingTools::new(&root.join("a"));
+        let tools_b = crate::facts::tests::CountingTools::new(&root.join("b"));
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let id = job(&root, &a).await;
+        a.suspend(id, &tools_a.env, &mut Out::default())
+            .await
+            .unwrap();
+        let work = paths::job_root(&a.cfg.home, id);
+        std::fs::write(work.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(work.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(work.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(work.join("node_modules/pkg")).unwrap();
+        std::fs::write(work.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        tools_a.ran();
+        tools_b.ran();
+        let mut out = Out::default();
+        let moved = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
+        assert!(moved.is_ok(), "{moved:?} {:?}", out.said());
+        assert!(
+            out.said().iter().any(|line| line.contains("node_modules")),
+            "the tree's path was not decided: {:?}",
+            out.said()
+        );
+        let ran_b = tools_b.ran();
+        for probe in [
+            "node --version",
+            "node -p process.versions.modules",
+            "pnpm --version",
+            "pnpm store path",
+        ] {
+            assert_eq!(
+                ran_b.iter().filter(|ran| *ran == probe).count(),
+                1,
+                "{probe}: {ran_b:?}"
+            );
+        }
+    }
+
     /// The preflight of a move and of a pull measures this node while the
-    /// peer measures itself (issue #26). Each node's `sw_vers` waits up to
-    /// five seconds for the other's to start and says whether it did, so a
-    /// node that measured only after the other finished reads `alone`.
+    /// peer measures itself (issue #26). Each node's `id`, which every
+    /// preflight runs, waits up to five seconds for the other's to start
+    /// and says whether it did, so a node that measured only after the
+    /// other finished reads `alone`.
     /// Both moves are refused, as the two test nodes have different homes,
     /// after the rows are reported.
     #[tokio::test(flavor = "multi_thread")]
@@ -7714,7 +9437,7 @@ pub(crate) mod tests {
             let tools = crate::facts::tests::CountingTools::only(&root.join(me), &[]);
             let (mine, theirs) = (meet.join(me), meet.join(other));
             tools.install(
-                "sw_vers",
+                "id",
                 &format!(
                     "touch '{mine}'\ni=0\nwhile [ ! -f '{theirs}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\nif [ -f '{theirs}' ]; then echo together; else echo alone; fi",
                     mine = mine.display(),
@@ -7736,12 +9459,12 @@ pub(crate) mod tests {
         );
         paired(&a, &b).await;
         let id = job(&root, &a).await;
-        let macos_row = |out: &Out| {
+        let user_row = |out: &Out| {
             out.events
                 .iter()
                 .find_map(|event| match event {
                     Event::Preflight { rows, .. } => {
-                        rows.iter().find(|row| row.fact == "macos.version").cloned()
+                        rows.iter().find(|row| row.fact == "user").cloned()
                     }
                     _ => None,
                 })
@@ -7752,7 +9475,7 @@ pub(crate) mod tests {
         let mut out = Out::default();
         let pushed = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
         assert!(matches!(pushed, Err(NodeError::Preflight(_))), "{pushed:?}");
-        assert_eq!(macos_row(&out), together, "the move");
+        assert_eq!(user_row(&out), together, "the move");
 
         for marker in ["a", "b"] {
             std::fs::remove_file(meet.join(marker)).unwrap();
@@ -7762,7 +9485,7 @@ pub(crate) mod tests {
             .job_resume(id, Some(a.id), None, false, &tools_b.env, &mut out)
             .await;
         assert!(matches!(pulled, Err(NodeError::Preflight(_))), "{pulled:?}");
-        assert_eq!(macos_row(&out), together, "the pull");
+        assert_eq!(user_row(&out), together, "the pull");
     }
 
     /// A pull decides the snapshot's paths with what its preflight measured

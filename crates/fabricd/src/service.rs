@@ -17,6 +17,7 @@
 //! chunks are named by their hashes and served to any paired peer.
 
 use fabric_core::BoxFuture;
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Author, LedgerError};
@@ -24,7 +25,7 @@ use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, Of
 use fabric_net::rpc::{JobFuture, Service};
 use fabric_net::wire::{
     Appended, Facts, Fault, FaultText, Fenced, KnownWriter, ManifestChunks, MoveRequested,
-    MoveState, Offered, Pulled, RecordBytes, RecordPage, VersionText,
+    MoveState, Offered, Pulled, RecordBytes, RecordPage, Tools, VersionText,
 };
 use fabric_store::objects::ObjectError;
 use fabric_store::store::StoreError;
@@ -163,6 +164,32 @@ impl Service for Node {
             )
         })
     }
+
+    fn facts_for(
+        &self,
+        _peer: NodeId,
+        harness: HarnessKind,
+        tools: Tools,
+    ) -> BoxFuture<'_, Result<Facts, Fault>> {
+        Box::pin(async move {
+            // This node is the target of a push of a job under `harness`,
+            // or the holder a pull asks. The answer holds the facts of the
+            // tools the asking node reads for that job (item 19 of the A/B
+            // lab: `ops::preflight_probes`), those no process gives, and
+            // for an ACP job where this node finds the agent and the
+            // `state_dir` it gives it, on the PATH the rest were measured
+            // with, so the pushing node refuses a target that could not
+            // launch the job (issue #16).
+            let env = self.node_env();
+            let probes = Probes::from_wire(&tools);
+            let mut facts = NodeFacts::measure(&self.cfg.home, &env, probes).await;
+            if let HarnessKind::Acp { program, .. } = &harness {
+                let harness_env = self.harness_env(&env).map_err(|e| internal(&e))?;
+                facts.measure_acp(program, &harness_env);
+            }
+            Ok(facts.to_wire())
+        })
+    }
 }
 
 impl Node {
@@ -286,17 +313,21 @@ impl Node {
         let id = token.job_id;
         let mut out = Out::default();
         // A job new here is made from the page's first record, which must be its `Created`.
-        let known = if let Ok(job) = self.job(id).await {
-            job
-        } else {
-            let first = records
-                .records()
-                .first()
-                .ok_or_else(|| bad(&"an empty page"))?;
-            self.accept_record(id, peer, first.as_bytes())
-                .await
-                .map_err(|e| bad(&e))?;
-            self.job(id).await.map_err(|_| Fault::UnknownJob)?
+        // A managed id, or any id while the managed ids cannot be read, is
+        // refused here and never made a standalone job (ADR 0019).
+        let known = match self.job(id).await {
+            Ok(job) => job,
+            Err(e @ NodeError::Managed { .. }) => return Err(bad(&e)),
+            Err(_) => {
+                let first = records
+                    .records()
+                    .first()
+                    .ok_or_else(|| bad(&"an empty page"))?;
+                self.accept_record(id, peer, first.as_bytes())
+                    .await
+                    .map_err(|e| bad(&e))?;
+                self.job(id).await.map_err(|_| Fault::UnknownJob)?
+            }
         };
         {
             let mut job = known.lock().await;

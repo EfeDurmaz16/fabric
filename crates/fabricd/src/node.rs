@@ -47,6 +47,14 @@ pub const MAX_SOCKET_PATH: usize = 104;
 /// How long the hello may take on a new connection.
 pub const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long a start waits for a daemon that holds the state directory to
+/// let it go: one that was just stopped holds it until it has shut down
+/// (issue #28, gate finding F14).
+pub const STOPPING_DAEMON_WAIT: Duration = Duration::from_secs(5);
+
+/// How often a start that waits tries the lock again.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
 /// What a node is started with.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -70,7 +78,8 @@ pub struct Node {
     pub(crate) id: NodeId,
     pub(crate) version: VersionText,
     pub(crate) peers: Arc<Peers>,
-    pub(crate) store: Arc<Mutex<Store>>,
+    /// The store; each task works on a handle of its own (`with_store`).
+    pub(crate) store: Store,
     pub(crate) jobs: tokio::sync::Mutex<BTreeMap<JobId, Arc<tokio::sync::Mutex<Job>>>>,
     pub(crate) broken: Mutex<BTreeMap<JobId, String>>,
     endpoint: Endpoint,
@@ -93,6 +102,8 @@ pub struct Node {
     /// The environment the last local client sent, which the node uses
     /// for work no client asks for (ADR 0018, The client's environment).
     client_env: Mutex<Option<ClientEnv>>,
+    /// The managed authority, the one writer of the managed journal (ADR 0020).
+    pub(crate) authority: crate::authority::Authority,
     _lock: File,
 }
 
@@ -116,15 +127,7 @@ impl Node {
     pub fn start(cfg: NodeConfig) -> Result<Arc<Self>, NodeError> {
         let root = cfg.state.root();
         prepare_state_dir(root)?;
-        let lock_path = cfg.state.lock();
-        let lock_file = open_lock(&lock_path)?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(NodeError::AlreadyRunning(root.to_owned()));
-            }
-            Err(fs::TryLockError::Error(e)) => return Err(NodeError::io(&lock_path, e)),
-        }
+        let lock_file = take_lock(root, &cfg.state.lock(), STOPPING_DAEMON_WAIT)?;
 
         crate::faults::arm()?;
         let identity = NodeIdentity::load_or_generate(&cfg.state.node_key())?;
@@ -153,12 +156,17 @@ impl Node {
             tracing::warn!(error = %e, "the environment a client last sent does not read; the node uses its own until a client sends one");
             None
         });
+        // One stat on the start path. The authority's thread starts only
+        // for an existing journal, which it opens and recovers on its own,
+        // or with the first managed command; it makes no journal.
+        let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
+            .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
         let node = Arc::new(Self {
             id: identity.node_id(),
             cfg,
             version,
             peers,
-            store: Arc::new(Mutex::new(store)),
+            store,
             jobs: tokio::sync::Mutex::new(jobs),
             broken: Mutex::new(broken),
             endpoint,
@@ -172,6 +180,7 @@ impl Node {
             catching_up: Mutex::new(BTreeMap::new()),
             waiting_catch_up: Mutex::new(BTreeSet::new()),
             client_env: Mutex::new(client_env),
+            authority,
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
@@ -187,6 +196,14 @@ impl Node {
     /// The address both transports listen on.
     pub fn local_addr(&self) -> Result<SocketAddr, NodeError> {
         Ok(self.endpoint.local_addr()?)
+    }
+
+    /// Called by `fabric serve` once it was told to stop, while it still
+    /// holds the node and so the state directory. It does nothing outside
+    /// the end-to-end test, which can arm the `while_stopping` fault point
+    /// here to make the stop slow.
+    pub async fn stopping(&self) {
+        crate::faults::hit(crate::faults::Point::WhileStopping).await;
     }
 
     /// Serves peers and the control socket until the endpoint closes.
@@ -382,13 +399,19 @@ impl Node {
     }
 
     /// The job's lock, if this node knows the job.
+    ///
+    /// A job only the managed authority holds is refused as a managed job,
+    /// so a standalone command never reads it as unknown and never acts on
+    /// it (ADR 0020); the authority is asked only on that path.
     pub(crate) async fn job(&self, id: JobId) -> Result<Arc<tokio::sync::Mutex<Job>>, NodeError> {
-        self.jobs
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .ok_or(NodeError::UnknownJob(id))
+        let found = self.jobs.lock().await.get(&id).cloned();
+        match found {
+            Some(job) => Ok(job),
+            None => Err(self
+                .managed_only(id)
+                .await
+                .unwrap_or(NodeError::UnknownJob(id))),
+        }
     }
 
     /// The node's environment, for work no client asked for, such as a
@@ -465,6 +488,39 @@ pub(crate) fn is_transport(err: &RpcError) -> bool {
     matches!(err, RpcError::Transport(_) | RpcError::Frame(_))
 }
 
+/// Opens the lock at `path` in the state directory `root` and takes it,
+/// waiting up to `wait` for another daemon to let it go. A daemon told to
+/// stop holds the lock until it has shut down, so a start typed right
+/// after a stop waits for it instead of refusing. A daemon that keeps the
+/// lock is refused once `wait` has passed, so one process still serves the
+/// directory (issue #28, gate finding F14). A start with no other daemon
+/// takes the lock at the first try and never sleeps.
+fn take_lock(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    wait: Duration,
+) -> Result<File, NodeError> {
+    let file = open_lock(path)?;
+    let deadline = std::time::Instant::now() + wait;
+    let mut waiting = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                if !waiting {
+                    waiting = true;
+                    tracing::info!(state = ?root, ?wait, "another daemon holds the state directory; waiting for it to stop");
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(NodeError::AlreadyRunning(root.to_owned()));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(NodeError::io(path, e)),
+        }
+    }
+}
+
 /// Opens the daemon's lock file at `path`, made with mode 0600 when it is missing.
 ///
 /// A link at the name is refused, never followed, and so is anything there
@@ -508,7 +564,7 @@ fn open_store(dir: &std::path::Path) -> Result<Store, NodeError> {
 /// where the adapters keep departure records and the Claude config lock
 /// under `~/.fabric`, which is the state directory unless `FABRIC_HOME`
 /// names another.
-const STATE_ENTRIES: [&str; 11] = [
+const STATE_ENTRIES: [&str; 12] = [
     "client-env",
     "daemon.lock",
     "fabric.sock",
@@ -516,6 +572,7 @@ const STATE_ENTRIES: [&str; 11] = [
     "harness.toml",
     "jobs",
     "locks",
+    "managed",
     "node.key",
     "peers",
     "peers.lock",
@@ -722,27 +779,27 @@ fn load_jobs(state: &StateDir) -> Result<(Jobs, BTreeMap<JobId, String>), NodeEr
 /// A live stream of every job's events (C2) is this sink made a broadcast.
 #[derive(Debug, Default)]
 pub(crate) struct Out {
-    live: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    live: Option<crate::control::Live>,
     /// The events kept when no client streams them.
     pub(crate) events: Vec<Event>,
 }
 
 impl Out {
-    /// A sink that sends each event to a client's connection as it is made.
-    pub(crate) fn streaming(live: tokio::sync::mpsc::UnboundedSender<Event>) -> Self {
+    /// A sink that sends each event to a client's connection as it is
+    /// made, within the backlog a client that does not read may hold.
+    pub(crate) fn streaming(live: crate::control::Live) -> Self {
         Self {
             live: Some(live),
             events: Vec::new(),
         }
     }
 
-    /// Reports an event.
+    /// Reports an event. Never waits on a client: one that left gets no
+    /// more events, and one that stopped reading loses those past its
+    /// backlog; the command runs on.
     pub(crate) fn emit(&mut self, event: Event) {
         match &self.live {
-            // A client that left gets no more events; the command runs on.
-            Some(live) => {
-                let _ = live.send(event);
-            }
+            Some(live) => live.send(event),
             None => self.events.push(event),
         }
     }
@@ -845,6 +902,45 @@ mod tests {
         }
         let kept = a.open_session(b.id).expect("no session kept");
         assert!(Arc::ptr_eq(&kept, &dialed));
+    }
+
+    /// M2-10, gate finding F14: `fabric serve` typed right after a stop
+    /// failed with "another fabric daemon holds", because the daemon told
+    /// to stop still held the lock while it shut down. A start waits for
+    /// the lock to be let go, and still refuses a daemon that keeps it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_waits_for_a_stopping_daemon_to_let_the_state_directory_go() {
+        let dir = tempfile::Builder::new()
+            .prefix("fnode")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+        let state = StateDir::resolve(Some(root.join("state").as_os_str()), &home).unwrap();
+        prepare_state_dir(state.root()).unwrap();
+        let stopping = open_lock(&state.lock()).unwrap();
+        stopping.lock().unwrap();
+        let stopped = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(stopping);
+        });
+        let started = Node::start(NodeConfig {
+            state: state.clone(),
+            home,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            dial: DialOrder::TcpOnly,
+            env: ToolEnv::current(),
+        });
+        stopped.join().unwrap();
+        assert!(started.is_ok(), "{started:?}");
+
+        // The started node keeps the lock, so a second start is refused.
+        let refused = take_lock(state.root(), &state.lock(), Duration::from_millis(100));
+        assert!(
+            matches!(refused, Err(NodeError::AlreadyRunning(_))),
+            "{refused:?}"
+        );
     }
 
     fn mode(path: &std::path::Path) -> u32 {

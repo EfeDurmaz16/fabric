@@ -4,10 +4,10 @@
 //! does with an id read from the other machine's screen. The book is the
 //! only input to the accept-side trust decision, it is written whole and
 //! atomically, and its text form is one line per peer so a user can read it.
-//! Two processes share one book file: `fabric node pair` runs by hand while
-//! the daemon serves. Every change therefore reloads the file under an
-//! exclusive lock before it applies, so no writer overwrites another's
-//! pairing, and `refresh`, which the accept path runs before every
+//! The daemon writes the book when `fabric node add` asks it to, and the
+//! file stays safe to share between processes: every change reloads the
+//! file under an exclusive lock before it applies, so no writer overwrites
+//! another's pairing, and `refresh`, which the accept path runs before every
 //! handshake, re-reads the file and parses it again when its bytes changed,
 //! so a pairing made after the daemon started is honoured at the next
 //! handshake. The bytes are the stamp: a length or a modified time can stay
@@ -15,8 +15,9 @@
 //! never holds a book under content it was not parsed from. The check
 //! inside the handshake reads only the book in memory.
 //!
-//! Pairing v0 is out of band: `fabric node pair <id>@<host>:<port>` on each
-//! side. A short pairing code, where one side shows six words and the other
+//! Pairing v0 is out of band: `fabric node add <id> <host>:<port>` on the
+//! dialing side and `fabric node add <id>` on a node behind a NAT
+//! (`docs/net.md`). A short pairing code, where one side shows six words and the other
 //! types them to fetch and confirm the id over the connection, is the
 //! documented follow-up; it needs a key exchange that this phase does not.
 

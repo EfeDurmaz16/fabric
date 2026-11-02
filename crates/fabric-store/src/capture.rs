@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -28,7 +28,8 @@ use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, PathError, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    HarnessState, LeaveReason, LeftBehind, ManifestError, Mode, Platform, Remake, SnapshotManifest,
+    HarnessState, LeaveReason, LeftBehind, ManifestError, Mode, PathMeta, Platform, Remake,
+    SnapshotManifest,
 };
 
 use crate::durable::TempFile;
@@ -291,6 +292,12 @@ pub enum CaptureError {
         /// The path.
         path: RelPath,
     },
+    /// The mtime of the workspace root or the harness-state root is before 1970; touch it.
+    #[error("{path}: the mtime is before 1970")]
+    RootMtimeBeforeEpoch {
+        /// The root.
+        path: PathBuf,
+    },
     /// A file name or a symlink target is not UTF-8, which a manifest cannot hold; rename or relink it.
     #[error("{path:?}: the name or the link target is not UTF-8")]
     NotUtf8 {
@@ -454,8 +461,10 @@ fn utf8_link(base: &Path, rel: &RelPath) -> Result<String, CaptureError> {
 }
 
 /// What identifies one state of a path: device, inode, size and mtime.
-type Stamp = (u64, u64, u64, i64, i64);
+type Stamp = (u64, u64, u64, i64, i64, u32);
 
+/// Device, inode, size, mtime and mode, so a `chmod` counts as a change as
+/// a write does: the mode travels (M2-04).
 fn stamp(meta: &fs::Metadata) -> Stamp {
     (
         meta.dev(),
@@ -463,6 +472,7 @@ fn stamp(meta: &fs::Metadata) -> Stamp {
         meta.len(),
         meta.mtime(),
         meta.mtime_nsec(),
+        meta.mode(),
     )
 }
 
@@ -490,10 +500,44 @@ fn stamps<'a>(
 /// A manifest records an unsigned time, so an mtime before 1970 is refused
 /// instead of being read as a different time.
 fn mtime_ns(meta: &fs::Metadata, rel: &RelPath) -> Result<u64, CaptureError> {
-    let before = || CaptureError::MtimeBeforeEpoch { path: rel.clone() };
-    let secs = u64::try_from(meta.mtime()).map_err(|_| before())?;
-    let nanos = u64::try_from(meta.mtime_nsec()).map_err(|_| before())?;
-    Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+    unsigned_mtime(meta).ok_or_else(|| CaptureError::MtimeBeforeEpoch { path: rel.clone() })
+}
+
+/// The mtime of `meta` in nanoseconds since the epoch, or `None` before 1970.
+fn unsigned_mtime(meta: &fs::Metadata) -> Option<u64> {
+    let secs = u64::try_from(meta.mtime()).ok()?;
+    let nanos = u64::try_from(meta.mtime_nsec()).ok()?;
+    Some(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
+/// Reads the mode and mtime of a root directory, which no entry records
+/// (M2-05), following a link to it as the walk below it does, since
+/// restore makes a directory there.
+fn root_meta(root: &Path) -> Result<PathMeta, CaptureError> {
+    let meta = fs::metadata(root).map_err(|e| io_err(root, e))?;
+    Ok(PathMeta {
+        mode: Mode::from_masked(meta.mode()),
+        mtime_ns: unsigned_mtime(&meta).ok_or_else(|| CaptureError::RootMtimeBeforeEpoch {
+            path: root.to_owned(),
+        })?,
+    })
+}
+
+/// The mode a file of `W` travels with: its own bits, with the execute
+/// bits made to agree with the tree, which records only whether the owner
+/// may execute (`100755`). They disagree only where git does not trust the
+/// execute bit (`core.fileMode=false`), and the target's git compares the
+/// file with the tree. A file the tree calls executable gets an execute
+/// bit wherever it has a read bit, as `chmod +x` gives it; one the tree
+/// calls plain loses them all.
+fn blob_mode(raw: u32, executable: bool) -> Mode {
+    let mode = Mode::from_masked(raw);
+    let bits = match (executable, mode.owner_executable()) {
+        (true, false) => mode.bits() | ((mode.bits() & 0o444) >> 2) | 0o100,
+        (false, true) => mode.bits() & !0o111,
+        _ => mode.bits(),
+    };
+    Mode::from_masked(u32::from(bits))
 }
 
 /// True when a link at `rel` with `target` points outside the tree root.
@@ -849,7 +893,7 @@ impl Census {
             .filter(|item| carried(&item.rel))
             .map(|item| {
                 let stamp = match item.kind {
-                    FoundKind::Dir => (item.meta.dev(), item.meta.ino(), 0, 0, 0),
+                    FoundKind::Dir => (item.meta.dev(), item.meta.ino(), 0, 0, 0, 0),
                     FoundKind::File | FoundKind::Symlink => stamp(&item.meta),
                 };
                 (item.rel.clone(), Some(stamp))
@@ -1132,25 +1176,33 @@ impl Markers for DirMarkers<'_> {
 /// The refs and `HEAD` of a repository at one moment.
 #[derive(Debug, PartialEq, Eq)]
 struct RefView {
+    /// Every ref but the symbolic ones, with its id; sorted by name.
     refs: Vec<(RefName, GitOid)>,
+    /// Every symbolic ref whose target is in `refs`, with that target; sorted by name.
+    symbolic: Vec<(RefName, RefName)>,
     head: GitHead,
 }
 
 impl RefView {
-    /// Names what differs in `later`: `HEAD` first, then the first ref by name.
+    /// Names what differs in `later`: `HEAD` first, then the first ref or symbolic ref by name.
     fn moved_in(&self, later: &RefView) -> Option<MovedRef> {
         if self.head != later.head {
             return Some(MovedRef::Head);
         }
-        self.refs
-            .iter()
-            .chain(&later.refs)
+        let refs = (self.refs.iter().chain(&later.refs))
             .filter(|r| !self.refs.contains(r) || !later.refs.contains(r))
-            .map(|(name, _)| name)
+            .map(|(name, _)| name);
+        let symbolic = (self.symbolic.iter().chain(&later.symbolic))
+            .filter(|r| !self.symbolic.contains(r) || !later.symbolic.contains(r))
+            .map(|(name, _)| name);
+        refs.chain(symbolic)
             .min()
             .map(|name| MovedRef::Ref(name.clone()))
     }
 }
+
+/// The refs with their ids, and the symbolic refs with their targets, both sorted by name.
+type ListedRefs = (Vec<(RefName, GitOid)>, Vec<(RefName, RefName)>);
 
 /// The bundle capture tries to make.
 enum BundlePlan {
@@ -1565,8 +1617,9 @@ struct IndexBlob {
     filtered: bool,
 }
 
-/// The mtime of every path of `W`, sorted by path, and an entry for every directory of `W`.
-type WorktreeMeta = (Vec<(RelPath, u64)>, Vec<Entry>);
+/// The mtime of every path of `W` and the mode of every file of `W`, both
+/// sorted by path, and an entry for every directory of `W`.
+type WorktreeMeta = (Vec<(RelPath, u64)>, Vec<(RelPath, Mode)>, Vec<Entry>);
 
 /// What the git half saw of the work tree, checked again once every file is stored.
 struct GitSeen {
@@ -1619,7 +1672,13 @@ impl GitCapture<'_> {
         if let Some(rel) = changed {
             return Err(CaptureError::WorkspaceChanged { path: rel.clone() });
         }
-        let (paths, nested) = self.untracked()?;
+        // The two listings are independent; the ignored one runs beside
+        // the untracked one, and is judged after it, as before.
+        let (untracked, ignored_now) = thread::scope(|scope| {
+            let ignored_now = scope.spawn(|| self.ignored_alone());
+            (self.untracked(), joined(ignored_now))
+        });
+        let (paths, nested) = untracked?;
         let before: BTreeSet<&RelPath> = seen
             .untracked
             .0
@@ -1639,13 +1698,19 @@ impl GitCapture<'_> {
                 path: (*rel).clone(),
             });
         }
-        let mut report = CaptureReport::default();
-        let found = self.ignored(&mut report)?;
+        let (found, report) = ignored_now?;
         let names = report
             .special_files
             .iter()
             .chain(&report.nested_repositories);
         ignored.unchanged_in(&Census::of(&found, names, carried))
+    }
+
+    /// `ignored` into a report of its own, for a listing that runs on another thread.
+    fn ignored_alone(&self) -> Result<(Vec<Found>, CaptureReport), CaptureError> {
+        let mut report = CaptureReport::default();
+        let found = self.ignored(&mut report)?;
+        Ok((found, report))
     }
 
     /// The `-c` value that makes a listing read the same user exclude rules as `W`.
@@ -2177,30 +2242,63 @@ impl GitCapture<'_> {
         format!("refs/fabric/{}/snap/", self.job_id)
     }
 
-    /// Lists refs with their ids; older snapshot refs of this job are already deleted.
-    fn refs(&self) -> Result<Vec<(RefName, GitOid)>, CaptureError> {
-        let out = self
-            .git
-            .run_text(&["for-each-ref", "--format=%(refname) %(objectname)"])?;
-        let mut refs = Vec::new();
+    /// Lists the refs with their ids, and apart from them the symbolic
+    /// refs with their targets, from one `for-each-ref` (M2-06).
+    ///
+    /// A symbolic ref, such as the `refs/remotes/origin/HEAD` of a clone,
+    /// travels as one, so the target's `git remote show` and the next fetch
+    /// still follow the remote's default branch. One whose target is not
+    /// itself a ref of the listing, as a symbolic ref to another symbolic
+    /// ref, keeps its id instead, as every ref did before format version 3.
+    /// Older snapshot refs of this job are already deleted.
+    fn refs(&self) -> Result<ListedRefs, CaptureError> {
+        let out = self.git.run_text(&[
+            "for-each-ref",
+            "--format=%(refname) %(symref) %(objectname)",
+        ])?;
+        let mut listed = Vec::new();
         for line in out.lines() {
-            let (name, oid) = line.split_once(' ').ok_or_else(|| GitError::Parse {
+            let bad = || GitError::Parse {
                 what: "ref line",
                 text: line.to_owned(),
-            })?;
-            refs.push((
+            };
+            let mut fields = line.splitn(3, ' ');
+            let (Some(name), Some(target), Some(oid)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(bad().into());
+            };
+            listed.push((
                 RefName::parse(name).map_err(GitError::from)?,
+                target,
                 GitOid::parse(oid).map_err(GitError::from)?,
             ));
         }
+        let direct: BTreeSet<&str> = (listed.iter())
+            .filter(|(_, target, _)| target.is_empty())
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        let mut refs = Vec::new();
+        let mut symbolic = Vec::new();
+        for (name, target, oid) in &listed {
+            match RefName::parse(target) {
+                Ok(target) if direct.contains(target.as_str()) => {
+                    symbolic.push((name.clone(), target));
+                }
+                _ => refs.push((name.clone(), oid.clone())),
+            }
+        }
         refs.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(refs)
+        symbolic.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((refs, symbolic))
     }
 
     /// Reads the refs and `HEAD` together.
     fn ref_view(&self) -> Result<RefView, CaptureError> {
+        let (refs, symbolic) = self.refs()?;
         Ok(RefView {
-            refs: self.refs()?,
+            refs,
+            symbolic,
             head: self.head()?,
         })
     }
@@ -2294,8 +2392,10 @@ impl GitCapture<'_> {
     /// A ref the bundle lists must have the id `view` gives it. A full
     /// bundle must list every ref. A ref an incremental or empty bundle
     /// leaves out must be reachable from the parent's tips, which the
-    /// earlier bundles of the chain carry. Anything else means a ref moved
-    /// while the bundle was made, and the snapshot would not restore.
+    /// earlier bundles of the chain carry. A symbolic ref the bundle lists,
+    /// as git lists `refs/remotes/origin/HEAD`, must have its target's id.
+    /// Anything else means a ref moved while the bundle was made, and the
+    /// snapshot would not restore.
     fn confirm_bundle(
         &self,
         built: &BuiltBundle,
@@ -2304,12 +2404,7 @@ impl GitCapture<'_> {
     ) -> Result<(), CaptureError> {
         let listed: BTreeMap<String, String> = match built {
             BuiltBundle::Full(file) | BuiltBundle::Incremental { file, .. } => {
-                let path = file.path().to_string_lossy().into_owned();
-                let out = self.git.run_text(&["bundle", "list-heads", &path])?;
-                out.lines()
-                    .filter_map(|line| line.split_once(' '))
-                    .map(|(oid, name)| (name.to_owned(), oid.to_owned()))
-                    .collect()
+                bundle_heads(file.path())?
             }
             BuiltBundle::Empty { .. } => BTreeMap::new(),
         };
@@ -2333,8 +2428,16 @@ impl GitCapture<'_> {
                 None => left_out.push((name, *oid)),
             }
         }
-        for name in listed.keys() {
-            if name != "HEAD" && !wanted.iter().any(|(n, _)| n.to_string() == *name) {
+        let target_id = |name: &str| {
+            let (_, target) = view.symbolic.iter().find(|(n, _)| n.as_str() == name)?;
+            let (_, oid) = view.refs.iter().find(|(n, _)| n == target)?;
+            Some(oid.as_str())
+        };
+        for (name, oid) in &listed {
+            let known = name == "HEAD"
+                || wanted.iter().any(|(n, _)| n.to_string() == *name)
+                || target_id(name) == Some(oid.as_str());
+            if !known {
                 let name = RefName::parse(name).map_err(GitError::from)?;
                 return Err(moved(&MovedRef::Ref(name)));
             }
@@ -2466,19 +2569,26 @@ impl GitCapture<'_> {
         }
         Ok(RefView {
             refs: refs.into_iter().collect(),
+            symbolic: read.symbolic,
             head: read.head,
         })
     }
 
-    /// Reads the mtime of every path in `W`, reporting the links among
-    /// them that escape the root, and the mode and mtime of every
-    /// directory of `W`, from one listing of its tree.
+    /// Reads the mtime of every path in `W` and the mode of every file in
+    /// it, reporting the links among them that escape the root, and the
+    /// mode and mtime of every directory of `W`, from one listing of its
+    /// tree.
     ///
     /// `before` holds the stamps taken just before `git add -A` built `W`.
-    /// A path whose stamp differs now, or that had none, was written while
-    /// or after `W` was built, so `W` may hold older bytes than the mtime
-    /// recorded here; that fails with `WorkspaceChanged` instead of
-    /// publishing a snapshot that loses the edit.
+    /// A path whose stamp differs now, or that had none, was written or
+    /// changed mode while or after `W` was built, so `W` may hold older
+    /// bytes or another execute bit than recorded here; that fails with
+    /// `WorkspaceChanged` instead of publishing a snapshot that loses the
+    /// edit.
+    ///
+    /// A tree records only `100644` or `100755`, so a file kept at 0600,
+    /// such as a key committed by mistake, would come back readable by
+    /// others; each file's own bits travel (`blob_mode`, M2-04).
     ///
     /// A tree holds no metadata of its own directories, so restore would
     /// make each with the default mode and a fresh mtime, and a directory
@@ -2502,14 +2612,17 @@ impl GitCapture<'_> {
                 text: text.to_owned(),
             })?;
             let rel = rel_path(path)?;
-            if meta.split(' ').nth(1) == Some("tree") {
+            let mut fields = meta.split(' ');
+            let tree_mode = fields.next().unwrap_or_default();
+            if fields.next() == Some("tree") {
                 trees.push(rel);
             } else {
-                paths.push(rel);
+                paths.push((rel, tree_mode));
             }
         }
         let mut mtimes = Vec::with_capacity(paths.len());
-        for rel in paths {
+        let mut modes = Vec::with_capacity(paths.len());
+        for (rel, tree_mode) in paths {
             let full = self.root.join(rel.as_str());
             let meta = match fs::symlink_metadata(&full) {
                 Ok(meta) => meta,
@@ -2527,10 +2640,17 @@ impl GitCapture<'_> {
                     report.escaping_symlinks.push(rel.clone());
                 }
             }
+            // A link's and a submodule's bits are never applied.
+            match tree_mode {
+                "100644" => modes.push((rel.clone(), blob_mode(meta.mode(), false))),
+                "100755" => modes.push((rel.clone(), blob_mode(meta.mode(), true))),
+                _ => {}
+            }
             let mtime = mtime_ns(&meta, &rel)?;
             mtimes.push((rel, mtime));
         }
         mtimes.sort_by(|a, b| a.0.cmp(&b.0));
+        modes.sort_by(|a, b| a.0.cmp(&b.0));
         let mut dirs = Vec::with_capacity(trees.len());
         for rel in trees {
             let full = self.root.join(rel.as_str());
@@ -2549,7 +2669,7 @@ impl GitCapture<'_> {
                 kind: EntryKind::Dir,
             });
         }
-        Ok((mtimes, dirs))
+        Ok((mtimes, modes, dirs))
     }
 
     /// Lists the paths of every stash entry in `stashes` and of their index and untracked parents that `denies` names.
@@ -2638,6 +2758,62 @@ impl GitCapture<'_> {
     }
 }
 
+/// The result of a scoped thread, its panic carried on to the caller.
+fn joined<T>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Reads the refs a bundle lists, by name, with their ids: the reference
+/// lines of its header, which `git bundle list-heads` prints as they are.
+///
+/// The header is text up to the first empty line (gitformat-bundle(5)):
+/// the signature `# v2 git bundle` or `# v3 git bundle`, a line per
+/// capability that starts with `@`, a line per prerequisite that starts
+/// with `-`, then `<id> <refname>` per reference. Reading it costs no
+/// process; `bundle verify` has already checked the header with git's own
+/// parser, and a ref this reads wrongly fails `confirm_bundle`, never
+/// passes it.
+fn bundle_heads(path: &Path) -> Result<BTreeMap<String, String>, CaptureError> {
+    let bad = |text: &str| -> CaptureError {
+        GitError::Parse {
+            what: "bundle header",
+            text: text.to_owned(),
+        }
+        .into()
+    };
+    let mut reader = BufReader::new(File::open(path).map_err(|e| io_err(path, e))?);
+    let mut line = Vec::new();
+    let mut heads = BTreeMap::new();
+    let mut first = true;
+    loop {
+        line.clear();
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| io_err(path, e))?;
+        let text = Git::text("bundle header", &line)?;
+        let Some(text) = text.strip_suffix('\n') else {
+            return Err(bad(text));
+        };
+        if first {
+            if !matches!(text, "# v2 git bundle" | "# v3 git bundle") {
+                return Err(bad(text));
+            }
+            first = false;
+            continue;
+        }
+        if text.is_empty() {
+            return Ok(heads);
+        }
+        if text.starts_with('@') || text.starts_with('-') {
+            continue;
+        }
+        let (oid, name) = text.split_once(' ').ok_or_else(|| bad(text))?;
+        heads.insert(name.to_owned(), oid.to_owned());
+    }
+}
+
 /// The most path bytes one git command line carries, well under every `ARG_MAX`.
 const ARG_BYTES: usize = 128 << 10;
 
@@ -2718,15 +2894,26 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let (state, mut seen) = capture_git(&mut capturer, &repo, &listing, parent)?;
+        // The ignored listing needs nothing the git half makes, and only
+        // has to come before the files are stored, so it runs beside it.
+        let (git_half, ignored_listing) = thread::scope(|scope| {
+            let ignored_listing = scope.spawn(|| repo.ignored_alone());
+            let git_half = capture_git(&mut capturer, &repo, &listing, parent);
+            (git_half, joined(ignored_listing))
+        });
+        let (state, mut seen) = git_half?;
+        let (mut found, listed) = ignored_listing?;
         worktree_dirs = std::mem::take(&mut seen.dirs);
-        let report = &mut capturer.report;
-        let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
-        let mut found = repo.ignored(report)?;
-        let names = report.special_files[special..]
+        let names = listed
+            .special_files
             .iter()
-            .chain(&report.nested_repositories[nested..]);
+            .chain(&listed.nested_repositories);
         let ignored = Census::of(&found, names, &mut carried);
+        let report = &mut capturer.report;
+        report.special_files.extend(listed.special_files);
+        report
+            .nested_repositories
+            .extend(listed.nested_repositories);
         // git lists files only, so an empty directory, untracked or
         // ignored, comes from a walk; one `W` holds as a submodule stays out.
         let in_w: HashSet<&RelPath> = seen.paths.iter().collect();
@@ -2759,12 +2946,14 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     let harness_state = match req.harness_state {
         Some(dir) => HarnessState {
             entries: capturer.harness_entries(dir)?,
+            root: Some(root_meta(dir)?),
         },
         None => HarnessState::default(),
     };
     let manifest = SnapshotManifest {
         job_id: req.job_id,
         root,
+        root_meta: Some(root_meta(req.root)?),
         parent: req.parent,
         created_at: req.created_at,
         created_by: req.created_by,
@@ -3017,10 +3206,14 @@ fn capture_git(
     let plan = BundlePlan::after(capturer.store, parent)?;
     let (built, view, stashes) = repo.bundle_with_stash(&plan, &worktree_commit)?;
     let (bundle, bundle_base) = capturer.store_bundle(built)?;
-    let RefView { refs, head } = view;
+    let RefView {
+        refs,
+        symbolic,
+        head,
+    } = view;
     capturer.report.stashed_secrets =
         repo.stashed_secrets(&stashes, &|rel| policy.denies_anywhere(rel))?;
-    let (worktree_mtimes, dirs) =
+    let (worktree_mtimes, worktree_modes, dirs) =
         repo.worktree_meta(&worktree_commit, &before, &mut capturer.report)?;
     let config = repo.config(&mut capturer.report);
     let exclude_path = &repo.layout.info_exclude;
@@ -3039,10 +3232,12 @@ fn capture_git(
         bundle,
         bundle_base,
         refs,
+        symbolic_refs: symbolic,
         head,
         index_commit,
         worktree_commit,
         worktree_mtimes,
+        worktree_modes,
         config,
         exclude,
     };
@@ -3073,6 +3268,100 @@ mod tests {
         GitCapture::open(git, root, policy, JobId::from_bytes([1; 16]), scratch)
             .unwrap()
             .unwrap()
+    }
+
+    /// The refs `git bundle list-heads` prints for the bundle at `path`, by name.
+    fn listed_heads(git: &Git, path: &Path) -> BTreeMap<String, String> {
+        let out = git
+            .run_text(&["bundle", "list-heads", &path.to_string_lossy()])
+            .unwrap();
+        out.lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(oid, name)| (name.to_owned(), oid.to_owned()))
+            .collect()
+    }
+
+    /// The header of a full and of an incremental bundle, of a SHA-1 and
+    /// of a SHA-256 repository (a `v3` bundle with a capability line),
+    /// with prerequisites and a symbolic `HEAD`, reads as `list-heads`
+    /// prints it.
+    #[test]
+    fn the_bundle_header_lists_what_list_heads_prints() {
+        for format in ["sha1", "sha256"] {
+            let dir = tempfile::tempdir().unwrap();
+            let git = Git::new(dir.path()).with_date(1_760_000_000_000);
+            git.run(&[
+                "init",
+                "-q",
+                "-b",
+                "main",
+                &format!("--object-format={format}"),
+            ])
+            .unwrap();
+            git.run(&["commit", "-q", "--allow-empty", "-m", "one"])
+                .unwrap();
+            git.run(&["tag", "-a", "-m", "tagged", "v1"]).unwrap();
+            let first = git.run_text(&["rev-parse", "HEAD"]).unwrap();
+            git.run(&["commit", "-q", "--allow-empty", "-m", "two"])
+                .unwrap();
+            git.run(&["branch", "side"]).unwrap();
+            let (full, incremental) = (dir.path().join("full"), dir.path().join("incremental"));
+            git.run(&["bundle", "create", &full.to_string_lossy(), "--all"])
+                .unwrap();
+            let incremental_text = incremental.to_string_lossy();
+            git.run(&[
+                "bundle",
+                "create",
+                &incremental_text,
+                "--all",
+                "--not",
+                &first,
+            ])
+            .unwrap();
+            for path in [&full, &incremental] {
+                let heads = bundle_heads(path).unwrap();
+                assert_eq!(
+                    heads,
+                    listed_heads(&git, path),
+                    "{format} {}",
+                    path.display()
+                );
+                assert!(heads.contains_key("refs/heads/side"), "{heads:?}");
+            }
+            let header = fs::read(&incremental).unwrap();
+            assert!(
+                header.windows(2).any(|w| w == b"\n-"),
+                "no prerequisite line"
+            );
+            if format == "sha256" {
+                assert!(header.starts_with(b"# v3 git bundle\n@object-format=sha256\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_bundle_header_that_is_not_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle");
+        let oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        for bytes in [
+            format!("# v9 git bundle\n{oid} refs/heads/main\n\n"),
+            format!("# v2 git bundle\n{oid} refs/heads/main\n"),
+            format!("# v2 git bundle\n{oid}\n\n"),
+            String::new(),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(bundle_heads(&path).is_err(), "{bytes:?}");
+        }
+        fs::write(
+            &path,
+            format!("# v2 git bundle\n-{oid} c\n{oid} refs/heads/main\n\nPACK"),
+        )
+        .unwrap();
+        assert_eq!(
+            bundle_heads(&path).unwrap(),
+            BTreeMap::from([("refs/heads/main".to_owned(), oid.to_owned())])
+        );
     }
 
     #[test]
@@ -3211,6 +3500,81 @@ mod tests {
             repo.worktree_meta(&w, &before, &mut report),
             Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
         ));
+    }
+
+    /// A chmod after `W` was built changes the mode the snapshot records,
+    /// which may no longer be the execute bit `W` holds (M2-04).
+    #[test]
+    fn a_file_chmodded_after_w_was_built_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let policy = IgnorePolicy::default();
+        let repo = new_repo(&root, dir.path(), &policy);
+        fs::write(root.join("a.txt"), "before\n").unwrap();
+        fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        repo.git.run(&["add", "a.txt"]).unwrap();
+        repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
+        let w = repo.head_commit().unwrap().unwrap();
+        let paths = [rel("a.txt")];
+        let before = stamps(&root, paths.iter()).unwrap();
+        let mut report = CaptureReport::default();
+        let (_, modes, _) = repo.worktree_meta(&w, &before, &mut report).unwrap();
+        assert_eq!(modes, vec![(rel("a.txt"), Mode::from_masked(0o600))]);
+        fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            repo.worktree_meta(&w, &before, &mut report),
+            Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
+        ));
+    }
+
+    /// A symbolic ref pointed elsewhere while capture ran, as by `git
+    /// remote set-head`, is a moved ref like any other (M2-06).
+    #[test]
+    fn a_symbolic_ref_pointed_elsewhere_counts_as_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let policy = IgnorePolicy::default();
+        let repo = new_repo(&root, dir.path(), &policy);
+        repo.git
+            .run(&["commit", "-q", "--allow-empty", "-m", "one"])
+            .unwrap();
+        for name in ["refs/remotes/origin/main", "refs/remotes/origin/next"] {
+            repo.git.run(&["update-ref", name, "HEAD"]).unwrap();
+        }
+        let set_head = |target: &str| {
+            repo.git
+                .run(&["symbolic-ref", "refs/remotes/origin/HEAD", target])
+                .unwrap();
+        };
+        set_head("refs/remotes/origin/main");
+        let view = repo.ref_view().unwrap();
+        assert_eq!(view.symbolic.len(), 1);
+        assert!(
+            view.refs
+                .iter()
+                .all(|(n, _)| n.as_str() != "refs/remotes/origin/HEAD")
+        );
+        assert_eq!(view.moved_in(&repo.ref_view().unwrap()), None);
+        set_head("refs/remotes/origin/next");
+        assert!(matches!(
+            view.moved_in(&repo.ref_view().unwrap()),
+            Some(MovedRef::Ref(name)) if name.as_str() == "refs/remotes/origin/HEAD"
+        ));
+    }
+
+    /// The execute bits of a file of `W` follow the tree, which records
+    /// only the owner's; the other bits are the file's own.
+    #[test]
+    fn a_blob_mode_agrees_with_the_tree() {
+        assert_eq!(blob_mode(0o100_600, false).bits(), 0o600);
+        assert_eq!(blob_mode(0o100_750, true).bits(), 0o750);
+        assert_eq!(blob_mode(0o100_644, true).bits(), 0o755);
+        assert_eq!(blob_mode(0o100_640, true).bits(), 0o750);
+        assert_eq!(blob_mode(0o100_755, false).bits(), 0o644);
+        assert_eq!(blob_mode(0o100_4755, true).bits(), 0o755);
     }
 
     /// A flag set after `refuse_bad_states` probed the real index is refused on the copy `I` is built from.

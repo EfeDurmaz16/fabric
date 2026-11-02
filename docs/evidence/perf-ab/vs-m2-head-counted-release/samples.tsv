@@ -1,0 +1,2413 @@
+phase	run	op	side	first	metric	value
+counted	1	acp new	candidate	candidate	barrierfsync	4
+counted	1	acp new	candidate	candidate	cli_cpu_us	13538
+counted	1	acp new	candidate	candidate	cli_maxrss_kib	6784
+counted	1	acp new	candidate	candidate	cli_processes	1
+counted	1	acp new	candidate	candidate	cmd:git clone	1
+counted	1	acp new	candidate	candidate	cpu_us	20410
+counted	1	acp new	candidate	candidate	frees	27210
+counted	1	acp new	candidate	candidate	fullfsync	3
+counted	1	acp new	candidate	candidate	malloc_bytes	13331129
+counted	1	acp new	candidate	candidate	mallocs	37861
+counted	1	acp new	candidate	candidate	opens	8
+counted	1	acp new	candidate	candidate	read_bytes.ledger	143
+counted	1	acp new	candidate	candidate	read_calls.ipc	2
+counted	1	acp new	candidate	candidate	read_calls.ledger	2
+counted	1	acp new	candidate	candidate	renames	3
+counted	1	acp new	candidate	candidate	spawn:git	1
+counted	1	acp new	candidate	candidate	spawns	1
+counted	1	acp new	candidate	candidate	syncs.jobs	4
+counted	1	acp new	candidate	candidate	syncs.ledger	1
+counted	1	acp new	candidate	candidate	syncs.outside	1
+counted	1	acp new	candidate	candidate	syncs.state	1
+counted	1	acp new	candidate	candidate	write_bytes.ipc	286
+counted	1	acp new	candidate	candidate	write_bytes.jobs	264
+counted	1	acp new	candidate	candidate	write_bytes.ledger	143
+counted	1	acp new	candidate	candidate	write_calls.ipc	3
+counted	1	acp new	candidate	candidate	write_calls.jobs	2
+counted	1	acp new	candidate	candidate	write_calls.ledger	1
+counted	1	acp new	candidate	candidate	daemon_rss_kib.a	11792
+counted	1	acp new	candidate	candidate	daemon_footprint_kib.a	5184
+counted	1	acp new	candidate	candidate	daemon_rss_kib.b	13072
+counted	1	acp new	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	acp new	anchor	candidate	cli_cpu_us	11046
+counted	1	acp new	anchor	candidate	cli_maxrss_kib	8032
+counted	1	acp new	anchor	candidate	cli_processes	1
+counted	1	acp new	anchor	candidate	cmd:defaults	2
+counted	1	acp new	anchor	candidate	cmd:git clone	1
+counted	1	acp new	anchor	candidate	cpu_us	18521
+counted	1	acp new	anchor	candidate	frees	27764
+counted	1	acp new	anchor	candidate	fullfsync	8
+counted	1	acp new	anchor	candidate	malloc_bytes	13424042
+counted	1	acp new	anchor	candidate	mallocs	38486
+counted	1	acp new	anchor	candidate	opens	11
+counted	1	acp new	anchor	candidate	read_bytes.ledger	143
+counted	1	acp new	anchor	candidate	read_calls.ipc	6
+counted	1	acp new	anchor	candidate	read_calls.ledger	2
+counted	1	acp new	anchor	candidate	renames	3
+counted	1	acp new	anchor	candidate	spawn:defaults	2
+counted	1	acp new	anchor	candidate	spawn:git	1
+counted	1	acp new	anchor	candidate	spawns	3
+counted	1	acp new	anchor	candidate	syncs.jobs	5
+counted	1	acp new	anchor	candidate	syncs.ledger	1
+counted	1	acp new	anchor	candidate	syncs.outside	1
+counted	1	acp new	anchor	candidate	syncs.state	1
+counted	1	acp new	anchor	candidate	write_bytes.ipc	286
+counted	1	acp new	anchor	candidate	write_bytes.jobs	264
+counted	1	acp new	anchor	candidate	write_bytes.ledger	143
+counted	1	acp new	anchor	candidate	write_calls.ipc	3
+counted	1	acp new	anchor	candidate	write_calls.jobs	2
+counted	1	acp new	anchor	candidate	write_calls.ledger	1
+counted	1	acp new	anchor	candidate	daemon_rss_kib.a	13376
+counted	1	acp new	anchor	candidate	daemon_footprint_kib.a	5376
+counted	1	acp new	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	acp new	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	acp launch	candidate	candidate	barrierfsync	5
+counted	1	acp launch	candidate	candidate	cli_cpu_us	7855
+counted	1	acp launch	candidate	candidate	cli_maxrss_kib	5984
+counted	1	acp launch	candidate	candidate	cli_processes	1
+counted	1	acp launch	candidate	candidate	cmd:dash holding fabric-fake-agent	1
+counted	1	acp launch	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	acp launch	candidate	candidate	cpu_us	10597
+counted	1	acp launch	candidate	candidate	frees	3341
+counted	1	acp launch	candidate	candidate	fullfsync	5
+counted	1	acp launch	candidate	candidate	malloc_bytes	778413
+counted	1	acp launch	candidate	candidate	mallocs	4442
+counted	1	acp launch	candidate	candidate	opens	26
+counted	1	acp launch	candidate	candidate	read_bytes.ipc	494
+counted	1	acp launch	candidate	candidate	read_bytes.jobs	121
+counted	1	acp launch	candidate	candidate	read_bytes.outside	40
+counted	1	acp launch	candidate	candidate	read_bytes.state	174
+counted	1	acp launch	candidate	candidate	read_calls.ipc	6
+counted	1	acp launch	candidate	candidate	read_calls.jobs	2
+counted	1	acp launch	candidate	candidate	read_calls.outside	3
+counted	1	acp launch	candidate	candidate	read_calls.state	4
+counted	1	acp launch	candidate	candidate	renames	5
+counted	1	acp launch	candidate	candidate	spawn:dash	1
+counted	1	acp launch	candidate	candidate	spawn:ps	1
+counted	1	acp launch	candidate	candidate	spawns	2
+counted	1	acp launch	candidate	candidate	syncs.jobs	9
+counted	1	acp launch	candidate	candidate	syncs.ledger	1
+counted	1	acp launch	candidate	candidate	unlinks	3
+counted	1	acp launch	candidate	candidate	write_bytes.ipc	1026
+counted	1	acp launch	candidate	candidate	write_bytes.jobs	577
+counted	1	acp launch	candidate	candidate	write_bytes.ledger	135
+counted	1	acp launch	candidate	candidate	write_calls.ipc	15
+counted	1	acp launch	candidate	candidate	write_calls.jobs	5
+counted	1	acp launch	candidate	candidate	write_calls.ledger	1
+counted	1	acp launch	candidate	candidate	daemon_rss_kib.a	12208
+counted	1	acp launch	candidate	candidate	daemon_footprint_kib.a	5360
+counted	1	acp launch	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	acp launch	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	acp launch	anchor	candidate	cli_cpu_us	10746
+counted	1	acp launch	anchor	candidate	cli_maxrss_kib	7440
+counted	1	acp launch	anchor	candidate	cli_processes	1
+counted	1	acp launch	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	acp launch	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	acp launch	anchor	candidate	cmd:sh holding fabric-fake-agent	1
+counted	1	acp launch	anchor	candidate	cpu_us	14596
+counted	1	acp launch	anchor	candidate	frees	3720
+counted	1	acp launch	anchor	candidate	fullfsync	12
+counted	1	acp launch	anchor	candidate	malloc_bytes	767910
+counted	1	acp launch	anchor	candidate	mallocs	4497
+counted	1	acp launch	anchor	candidate	opens	37
+counted	1	acp launch	anchor	candidate	read_bytes.ipc	500
+counted	1	acp launch	anchor	candidate	read_bytes.jobs	509
+counted	1	acp launch	anchor	candidate	read_bytes.outside	40
+counted	1	acp launch	anchor	candidate	read_bytes.state	174
+counted	1	acp launch	anchor	candidate	read_calls.ipc	11
+counted	1	acp launch	anchor	candidate	read_calls.jobs	10
+counted	1	acp launch	anchor	candidate	read_calls.outside	3
+counted	1	acp launch	anchor	candidate	read_calls.state	4
+counted	1	acp launch	anchor	candidate	renames	5
+counted	1	acp launch	anchor	candidate	spawn:ps	3
+counted	1	acp launch	anchor	candidate	spawn:sh	1
+counted	1	acp launch	anchor	candidate	spawns	4
+counted	1	acp launch	anchor	candidate	syncs.jobs	11
+counted	1	acp launch	anchor	candidate	syncs.ledger	1
+counted	1	acp launch	anchor	candidate	unlinks	3
+counted	1	acp launch	anchor	candidate	write_bytes.ipc	1025
+counted	1	acp launch	anchor	candidate	write_bytes.jobs	577
+counted	1	acp launch	anchor	candidate	write_bytes.ledger	135
+counted	1	acp launch	anchor	candidate	write_calls.ipc	14
+counted	1	acp launch	anchor	candidate	write_calls.jobs	5
+counted	1	acp launch	anchor	candidate	write_calls.ledger	1
+counted	1	acp launch	anchor	candidate	daemon_rss_kib.a	13664
+counted	1	acp launch	anchor	candidate	daemon_footprint_kib.a	5456
+counted	1	acp launch	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	acp launch	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	acp approve	candidate	candidate	barrierfsync	1
+counted	1	acp approve	candidate	candidate	cli_cpu_us	7040
+counted	1	acp approve	candidate	candidate	cli_maxrss_kib	4144
+counted	1	acp approve	candidate	candidate	cli_processes	1
+counted	1	acp approve	candidate	candidate	cpu_us	7596
+counted	1	acp approve	candidate	candidate	frees	659
+counted	1	acp approve	candidate	candidate	fullfsync	1
+counted	1	acp approve	candidate	candidate	malloc_bytes	254574
+counted	1	acp approve	candidate	candidate	mallocs	785
+counted	1	acp approve	candidate	candidate	opens	1
+counted	1	acp approve	candidate	candidate	renames	1
+counted	1	acp approve	candidate	candidate	syncs.jobs	1
+counted	1	acp approve	candidate	candidate	syncs.ledger	1
+counted	1	acp approve	candidate	candidate	write_bytes.ipc	26
+counted	1	acp approve	candidate	candidate	write_bytes.jobs	143
+counted	1	acp approve	candidate	candidate	write_bytes.ledger	98
+counted	1	acp approve	candidate	candidate	write_calls.ipc	1
+counted	1	acp approve	candidate	candidate	write_calls.jobs	1
+counted	1	acp approve	candidate	candidate	write_calls.ledger	1
+counted	1	acp approve	candidate	candidate	daemon_rss_kib.a	12208
+counted	1	acp approve	candidate	candidate	daemon_footprint_kib.a	5040
+counted	1	acp approve	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	acp approve	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	acp approve	anchor	candidate	cli_cpu_us	10438
+counted	1	acp approve	anchor	candidate	cli_maxrss_kib	5024
+counted	1	acp approve	anchor	candidate	cli_processes	1
+counted	1	acp approve	anchor	candidate	cpu_us	11178
+counted	1	acp approve	anchor	candidate	frees	1037
+counted	1	acp approve	anchor	candidate	fullfsync	3
+counted	1	acp approve	anchor	candidate	malloc_bytes	319454
+counted	1	acp approve	anchor	candidate	mallocs	1189
+counted	1	acp approve	anchor	candidate	opens	3
+counted	1	acp approve	anchor	candidate	renames	1
+counted	1	acp approve	anchor	candidate	syncs.jobs	2
+counted	1	acp approve	anchor	candidate	syncs.ledger	1
+counted	1	acp approve	anchor	candidate	write_bytes.ipc	26
+counted	1	acp approve	anchor	candidate	write_bytes.jobs	143
+counted	1	acp approve	anchor	candidate	write_bytes.ledger	98
+counted	1	acp approve	anchor	candidate	write_calls.ipc	1
+counted	1	acp approve	anchor	candidate	write_calls.jobs	1
+counted	1	acp approve	anchor	candidate	write_calls.ledger	1
+counted	1	acp approve	anchor	candidate	daemon_rss_kib.a	13664
+counted	1	acp approve	anchor	candidate	daemon_footprint_kib.a	5456
+counted	1	acp approve	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	acp approve	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	claude new	candidate	candidate	barrierfsync	4
+counted	1	claude new	candidate	candidate	cli_cpu_us	6844
+counted	1	claude new	candidate	candidate	cli_maxrss_kib	4256
+counted	1	claude new	candidate	candidate	cli_processes	1
+counted	1	claude new	candidate	candidate	cmd:git clone	1
+counted	1	claude new	candidate	candidate	cpu_us	8273
+counted	1	claude new	candidate	candidate	frees	853
+counted	1	claude new	candidate	candidate	fullfsync	3
+counted	1	claude new	candidate	candidate	malloc_bytes	293901
+counted	1	claude new	candidate	candidate	mallocs	1055
+counted	1	claude new	candidate	candidate	opens	8
+counted	1	claude new	candidate	candidate	read_bytes.ledger	124
+counted	1	claude new	candidate	candidate	read_calls.ipc	2
+counted	1	claude new	candidate	candidate	read_calls.ledger	2
+counted	1	claude new	candidate	candidate	renames	3
+counted	1	claude new	candidate	candidate	spawn:git	1
+counted	1	claude new	candidate	candidate	spawns	1
+counted	1	claude new	candidate	candidate	syncs.jobs	4
+counted	1	claude new	candidate	candidate	syncs.ledger	1
+counted	1	claude new	candidate	candidate	syncs.outside	1
+counted	1	claude new	candidate	candidate	syncs.state	1
+counted	1	claude new	candidate	candidate	write_bytes.ipc	276
+counted	1	claude new	candidate	candidate	write_bytes.jobs	245
+counted	1	claude new	candidate	candidate	write_bytes.ledger	124
+counted	1	claude new	candidate	candidate	write_calls.ipc	3
+counted	1	claude new	candidate	candidate	write_calls.jobs	2
+counted	1	claude new	candidate	candidate	write_calls.ledger	1
+counted	1	claude new	candidate	candidate	daemon_rss_kib.a	12208
+counted	1	claude new	candidate	candidate	daemon_footprint_kib.a	5040
+counted	1	claude new	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	claude new	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	claude new	anchor	candidate	cli_cpu_us	9027
+counted	1	claude new	anchor	candidate	cli_maxrss_kib	5008
+counted	1	claude new	anchor	candidate	cli_processes	1
+counted	1	claude new	anchor	candidate	cmd:defaults	2
+counted	1	claude new	anchor	candidate	cmd:git clone	1
+counted	1	claude new	anchor	candidate	cpu_us	11130
+counted	1	claude new	anchor	candidate	frees	1418
+counted	1	claude new	anchor	candidate	fullfsync	8
+counted	1	claude new	anchor	candidate	malloc_bytes	386555
+counted	1	claude new	anchor	candidate	mallocs	1673
+counted	1	claude new	anchor	candidate	opens	11
+counted	1	claude new	anchor	candidate	read_bytes.ledger	124
+counted	1	claude new	anchor	candidate	read_calls.ipc	6
+counted	1	claude new	anchor	candidate	read_calls.ledger	2
+counted	1	claude new	anchor	candidate	renames	3
+counted	1	claude new	anchor	candidate	spawn:defaults	2
+counted	1	claude new	anchor	candidate	spawn:git	1
+counted	1	claude new	anchor	candidate	spawns	3
+counted	1	claude new	anchor	candidate	syncs.jobs	5
+counted	1	claude new	anchor	candidate	syncs.ledger	1
+counted	1	claude new	anchor	candidate	syncs.outside	1
+counted	1	claude new	anchor	candidate	syncs.state	1
+counted	1	claude new	anchor	candidate	write_bytes.ipc	276
+counted	1	claude new	anchor	candidate	write_bytes.jobs	245
+counted	1	claude new	anchor	candidate	write_bytes.ledger	124
+counted	1	claude new	anchor	candidate	write_calls.ipc	3
+counted	1	claude new	anchor	candidate	write_calls.jobs	2
+counted	1	claude new	anchor	candidate	write_calls.ledger	1
+counted	1	claude new	anchor	candidate	daemon_rss_kib.a	13696
+counted	1	claude new	anchor	candidate	daemon_footprint_kib.a	5488
+counted	1	claude new	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	claude new	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	claude launch	candidate	candidate	barrierfsync	6
+counted	1	claude launch	candidate	candidate	cli_cpu_us	8683
+counted	1	claude launch	candidate	candidate	cli_maxrss_kib	5632
+counted	1	claude launch	candidate	candidate	cli_processes	1
+counted	1	claude launch	candidate	candidate	cmd:dash holding claude	1
+counted	1	claude launch	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	claude launch	candidate	candidate	cpu_us	11548
+counted	1	claude launch	candidate	candidate	frees	2778
+counted	1	claude launch	candidate	candidate	fullfsync	7
+counted	1	claude launch	candidate	candidate	malloc_bytes	518992
+counted	1	claude launch	candidate	candidate	mallocs	3133
+counted	1	claude launch	candidate	candidate	opens	33
+counted	1	claude launch	candidate	candidate	read_bytes.ipc	163
+counted	1	claude launch	candidate	candidate	read_bytes.jobs	613
+counted	1	claude launch	candidate	candidate	read_bytes.outside	40
+counted	1	claude launch	candidate	candidate	read_bytes.state	174
+counted	1	claude launch	candidate	candidate	read_calls.ipc	6
+counted	1	claude launch	candidate	candidate	read_calls.jobs	6
+counted	1	claude launch	candidate	candidate	read_calls.outside	4
+counted	1	claude launch	candidate	candidate	read_calls.state	4
+counted	1	claude launch	candidate	candidate	renames	6
+counted	1	claude launch	candidate	candidate	spawn:dash	1
+counted	1	claude launch	candidate	candidate	spawn:ps	1
+counted	1	claude launch	candidate	candidate	spawns	2
+counted	1	claude launch	candidate	candidate	syncs.jobs	12
+counted	1	claude launch	candidate	candidate	syncs.ledger	1
+counted	1	claude launch	candidate	candidate	unlinks	3
+counted	1	claude launch	candidate	candidate	write_bytes.ipc	693
+counted	1	claude launch	candidate	candidate	write_bytes.jobs	931
+counted	1	claude launch	candidate	candidate	write_bytes.ledger	116
+counted	1	claude launch	candidate	candidate	write_calls.ipc	12
+counted	1	claude launch	candidate	candidate	write_calls.jobs	6
+counted	1	claude launch	candidate	candidate	write_calls.ledger	1
+counted	1	claude launch	candidate	candidate	daemon_rss_kib.a	12224
+counted	1	claude launch	candidate	candidate	daemon_footprint_kib.a	5040
+counted	1	claude launch	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	claude launch	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	claude launch	anchor	candidate	cli_cpu_us	11562
+counted	1	claude launch	anchor	candidate	cli_maxrss_kib	7056
+counted	1	claude launch	anchor	candidate	cli_processes	1
+counted	1	claude launch	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	claude launch	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	claude launch	anchor	candidate	cmd:sh holding claude	1
+counted	1	claude launch	anchor	candidate	cpu_us	15766
+counted	1	claude launch	anchor	candidate	frees	3188
+counted	1	claude launch	anchor	candidate	fullfsync	15
+counted	1	claude launch	anchor	candidate	malloc_bytes	605682
+counted	1	claude launch	anchor	candidate	mallocs	3585
+counted	1	claude launch	anchor	candidate	opens	43
+counted	1	claude launch	anchor	candidate	read_bytes.ipc	169
+counted	1	claude launch	anchor	candidate	read_bytes.jobs	930
+counted	1	claude launch	anchor	candidate	read_bytes.outside	40
+counted	1	claude launch	anchor	candidate	read_bytes.state	174
+counted	1	claude launch	anchor	candidate	read_calls.ipc	11
+counted	1	claude launch	anchor	candidate	read_calls.jobs	12
+counted	1	claude launch	anchor	candidate	read_calls.outside	4
+counted	1	claude launch	anchor	candidate	read_calls.state	4
+counted	1	claude launch	anchor	candidate	renames	6
+counted	1	claude launch	anchor	candidate	spawn:ps	3
+counted	1	claude launch	anchor	candidate	spawn:sh	1
+counted	1	claude launch	anchor	candidate	spawns	4
+counted	1	claude launch	anchor	candidate	syncs.jobs	14
+counted	1	claude launch	anchor	candidate	syncs.ledger	1
+counted	1	claude launch	anchor	candidate	unlinks	3
+counted	1	claude launch	anchor	candidate	write_bytes.ipc	692
+counted	1	claude launch	anchor	candidate	write_bytes.jobs	933
+counted	1	claude launch	anchor	candidate	write_bytes.ledger	116
+counted	1	claude launch	anchor	candidate	write_calls.ipc	11
+counted	1	claude launch	anchor	candidate	write_calls.jobs	6
+counted	1	claude launch	anchor	candidate	write_calls.ledger	1
+counted	1	claude launch	anchor	candidate	daemon_rss_kib.a	13696
+counted	1	claude launch	anchor	candidate	daemon_footprint_kib.a	5168
+counted	1	claude launch	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	claude launch	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	claude approve	candidate	candidate	barrierfsync	1
+counted	1	claude approve	candidate	candidate	cli_cpu_us	6314
+counted	1	claude approve	candidate	candidate	cli_maxrss_kib	4176
+counted	1	claude approve	candidate	candidate	cli_processes	1
+counted	1	claude approve	candidate	candidate	cpu_us	6901
+counted	1	claude approve	candidate	candidate	frees	659
+counted	1	claude approve	candidate	candidate	fullfsync	1
+counted	1	claude approve	candidate	candidate	malloc_bytes	253982
+counted	1	claude approve	candidate	candidate	mallocs	783
+counted	1	claude approve	candidate	candidate	opens	1
+counted	1	claude approve	candidate	candidate	renames	1
+counted	1	claude approve	candidate	candidate	syncs.jobs	1
+counted	1	claude approve	candidate	candidate	syncs.ledger	1
+counted	1	claude approve	candidate	candidate	write_bytes.ipc	26
+counted	1	claude approve	candidate	candidate	write_bytes.jobs	124
+counted	1	claude approve	candidate	candidate	write_bytes.ledger	98
+counted	1	claude approve	candidate	candidate	write_calls.ipc	1
+counted	1	claude approve	candidate	candidate	write_calls.jobs	1
+counted	1	claude approve	candidate	candidate	write_calls.ledger	1
+counted	1	claude approve	candidate	candidate	daemon_rss_kib.a	12224
+counted	1	claude approve	candidate	candidate	daemon_footprint_kib.a	5040
+counted	1	claude approve	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	claude approve	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	claude approve	anchor	candidate	cli_cpu_us	8753
+counted	1	claude approve	anchor	candidate	cli_maxrss_kib	5040
+counted	1	claude approve	anchor	candidate	cli_processes	1
+counted	1	claude approve	anchor	candidate	cpu_us	9393
+counted	1	claude approve	anchor	candidate	frees	1035
+counted	1	claude approve	anchor	candidate	fullfsync	3
+counted	1	claude approve	anchor	candidate	malloc_bytes	318558
+counted	1	claude approve	anchor	candidate	mallocs	1185
+counted	1	claude approve	anchor	candidate	opens	3
+counted	1	claude approve	anchor	candidate	renames	1
+counted	1	claude approve	anchor	candidate	syncs.jobs	2
+counted	1	claude approve	anchor	candidate	syncs.ledger	1
+counted	1	claude approve	anchor	candidate	write_bytes.ipc	26
+counted	1	claude approve	anchor	candidate	write_bytes.jobs	124
+counted	1	claude approve	anchor	candidate	write_bytes.ledger	98
+counted	1	claude approve	anchor	candidate	write_calls.ipc	1
+counted	1	claude approve	anchor	candidate	write_calls.jobs	1
+counted	1	claude approve	anchor	candidate	write_calls.ledger	1
+counted	1	claude approve	anchor	candidate	daemon_rss_kib.a	13696
+counted	1	claude approve	anchor	candidate	daemon_footprint_kib.a	5168
+counted	1	claude approve	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	claude approve	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	codex new	candidate	candidate	barrierfsync	4
+counted	1	codex new	candidate	candidate	cli_cpu_us	6279
+counted	1	codex new	candidate	candidate	cli_maxrss_kib	4224
+counted	1	codex new	candidate	candidate	cli_processes	1
+counted	1	codex new	candidate	candidate	cmd:git clone	1
+counted	1	codex new	candidate	candidate	cpu_us	7711
+counted	1	codex new	candidate	candidate	frees	853
+counted	1	codex new	candidate	candidate	fullfsync	3
+counted	1	codex new	candidate	candidate	malloc_bytes	293845
+counted	1	codex new	candidate	candidate	mallocs	1055
+counted	1	codex new	candidate	candidate	opens	8
+counted	1	codex new	candidate	candidate	read_bytes.ledger	124
+counted	1	codex new	candidate	candidate	read_calls.ipc	2
+counted	1	codex new	candidate	candidate	read_calls.ledger	2
+counted	1	codex new	candidate	candidate	renames	3
+counted	1	codex new	candidate	candidate	spawn:git	1
+counted	1	codex new	candidate	candidate	spawns	1
+counted	1	codex new	candidate	candidate	syncs.jobs	4
+counted	1	codex new	candidate	candidate	syncs.ledger	1
+counted	1	codex new	candidate	candidate	syncs.outside	1
+counted	1	codex new	candidate	candidate	syncs.state	1
+counted	1	codex new	candidate	candidate	write_bytes.ipc	270
+counted	1	codex new	candidate	candidate	write_bytes.jobs	245
+counted	1	codex new	candidate	candidate	write_bytes.ledger	124
+counted	1	codex new	candidate	candidate	write_calls.ipc	3
+counted	1	codex new	candidate	candidate	write_calls.jobs	2
+counted	1	codex new	candidate	candidate	write_calls.ledger	1
+counted	1	codex new	candidate	candidate	daemon_rss_kib.a	12224
+counted	1	codex new	candidate	candidate	daemon_footprint_kib.a	5040
+counted	1	codex new	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	codex new	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	codex new	anchor	candidate	cli_cpu_us	9177
+counted	1	codex new	anchor	candidate	cli_maxrss_kib	5104
+counted	1	codex new	anchor	candidate	cli_processes	1
+counted	1	codex new	anchor	candidate	cmd:defaults	2
+counted	1	codex new	anchor	candidate	cmd:git clone	1
+counted	1	codex new	anchor	candidate	cpu_us	11486
+counted	1	codex new	anchor	candidate	frees	1397
+counted	1	codex new	anchor	candidate	fullfsync	8
+counted	1	codex new	anchor	candidate	malloc_bytes	384815
+counted	1	codex new	anchor	candidate	mallocs	1650
+counted	1	codex new	anchor	candidate	opens	11
+counted	1	codex new	anchor	candidate	read_bytes.ledger	124
+counted	1	codex new	anchor	candidate	read_calls.ipc	6
+counted	1	codex new	anchor	candidate	read_calls.ledger	2
+counted	1	codex new	anchor	candidate	renames	3
+counted	1	codex new	anchor	candidate	spawn:defaults	2
+counted	1	codex new	anchor	candidate	spawn:git	1
+counted	1	codex new	anchor	candidate	spawns	3
+counted	1	codex new	anchor	candidate	syncs.jobs	5
+counted	1	codex new	anchor	candidate	syncs.ledger	1
+counted	1	codex new	anchor	candidate	syncs.outside	1
+counted	1	codex new	anchor	candidate	syncs.state	1
+counted	1	codex new	anchor	candidate	write_bytes.ipc	270
+counted	1	codex new	anchor	candidate	write_bytes.jobs	245
+counted	1	codex new	anchor	candidate	write_bytes.ledger	124
+counted	1	codex new	anchor	candidate	write_calls.ipc	3
+counted	1	codex new	anchor	candidate	write_calls.jobs	2
+counted	1	codex new	anchor	candidate	write_calls.ledger	1
+counted	1	codex new	anchor	candidate	daemon_rss_kib.a	13712
+counted	1	codex new	anchor	candidate	daemon_footprint_kib.a	5184
+counted	1	codex new	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	codex new	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	codex launch	candidate	candidate	barrierfsync	7
+counted	1	codex launch	candidate	candidate	cli_cpu_us	8774
+counted	1	codex launch	candidate	candidate	cli_maxrss_kib	5664
+counted	1	codex launch	candidate	candidate	cli_processes	1
+counted	1	codex launch	candidate	candidate	cmd:dash holding codex	1
+counted	1	codex launch	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	codex launch	candidate	candidate	cpu_us	12013
+counted	1	codex launch	candidate	candidate	frees	3101
+counted	1	codex launch	candidate	candidate	fullfsync	8
+counted	1	codex launch	candidate	candidate	malloc_bytes	609171
+counted	1	codex launch	candidate	candidate	mallocs	3469
+counted	1	codex launch	candidate	candidate	opens	34
+counted	1	codex launch	candidate	candidate	read_bytes.ipc	321
+counted	1	codex launch	candidate	candidate	read_bytes.jobs	123
+counted	1	codex launch	candidate	candidate	read_bytes.outside	1279
+counted	1	codex launch	candidate	candidate	read_bytes.state	174
+counted	1	codex launch	candidate	candidate	read_calls.ipc	8
+counted	1	codex launch	candidate	candidate	read_calls.jobs	4
+counted	1	codex launch	candidate	candidate	read_calls.outside	4
+counted	1	codex launch	candidate	candidate	read_calls.state	4
+counted	1	codex launch	candidate	candidate	renames	7
+counted	1	codex launch	candidate	candidate	spawn:dash	1
+counted	1	codex launch	candidate	candidate	spawn:ps	1
+counted	1	codex launch	candidate	candidate	spawns	2
+counted	1	codex launch	candidate	candidate	syncs.jobs	14
+counted	1	codex launch	candidate	candidate	syncs.ledger	1
+counted	1	codex launch	candidate	candidate	unlinks	3
+counted	1	codex launch	candidate	candidate	write_bytes.ipc	531
+counted	1	codex launch	candidate	candidate	write_bytes.jobs	520
+counted	1	codex launch	candidate	candidate	write_bytes.ledger	116
+counted	1	codex launch	candidate	candidate	write_calls.ipc	12
+counted	1	codex launch	candidate	candidate	write_calls.jobs	7
+counted	1	codex launch	candidate	candidate	write_calls.ledger	1
+counted	1	codex launch	candidate	candidate	daemon_rss_kib.a	12320
+counted	1	codex launch	candidate	candidate	daemon_footprint_kib.a	5056
+counted	1	codex launch	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	codex launch	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	codex launch	anchor	candidate	cli_cpu_us	13540
+counted	1	codex launch	anchor	candidate	cli_maxrss_kib	7008
+counted	1	codex launch	anchor	candidate	cli_processes	1
+counted	1	codex launch	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	codex launch	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	codex launch	anchor	candidate	cmd:sh holding codex	1
+counted	1	codex launch	anchor	candidate	cpu_us	18330
+counted	1	codex launch	anchor	candidate	frees	3505
+counted	1	codex launch	anchor	candidate	fullfsync	17
+counted	1	codex launch	anchor	candidate	malloc_bytes	699713
+counted	1	codex launch	anchor	candidate	mallocs	3922
+counted	1	codex launch	anchor	candidate	opens	46
+counted	1	codex launch	anchor	candidate	read_bytes.ipc	327
+counted	1	codex launch	anchor	candidate	read_bytes.jobs	511
+counted	1	codex launch	anchor	candidate	read_bytes.outside	1279
+counted	1	codex launch	anchor	candidate	read_bytes.state	174
+counted	1	codex launch	anchor	candidate	read_calls.ipc	14
+counted	1	codex launch	anchor	candidate	read_calls.jobs	12
+counted	1	codex launch	anchor	candidate	read_calls.outside	4
+counted	1	codex launch	anchor	candidate	read_calls.state	4
+counted	1	codex launch	anchor	candidate	renames	7
+counted	1	codex launch	anchor	candidate	spawn:ps	3
+counted	1	codex launch	anchor	candidate	spawn:sh	1
+counted	1	codex launch	anchor	candidate	spawns	4
+counted	1	codex launch	anchor	candidate	syncs.jobs	16
+counted	1	codex launch	anchor	candidate	syncs.ledger	1
+counted	1	codex launch	anchor	candidate	unlinks	3
+counted	1	codex launch	anchor	candidate	write_bytes.ipc	530
+counted	1	codex launch	anchor	candidate	write_bytes.jobs	520
+counted	1	codex launch	anchor	candidate	write_bytes.ledger	116
+counted	1	codex launch	anchor	candidate	write_calls.ipc	11
+counted	1	codex launch	anchor	candidate	write_calls.jobs	7
+counted	1	codex launch	anchor	candidate	write_calls.ledger	1
+counted	1	codex launch	anchor	candidate	daemon_rss_kib.a	13888
+counted	1	codex launch	anchor	candidate	daemon_footprint_kib.a	5200
+counted	1	codex launch	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	codex launch	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	codex approve	candidate	candidate	barrierfsync	1
+counted	1	codex approve	candidate	candidate	cli_cpu_us	6037
+counted	1	codex approve	candidate	candidate	cli_maxrss_kib	4144
+counted	1	codex approve	candidate	candidate	cli_processes	1
+counted	1	codex approve	candidate	candidate	cpu_us	6534
+counted	1	codex approve	candidate	candidate	frees	663
+counted	1	codex approve	candidate	candidate	fullfsync	1
+counted	1	codex approve	candidate	candidate	malloc_bytes	254238
+counted	1	codex approve	candidate	candidate	mallocs	787
+counted	1	codex approve	candidate	candidate	opens	1
+counted	1	codex approve	candidate	candidate	renames	1
+counted	1	codex approve	candidate	candidate	syncs.jobs	1
+counted	1	codex approve	candidate	candidate	syncs.ledger	1
+counted	1	codex approve	candidate	candidate	write_bytes.ipc	26
+counted	1	codex approve	candidate	candidate	write_bytes.jobs	124
+counted	1	codex approve	candidate	candidate	write_bytes.ledger	98
+counted	1	codex approve	candidate	candidate	write_calls.ipc	1
+counted	1	codex approve	candidate	candidate	write_calls.jobs	1
+counted	1	codex approve	candidate	candidate	write_calls.ledger	1
+counted	1	codex approve	candidate	candidate	daemon_rss_kib.a	12320
+counted	1	codex approve	candidate	candidate	daemon_footprint_kib.a	5056
+counted	1	codex approve	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	codex approve	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	codex approve	anchor	candidate	cli_cpu_us	8687
+counted	1	codex approve	anchor	candidate	cli_maxrss_kib	5056
+counted	1	codex approve	anchor	candidate	cli_processes	1
+counted	1	codex approve	anchor	candidate	cpu_us	9449
+counted	1	codex approve	anchor	candidate	frees	1073
+counted	1	codex approve	anchor	candidate	fullfsync	3
+counted	1	codex approve	anchor	candidate	malloc_bytes	320990
+counted	1	codex approve	anchor	candidate	mallocs	1223
+counted	1	codex approve	anchor	candidate	opens	3
+counted	1	codex approve	anchor	candidate	renames	1
+counted	1	codex approve	anchor	candidate	syncs.jobs	2
+counted	1	codex approve	anchor	candidate	syncs.ledger	1
+counted	1	codex approve	anchor	candidate	write_bytes.ipc	26
+counted	1	codex approve	anchor	candidate	write_bytes.jobs	124
+counted	1	codex approve	anchor	candidate	write_bytes.ledger	98
+counted	1	codex approve	anchor	candidate	write_calls.ipc	1
+counted	1	codex approve	anchor	candidate	write_calls.jobs	1
+counted	1	codex approve	anchor	candidate	write_calls.ledger	1
+counted	1	codex approve	anchor	candidate	daemon_rss_kib.a	13888
+counted	1	codex approve	anchor	candidate	daemon_footprint_kib.a	5200
+counted	1	codex approve	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	codex approve	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	ledger append	candidate	candidate	barrierfsync	1
+counted	1	ledger append	candidate	candidate	cli_cpu_us	7136
+counted	1	ledger append	candidate	candidate	cli_maxrss_kib	4160
+counted	1	ledger append	candidate	candidate	cli_processes	1
+counted	1	ledger append	candidate	candidate	cpu_us	7831
+counted	1	ledger append	candidate	candidate	frees	659
+counted	1	ledger append	candidate	candidate	fullfsync	1
+counted	1	ledger append	candidate	candidate	malloc_bytes	254238
+counted	1	ledger append	candidate	candidate	mallocs	784
+counted	1	ledger append	candidate	candidate	opens	1
+counted	1	ledger append	candidate	candidate	renames	1
+counted	1	ledger append	candidate	candidate	syncs.jobs	1
+counted	1	ledger append	candidate	candidate	syncs.ledger	1
+counted	1	ledger append	candidate	candidate	write_bytes.ipc	26
+counted	1	ledger append	candidate	candidate	write_bytes.jobs	143
+counted	1	ledger append	candidate	candidate	write_bytes.ledger	98
+counted	1	ledger append	candidate	candidate	write_calls.ipc	1
+counted	1	ledger append	candidate	candidate	write_calls.jobs	1
+counted	1	ledger append	candidate	candidate	write_calls.ledger	1
+counted	1	ledger append	candidate	candidate	daemon_rss_kib.a	12336
+counted	1	ledger append	candidate	candidate	daemon_footprint_kib.a	5056
+counted	1	ledger append	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	ledger append	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	ledger append	anchor	candidate	cli_cpu_us	8271
+counted	1	ledger append	anchor	candidate	cli_maxrss_kib	5040
+counted	1	ledger append	anchor	candidate	cli_processes	1
+counted	1	ledger append	anchor	candidate	cpu_us	8855
+counted	1	ledger append	anchor	candidate	frees	1073
+counted	1	ledger append	anchor	candidate	fullfsync	3
+counted	1	ledger append	anchor	candidate	malloc_bytes	321246
+counted	1	ledger append	anchor	candidate	mallocs	1224
+counted	1	ledger append	anchor	candidate	opens	3
+counted	1	ledger append	anchor	candidate	renames	1
+counted	1	ledger append	anchor	candidate	syncs.jobs	2
+counted	1	ledger append	anchor	candidate	syncs.ledger	1
+counted	1	ledger append	anchor	candidate	write_bytes.ipc	26
+counted	1	ledger append	anchor	candidate	write_bytes.jobs	143
+counted	1	ledger append	anchor	candidate	write_bytes.ledger	98
+counted	1	ledger append	anchor	candidate	write_calls.ipc	1
+counted	1	ledger append	anchor	candidate	write_calls.jobs	1
+counted	1	ledger append	anchor	candidate	write_calls.ledger	1
+counted	1	ledger append	anchor	candidate	daemon_rss_kib.a	13888
+counted	1	ledger append	anchor	candidate	daemon_footprint_kib.a	5200
+counted	1	ledger append	anchor	candidate	daemon_rss_kib.b	15200
+counted	1	ledger append	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	cli version	candidate	candidate	cli_cpu_us	5496
+counted	1	cli version	candidate	candidate	cli_maxrss_kib	3024
+counted	1	cli version	candidate	candidate	cli_processes	1
+counted	1	cli version	candidate	candidate	cpu_us	5496
+counted	1	cli version	candidate	candidate	frees	231
+counted	1	cli version	candidate	candidate	malloc_bytes	105993
+counted	1	cli version	candidate	candidate	mallocs	244
+counted	1	cli version	candidate	candidate	write_bytes.ipc	13
+counted	1	cli version	candidate	candidate	write_calls.ipc	1
+counted	1	cli version	candidate	candidate	daemon_rss_kib.a	12336
+counted	1	cli version	candidate	candidate	daemon_footprint_kib.a	5056
+counted	1	cli version	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	cli version	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	cli version	anchor	candidate	cli_cpu_us	5591
+counted	1	cli version	anchor	candidate	cli_maxrss_kib	3184
+counted	1	cli version	anchor	candidate	cli_processes	1
+counted	1	cli version	anchor	candidate	cpu_us	5591
+counted	1	cli version	anchor	candidate	frees	176
+counted	1	cli version	anchor	candidate	malloc_bytes	87612
+counted	1	cli version	anchor	candidate	mallocs	189
+counted	1	cli version	anchor	candidate	write_bytes.ipc	13
+counted	1	cli version	anchor	candidate	write_calls.ipc	1
+counted	1	cli version	anchor	candidate	daemon_rss_kib.a	13888
+counted	1	cli version	anchor	candidate	daemon_footprint_kib.a	5200
+counted	1	cli version	anchor	candidate	daemon_rss_kib.b	15168
+counted	1	cli version	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	cli ls	candidate	candidate	cli_cpu_us	6618
+counted	1	cli ls	candidate	candidate	cli_maxrss_kib	4288
+counted	1	cli ls	candidate	candidate	cli_processes	1
+counted	1	cli ls	candidate	candidate	cpu_us	6618
+counted	1	cli ls	candidate	candidate	frees	880
+counted	1	cli ls	candidate	candidate	malloc_bytes	290254
+counted	1	cli ls	candidate	candidate	mallocs	1035
+counted	1	cli ls	candidate	candidate	write_bytes.ipc	660
+counted	1	cli ls	candidate	candidate	write_calls.ipc	10
+counted	1	cli ls	candidate	candidate	daemon_rss_kib.a	12336
+counted	1	cli ls	candidate	candidate	daemon_footprint_kib.a	5056
+counted	1	cli ls	candidate	candidate	daemon_rss_kib.b	13072
+counted	1	cli ls	candidate	candidate	daemon_footprint_kib.b	5760
+counted	1	cli ls	anchor	candidate	cli_cpu_us	8268
+counted	1	cli ls	anchor	candidate	cli_maxrss_kib	5152
+counted	1	cli ls	anchor	candidate	cli_processes	1
+counted	1	cli ls	anchor	candidate	cpu_us	8268
+counted	1	cli ls	anchor	candidate	frees	1248
+counted	1	cli ls	anchor	candidate	malloc_bytes	354205
+counted	1	cli ls	anchor	candidate	mallocs	1427
+counted	1	cli ls	anchor	candidate	opens	10
+counted	1	cli ls	anchor	candidate	write_bytes.ipc	660
+counted	1	cli ls	anchor	candidate	write_calls.ipc	10
+counted	1	cli ls	anchor	candidate	daemon_rss_kib.a	13888
+counted	1	cli ls	anchor	candidate	daemon_footprint_kib.a	5200
+counted	1	cli ls	anchor	candidate	daemon_rss_kib.b	15120
+counted	1	cli ls	anchor	candidate	daemon_footprint_kib.b	6160
+counted	1	acp suspend	candidate	candidate	barrierfsync	10
+counted	1	acp suspend	candidate	candidate	cli_cpu_us	6092
+counted	1	acp suspend	candidate	candidate	cli_maxrss_kib	4384
+counted	1	acp suspend	candidate	candidate	cli_processes	1
+counted	1	acp suspend	candidate	candidate	cmd:fabric-fake-agent	1
+counted	1	acp suspend	candidate	candidate	cmd:git add	1
+counted	1	acp suspend	candidate	candidate	cmd:git bundle	2
+counted	1	acp suspend	candidate	candidate	cmd:git check-attr	2
+counted	1	acp suspend	candidate	candidate	cmd:git commit-tree	2
+counted	1	acp suspend	candidate	candidate	cmd:git config	1
+counted	1	acp suspend	candidate	candidate	cmd:git for-each-ref	2
+counted	1	acp suspend	candidate	candidate	cmd:git ls-files	6
+counted	1	acp suspend	candidate	candidate	cmd:git ls-tree	2
+counted	1	acp suspend	candidate	candidate	cmd:git read-tree	1
+counted	1	acp suspend	candidate	candidate	cmd:git rev-list	1
+counted	1	acp suspend	candidate	candidate	cmd:git rev-parse	3
+counted	1	acp suspend	candidate	candidate	cmd:git status	1
+counted	1	acp suspend	candidate	candidate	cmd:git symbolic-ref	2
+counted	1	acp suspend	candidate	candidate	cmd:git update-ref	1
+counted	1	acp suspend	candidate	candidate	cmd:git write-tree	2
+counted	1	acp suspend	candidate	candidate	cmd:node	2
+counted	1	acp suspend	candidate	candidate	cmd:python3	2
+counted	1	acp suspend	candidate	candidate	cmd:xcrun	1
+counted	1	acp suspend	candidate	candidate	cpu_us	32138
+counted	1	acp suspend	candidate	candidate	frees	9212
+counted	1	acp suspend	candidate	candidate	fsync	14
+counted	1	acp suspend	candidate	candidate	fullfsync	20
+counted	1	acp suspend	candidate	candidate	malloc_bytes	3426480
+counted	1	acp suspend	candidate	candidate	mallocs	12250
+counted	1	acp suspend	candidate	candidate	opens	128
+counted	1	acp suspend	candidate	candidate	read_bytes.ipc	5199
+counted	1	acp suspend	candidate	candidate	read_bytes.jobs	2181
+counted	1	acp suspend	candidate	candidate	read_bytes.outside	794
+counted	1	acp suspend	candidate	candidate	read_bytes.state	87
+counted	1	acp suspend	candidate	candidate	read_bytes.store	22312
+counted	1	acp suspend	candidate	candidate	read_calls.ipc	177
+counted	1	acp suspend	candidate	candidate	read_calls.jobs	22
+counted	1	acp suspend	candidate	candidate	read_calls.outside	18
+counted	1	acp suspend	candidate	candidate	read_calls.state	2
+counted	1	acp suspend	candidate	candidate	read_calls.store	71
+counted	1	acp suspend	candidate	candidate	renames	14
+counted	1	acp suspend	candidate	candidate	spawn:fabric-fake-agent	1
+counted	1	acp suspend	candidate	candidate	spawn:git	29
+counted	1	acp suspend	candidate	candidate	spawn:node	2
+counted	1	acp suspend	candidate	candidate	spawn:python3	2
+counted	1	acp suspend	candidate	candidate	spawn:xcrun	1
+counted	1	acp suspend	candidate	candidate	spawns	35
+counted	1	acp suspend	candidate	candidate	syncs.jobs	18
+counted	1	acp suspend	candidate	candidate	syncs.ledger	4
+counted	1	acp suspend	candidate	candidate	syncs.outside	3
+counted	1	acp suspend	candidate	candidate	syncs.store	19
+counted	1	acp suspend	candidate	candidate	unlinks	19
+counted	1	acp suspend	candidate	candidate	write_bytes.ipc	1028
+counted	1	acp suspend	candidate	candidate	write_bytes.jobs	3574
+counted	1	acp suspend	candidate	candidate	write_bytes.ledger	522
+counted	1	acp suspend	candidate	candidate	write_bytes.outside	243
+counted	1	acp suspend	candidate	candidate	write_bytes.state	736
+counted	1	acp suspend	candidate	candidate	write_bytes.store	79439
+counted	1	acp suspend	candidate	candidate	write_calls.ipc	8
+counted	1	acp suspend	candidate	candidate	write_calls.jobs	10
+counted	1	acp suspend	candidate	candidate	write_calls.ledger	4
+counted	1	acp suspend	candidate	candidate	write_calls.outside	1
+counted	1	acp suspend	candidate	candidate	write_calls.state	5
+counted	1	acp suspend	candidate	candidate	write_calls.store	45
+counted	1	acp suspend	candidate	candidate	daemon_rss_kib.a	14000
+counted	1	acp suspend	candidate	candidate	daemon_footprint_kib.a	5616
+counted	1	acp suspend	candidate	candidate	daemon_rss_kib.b	13040
+counted	1	acp suspend	candidate	candidate	daemon_footprint_kib.b	5792
+counted	1	acp suspend	anchor	candidate	cli_cpu_us	8454
+counted	1	acp suspend	anchor	candidate	cli_maxrss_kib	5264
+counted	1	acp suspend	anchor	candidate	cli_processes	1
+counted	1	acp suspend	anchor	candidate	cmd:fabric-fake-agent	1
+counted	1	acp suspend	anchor	candidate	cmd:git add	1
+counted	1	acp suspend	anchor	candidate	cmd:git bundle	3
+counted	1	acp suspend	anchor	candidate	cmd:git check-attr	2
+counted	1	acp suspend	anchor	candidate	cmd:git commit-tree	2
+counted	1	acp suspend	anchor	candidate	cmd:git config	1
+counted	1	acp suspend	anchor	candidate	cmd:git for-each-ref	2
+counted	1	acp suspend	anchor	candidate	cmd:git ls-files	6
+counted	1	acp suspend	anchor	candidate	cmd:git ls-tree	2
+counted	1	acp suspend	anchor	candidate	cmd:git read-tree	1
+counted	1	acp suspend	anchor	candidate	cmd:git rev-list	1
+counted	1	acp suspend	anchor	candidate	cmd:git rev-parse	3
+counted	1	acp suspend	anchor	candidate	cmd:git status	1
+counted	1	acp suspend	anchor	candidate	cmd:git symbolic-ref	2
+counted	1	acp suspend	anchor	candidate	cmd:git update-ref	1
+counted	1	acp suspend	anchor	candidate	cmd:git write-tree	2
+counted	1	acp suspend	anchor	candidate	cmd:node	2
+counted	1	acp suspend	anchor	candidate	cmd:python3	2
+counted	1	acp suspend	anchor	candidate	cmd:xcrun	1
+counted	1	acp suspend	anchor	candidate	cpu_us	35063
+counted	1	acp suspend	anchor	candidate	frees	9697
+counted	1	acp suspend	anchor	candidate	fsync	9
+counted	1	acp suspend	anchor	candidate	fullfsync	39
+counted	1	acp suspend	anchor	candidate	malloc_bytes	3503995
+counted	1	acp suspend	anchor	candidate	mallocs	12781
+counted	1	acp suspend	anchor	candidate	opens	142
+counted	1	acp suspend	anchor	candidate	read_bytes.ipc	5325
+counted	1	acp suspend	anchor	candidate	read_bytes.jobs	2302
+counted	1	acp suspend	anchor	candidate	read_bytes.outside	794
+counted	1	acp suspend	anchor	candidate	read_bytes.state	87
+counted	1	acp suspend	anchor	candidate	read_bytes.store	21583
+counted	1	acp suspend	anchor	candidate	read_calls.ipc	187
+counted	1	acp suspend	anchor	candidate	read_calls.jobs	24
+counted	1	acp suspend	anchor	candidate	read_calls.outside	18
+counted	1	acp suspend	anchor	candidate	read_calls.state	2
+counted	1	acp suspend	anchor	candidate	read_calls.store	70
+counted	1	acp suspend	anchor	candidate	renames	14
+counted	1	acp suspend	anchor	candidate	spawn:fabric-fake-agent	1
+counted	1	acp suspend	anchor	candidate	spawn:git	30
+counted	1	acp suspend	anchor	candidate	spawn:node	2
+counted	1	acp suspend	anchor	candidate	spawn:python3	2
+counted	1	acp suspend	anchor	candidate	spawn:xcrun	1
+counted	1	acp suspend	anchor	candidate	spawns	36
+counted	1	acp suspend	anchor	candidate	syncs.jobs	22
+counted	1	acp suspend	anchor	candidate	syncs.ledger	4
+counted	1	acp suspend	anchor	candidate	syncs.outside	3
+counted	1	acp suspend	anchor	candidate	syncs.store	19
+counted	1	acp suspend	anchor	candidate	unlinks	19
+counted	1	acp suspend	anchor	candidate	write_bytes.ipc	1028
+counted	1	acp suspend	anchor	candidate	write_bytes.jobs	3572
+counted	1	acp suspend	anchor	candidate	write_bytes.ledger	522
+counted	1	acp suspend	anchor	candidate	write_bytes.outside	243
+counted	1	acp suspend	anchor	candidate	write_bytes.state	736
+counted	1	acp suspend	anchor	candidate	write_bytes.store	79463
+counted	1	acp suspend	anchor	candidate	write_calls.ipc	8
+counted	1	acp suspend	anchor	candidate	write_calls.jobs	10
+counted	1	acp suspend	anchor	candidate	write_calls.ledger	4
+counted	1	acp suspend	anchor	candidate	write_calls.outside	1
+counted	1	acp suspend	anchor	candidate	write_calls.state	5
+counted	1	acp suspend	anchor	candidate	write_calls.store	45
+counted	1	acp suspend	anchor	candidate	daemon_rss_kib.a	15664
+counted	1	acp suspend	anchor	candidate	daemon_footprint_kib.a	5664
+counted	1	acp suspend	anchor	candidate	daemon_rss_kib.b	15168
+counted	1	acp suspend	anchor	candidate	daemon_footprint_kib.b	6176
+counted	1	acp move	candidate	candidate	barrierfsync	4
+counted	1	acp move	candidate	candidate	cli_cpu_us	6389
+counted	1	acp move	candidate	candidate	cli_maxrss_kib	4688
+counted	1	acp move	candidate	candidate	cli_processes	1
+counted	1	acp move	candidate	candidate	cmd:git	2
+counted	1	acp move	candidate	candidate	cmd:id	2
+counted	1	acp move	candidate	candidate	cmd:node	4
+counted	1	acp move	candidate	candidate	cpu_us	15639
+counted	1	acp move	candidate	candidate	frees	3770
+counted	1	acp move	candidate	candidate	fullfsync	7
+counted	1	acp move	candidate	candidate	malloc_bytes	1613836
+counted	1	acp move	candidate	candidate	mallocs	4732
+counted	1	acp move	candidate	candidate	opens	15
+counted	1	acp move	candidate	candidate	read_bytes.ipc	110
+counted	1	acp move	candidate	candidate	read_bytes.jobs	119
+counted	1	acp move	candidate	candidate	read_bytes.store	2334
+counted	1	acp move	candidate	candidate	read_calls.ipc	16
+counted	1	acp move	candidate	candidate	read_calls.jobs	2
+counted	1	acp move	candidate	candidate	read_calls.store	20
+counted	1	acp move	candidate	candidate	renames	5
+counted	1	acp move	candidate	candidate	spawn:git	2
+counted	1	acp move	candidate	candidate	spawn:id	2
+counted	1	acp move	candidate	candidate	spawn:node	4
+counted	1	acp move	candidate	candidate	spawns	8
+counted	1	acp move	candidate	candidate	syncs.jobs	5
+counted	1	acp move	candidate	candidate	syncs.ledger	4
+counted	1	acp move	candidate	candidate	syncs.outside	2
+counted	1	acp move	candidate	candidate	unlinks	1
+counted	1	acp move	candidate	candidate	write_bytes.ipc	1913
+counted	1	acp move	candidate	candidate	write_bytes.jobs	796
+counted	1	acp move	candidate	candidate	write_bytes.ledger	520
+counted	1	acp move	candidate	candidate	write_bytes.state	127
+counted	1	acp move	candidate	candidate	write_calls.ipc	22
+counted	1	acp move	candidate	candidate	write_calls.jobs	4
+counted	1	acp move	candidate	candidate	write_calls.ledger	4
+counted	1	acp move	candidate	candidate	write_calls.state	1
+counted	1	acp move	candidate	candidate	daemon_rss_kib.a	14032
+counted	1	acp move	candidate	candidate	daemon_footprint_kib.a	5616
+counted	1	acp move	candidate	candidate	daemon_rss_kib.b	13040
+counted	1	acp move	candidate	candidate	daemon_footprint_kib.b	5792
+counted	1	acp move	anchor	candidate	cli_cpu_us	9161
+counted	1	acp move	anchor	candidate	cli_maxrss_kib	5648
+counted	1	acp move	anchor	candidate	cli_processes	1
+counted	1	acp move	anchor	candidate	cmd:bun	2
+counted	1	acp move	anchor	candidate	cmd:cargo	2
+counted	1	acp move	anchor	candidate	cmd:claude	3
+counted	1	acp move	anchor	candidate	cmd:codex	3
+counted	1	acp move	anchor	candidate	cmd:defaults	4
+counted	1	acp move	anchor	candidate	cmd:git	2
+counted	1	acp move	anchor	candidate	cmd:id	2
+counted	1	acp move	anchor	candidate	cmd:node	4
+counted	1	acp move	anchor	candidate	cmd:npm	2
+counted	1	acp move	anchor	candidate	cmd:pnpm	4
+counted	1	acp move	anchor	candidate	cmd:python3	4
+counted	1	acp move	anchor	candidate	cmd:rustc	2
+counted	1	acp move	anchor	candidate	cmd:sw_vers	2
+counted	1	acp move	anchor	candidate	cmd:uv	2
+counted	1	acp move	anchor	candidate	cmd:xcrun	2
+counted	1	acp move	anchor	candidate	cmd:yarn	2
+counted	1	acp move	anchor	candidate	cpu_us	37528
+counted	1	acp move	anchor	candidate	frees	6793
+counted	1	acp move	anchor	candidate	fullfsync	15
+counted	1	acp move	anchor	candidate	malloc_bytes	1978392
+counted	1	acp move	anchor	candidate	mallocs	8280
+counted	1	acp move	anchor	candidate	opens	73
+counted	1	acp move	anchor	candidate	read_bytes.ipc	468
+counted	1	acp move	anchor	candidate	read_bytes.jobs	4071
+counted	1	acp move	anchor	candidate	read_bytes.store	1171
+counted	1	acp move	anchor	candidate	read_calls.ipc	124
+counted	1	acp move	anchor	candidate	read_calls.jobs	10
+counted	1	acp move	anchor	candidate	read_calls.store	10
+counted	1	acp move	anchor	candidate	renames	5
+counted	1	acp move	anchor	candidate	spawn:bun	2
+counted	1	acp move	anchor	candidate	spawn:cargo	2
+counted	1	acp move	anchor	candidate	spawn:claude	3
+counted	1	acp move	anchor	candidate	spawn:codex	3
+counted	1	acp move	anchor	candidate	spawn:defaults	4
+counted	1	acp move	anchor	candidate	spawn:git	2
+counted	1	acp move	anchor	candidate	spawn:id	2
+counted	1	acp move	anchor	candidate	spawn:node	4
+counted	1	acp move	anchor	candidate	spawn:npm	2
+counted	1	acp move	anchor	candidate	spawn:pnpm	4
+counted	1	acp move	anchor	candidate	spawn:python3	4
+counted	1	acp move	anchor	candidate	spawn:rustc	2
+counted	1	acp move	anchor	candidate	spawn:sw_vers	2
+counted	1	acp move	anchor	candidate	spawn:uv	2
+counted	1	acp move	anchor	candidate	spawn:xcrun	2
+counted	1	acp move	anchor	candidate	spawn:yarn	2
+counted	1	acp move	anchor	candidate	spawns	42
+counted	1	acp move	anchor	candidate	syncs.jobs	9
+counted	1	acp move	anchor	candidate	syncs.ledger	4
+counted	1	acp move	anchor	candidate	syncs.outside	2
+counted	1	acp move	anchor	candidate	unlinks	1
+counted	1	acp move	anchor	candidate	write_bytes.ipc	2510
+counted	1	acp move	anchor	candidate	write_bytes.jobs	796
+counted	1	acp move	anchor	candidate	write_bytes.ledger	520
+counted	1	acp move	anchor	candidate	write_bytes.state	127
+counted	1	acp move	anchor	candidate	write_calls.ipc	31
+counted	1	acp move	anchor	candidate	write_calls.jobs	4
+counted	1	acp move	anchor	candidate	write_calls.ledger	4
+counted	1	acp move	anchor	candidate	write_calls.state	1
+counted	1	acp move	anchor	candidate	daemon_rss_kib.a	16048
+counted	1	acp move	anchor	candidate	daemon_footprint_kib.a	5968
+counted	1	acp move	anchor	candidate	daemon_rss_kib.b	15152
+counted	1	acp move	anchor	candidate	daemon_footprint_kib.b	6176
+counted	1	acp resume	candidate	candidate	barrierfsync	9
+counted	1	acp resume	candidate	candidate	cli_cpu_us	8046
+counted	1	acp resume	candidate	candidate	cli_maxrss_kib	6096
+counted	1	acp resume	candidate	candidate	cli_processes	1
+counted	1	acp resume	candidate	candidate	cmd:dash holding fabric-fake-agent	1
+counted	1	acp resume	candidate	candidate	cmd:git bundle	2
+counted	1	acp resume	candidate	candidate	cmd:git cat-file	1
+counted	1	acp resume	candidate	candidate	cmd:git hash-object	1
+counted	1	acp resume	candidate	candidate	cmd:git init	1
+counted	1	acp resume	candidate	candidate	cmd:git ls-tree	2
+counted	1	acp resume	candidate	candidate	cmd:git read-tree	1
+counted	1	acp resume	candidate	candidate	cmd:git update-index	1
+counted	1	acp resume	candidate	candidate	cmd:git update-ref	1
+counted	1	acp resume	candidate	candidate	cmd:node	2
+counted	1	acp resume	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	acp resume	candidate	candidate	cpu_us	23988
+counted	1	acp resume	candidate	candidate	frees	6431
+counted	1	acp resume	candidate	candidate	fsync	55
+counted	1	acp resume	candidate	candidate	fullfsync	13
+counted	1	acp resume	candidate	candidate	malloc_bytes	3462574
+counted	1	acp resume	candidate	candidate	mallocs	7722
+counted	1	acp resume	candidate	candidate	opens	199
+counted	1	acp resume	candidate	candidate	read_bytes.ipc	2406
+counted	1	acp resume	candidate	candidate	read_bytes.jobs	3364
+counted	1	acp resume	candidate	candidate	read_bytes.outside	691
+counted	1	acp resume	candidate	candidate	read_bytes.state	122
+counted	1	acp resume	candidate	candidate	read_bytes.store	13421
+counted	1	acp resume	candidate	candidate	read_calls.ipc	67
+counted	1	acp resume	candidate	candidate	read_calls.jobs	24
+counted	1	acp resume	candidate	candidate	read_calls.outside	15
+counted	1	acp resume	candidate	candidate	read_calls.state	4
+counted	1	acp resume	candidate	candidate	read_calls.store	99
+counted	1	acp resume	candidate	candidate	renames	11
+counted	1	acp resume	candidate	candidate	spawn:dash	1
+counted	1	acp resume	candidate	candidate	spawn:git	10
+counted	1	acp resume	candidate	candidate	spawn:node	2
+counted	1	acp resume	candidate	candidate	spawn:ps	1
+counted	1	acp resume	candidate	candidate	spawns	14
+counted	1	acp resume	candidate	candidate	syncs.jobs	29
+counted	1	acp resume	candidate	candidate	syncs.ledger	1
+counted	1	acp resume	candidate	candidate	syncs.outside	47
+counted	1	acp resume	candidate	candidate	unlinks	20
+counted	1	acp resume	candidate	candidate	write_bytes.ipc	2141
+counted	1	acp resume	candidate	candidate	write_bytes.jobs	3537
+counted	1	acp resume	candidate	candidate	write_bytes.ledger	167
+counted	1	acp resume	candidate	candidate	write_bytes.outside	640
+counted	1	acp resume	candidate	candidate	write_bytes.state	345
+counted	1	acp resume	candidate	candidate	write_bytes.store	2479
+counted	1	acp resume	candidate	candidate	write_calls.ipc	30
+counted	1	acp resume	candidate	candidate	write_calls.jobs	12
+counted	1	acp resume	candidate	candidate	write_calls.ledger	1
+counted	1	acp resume	candidate	candidate	write_calls.outside	12
+counted	1	acp resume	candidate	candidate	write_calls.state	2
+counted	1	acp resume	candidate	candidate	write_calls.store	4
+counted	1	acp resume	candidate	candidate	daemon_rss_kib.a	14032
+counted	1	acp resume	candidate	candidate	daemon_footprint_kib.a	5616
+counted	1	acp resume	candidate	candidate	daemon_rss_kib.b	13008
+counted	1	acp resume	candidate	candidate	daemon_footprint_kib.b	5824
+counted	1	acp resume	anchor	candidate	cli_cpu_us	10753
+counted	1	acp resume	anchor	candidate	cli_maxrss_kib	7344
+counted	1	acp resume	anchor	candidate	cli_processes	1
+counted	1	acp resume	anchor	candidate	cmd:defaults	2
+counted	1	acp resume	anchor	candidate	cmd:git bundle	6
+counted	1	acp resume	anchor	candidate	cmd:git cat-file	1
+counted	1	acp resume	anchor	candidate	cmd:git config	4
+counted	1	acp resume	anchor	candidate	cmd:git hash-object	1
+counted	1	acp resume	anchor	candidate	cmd:git init	1
+counted	1	acp resume	anchor	candidate	cmd:git ls-tree	2
+counted	1	acp resume	anchor	candidate	cmd:git read-tree	1
+counted	1	acp resume	anchor	candidate	cmd:git rev-parse	1
+counted	1	acp resume	anchor	candidate	cmd:git symbolic-ref	2
+counted	1	acp resume	anchor	candidate	cmd:git update-index	1
+counted	1	acp resume	anchor	candidate	cmd:git update-ref	1
+counted	1	acp resume	anchor	candidate	cmd:node	2
+counted	1	acp resume	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	acp resume	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	acp resume	anchor	candidate	cmd:sh holding fabric-fake-agent	1
+counted	1	acp resume	anchor	candidate	cpu_us	30062
+counted	1	acp resume	anchor	candidate	frees	8470
+counted	1	acp resume	anchor	candidate	fsync	51
+counted	1	acp resume	anchor	candidate	fullfsync	24
+counted	1	acp resume	anchor	candidate	malloc_bytes	3878413
+counted	1	acp resume	anchor	candidate	mallocs	10499
+counted	1	acp resume	anchor	candidate	opens	203
+counted	1	acp resume	anchor	candidate	read_bytes.ipc	4008
+counted	1	acp resume	anchor	candidate	read_bytes.jobs	3559
+counted	1	acp resume	anchor	candidate	read_bytes.outside	554
+counted	1	acp resume	anchor	candidate	read_bytes.state	122
+counted	1	acp resume	anchor	candidate	read_bytes.store	8818
+counted	1	acp resume	anchor	candidate	read_calls.ipc	139
+counted	1	acp resume	anchor	candidate	read_calls.jobs	28
+counted	1	acp resume	anchor	candidate	read_calls.outside	13
+counted	1	acp resume	anchor	candidate	read_calls.state	4
+counted	1	acp resume	anchor	candidate	read_calls.store	95
+counted	1	acp resume	anchor	candidate	renames	11
+counted	1	acp resume	anchor	candidate	spawn:defaults	2
+counted	1	acp resume	anchor	candidate	spawn:git	21
+counted	1	acp resume	anchor	candidate	spawn:node	2
+counted	1	acp resume	anchor	candidate	spawn:ps	3
+counted	1	acp resume	anchor	candidate	spawn:sh	1
+counted	1	acp resume	anchor	candidate	spawns	29
+counted	1	acp resume	anchor	candidate	syncs.jobs	31
+counted	1	acp resume	anchor	candidate	syncs.ledger	1
+counted	1	acp resume	anchor	candidate	syncs.outside	43
+counted	1	acp resume	anchor	candidate	unlinks	21
+counted	1	acp resume	anchor	candidate	write_bytes.ipc	2076
+counted	1	acp resume	anchor	candidate	write_bytes.jobs	3543
+counted	1	acp resume	anchor	candidate	write_bytes.ledger	167
+counted	1	acp resume	anchor	candidate	write_bytes.outside	483
+counted	1	acp resume	anchor	candidate	write_bytes.state	345
+counted	1	acp resume	anchor	candidate	write_bytes.store	2911
+counted	1	acp resume	anchor	candidate	write_calls.ipc	29
+counted	1	acp resume	anchor	candidate	write_calls.jobs	12
+counted	1	acp resume	anchor	candidate	write_calls.ledger	1
+counted	1	acp resume	anchor	candidate	write_calls.outside	11
+counted	1	acp resume	anchor	candidate	write_calls.state	2
+counted	1	acp resume	anchor	candidate	write_calls.store	3
+counted	1	acp resume	anchor	candidate	daemon_rss_kib.a	16048
+counted	1	acp resume	anchor	candidate	daemon_footprint_kib.a	5968
+counted	1	acp resume	anchor	candidate	daemon_rss_kib.b	15248
+counted	1	acp resume	anchor	candidate	daemon_footprint_kib.b	6288
+counted	1	acp pull	candidate	candidate	barrierfsync	24
+counted	1	acp pull	candidate	candidate	cli_cpu_us	9510
+counted	1	acp pull	candidate	candidate	cli_maxrss_kib	6272
+counted	1	acp pull	candidate	candidate	cli_processes	1
+counted	1	acp pull	candidate	candidate	cmd:dash holding fabric-fake-agent	1
+counted	1	acp pull	candidate	candidate	cmd:fabric-fake-agent	1
+counted	1	acp pull	candidate	candidate	cmd:git	2
+counted	1	acp pull	candidate	candidate	cmd:git add	1
+counted	1	acp pull	candidate	candidate	cmd:git bundle	4
+counted	1	acp pull	candidate	candidate	cmd:git cat-file	1
+counted	1	acp pull	candidate	candidate	cmd:git check-attr	2
+counted	1	acp pull	candidate	candidate	cmd:git commit-tree	2
+counted	1	acp pull	candidate	candidate	cmd:git config	1
+counted	1	acp pull	candidate	candidate	cmd:git for-each-ref	2
+counted	1	acp pull	candidate	candidate	cmd:git hash-object	1
+counted	1	acp pull	candidate	candidate	cmd:git init	1
+counted	1	acp pull	candidate	candidate	cmd:git ls-files	6
+counted	1	acp pull	candidate	candidate	cmd:git ls-tree	4
+counted	1	acp pull	candidate	candidate	cmd:git read-tree	2
+counted	1	acp pull	candidate	candidate	cmd:git rev-list	1
+counted	1	acp pull	candidate	candidate	cmd:git rev-parse	3
+counted	1	acp pull	candidate	candidate	cmd:git status	1
+counted	1	acp pull	candidate	candidate	cmd:git symbolic-ref	2
+counted	1	acp pull	candidate	candidate	cmd:git update-index	1
+counted	1	acp pull	candidate	candidate	cmd:git update-ref	2
+counted	1	acp pull	candidate	candidate	cmd:git write-tree	2
+counted	1	acp pull	candidate	candidate	cmd:id	2
+counted	1	acp pull	candidate	candidate	cmd:node	8
+counted	1	acp pull	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	acp pull	candidate	candidate	cmd:python3	2
+counted	1	acp pull	candidate	candidate	cpu_us	57264
+counted	1	acp pull	candidate	candidate	frees	17214
+counted	1	acp pull	candidate	candidate	fsync	71
+counted	1	acp pull	candidate	candidate	fullfsync	41
+counted	1	acp pull	candidate	candidate	malloc_bytes	7422938
+counted	1	acp pull	candidate	candidate	mallocs	21520
+counted	1	acp pull	candidate	candidate	opens	350
+counted	1	acp pull	candidate	candidate	read_bytes.ipc	7682
+counted	1	acp pull	candidate	candidate	read_bytes.jobs	6228
+counted	1	acp pull	candidate	candidate	read_bytes.outside	1769
+counted	1	acp pull	candidate	candidate	read_bytes.state	322
+counted	1	acp pull	candidate	candidate	read_bytes.store	28392
+counted	1	acp pull	candidate	candidate	read_calls.ipc	257
+counted	1	acp pull	candidate	candidate	read_calls.jobs	49
+counted	1	acp pull	candidate	candidate	read_calls.outside	33
+counted	1	acp pull	candidate	candidate	read_calls.state	8
+counted	1	acp pull	candidate	candidate	read_calls.store	193
+counted	1	acp pull	candidate	candidate	renames	31
+counted	1	acp pull	candidate	candidate	spawn:dash	1
+counted	1	acp pull	candidate	candidate	spawn:fabric-fake-agent	1
+counted	1	acp pull	candidate	candidate	spawn:git	41
+counted	1	acp pull	candidate	candidate	spawn:id	2
+counted	1	acp pull	candidate	candidate	spawn:node	8
+counted	1	acp pull	candidate	candidate	spawn:ps	1
+counted	1	acp pull	candidate	candidate	spawn:python3	2
+counted	1	acp pull	candidate	candidate	spawns	56
+counted	1	acp pull	candidate	candidate	syncs.jobs	53
+counted	1	acp pull	candidate	candidate	syncs.ledger	10
+counted	1	acp pull	candidate	candidate	syncs.outside	55
+counted	1	acp pull	candidate	candidate	syncs.store	18
+counted	1	acp pull	candidate	candidate	unlinks	40
+counted	1	acp pull	candidate	candidate	write_bytes.ipc	4084
+counted	1	acp pull	candidate	candidate	write_bytes.jobs	8388
+counted	1	acp pull	candidate	candidate	write_bytes.ledger	1376
+counted	1	acp pull	candidate	candidate	write_bytes.outside	904
+counted	1	acp pull	candidate	candidate	write_bytes.state	1919
+counted	1	acp pull	candidate	candidate	write_bytes.store	49082
+counted	1	acp pull	candidate	candidate	write_calls.ipc	68
+counted	1	acp pull	candidate	candidate	write_calls.jobs	27
+counted	1	acp pull	candidate	candidate	write_calls.ledger	10
+counted	1	acp pull	candidate	candidate	write_calls.outside	13
+counted	1	acp pull	candidate	candidate	write_calls.state	11
+counted	1	acp pull	candidate	candidate	write_calls.store	33
+counted	1	acp pull	candidate	candidate	daemon_rss_kib.a	14400
+counted	1	acp pull	candidate	candidate	daemon_footprint_kib.a	5840
+counted	1	acp pull	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	acp pull	candidate	candidate	daemon_footprint_kib.b	5856
+counted	1	acp pull	anchor	candidate	cli_cpu_us	10366
+counted	1	acp pull	anchor	candidate	cli_maxrss_kib	7568
+counted	1	acp pull	anchor	candidate	cli_processes	1
+counted	1	acp pull	anchor	candidate	cmd:bun	2
+counted	1	acp pull	anchor	candidate	cmd:cargo	2
+counted	1	acp pull	anchor	candidate	cmd:claude	3
+counted	1	acp pull	anchor	candidate	cmd:codex	3
+counted	1	acp pull	anchor	candidate	cmd:defaults	6
+counted	1	acp pull	anchor	candidate	cmd:fabric-fake-agent	1
+counted	1	acp pull	anchor	candidate	cmd:git	2
+counted	1	acp pull	anchor	candidate	cmd:git add	1
+counted	1	acp pull	anchor	candidate	cmd:git bundle	11
+counted	1	acp pull	anchor	candidate	cmd:git cat-file	1
+counted	1	acp pull	anchor	candidate	cmd:git check-attr	2
+counted	1	acp pull	anchor	candidate	cmd:git commit-tree	2
+counted	1	acp pull	anchor	candidate	cmd:git config	5
+counted	1	acp pull	anchor	candidate	cmd:git for-each-ref	2
+counted	1	acp pull	anchor	candidate	cmd:git hash-object	1
+counted	1	acp pull	anchor	candidate	cmd:git init	1
+counted	1	acp pull	anchor	candidate	cmd:git ls-files	6
+counted	1	acp pull	anchor	candidate	cmd:git ls-tree	4
+counted	1	acp pull	anchor	candidate	cmd:git read-tree	2
+counted	1	acp pull	anchor	candidate	cmd:git rev-list	1
+counted	1	acp pull	anchor	candidate	cmd:git rev-parse	4
+counted	1	acp pull	anchor	candidate	cmd:git status	1
+counted	1	acp pull	anchor	candidate	cmd:git symbolic-ref	4
+counted	1	acp pull	anchor	candidate	cmd:git update-index	1
+counted	1	acp pull	anchor	candidate	cmd:git update-ref	2
+counted	1	acp pull	anchor	candidate	cmd:git write-tree	2
+counted	1	acp pull	anchor	candidate	cmd:id	2
+counted	1	acp pull	anchor	candidate	cmd:node	8
+counted	1	acp pull	anchor	candidate	cmd:npm	2
+counted	1	acp pull	anchor	candidate	cmd:pnpm	4
+counted	1	acp pull	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	acp pull	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	acp pull	anchor	candidate	cmd:python3	6
+counted	1	acp pull	anchor	candidate	cmd:rustc	2
+counted	1	acp pull	anchor	candidate	cmd:sh holding fabric-fake-agent	1
+counted	1	acp pull	anchor	candidate	cmd:sw_vers	2
+counted	1	acp pull	anchor	candidate	cmd:uv	2
+counted	1	acp pull	anchor	candidate	cmd:xcrun	2
+counted	1	acp pull	anchor	candidate	cmd:yarn	2
+counted	1	acp pull	anchor	candidate	cpu_us	88477
+counted	1	acp pull	anchor	candidate	frees	22387
+counted	1	acp pull	anchor	candidate	fsync	59
+counted	1	acp pull	anchor	candidate	fullfsync	81
+counted	1	acp pull	anchor	candidate	malloc_bytes	8515410
+counted	1	acp pull	anchor	candidate	mallocs	28512
+counted	1	acp pull	anchor	candidate	opens	406
+counted	1	acp pull	anchor	candidate	read_bytes.ipc	10231
+counted	1	acp pull	anchor	candidate	read_bytes.jobs	8543
+counted	1	acp pull	anchor	candidate	read_bytes.outside	1632
+counted	1	acp pull	anchor	candidate	read_bytes.state	174
+counted	1	acp pull	anchor	candidate	read_bytes.store	21398
+counted	1	acp pull	anchor	candidate	read_calls.ipc	464
+counted	1	acp pull	anchor	candidate	read_calls.jobs	59
+counted	1	acp pull	anchor	candidate	read_calls.outside	31
+counted	1	acp pull	anchor	candidate	read_calls.state	4
+counted	1	acp pull	anchor	candidate	read_calls.store	187
+counted	1	acp pull	anchor	candidate	renames	31
+counted	1	acp pull	anchor	candidate	spawn:bun	2
+counted	1	acp pull	anchor	candidate	spawn:cargo	2
+counted	1	acp pull	anchor	candidate	spawn:claude	3
+counted	1	acp pull	anchor	candidate	spawn:codex	3
+counted	1	acp pull	anchor	candidate	spawn:defaults	6
+counted	1	acp pull	anchor	candidate	spawn:fabric-fake-agent	1
+counted	1	acp pull	anchor	candidate	spawn:git	55
+counted	1	acp pull	anchor	candidate	spawn:id	2
+counted	1	acp pull	anchor	candidate	spawn:node	8
+counted	1	acp pull	anchor	candidate	spawn:npm	2
+counted	1	acp pull	anchor	candidate	spawn:pnpm	4
+counted	1	acp pull	anchor	candidate	spawn:ps	3
+counted	1	acp pull	anchor	candidate	spawn:python3	6
+counted	1	acp pull	anchor	candidate	spawn:rustc	2
+counted	1	acp pull	anchor	candidate	spawn:sh	1
+counted	1	acp pull	anchor	candidate	spawn:sw_vers	2
+counted	1	acp pull	anchor	candidate	spawn:uv	2
+counted	1	acp pull	anchor	candidate	spawn:xcrun	2
+counted	1	acp pull	anchor	candidate	spawn:yarn	2
+counted	1	acp pull	anchor	candidate	spawns	108
+counted	1	acp pull	anchor	candidate	syncs.jobs	64
+counted	1	acp pull	anchor	candidate	syncs.ledger	10
+counted	1	acp pull	anchor	candidate	syncs.outside	48
+counted	1	acp pull	anchor	candidate	syncs.store	18
+counted	1	acp pull	anchor	candidate	unlinks	42
+counted	1	acp pull	anchor	candidate	write_bytes.ipc	4616
+counted	1	acp pull	anchor	candidate	write_bytes.jobs	8401
+counted	1	acp pull	anchor	candidate	write_bytes.ledger	1376
+counted	1	acp pull	anchor	candidate	write_bytes.outside	747
+counted	1	acp pull	anchor	candidate	write_bytes.state	1919
+counted	1	acp pull	anchor	candidate	write_bytes.store	50366
+counted	1	acp pull	anchor	candidate	write_calls.ipc	85
+counted	1	acp pull	anchor	candidate	write_calls.jobs	27
+counted	1	acp pull	anchor	candidate	write_calls.ledger	10
+counted	1	acp pull	anchor	candidate	write_calls.outside	12
+counted	1	acp pull	anchor	candidate	write_calls.state	11
+counted	1	acp pull	anchor	candidate	write_calls.store	33
+counted	1	acp pull	anchor	candidate	daemon_rss_kib.a	14912
+counted	1	acp pull	anchor	candidate	daemon_footprint_kib.a	6272
+counted	1	acp pull	anchor	candidate	daemon_rss_kib.b	15312
+counted	1	acp pull	anchor	candidate	daemon_footprint_kib.b	6528
+counted	1	claude suspend	candidate	candidate	barrierfsync	10
+counted	1	claude suspend	candidate	candidate	cli_cpu_us	7250
+counted	1	claude suspend	candidate	candidate	cli_maxrss_kib	4368
+counted	1	claude suspend	candidate	candidate	cli_processes	1
+counted	1	claude suspend	candidate	candidate	cmd:claude	1
+counted	1	claude suspend	candidate	candidate	cmd:git add	1
+counted	1	claude suspend	candidate	candidate	cmd:git bundle	2
+counted	1	claude suspend	candidate	candidate	cmd:git check-attr	2
+counted	1	claude suspend	candidate	candidate	cmd:git commit-tree	2
+counted	1	claude suspend	candidate	candidate	cmd:git config	1
+counted	1	claude suspend	candidate	candidate	cmd:git for-each-ref	2
+counted	1	claude suspend	candidate	candidate	cmd:git ls-files	6
+counted	1	claude suspend	candidate	candidate	cmd:git ls-tree	2
+counted	1	claude suspend	candidate	candidate	cmd:git read-tree	1
+counted	1	claude suspend	candidate	candidate	cmd:git rev-list	1
+counted	1	claude suspend	candidate	candidate	cmd:git rev-parse	3
+counted	1	claude suspend	candidate	candidate	cmd:git status	1
+counted	1	claude suspend	candidate	candidate	cmd:git symbolic-ref	2
+counted	1	claude suspend	candidate	candidate	cmd:git update-ref	1
+counted	1	claude suspend	candidate	candidate	cmd:git write-tree	2
+counted	1	claude suspend	candidate	candidate	cmd:node	2
+counted	1	claude suspend	candidate	candidate	cmd:python3	2
+counted	1	claude suspend	candidate	candidate	cpu_us	31028
+counted	1	claude suspend	candidate	candidate	frees	11239
+counted	1	claude suspend	candidate	candidate	fsync	15
+counted	1	claude suspend	candidate	candidate	fullfsync	20
+counted	1	claude suspend	candidate	candidate	malloc_bytes	3413605
+counted	1	claude suspend	candidate	candidate	mallocs	14082
+counted	1	claude suspend	candidate	candidate	opens	131
+counted	1	claude suspend	candidate	candidate	read_bytes.ipc	5167
+counted	1	claude suspend	candidate	candidate	read_bytes.jobs	2994
+counted	1	claude suspend	candidate	candidate	read_bytes.outside	1314
+counted	1	claude suspend	candidate	candidate	read_bytes.state	87
+counted	1	claude suspend	candidate	candidate	read_bytes.store	10530
+counted	1	claude suspend	candidate	candidate	read_calls.ipc	175
+counted	1	claude suspend	candidate	candidate	read_calls.jobs	24
+counted	1	claude suspend	candidate	candidate	read_calls.outside	17
+counted	1	claude suspend	candidate	candidate	read_calls.state	2
+counted	1	claude suspend	candidate	candidate	read_calls.store	68
+counted	1	claude suspend	candidate	candidate	renames	14
+counted	1	claude suspend	candidate	candidate	spawn:claude	1
+counted	1	claude suspend	candidate	candidate	spawn:git	29
+counted	1	claude suspend	candidate	candidate	spawn:node	2
+counted	1	claude suspend	candidate	candidate	spawn:python3	2
+counted	1	claude suspend	candidate	candidate	spawns	34
+counted	1	claude suspend	candidate	candidate	syncs.jobs	20
+counted	1	claude suspend	candidate	candidate	syncs.ledger	4
+counted	1	claude suspend	candidate	candidate	syncs.outside	3
+counted	1	claude suspend	candidate	candidate	syncs.store	18
+counted	1	claude suspend	candidate	candidate	unlinks	21
+counted	1	claude suspend	candidate	candidate	write_bytes.ipc	1048
+counted	1	claude suspend	candidate	candidate	write_bytes.jobs	4210
+counted	1	claude suspend	candidate	candidate	write_bytes.ledger	522
+counted	1	claude suspend	candidate	candidate	write_bytes.outside	113
+counted	1	claude suspend	candidate	candidate	write_bytes.state	748
+counted	1	claude suspend	candidate	candidate	write_bytes.store	46685
+counted	1	claude suspend	candidate	candidate	write_calls.ipc	8
+counted	1	claude suspend	candidate	candidate	write_calls.jobs	10
+counted	1	claude suspend	candidate	candidate	write_calls.ledger	4
+counted	1	claude suspend	candidate	candidate	write_calls.outside	1
+counted	1	claude suspend	candidate	candidate	write_calls.state	5
+counted	1	claude suspend	candidate	candidate	write_calls.store	29
+counted	1	claude suspend	candidate	candidate	daemon_rss_kib.a	13216
+counted	1	claude suspend	candidate	candidate	daemon_footprint_kib.a	6112
+counted	1	claude suspend	candidate	candidate	daemon_rss_kib.b	13024
+counted	1	claude suspend	candidate	candidate	daemon_footprint_kib.b	5856
+counted	1	claude suspend	anchor	candidate	cli_cpu_us	8235
+counted	1	claude suspend	anchor	candidate	cli_maxrss_kib	5280
+counted	1	claude suspend	anchor	candidate	cli_processes	1
+counted	1	claude suspend	anchor	candidate	cmd:claude	1
+counted	1	claude suspend	anchor	candidate	cmd:git add	1
+counted	1	claude suspend	anchor	candidate	cmd:git bundle	3
+counted	1	claude suspend	anchor	candidate	cmd:git check-attr	2
+counted	1	claude suspend	anchor	candidate	cmd:git commit-tree	2
+counted	1	claude suspend	anchor	candidate	cmd:git config	1
+counted	1	claude suspend	anchor	candidate	cmd:git for-each-ref	2
+counted	1	claude suspend	anchor	candidate	cmd:git ls-files	6
+counted	1	claude suspend	anchor	candidate	cmd:git ls-tree	2
+counted	1	claude suspend	anchor	candidate	cmd:git read-tree	1
+counted	1	claude suspend	anchor	candidate	cmd:git rev-list	1
+counted	1	claude suspend	anchor	candidate	cmd:git rev-parse	3
+counted	1	claude suspend	anchor	candidate	cmd:git status	1
+counted	1	claude suspend	anchor	candidate	cmd:git symbolic-ref	2
+counted	1	claude suspend	anchor	candidate	cmd:git update-ref	1
+counted	1	claude suspend	anchor	candidate	cmd:git write-tree	2
+counted	1	claude suspend	anchor	candidate	cmd:node	2
+counted	1	claude suspend	anchor	candidate	cmd:python3	2
+counted	1	claude suspend	anchor	candidate	cpu_us	34315
+counted	1	claude suspend	anchor	candidate	frees	11718
+counted	1	claude suspend	anchor	candidate	fsync	8
+counted	1	claude suspend	anchor	candidate	fullfsync	41
+counted	1	claude suspend	anchor	candidate	malloc_bytes	3491326
+counted	1	claude suspend	anchor	candidate	mallocs	14620
+counted	1	claude suspend	anchor	candidate	opens	145
+counted	1	claude suspend	anchor	candidate	read_bytes.ipc	5292
+counted	1	claude suspend	anchor	candidate	read_bytes.jobs	3115
+counted	1	claude suspend	anchor	candidate	read_bytes.outside	1314
+counted	1	claude suspend	anchor	candidate	read_bytes.state	87
+counted	1	claude suspend	anchor	candidate	read_bytes.store	9732
+counted	1	claude suspend	anchor	candidate	read_calls.ipc	185
+counted	1	claude suspend	anchor	candidate	read_calls.jobs	26
+counted	1	claude suspend	anchor	candidate	read_calls.outside	17
+counted	1	claude suspend	anchor	candidate	read_calls.state	2
+counted	1	claude suspend	anchor	candidate	read_calls.store	67
+counted	1	claude suspend	anchor	candidate	renames	14
+counted	1	claude suspend	anchor	candidate	spawn:claude	1
+counted	1	claude suspend	anchor	candidate	spawn:git	30
+counted	1	claude suspend	anchor	candidate	spawn:node	2
+counted	1	claude suspend	anchor	candidate	spawn:python3	2
+counted	1	claude suspend	anchor	candidate	spawns	35
+counted	1	claude suspend	anchor	candidate	syncs.jobs	24
+counted	1	claude suspend	anchor	candidate	syncs.ledger	4
+counted	1	claude suspend	anchor	candidate	syncs.outside	3
+counted	1	claude suspend	anchor	candidate	syncs.store	18
+counted	1	claude suspend	anchor	candidate	unlinks	21
+counted	1	claude suspend	anchor	candidate	write_bytes.ipc	1048
+counted	1	claude suspend	anchor	candidate	write_bytes.jobs	4204
+counted	1	claude suspend	anchor	candidate	write_bytes.ledger	522
+counted	1	claude suspend	anchor	candidate	write_bytes.outside	113
+counted	1	claude suspend	anchor	candidate	write_bytes.state	748
+counted	1	claude suspend	anchor	candidate	write_bytes.store	46703
+counted	1	claude suspend	anchor	candidate	write_calls.ipc	8
+counted	1	claude suspend	anchor	candidate	write_calls.jobs	10
+counted	1	claude suspend	anchor	candidate	write_calls.ledger	4
+counted	1	claude suspend	anchor	candidate	write_calls.outside	1
+counted	1	claude suspend	anchor	candidate	write_calls.state	5
+counted	1	claude suspend	anchor	candidate	write_calls.store	29
+counted	1	claude suspend	anchor	candidate	daemon_rss_kib.a	15008
+counted	1	claude suspend	anchor	candidate	daemon_footprint_kib.a	6304
+counted	1	claude suspend	anchor	candidate	daemon_rss_kib.b	15280
+counted	1	claude suspend	anchor	candidate	daemon_footprint_kib.b	6528
+counted	1	claude move	candidate	candidate	barrierfsync	4
+counted	1	claude move	candidate	candidate	cli_cpu_us	6836
+counted	1	claude move	candidate	candidate	cli_maxrss_kib	4688
+counted	1	claude move	candidate	candidate	cli_processes	1
+counted	1	claude move	candidate	candidate	cmd:claude	3
+counted	1	claude move	candidate	candidate	cmd:git	2
+counted	1	claude move	candidate	candidate	cmd:id	2
+counted	1	claude move	candidate	candidate	cmd:node	4
+counted	1	claude move	candidate	candidate	cpu_us	17185
+counted	1	claude move	candidate	candidate	frees	3943
+counted	1	claude move	candidate	candidate	fullfsync	7
+counted	1	claude move	candidate	candidate	malloc_bytes	1648099
+counted	1	claude move	candidate	candidate	mallocs	4935
+counted	1	claude move	candidate	candidate	opens	15
+counted	1	claude move	candidate	candidate	read_bytes.ipc	154
+counted	1	claude move	candidate	candidate	read_bytes.jobs	82
+counted	1	claude move	candidate	candidate	read_bytes.store	2488
+counted	1	claude move	candidate	candidate	read_calls.ipc	20
+counted	1	claude move	candidate	candidate	read_calls.jobs	2
+counted	1	claude move	candidate	candidate	read_calls.store	20
+counted	1	claude move	candidate	candidate	renames	5
+counted	1	claude move	candidate	candidate	spawn:claude	3
+counted	1	claude move	candidate	candidate	spawn:git	2
+counted	1	claude move	candidate	candidate	spawn:id	2
+counted	1	claude move	candidate	candidate	spawn:node	4
+counted	1	claude move	candidate	candidate	spawns	11
+counted	1	claude move	candidate	candidate	syncs.jobs	5
+counted	1	claude move	candidate	candidate	syncs.ledger	4
+counted	1	claude move	candidate	candidate	syncs.outside	2
+counted	1	claude move	candidate	candidate	unlinks	1
+counted	1	claude move	candidate	candidate	write_bytes.ipc	1896
+counted	1	claude move	candidate	candidate	write_bytes.jobs	720
+counted	1	claude move	candidate	candidate	write_bytes.ledger	520
+counted	1	claude move	candidate	candidate	write_bytes.state	127
+counted	1	claude move	candidate	candidate	write_calls.ipc	22
+counted	1	claude move	candidate	candidate	write_calls.jobs	4
+counted	1	claude move	candidate	candidate	write_calls.ledger	4
+counted	1	claude move	candidate	candidate	write_calls.state	1
+counted	1	claude move	candidate	candidate	daemon_rss_kib.a	13200
+counted	1	claude move	candidate	candidate	daemon_footprint_kib.a	6112
+counted	1	claude move	candidate	candidate	daemon_rss_kib.b	12864
+counted	1	claude move	candidate	candidate	daemon_footprint_kib.b	5856
+counted	1	claude move	anchor	candidate	cli_cpu_us	9351
+counted	1	claude move	anchor	candidate	cli_maxrss_kib	5600
+counted	1	claude move	anchor	candidate	cli_processes	1
+counted	1	claude move	anchor	candidate	cmd:bun	2
+counted	1	claude move	anchor	candidate	cmd:cargo	2
+counted	1	claude move	anchor	candidate	cmd:claude	3
+counted	1	claude move	anchor	candidate	cmd:codex	3
+counted	1	claude move	anchor	candidate	cmd:defaults	4
+counted	1	claude move	anchor	candidate	cmd:git	2
+counted	1	claude move	anchor	candidate	cmd:id	2
+counted	1	claude move	anchor	candidate	cmd:node	4
+counted	1	claude move	anchor	candidate	cmd:npm	2
+counted	1	claude move	anchor	candidate	cmd:pnpm	4
+counted	1	claude move	anchor	candidate	cmd:python3	4
+counted	1	claude move	anchor	candidate	cmd:rustc	2
+counted	1	claude move	anchor	candidate	cmd:sw_vers	2
+counted	1	claude move	anchor	candidate	cmd:uv	2
+counted	1	claude move	anchor	candidate	cmd:xcrun	2
+counted	1	claude move	anchor	candidate	cmd:yarn	2
+counted	1	claude move	anchor	candidate	cpu_us	34511
+counted	1	claude move	anchor	candidate	frees	6694
+counted	1	claude move	anchor	candidate	fullfsync	15
+counted	1	claude move	anchor	candidate	malloc_bytes	1964017
+counted	1	claude move	anchor	candidate	mallocs	8148
+counted	1	claude move	anchor	candidate	opens	73
+counted	1	claude move	anchor	candidate	read_bytes.ipc	468
+counted	1	claude move	anchor	candidate	read_bytes.jobs	4082
+counted	1	claude move	anchor	candidate	read_bytes.store	1251
+counted	1	claude move	anchor	candidate	read_calls.ipc	124
+counted	1	claude move	anchor	candidate	read_calls.jobs	10
+counted	1	claude move	anchor	candidate	read_calls.store	10
+counted	1	claude move	anchor	candidate	renames	5
+counted	1	claude move	anchor	candidate	spawn:bun	2
+counted	1	claude move	anchor	candidate	spawn:cargo	2
+counted	1	claude move	anchor	candidate	spawn:claude	3
+counted	1	claude move	anchor	candidate	spawn:codex	3
+counted	1	claude move	anchor	candidate	spawn:defaults	4
+counted	1	claude move	anchor	candidate	spawn:git	2
+counted	1	claude move	anchor	candidate	spawn:id	2
+counted	1	claude move	anchor	candidate	spawn:node	4
+counted	1	claude move	anchor	candidate	spawn:npm	2
+counted	1	claude move	anchor	candidate	spawn:pnpm	4
+counted	1	claude move	anchor	candidate	spawn:python3	4
+counted	1	claude move	anchor	candidate	spawn:rustc	2
+counted	1	claude move	anchor	candidate	spawn:sw_vers	2
+counted	1	claude move	anchor	candidate	spawn:uv	2
+counted	1	claude move	anchor	candidate	spawn:xcrun	2
+counted	1	claude move	anchor	candidate	spawn:yarn	2
+counted	1	claude move	anchor	candidate	spawns	42
+counted	1	claude move	anchor	candidate	syncs.jobs	9
+counted	1	claude move	anchor	candidate	syncs.ledger	4
+counted	1	claude move	anchor	candidate	syncs.outside	2
+counted	1	claude move	anchor	candidate	unlinks	1
+counted	1	claude move	anchor	candidate	write_bytes.ipc	2362
+counted	1	claude move	anchor	candidate	write_bytes.jobs	720
+counted	1	claude move	anchor	candidate	write_bytes.ledger	520
+counted	1	claude move	anchor	candidate	write_bytes.state	127
+counted	1	claude move	anchor	candidate	write_calls.ipc	29
+counted	1	claude move	anchor	candidate	write_calls.jobs	4
+counted	1	claude move	anchor	candidate	write_calls.ledger	4
+counted	1	claude move	anchor	candidate	write_calls.state	1
+counted	1	claude move	anchor	candidate	daemon_rss_kib.a	15056
+counted	1	claude move	anchor	candidate	daemon_footprint_kib.a	6320
+counted	1	claude move	anchor	candidate	daemon_rss_kib.b	15376
+counted	1	claude move	anchor	candidate	daemon_footprint_kib.b	6608
+counted	1	claude resume	candidate	candidate	barrierfsync	9
+counted	1	claude resume	candidate	candidate	cli_cpu_us	8118
+counted	1	claude resume	candidate	candidate	cli_maxrss_kib	6176
+counted	1	claude resume	candidate	candidate	cli_processes	1
+counted	1	claude resume	candidate	candidate	cmd:claude	2
+counted	1	claude resume	candidate	candidate	cmd:dash holding claude	1
+counted	1	claude resume	candidate	candidate	cmd:git bundle	2
+counted	1	claude resume	candidate	candidate	cmd:git cat-file	1
+counted	1	claude resume	candidate	candidate	cmd:git hash-object	1
+counted	1	claude resume	candidate	candidate	cmd:git init	1
+counted	1	claude resume	candidate	candidate	cmd:git ls-tree	2
+counted	1	claude resume	candidate	candidate	cmd:git read-tree	1
+counted	1	claude resume	candidate	candidate	cmd:git update-index	1
+counted	1	claude resume	candidate	candidate	cmd:git update-ref	1
+counted	1	claude resume	candidate	candidate	cmd:node	2
+counted	1	claude resume	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	claude resume	candidate	candidate	cpu_us	24678
+counted	1	claude resume	candidate	candidate	frees	6579
+counted	1	claude resume	candidate	candidate	fsync	59
+counted	1	claude resume	candidate	candidate	fullfsync	13
+counted	1	claude resume	candidate	candidate	malloc_bytes	3569913
+counted	1	claude resume	candidate	candidate	mallocs	7983
+counted	1	claude resume	candidate	candidate	opens	234
+counted	1	claude resume	candidate	candidate	read_bytes.ipc	1884
+counted	1	claude resume	candidate	candidate	read_bytes.jobs	6156
+counted	1	claude resume	candidate	candidate	read_bytes.outside	2047
+counted	1	claude resume	candidate	candidate	read_bytes.state	122
+counted	1	claude resume	candidate	candidate	read_bytes.store	13709
+counted	1	claude resume	candidate	candidate	read_calls.ipc	73
+counted	1	claude resume	candidate	candidate	read_calls.jobs	26
+counted	1	claude resume	candidate	candidate	read_calls.outside	18
+counted	1	claude resume	candidate	candidate	read_calls.state	4
+counted	1	claude resume	candidate	candidate	read_calls.store	99
+counted	1	claude resume	candidate	candidate	renames	11
+counted	1	claude resume	candidate	candidate	spawn:claude	2
+counted	1	claude resume	candidate	candidate	spawn:dash	1
+counted	1	claude resume	candidate	candidate	spawn:git	10
+counted	1	claude resume	candidate	candidate	spawn:node	2
+counted	1	claude resume	candidate	candidate	spawn:ps	1
+counted	1	claude resume	candidate	candidate	spawns	16
+counted	1	claude resume	candidate	candidate	syncs.jobs	33
+counted	1	claude resume	candidate	candidate	syncs.ledger	1
+counted	1	claude resume	candidate	candidate	syncs.outside	47
+counted	1	claude resume	candidate	candidate	unlinks	22
+counted	1	claude resume	candidate	candidate	write_bytes.ipc	1844
+counted	1	claude resume	candidate	candidate	write_bytes.jobs	4149
+counted	1	claude resume	candidate	candidate	write_bytes.ledger	148
+counted	1	claude resume	candidate	candidate	write_bytes.outside	640
+counted	1	claude resume	candidate	candidate	write_bytes.state	357
+counted	1	claude resume	candidate	candidate	write_bytes.store	2478
+counted	1	claude resume	candidate	candidate	write_calls.ipc	29
+counted	1	claude resume	candidate	candidate	write_calls.jobs	12
+counted	1	claude resume	candidate	candidate	write_calls.ledger	1
+counted	1	claude resume	candidate	candidate	write_calls.outside	12
+counted	1	claude resume	candidate	candidate	write_calls.state	2
+counted	1	claude resume	candidate	candidate	write_calls.store	4
+counted	1	claude resume	candidate	candidate	daemon_rss_kib.a	13200
+counted	1	claude resume	candidate	candidate	daemon_footprint_kib.a	6112
+counted	1	claude resume	candidate	candidate	daemon_rss_kib.b	12992
+counted	1	claude resume	candidate	candidate	daemon_footprint_kib.b	5840
+counted	1	claude resume	anchor	candidate	cli_cpu_us	11299
+counted	1	claude resume	anchor	candidate	cli_maxrss_kib	7408
+counted	1	claude resume	anchor	candidate	cli_processes	1
+counted	1	claude resume	anchor	candidate	cmd:claude	2
+counted	1	claude resume	anchor	candidate	cmd:defaults	2
+counted	1	claude resume	anchor	candidate	cmd:git bundle	6
+counted	1	claude resume	anchor	candidate	cmd:git cat-file	1
+counted	1	claude resume	anchor	candidate	cmd:git config	4
+counted	1	claude resume	anchor	candidate	cmd:git hash-object	1
+counted	1	claude resume	anchor	candidate	cmd:git init	1
+counted	1	claude resume	anchor	candidate	cmd:git ls-tree	2
+counted	1	claude resume	anchor	candidate	cmd:git read-tree	1
+counted	1	claude resume	anchor	candidate	cmd:git rev-parse	1
+counted	1	claude resume	anchor	candidate	cmd:git symbolic-ref	2
+counted	1	claude resume	anchor	candidate	cmd:git update-index	1
+counted	1	claude resume	anchor	candidate	cmd:git update-ref	1
+counted	1	claude resume	anchor	candidate	cmd:node	2
+counted	1	claude resume	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	claude resume	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	claude resume	anchor	candidate	cmd:sh holding claude	1
+counted	1	claude resume	anchor	candidate	cpu_us	34848
+counted	1	claude resume	anchor	candidate	frees	8529
+counted	1	claude resume	anchor	candidate	fsync	55
+counted	1	claude resume	anchor	candidate	fullfsync	24
+counted	1	claude resume	anchor	candidate	malloc_bytes	3877565
+counted	1	claude resume	anchor	candidate	mallocs	10295
+counted	1	claude resume	anchor	candidate	opens	241
+counted	1	claude resume	anchor	candidate	read_bytes.ipc	3483
+counted	1	claude resume	anchor	candidate	read_bytes.jobs	6351
+counted	1	claude resume	anchor	candidate	read_bytes.outside	1910
+counted	1	claude resume	anchor	candidate	read_bytes.state	270
+counted	1	claude resume	anchor	candidate	read_bytes.store	9155
+counted	1	claude resume	anchor	candidate	read_calls.ipc	143
+counted	1	claude resume	anchor	candidate	read_calls.jobs	30
+counted	1	claude resume	anchor	candidate	read_calls.outside	16
+counted	1	claude resume	anchor	candidate	read_calls.state	8
+counted	1	claude resume	anchor	candidate	read_calls.store	95
+counted	1	claude resume	anchor	candidate	renames	11
+counted	1	claude resume	anchor	candidate	spawn:claude	2
+counted	1	claude resume	anchor	candidate	spawn:defaults	2
+counted	1	claude resume	anchor	candidate	spawn:git	21
+counted	1	claude resume	anchor	candidate	spawn:node	2
+counted	1	claude resume	anchor	candidate	spawn:ps	3
+counted	1	claude resume	anchor	candidate	spawn:sh	1
+counted	1	claude resume	anchor	candidate	spawns	31
+counted	1	claude resume	anchor	candidate	syncs.jobs	35
+counted	1	claude resume	anchor	candidate	syncs.ledger	1
+counted	1	claude resume	anchor	candidate	syncs.outside	43
+counted	1	claude resume	anchor	candidate	unlinks	23
+counted	1	claude resume	anchor	candidate	write_bytes.ipc	1779
+counted	1	claude resume	anchor	candidate	write_bytes.jobs	4153
+counted	1	claude resume	anchor	candidate	write_bytes.ledger	148
+counted	1	claude resume	anchor	candidate	write_bytes.outside	483
+counted	1	claude resume	anchor	candidate	write_bytes.state	357
+counted	1	claude resume	anchor	candidate	write_bytes.store	2912
+counted	1	claude resume	anchor	candidate	write_calls.ipc	28
+counted	1	claude resume	anchor	candidate	write_calls.jobs	12
+counted	1	claude resume	anchor	candidate	write_calls.ledger	1
+counted	1	claude resume	anchor	candidate	write_calls.outside	11
+counted	1	claude resume	anchor	candidate	write_calls.state	2
+counted	1	claude resume	anchor	candidate	write_calls.store	3
+counted	1	claude resume	anchor	candidate	daemon_rss_kib.a	15056
+counted	1	claude resume	anchor	candidate	daemon_footprint_kib.a	6240
+counted	1	claude resume	anchor	candidate	daemon_rss_kib.b	15456
+counted	1	claude resume	anchor	candidate	daemon_footprint_kib.b	6640
+counted	1	claude pull	candidate	candidate	barrierfsync	24
+counted	1	claude pull	candidate	candidate	cli_cpu_us	10287
+counted	1	claude pull	candidate	candidate	cli_maxrss_kib	6272
+counted	1	claude pull	candidate	candidate	cli_processes	1
+counted	1	claude pull	candidate	candidate	cmd:claude	6
+counted	1	claude pull	candidate	candidate	cmd:dash holding claude	1
+counted	1	claude pull	candidate	candidate	cmd:git	2
+counted	1	claude pull	candidate	candidate	cmd:git add	1
+counted	1	claude pull	candidate	candidate	cmd:git bundle	4
+counted	1	claude pull	candidate	candidate	cmd:git cat-file	1
+counted	1	claude pull	candidate	candidate	cmd:git check-attr	2
+counted	1	claude pull	candidate	candidate	cmd:git commit-tree	2
+counted	1	claude pull	candidate	candidate	cmd:git config	1
+counted	1	claude pull	candidate	candidate	cmd:git for-each-ref	2
+counted	1	claude pull	candidate	candidate	cmd:git hash-object	1
+counted	1	claude pull	candidate	candidate	cmd:git init	1
+counted	1	claude pull	candidate	candidate	cmd:git ls-files	6
+counted	1	claude pull	candidate	candidate	cmd:git ls-tree	4
+counted	1	claude pull	candidate	candidate	cmd:git read-tree	2
+counted	1	claude pull	candidate	candidate	cmd:git rev-list	1
+counted	1	claude pull	candidate	candidate	cmd:git rev-parse	3
+counted	1	claude pull	candidate	candidate	cmd:git status	1
+counted	1	claude pull	candidate	candidate	cmd:git symbolic-ref	2
+counted	1	claude pull	candidate	candidate	cmd:git update-index	1
+counted	1	claude pull	candidate	candidate	cmd:git update-ref	2
+counted	1	claude pull	candidate	candidate	cmd:git write-tree	2
+counted	1	claude pull	candidate	candidate	cmd:id	2
+counted	1	claude pull	candidate	candidate	cmd:node	8
+counted	1	claude pull	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	claude pull	candidate	candidate	cmd:python3	2
+counted	1	claude pull	candidate	candidate	cpu_us	60328
+counted	1	claude pull	candidate	candidate	frees	20220
+counted	1	claude pull	candidate	candidate	fsync	77
+counted	1	claude pull	candidate	candidate	fullfsync	41
+counted	1	claude pull	candidate	candidate	malloc_bytes	7710052
+counted	1	claude pull	candidate	candidate	mallocs	25156
+counted	1	claude pull	candidate	candidate	opens	389
+counted	1	claude pull	candidate	candidate	read_bytes.ipc	7226
+counted	1	claude pull	candidate	candidate	read_bytes.jobs	10627
+counted	1	claude pull	candidate	candidate	read_bytes.outside	4198
+counted	1	claude pull	candidate	candidate	read_bytes.state	174
+counted	1	claude pull	candidate	candidate	read_bytes.store	29189
+counted	1	claude pull	candidate	candidate	read_calls.ipc	268
+counted	1	claude pull	candidate	candidate	read_calls.jobs	53
+counted	1	claude pull	candidate	candidate	read_calls.outside	35
+counted	1	claude pull	candidate	candidate	read_calls.state	4
+counted	1	claude pull	candidate	candidate	read_calls.store	193
+counted	1	claude pull	candidate	candidate	renames	31
+counted	1	claude pull	candidate	candidate	spawn:claude	6
+counted	1	claude pull	candidate	candidate	spawn:dash	1
+counted	1	claude pull	candidate	candidate	spawn:git	41
+counted	1	claude pull	candidate	candidate	spawn:id	2
+counted	1	claude pull	candidate	candidate	spawn:node	8
+counted	1	claude pull	candidate	candidate	spawn:ps	1
+counted	1	claude pull	candidate	candidate	spawn:python3	2
+counted	1	claude pull	candidate	candidate	spawns	61
+counted	1	claude pull	candidate	candidate	syncs.jobs	59
+counted	1	claude pull	candidate	candidate	syncs.ledger	10
+counted	1	claude pull	candidate	candidate	syncs.outside	55
+counted	1	claude pull	candidate	candidate	syncs.store	18
+counted	1	claude pull	candidate	candidate	unlinks	44
+counted	1	claude pull	candidate	candidate	write_bytes.ipc	3725
+counted	1	claude pull	candidate	candidate	write_bytes.jobs	9787
+counted	1	claude pull	candidate	candidate	write_bytes.ledger	1338
+counted	1	claude pull	candidate	candidate	write_bytes.outside	774
+counted	1	claude pull	candidate	candidate	write_bytes.state	1963
+counted	1	claude pull	candidate	candidate	write_bytes.store	49210
+counted	1	claude pull	candidate	candidate	write_calls.ipc	67
+counted	1	claude pull	candidate	candidate	write_calls.jobs	27
+counted	1	claude pull	candidate	candidate	write_calls.ledger	10
+counted	1	claude pull	candidate	candidate	write_calls.outside	13
+counted	1	claude pull	candidate	candidate	write_calls.state	11
+counted	1	claude pull	candidate	candidate	write_calls.store	33
+counted	1	claude pull	candidate	candidate	daemon_rss_kib.a	13376
+counted	1	claude pull	candidate	candidate	daemon_footprint_kib.a	6144
+counted	1	claude pull	candidate	candidate	daemon_rss_kib.b	13088
+counted	1	claude pull	candidate	candidate	daemon_footprint_kib.b	5904
+counted	1	claude pull	anchor	candidate	cli_cpu_us	12900
+counted	1	claude pull	anchor	candidate	cli_maxrss_kib	7664
+counted	1	claude pull	anchor	candidate	cli_processes	1
+counted	1	claude pull	anchor	candidate	cmd:bun	2
+counted	1	claude pull	anchor	candidate	cmd:cargo	2
+counted	1	claude pull	anchor	candidate	cmd:claude	7
+counted	1	claude pull	anchor	candidate	cmd:codex	3
+counted	1	claude pull	anchor	candidate	cmd:defaults	6
+counted	1	claude pull	anchor	candidate	cmd:git	2
+counted	1	claude pull	anchor	candidate	cmd:git add	1
+counted	1	claude pull	anchor	candidate	cmd:git bundle	11
+counted	1	claude pull	anchor	candidate	cmd:git cat-file	1
+counted	1	claude pull	anchor	candidate	cmd:git check-attr	2
+counted	1	claude pull	anchor	candidate	cmd:git commit-tree	2
+counted	1	claude pull	anchor	candidate	cmd:git config	5
+counted	1	claude pull	anchor	candidate	cmd:git for-each-ref	2
+counted	1	claude pull	anchor	candidate	cmd:git hash-object	1
+counted	1	claude pull	anchor	candidate	cmd:git init	1
+counted	1	claude pull	anchor	candidate	cmd:git ls-files	6
+counted	1	claude pull	anchor	candidate	cmd:git ls-tree	4
+counted	1	claude pull	anchor	candidate	cmd:git read-tree	2
+counted	1	claude pull	anchor	candidate	cmd:git rev-list	1
+counted	1	claude pull	anchor	candidate	cmd:git rev-parse	4
+counted	1	claude pull	anchor	candidate	cmd:git status	1
+counted	1	claude pull	anchor	candidate	cmd:git symbolic-ref	4
+counted	1	claude pull	anchor	candidate	cmd:git update-index	1
+counted	1	claude pull	anchor	candidate	cmd:git update-ref	2
+counted	1	claude pull	anchor	candidate	cmd:git write-tree	2
+counted	1	claude pull	anchor	candidate	cmd:id	2
+counted	1	claude pull	anchor	candidate	cmd:node	8
+counted	1	claude pull	anchor	candidate	cmd:npm	2
+counted	1	claude pull	anchor	candidate	cmd:pnpm	4
+counted	1	claude pull	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	claude pull	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	claude pull	anchor	candidate	cmd:python3	6
+counted	1	claude pull	anchor	candidate	cmd:rustc	2
+counted	1	claude pull	anchor	candidate	cmd:sh holding claude	1
+counted	1	claude pull	anchor	candidate	cmd:sw_vers	2
+counted	1	claude pull	anchor	candidate	cmd:uv	2
+counted	1	claude pull	anchor	candidate	cmd:xcrun	2
+counted	1	claude pull	anchor	candidate	cmd:yarn	2
+counted	1	claude pull	anchor	candidate	cpu_us	93936
+counted	1	claude pull	anchor	candidate	frees	25091
+counted	1	claude pull	anchor	candidate	fsync	63
+counted	1	claude pull	anchor	candidate	fullfsync	83
+counted	1	claude pull	anchor	candidate	malloc_bytes	8537246
+counted	1	claude pull	anchor	candidate	mallocs	30956
+counted	1	claude pull	anchor	candidate	opens	449
+counted	1	claude pull	anchor	candidate	read_bytes.ipc	9731
+counted	1	claude pull	anchor	candidate	read_bytes.jobs	12941
+counted	1	claude pull	anchor	candidate	read_bytes.outside	4061
+counted	1	claude pull	anchor	candidate	read_bytes.state	174
+counted	1	claude pull	anchor	candidate	read_bytes.store	22258
+counted	1	claude pull	anchor	candidate	read_calls.ipc	472
+counted	1	claude pull	anchor	candidate	read_calls.jobs	63
+counted	1	claude pull	anchor	candidate	read_calls.outside	33
+counted	1	claude pull	anchor	candidate	read_calls.state	4
+counted	1	claude pull	anchor	candidate	read_calls.store	187
+counted	1	claude pull	anchor	candidate	renames	31
+counted	1	claude pull	anchor	candidate	spawn:bun	2
+counted	1	claude pull	anchor	candidate	spawn:cargo	2
+counted	1	claude pull	anchor	candidate	spawn:claude	7
+counted	1	claude pull	anchor	candidate	spawn:codex	3
+counted	1	claude pull	anchor	candidate	spawn:defaults	6
+counted	1	claude pull	anchor	candidate	spawn:git	55
+counted	1	claude pull	anchor	candidate	spawn:id	2
+counted	1	claude pull	anchor	candidate	spawn:node	8
+counted	1	claude pull	anchor	candidate	spawn:npm	2
+counted	1	claude pull	anchor	candidate	spawn:pnpm	4
+counted	1	claude pull	anchor	candidate	spawn:ps	3
+counted	1	claude pull	anchor	candidate	spawn:python3	6
+counted	1	claude pull	anchor	candidate	spawn:rustc	2
+counted	1	claude pull	anchor	candidate	spawn:sh	1
+counted	1	claude pull	anchor	candidate	spawn:sw_vers	2
+counted	1	claude pull	anchor	candidate	spawn:uv	2
+counted	1	claude pull	anchor	candidate	spawn:xcrun	2
+counted	1	claude pull	anchor	candidate	spawn:yarn	2
+counted	1	claude pull	anchor	candidate	spawns	111
+counted	1	claude pull	anchor	candidate	syncs.jobs	70
+counted	1	claude pull	anchor	candidate	syncs.ledger	10
+counted	1	claude pull	anchor	candidate	syncs.outside	48
+counted	1	claude pull	anchor	candidate	syncs.store	18
+counted	1	claude pull	anchor	candidate	unlinks	46
+counted	1	claude pull	anchor	candidate	write_bytes.ipc	4123
+counted	1	claude pull	anchor	candidate	write_bytes.jobs	9779
+counted	1	claude pull	anchor	candidate	write_bytes.ledger	1338
+counted	1	claude pull	anchor	candidate	write_bytes.outside	617
+counted	1	claude pull	anchor	candidate	write_bytes.state	1963
+counted	1	claude pull	anchor	candidate	write_bytes.store	50490
+counted	1	claude pull	anchor	candidate	write_calls.ipc	80
+counted	1	claude pull	anchor	candidate	write_calls.jobs	27
+counted	1	claude pull	anchor	candidate	write_calls.ledger	10
+counted	1	claude pull	anchor	candidate	write_calls.outside	12
+counted	1	claude pull	anchor	candidate	write_calls.state	11
+counted	1	claude pull	anchor	candidate	write_calls.store	33
+counted	1	claude pull	anchor	candidate	daemon_rss_kib.a	15136
+counted	1	claude pull	anchor	candidate	daemon_footprint_kib.a	6320
+counted	1	claude pull	anchor	candidate	daemon_rss_kib.b	15392
+counted	1	claude pull	anchor	candidate	daemon_footprint_kib.b	6704
+counted	1	codex suspend	candidate	candidate	barrierfsync	9
+counted	1	codex suspend	candidate	candidate	cli_cpu_us	6228
+counted	1	codex suspend	candidate	candidate	cli_maxrss_kib	4400
+counted	1	codex suspend	candidate	candidate	cli_processes	1
+counted	1	codex suspend	candidate	candidate	cmd:codex	2
+counted	1	codex suspend	candidate	candidate	cmd:git add	1
+counted	1	codex suspend	candidate	candidate	cmd:git bundle	2
+counted	1	codex suspend	candidate	candidate	cmd:git check-attr	2
+counted	1	codex suspend	candidate	candidate	cmd:git commit-tree	2
+counted	1	codex suspend	candidate	candidate	cmd:git config	1
+counted	1	codex suspend	candidate	candidate	cmd:git for-each-ref	2
+counted	1	codex suspend	candidate	candidate	cmd:git ls-files	6
+counted	1	codex suspend	candidate	candidate	cmd:git ls-tree	2
+counted	1	codex suspend	candidate	candidate	cmd:git read-tree	1
+counted	1	codex suspend	candidate	candidate	cmd:git rev-list	1
+counted	1	codex suspend	candidate	candidate	cmd:git rev-parse	3
+counted	1	codex suspend	candidate	candidate	cmd:git status	1
+counted	1	codex suspend	candidate	candidate	cmd:git symbolic-ref	2
+counted	1	codex suspend	candidate	candidate	cmd:git update-ref	1
+counted	1	codex suspend	candidate	candidate	cmd:git write-tree	2
+counted	1	codex suspend	candidate	candidate	cmd:lsof	1
+counted	1	codex suspend	candidate	candidate	cmd:node	2
+counted	1	codex suspend	candidate	candidate	cmd:python3	2
+counted	1	codex suspend	candidate	candidate	cpu_us	29250
+counted	1	codex suspend	candidate	candidate	frees	9733
+counted	1	codex suspend	candidate	candidate	fsync	16
+counted	1	codex suspend	candidate	candidate	fullfsync	19
+counted	1	codex suspend	candidate	candidate	malloc_bytes	3709184
+counted	1	codex suspend	candidate	candidate	mallocs	12810
+counted	1	codex suspend	candidate	candidate	opens	138
+counted	1	codex suspend	candidate	candidate	read_bytes.ipc	5181
+counted	1	codex suspend	candidate	candidate	read_bytes.jobs	3581
+counted	1	codex suspend	candidate	candidate	read_bytes.outside	4871
+counted	1	codex suspend	candidate	candidate	read_bytes.state	87
+counted	1	codex suspend	candidate	candidate	read_bytes.store	10808
+counted	1	codex suspend	candidate	candidate	read_calls.ipc	180
+counted	1	codex suspend	candidate	candidate	read_calls.jobs	25
+counted	1	codex suspend	candidate	candidate	read_calls.outside	18
+counted	1	codex suspend	candidate	candidate	read_calls.state	2
+counted	1	codex suspend	candidate	candidate	read_calls.store	68
+counted	1	codex suspend	candidate	candidate	renames	12
+counted	1	codex suspend	candidate	candidate	spawn:codex	2
+counted	1	codex suspend	candidate	candidate	spawn:git	29
+counted	1	codex suspend	candidate	candidate	spawn:lsof	1
+counted	1	codex suspend	candidate	candidate	spawn:node	2
+counted	1	codex suspend	candidate	candidate	spawn:python3	2
+counted	1	codex suspend	candidate	candidate	spawns	36
+counted	1	codex suspend	candidate	candidate	syncs.jobs	22
+counted	1	codex suspend	candidate	candidate	syncs.ledger	4
+counted	1	codex suspend	candidate	candidate	syncs.store	18
+counted	1	codex suspend	candidate	candidate	unlinks	24
+counted	1	codex suspend	candidate	candidate	write_bytes.ipc	1042
+counted	1	codex suspend	candidate	candidate	write_bytes.jobs	4853
+counted	1	codex suspend	candidate	candidate	write_bytes.ledger	522
+counted	1	codex suspend	candidate	candidate	write_bytes.state	749
+counted	1	codex suspend	candidate	candidate	write_bytes.store	71775
+counted	1	codex suspend	candidate	candidate	write_calls.ipc	8
+counted	1	codex suspend	candidate	candidate	write_calls.jobs	10
+counted	1	codex suspend	candidate	candidate	write_calls.ledger	4
+counted	1	codex suspend	candidate	candidate	write_calls.state	5
+counted	1	codex suspend	candidate	candidate	write_calls.store	41
+counted	1	codex suspend	candidate	candidate	daemon_rss_kib.a	13744
+counted	1	codex suspend	candidate	candidate	daemon_footprint_kib.a	6432
+counted	1	codex suspend	candidate	candidate	daemon_rss_kib.b	12976
+counted	1	codex suspend	candidate	candidate	daemon_footprint_kib.b	5888
+counted	1	codex suspend	anchor	candidate	cli_cpu_us	8266
+counted	1	codex suspend	anchor	candidate	cli_maxrss_kib	5312
+counted	1	codex suspend	anchor	candidate	cli_processes	1
+counted	1	codex suspend	anchor	candidate	cmd:codex	2
+counted	1	codex suspend	anchor	candidate	cmd:git add	1
+counted	1	codex suspend	anchor	candidate	cmd:git bundle	3
+counted	1	codex suspend	anchor	candidate	cmd:git check-attr	2
+counted	1	codex suspend	anchor	candidate	cmd:git commit-tree	2
+counted	1	codex suspend	anchor	candidate	cmd:git config	1
+counted	1	codex suspend	anchor	candidate	cmd:git for-each-ref	2
+counted	1	codex suspend	anchor	candidate	cmd:git ls-files	6
+counted	1	codex suspend	anchor	candidate	cmd:git ls-tree	2
+counted	1	codex suspend	anchor	candidate	cmd:git read-tree	1
+counted	1	codex suspend	anchor	candidate	cmd:git rev-list	1
+counted	1	codex suspend	anchor	candidate	cmd:git rev-parse	3
+counted	1	codex suspend	anchor	candidate	cmd:git status	1
+counted	1	codex suspend	anchor	candidate	cmd:git symbolic-ref	2
+counted	1	codex suspend	anchor	candidate	cmd:git update-ref	1
+counted	1	codex suspend	anchor	candidate	cmd:git write-tree	2
+counted	1	codex suspend	anchor	candidate	cmd:lsof	1
+counted	1	codex suspend	anchor	candidate	cmd:node	2
+counted	1	codex suspend	anchor	candidate	cmd:python3	2
+counted	1	codex suspend	anchor	candidate	cpu_us	32845
+counted	1	codex suspend	anchor	candidate	frees	10154
+counted	1	codex suspend	anchor	candidate	fsync	8
+counted	1	codex suspend	anchor	candidate	fullfsync	40
+counted	1	codex suspend	anchor	candidate	malloc_bytes	3572222
+counted	1	codex suspend	anchor	candidate	mallocs	12444
+counted	1	codex suspend	anchor	candidate	opens	152
+counted	1	codex suspend	anchor	candidate	read_bytes.ipc	5307
+counted	1	codex suspend	anchor	candidate	read_bytes.jobs	3702
+counted	1	codex suspend	anchor	candidate	read_bytes.outside	4871
+counted	1	codex suspend	anchor	candidate	read_bytes.state	87
+counted	1	codex suspend	anchor	candidate	read_bytes.store	10100
+counted	1	codex suspend	anchor	candidate	read_calls.ipc	190
+counted	1	codex suspend	anchor	candidate	read_calls.jobs	27
+counted	1	codex suspend	anchor	candidate	read_calls.outside	18
+counted	1	codex suspend	anchor	candidate	read_calls.state	2
+counted	1	codex suspend	anchor	candidate	read_calls.store	67
+counted	1	codex suspend	anchor	candidate	renames	12
+counted	1	codex suspend	anchor	candidate	spawn:codex	2
+counted	1	codex suspend	anchor	candidate	spawn:git	30
+counted	1	codex suspend	anchor	candidate	spawn:lsof	1
+counted	1	codex suspend	anchor	candidate	spawn:node	2
+counted	1	codex suspend	anchor	candidate	spawn:python3	2
+counted	1	codex suspend	anchor	candidate	spawns	37
+counted	1	codex suspend	anchor	candidate	syncs.jobs	26
+counted	1	codex suspend	anchor	candidate	syncs.ledger	4
+counted	1	codex suspend	anchor	candidate	syncs.store	18
+counted	1	codex suspend	anchor	candidate	unlinks	24
+counted	1	codex suspend	anchor	candidate	write_bytes.ipc	1042
+counted	1	codex suspend	anchor	candidate	write_bytes.jobs	4847
+counted	1	codex suspend	anchor	candidate	write_bytes.ledger	522
+counted	1	codex suspend	anchor	candidate	write_bytes.state	749
+counted	1	codex suspend	anchor	candidate	write_bytes.store	63559
+counted	1	codex suspend	anchor	candidate	write_calls.ipc	8
+counted	1	codex suspend	anchor	candidate	write_calls.jobs	10
+counted	1	codex suspend	anchor	candidate	write_calls.ledger	4
+counted	1	codex suspend	anchor	candidate	write_calls.state	5
+counted	1	codex suspend	anchor	candidate	write_calls.store	37
+counted	1	codex suspend	anchor	candidate	daemon_rss_kib.a	15248
+counted	1	codex suspend	anchor	candidate	daemon_footprint_kib.a	6368
+counted	1	codex suspend	anchor	candidate	daemon_rss_kib.b	15392
+counted	1	codex suspend	anchor	candidate	daemon_footprint_kib.b	6656
+counted	1	codex move	candidate	candidate	barrierfsync	4
+counted	1	codex move	candidate	candidate	cli_cpu_us	6533
+counted	1	codex move	candidate	candidate	cli_maxrss_kib	4640
+counted	1	codex move	candidate	candidate	cli_processes	1
+counted	1	codex move	candidate	candidate	cmd:codex	3
+counted	1	codex move	candidate	candidate	cmd:git	2
+counted	1	codex move	candidate	candidate	cmd:id	2
+counted	1	codex move	candidate	candidate	cmd:node	4
+counted	1	codex move	candidate	candidate	cpu_us	18376
+counted	1	codex move	candidate	candidate	frees	3959
+counted	1	codex move	candidate	candidate	fullfsync	7
+counted	1	codex move	candidate	candidate	malloc_bytes	1648257
+counted	1	codex move	candidate	candidate	mallocs	4953
+counted	1	codex move	candidate	candidate	opens	15
+counted	1	codex move	candidate	candidate	read_bytes.ipc	146
+counted	1	codex move	candidate	candidate	read_bytes.jobs	106
+counted	1	codex move	candidate	candidate	read_bytes.store	2530
+counted	1	codex move	candidate	candidate	read_calls.ipc	20
+counted	1	codex move	candidate	candidate	read_calls.jobs	2
+counted	1	codex move	candidate	candidate	read_calls.store	20
+counted	1	codex move	candidate	candidate	renames	5
+counted	1	codex move	candidate	candidate	spawn:codex	3
+counted	1	codex move	candidate	candidate	spawn:git	2
+counted	1	codex move	candidate	candidate	spawn:id	2
+counted	1	codex move	candidate	candidate	spawn:node	4
+counted	1	codex move	candidate	candidate	spawns	11
+counted	1	codex move	candidate	candidate	syncs.jobs	5
+counted	1	codex move	candidate	candidate	syncs.ledger	4
+counted	1	codex move	candidate	candidate	syncs.outside	2
+counted	1	codex move	candidate	candidate	unlinks	1
+counted	1	codex move	candidate	candidate	write_bytes.ipc	1888
+counted	1	codex move	candidate	candidate	write_bytes.jobs	720
+counted	1	codex move	candidate	candidate	write_bytes.ledger	520
+counted	1	codex move	candidate	candidate	write_bytes.state	127
+counted	1	codex move	candidate	candidate	write_calls.ipc	22
+counted	1	codex move	candidate	candidate	write_calls.jobs	4
+counted	1	codex move	candidate	candidate	write_calls.ledger	4
+counted	1	codex move	candidate	candidate	write_calls.state	1
+counted	1	codex move	candidate	candidate	daemon_rss_kib.a	13744
+counted	1	codex move	candidate	candidate	daemon_footprint_kib.a	6432
+counted	1	codex move	candidate	candidate	daemon_rss_kib.b	12992
+counted	1	codex move	candidate	candidate	daemon_footprint_kib.b	5888
+counted	1	codex move	anchor	candidate	cli_cpu_us	8437
+counted	1	codex move	anchor	candidate	cli_maxrss_kib	5632
+counted	1	codex move	anchor	candidate	cli_processes	1
+counted	1	codex move	anchor	candidate	cmd:bun	2
+counted	1	codex move	anchor	candidate	cmd:cargo	2
+counted	1	codex move	anchor	candidate	cmd:claude	3
+counted	1	codex move	anchor	candidate	cmd:codex	3
+counted	1	codex move	anchor	candidate	cmd:defaults	4
+counted	1	codex move	anchor	candidate	cmd:git	2
+counted	1	codex move	anchor	candidate	cmd:id	2
+counted	1	codex move	anchor	candidate	cmd:node	4
+counted	1	codex move	anchor	candidate	cmd:npm	2
+counted	1	codex move	anchor	candidate	cmd:pnpm	4
+counted	1	codex move	anchor	candidate	cmd:python3	4
+counted	1	codex move	anchor	candidate	cmd:rustc	2
+counted	1	codex move	anchor	candidate	cmd:sw_vers	2
+counted	1	codex move	anchor	candidate	cmd:uv	2
+counted	1	codex move	anchor	candidate	cmd:xcrun	2
+counted	1	codex move	anchor	candidate	cmd:yarn	2
+counted	1	codex move	anchor	candidate	cpu_us	57745
+counted	1	codex move	anchor	candidate	frees	6707
+counted	1	codex move	anchor	candidate	fullfsync	15
+counted	1	codex move	anchor	candidate	malloc_bytes	1964300
+counted	1	codex move	anchor	candidate	mallocs	8147
+counted	1	codex move	anchor	candidate	opens	75
+counted	1	codex move	anchor	candidate	read_bytes.ipc	468
+counted	1	codex move	anchor	candidate	read_bytes.jobs	4086
+counted	1	codex move	anchor	candidate	read_bytes.state	148
+counted	1	codex move	anchor	candidate	read_bytes.store	1276
+counted	1	codex move	anchor	candidate	read_calls.ipc	124
+counted	1	codex move	anchor	candidate	read_calls.jobs	10
+counted	1	codex move	anchor	candidate	read_calls.state	4
+counted	1	codex move	anchor	candidate	read_calls.store	10
+counted	1	codex move	anchor	candidate	renames	5
+counted	1	codex move	anchor	candidate	spawn:bun	2
+counted	1	codex move	anchor	candidate	spawn:cargo	2
+counted	1	codex move	anchor	candidate	spawn:claude	3
+counted	1	codex move	anchor	candidate	spawn:codex	3
+counted	1	codex move	anchor	candidate	spawn:defaults	4
+counted	1	codex move	anchor	candidate	spawn:git	2
+counted	1	codex move	anchor	candidate	spawn:id	2
+counted	1	codex move	anchor	candidate	spawn:node	4
+counted	1	codex move	anchor	candidate	spawn:npm	2
+counted	1	codex move	anchor	candidate	spawn:pnpm	4
+counted	1	codex move	anchor	candidate	spawn:python3	4
+counted	1	codex move	anchor	candidate	spawn:rustc	2
+counted	1	codex move	anchor	candidate	spawn:sw_vers	2
+counted	1	codex move	anchor	candidate	spawn:uv	2
+counted	1	codex move	anchor	candidate	spawn:xcrun	2
+counted	1	codex move	anchor	candidate	spawn:yarn	2
+counted	1	codex move	anchor	candidate	spawns	42
+counted	1	codex move	anchor	candidate	syncs.jobs	9
+counted	1	codex move	anchor	candidate	syncs.ledger	4
+counted	1	codex move	anchor	candidate	syncs.outside	2
+counted	1	codex move	anchor	candidate	unlinks	1
+counted	1	codex move	anchor	candidate	write_bytes.ipc	2362
+counted	1	codex move	anchor	candidate	write_bytes.jobs	720
+counted	1	codex move	anchor	candidate	write_bytes.ledger	520
+counted	1	codex move	anchor	candidate	write_bytes.state	127
+counted	1	codex move	anchor	candidate	write_calls.ipc	29
+counted	1	codex move	anchor	candidate	write_calls.jobs	4
+counted	1	codex move	anchor	candidate	write_calls.ledger	4
+counted	1	codex move	anchor	candidate	write_calls.state	1
+counted	1	codex move	anchor	candidate	daemon_rss_kib.a	15328
+counted	1	codex move	anchor	candidate	daemon_footprint_kib.a	6432
+counted	1	codex move	anchor	candidate	daemon_rss_kib.b	15392
+counted	1	codex move	anchor	candidate	daemon_footprint_kib.b	6656
+counted	1	codex resume	candidate	candidate	barrierfsync	9
+counted	1	codex resume	candidate	candidate	cli_cpu_us	8068
+counted	1	codex resume	candidate	candidate	cli_maxrss_kib	6192
+counted	1	codex resume	candidate	candidate	cli_processes	1
+counted	1	codex resume	candidate	candidate	cmd:codex	2
+counted	1	codex resume	candidate	candidate	cmd:dash holding codex	1
+counted	1	codex resume	candidate	candidate	cmd:git bundle	2
+counted	1	codex resume	candidate	candidate	cmd:git cat-file	1
+counted	1	codex resume	candidate	candidate	cmd:git hash-object	1
+counted	1	codex resume	candidate	candidate	cmd:git init	1
+counted	1	codex resume	candidate	candidate	cmd:git ls-tree	2
+counted	1	codex resume	candidate	candidate	cmd:git read-tree	1
+counted	1	codex resume	candidate	candidate	cmd:git update-index	1
+counted	1	codex resume	candidate	candidate	cmd:git update-ref	1
+counted	1	codex resume	candidate	candidate	cmd:lsof	1
+counted	1	codex resume	candidate	candidate	cmd:node	2
+counted	1	codex resume	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	codex resume	candidate	candidate	cpu_us	25408
+counted	1	codex resume	candidate	candidate	frees	6745
+counted	1	codex resume	candidate	candidate	fsync	63
+counted	1	codex resume	candidate	candidate	fullfsync	13
+counted	1	codex resume	candidate	candidate	malloc_bytes	3677570
+counted	1	codex resume	candidate	candidate	mallocs	8136
+counted	1	codex resume	candidate	candidate	opens	278
+counted	1	codex resume	candidate	candidate	read_bytes.ipc	2034
+counted	1	codex resume	candidate	candidate	read_bytes.jobs	8845
+counted	1	codex resume	candidate	candidate	read_bytes.outside	6270
+counted	1	codex resume	candidate	candidate	read_bytes.state	122
+counted	1	codex resume	candidate	candidate	read_bytes.store	14097
+counted	1	codex resume	candidate	candidate	read_calls.ipc	77
+counted	1	codex resume	candidate	candidate	read_calls.jobs	25
+counted	1	codex resume	candidate	candidate	read_calls.outside	17
+counted	1	codex resume	candidate	candidate	read_calls.state	4
+counted	1	codex resume	candidate	candidate	read_calls.store	101
+counted	1	codex resume	candidate	candidate	renames	11
+counted	1	codex resume	candidate	candidate	spawn:codex	2
+counted	1	codex resume	candidate	candidate	spawn:dash	1
+counted	1	codex resume	candidate	candidate	spawn:git	10
+counted	1	codex resume	candidate	candidate	spawn:lsof	1
+counted	1	codex resume	candidate	candidate	spawn:node	2
+counted	1	codex resume	candidate	candidate	spawn:ps	1
+counted	1	codex resume	candidate	candidate	spawns	17
+counted	1	codex resume	candidate	candidate	syncs.jobs	37
+counted	1	codex resume	candidate	candidate	syncs.ledger	1
+counted	1	codex resume	candidate	candidate	syncs.outside	47
+counted	1	codex resume	candidate	candidate	unlinks	25
+counted	1	codex resume	candidate	candidate	write_bytes.ipc	1778
+counted	1	codex resume	candidate	candidate	write_bytes.jobs	4857
+counted	1	codex resume	candidate	candidate	write_bytes.ledger	148
+counted	1	codex resume	candidate	candidate	write_bytes.outside	640
+counted	1	codex resume	candidate	candidate	write_bytes.state	355
+counted	1	codex resume	candidate	candidate	write_bytes.store	2479
+counted	1	codex resume	candidate	candidate	write_calls.ipc	29
+counted	1	codex resume	candidate	candidate	write_calls.jobs	12
+counted	1	codex resume	candidate	candidate	write_calls.ledger	1
+counted	1	codex resume	candidate	candidate	write_calls.outside	12
+counted	1	codex resume	candidate	candidate	write_calls.state	2
+counted	1	codex resume	candidate	candidate	write_calls.store	4
+counted	1	codex resume	candidate	candidate	daemon_rss_kib.a	13744
+counted	1	codex resume	candidate	candidate	daemon_footprint_kib.a	6432
+counted	1	codex resume	candidate	candidate	daemon_rss_kib.b	13024
+counted	1	codex resume	candidate	candidate	daemon_footprint_kib.b	5888
+counted	1	codex resume	anchor	candidate	cli_cpu_us	13543
+counted	1	codex resume	anchor	candidate	cli_maxrss_kib	7456
+counted	1	codex resume	anchor	candidate	cli_processes	1
+counted	1	codex resume	anchor	candidate	cmd:codex	2
+counted	1	codex resume	anchor	candidate	cmd:defaults	2
+counted	1	codex resume	anchor	candidate	cmd:git bundle	6
+counted	1	codex resume	anchor	candidate	cmd:git cat-file	1
+counted	1	codex resume	anchor	candidate	cmd:git config	4
+counted	1	codex resume	anchor	candidate	cmd:git hash-object	1
+counted	1	codex resume	anchor	candidate	cmd:git init	1
+counted	1	codex resume	anchor	candidate	cmd:git ls-tree	2
+counted	1	codex resume	anchor	candidate	cmd:git read-tree	1
+counted	1	codex resume	anchor	candidate	cmd:git rev-parse	1
+counted	1	codex resume	anchor	candidate	cmd:git symbolic-ref	2
+counted	1	codex resume	anchor	candidate	cmd:git update-index	1
+counted	1	codex resume	anchor	candidate	cmd:git update-ref	1
+counted	1	codex resume	anchor	candidate	cmd:lsof	1
+counted	1	codex resume	anchor	candidate	cmd:node	2
+counted	1	codex resume	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	codex resume	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	codex resume	anchor	candidate	cmd:sh holding codex	1
+counted	1	codex resume	anchor	candidate	cpu_us	36529
+counted	1	codex resume	anchor	candidate	frees	8695
+counted	1	codex resume	anchor	candidate	fsync	59
+counted	1	codex resume	anchor	candidate	fullfsync	24
+counted	1	codex resume	anchor	candidate	malloc_bytes	3983190
+counted	1	codex resume	anchor	candidate	mallocs	10445
+counted	1	codex resume	anchor	candidate	opens	283
+counted	1	codex resume	anchor	candidate	read_bytes.ipc	3636
+counted	1	codex resume	anchor	candidate	read_bytes.jobs	9040
+counted	1	codex resume	anchor	candidate	read_bytes.outside	6133
+counted	1	codex resume	anchor	candidate	read_bytes.state	122
+counted	1	codex resume	anchor	candidate	read_bytes.store	9608
+counted	1	codex resume	anchor	candidate	read_calls.ipc	148
+counted	1	codex resume	anchor	candidate	read_calls.jobs	29
+counted	1	codex resume	anchor	candidate	read_calls.outside	15
+counted	1	codex resume	anchor	candidate	read_calls.state	4
+counted	1	codex resume	anchor	candidate	read_calls.store	97
+counted	1	codex resume	anchor	candidate	renames	11
+counted	1	codex resume	anchor	candidate	spawn:codex	2
+counted	1	codex resume	anchor	candidate	spawn:defaults	2
+counted	1	codex resume	anchor	candidate	spawn:git	21
+counted	1	codex resume	anchor	candidate	spawn:lsof	1
+counted	1	codex resume	anchor	candidate	spawn:node	2
+counted	1	codex resume	anchor	candidate	spawn:ps	3
+counted	1	codex resume	anchor	candidate	spawn:sh	1
+counted	1	codex resume	anchor	candidate	spawns	32
+counted	1	codex resume	anchor	candidate	syncs.jobs	39
+counted	1	codex resume	anchor	candidate	syncs.ledger	1
+counted	1	codex resume	anchor	candidate	syncs.outside	43
+counted	1	codex resume	anchor	candidate	unlinks	26
+counted	1	codex resume	anchor	candidate	write_bytes.ipc	1713
+counted	1	codex resume	anchor	candidate	write_bytes.jobs	4847
+counted	1	codex resume	anchor	candidate	write_bytes.ledger	148
+counted	1	codex resume	anchor	candidate	write_bytes.outside	483
+counted	1	codex resume	anchor	candidate	write_bytes.state	355
+counted	1	codex resume	anchor	candidate	write_bytes.store	2913
+counted	1	codex resume	anchor	candidate	write_calls.ipc	28
+counted	1	codex resume	anchor	candidate	write_calls.jobs	12
+counted	1	codex resume	anchor	candidate	write_calls.ledger	1
+counted	1	codex resume	anchor	candidate	write_calls.outside	11
+counted	1	codex resume	anchor	candidate	write_calls.state	2
+counted	1	codex resume	anchor	candidate	write_calls.store	3
+counted	1	codex resume	anchor	candidate	daemon_rss_kib.a	15328
+counted	1	codex resume	anchor	candidate	daemon_footprint_kib.a	6432
+counted	1	codex resume	anchor	candidate	daemon_rss_kib.b	15424
+counted	1	codex resume	anchor	candidate	daemon_footprint_kib.b	6672
+counted	1	codex pull	candidate	candidate	barrierfsync	23
+counted	1	codex pull	candidate	candidate	cli_cpu_us	8802
+counted	1	codex pull	candidate	candidate	cli_maxrss_kib	6272
+counted	1	codex pull	candidate	candidate	cli_processes	1
+counted	1	codex pull	candidate	candidate	cmd:codex	7
+counted	1	codex pull	candidate	candidate	cmd:dash holding codex	1
+counted	1	codex pull	candidate	candidate	cmd:git	2
+counted	1	codex pull	candidate	candidate	cmd:git add	1
+counted	1	codex pull	candidate	candidate	cmd:git bundle	4
+counted	1	codex pull	candidate	candidate	cmd:git cat-file	1
+counted	1	codex pull	candidate	candidate	cmd:git check-attr	2
+counted	1	codex pull	candidate	candidate	cmd:git commit-tree	2
+counted	1	codex pull	candidate	candidate	cmd:git config	1
+counted	1	codex pull	candidate	candidate	cmd:git for-each-ref	2
+counted	1	codex pull	candidate	candidate	cmd:git hash-object	1
+counted	1	codex pull	candidate	candidate	cmd:git init	1
+counted	1	codex pull	candidate	candidate	cmd:git ls-files	6
+counted	1	codex pull	candidate	candidate	cmd:git ls-tree	4
+counted	1	codex pull	candidate	candidate	cmd:git read-tree	2
+counted	1	codex pull	candidate	candidate	cmd:git rev-list	1
+counted	1	codex pull	candidate	candidate	cmd:git rev-parse	3
+counted	1	codex pull	candidate	candidate	cmd:git status	1
+counted	1	codex pull	candidate	candidate	cmd:git symbolic-ref	2
+counted	1	codex pull	candidate	candidate	cmd:git update-index	1
+counted	1	codex pull	candidate	candidate	cmd:git update-ref	2
+counted	1	codex pull	candidate	candidate	cmd:git write-tree	2
+counted	1	codex pull	candidate	candidate	cmd:id	2
+counted	1	codex pull	candidate	candidate	cmd:lsof	2
+counted	1	codex pull	candidate	candidate	cmd:node	8
+counted	1	codex pull	candidate	candidate	cmd:ps -o lstart=	1
+counted	1	codex pull	candidate	candidate	cmd:python3	2
+counted	1	codex pull	candidate	candidate	cpu_us	58673
+counted	1	codex pull	candidate	candidate	frees	18187
+counted	1	codex pull	candidate	candidate	fsync	82
+counted	1	codex pull	candidate	candidate	fullfsync	40
+counted	1	codex pull	candidate	candidate	malloc_bytes	7846939
+counted	1	codex pull	candidate	candidate	mallocs	22294
+counted	1	codex pull	candidate	candidate	opens	440
+counted	1	codex pull	candidate	candidate	read_bytes.ipc	7382
+counted	1	codex pull	candidate	candidate	read_bytes.jobs	13841
+counted	1	codex pull	candidate	candidate	read_bytes.outside	12989
+counted	1	codex pull	candidate	candidate	read_bytes.state	174
+counted	1	codex pull	candidate	candidate	read_bytes.store	29926
+counted	1	codex pull	candidate	candidate	read_calls.ipc	277
+counted	1	codex pull	candidate	candidate	read_calls.jobs	52
+counted	1	codex pull	candidate	candidate	read_calls.outside	35
+counted	1	codex pull	candidate	candidate	read_calls.state	4
+counted	1	codex pull	candidate	candidate	read_calls.store	195
+counted	1	codex pull	candidate	candidate	renames	29
+counted	1	codex pull	candidate	candidate	spawn:codex	7
+counted	1	codex pull	candidate	candidate	spawn:dash	1
+counted	1	codex pull	candidate	candidate	spawn:git	41
+counted	1	codex pull	candidate	candidate	spawn:id	2
+counted	1	codex pull	candidate	candidate	spawn:lsof	2
+counted	1	codex pull	candidate	candidate	spawn:node	8
+counted	1	codex pull	candidate	candidate	spawn:ps	1
+counted	1	codex pull	candidate	candidate	spawn:python3	2
+counted	1	codex pull	candidate	candidate	spawns	64
+counted	1	codex pull	candidate	candidate	syncs.jobs	65
+counted	1	codex pull	candidate	candidate	syncs.ledger	10
+counted	1	codex pull	candidate	candidate	syncs.outside	52
+counted	1	codex pull	candidate	candidate	syncs.store	18
+counted	1	codex pull	candidate	candidate	unlinks	50
+counted	1	codex pull	candidate	candidate	write_bytes.ipc	3651
+counted	1	codex pull	candidate	candidate	write_bytes.jobs	11083
+counted	1	codex pull	candidate	candidate	write_bytes.ledger	1338
+counted	1	codex pull	candidate	candidate	write_bytes.outside	661
+counted	1	codex pull	candidate	candidate	write_bytes.state	1956
+counted	1	codex pull	candidate	candidate	write_bytes.store	49584
+counted	1	codex pull	candidate	candidate	write_calls.ipc	67
+counted	1	codex pull	candidate	candidate	write_calls.jobs	27
+counted	1	codex pull	candidate	candidate	write_calls.ledger	10
+counted	1	codex pull	candidate	candidate	write_calls.outside	12
+counted	1	codex pull	candidate	candidate	write_calls.state	11
+counted	1	codex pull	candidate	candidate	write_calls.store	33
+counted	1	codex pull	candidate	candidate	daemon_rss_kib.a	13792
+counted	1	codex pull	candidate	candidate	daemon_footprint_kib.a	6480
+counted	1	codex pull	candidate	candidate	daemon_rss_kib.b	13056
+counted	1	codex pull	candidate	candidate	daemon_footprint_kib.b	5888
+counted	1	codex pull	anchor	candidate	cli_cpu_us	11991
+counted	1	codex pull	anchor	candidate	cli_maxrss_kib	7664
+counted	1	codex pull	anchor	candidate	cli_processes	1
+counted	1	codex pull	anchor	candidate	cmd:bun	2
+counted	1	codex pull	anchor	candidate	cmd:cargo	2
+counted	1	codex pull	anchor	candidate	cmd:claude	3
+counted	1	codex pull	anchor	candidate	cmd:codex	8
+counted	1	codex pull	anchor	candidate	cmd:defaults	6
+counted	1	codex pull	anchor	candidate	cmd:git	2
+counted	1	codex pull	anchor	candidate	cmd:git add	1
+counted	1	codex pull	anchor	candidate	cmd:git bundle	11
+counted	1	codex pull	anchor	candidate	cmd:git cat-file	1
+counted	1	codex pull	anchor	candidate	cmd:git check-attr	2
+counted	1	codex pull	anchor	candidate	cmd:git commit-tree	2
+counted	1	codex pull	anchor	candidate	cmd:git config	5
+counted	1	codex pull	anchor	candidate	cmd:git for-each-ref	2
+counted	1	codex pull	anchor	candidate	cmd:git hash-object	1
+counted	1	codex pull	anchor	candidate	cmd:git init	1
+counted	1	codex pull	anchor	candidate	cmd:git ls-files	6
+counted	1	codex pull	anchor	candidate	cmd:git ls-tree	4
+counted	1	codex pull	anchor	candidate	cmd:git read-tree	2
+counted	1	codex pull	anchor	candidate	cmd:git rev-list	1
+counted	1	codex pull	anchor	candidate	cmd:git rev-parse	4
+counted	1	codex pull	anchor	candidate	cmd:git status	1
+counted	1	codex pull	anchor	candidate	cmd:git symbolic-ref	4
+counted	1	codex pull	anchor	candidate	cmd:git update-index	1
+counted	1	codex pull	anchor	candidate	cmd:git update-ref	2
+counted	1	codex pull	anchor	candidate	cmd:git write-tree	2
+counted	1	codex pull	anchor	candidate	cmd:id	2
+counted	1	codex pull	anchor	candidate	cmd:lsof	2
+counted	1	codex pull	anchor	candidate	cmd:node	8
+counted	1	codex pull	anchor	candidate	cmd:npm	2
+counted	1	codex pull	anchor	candidate	cmd:pnpm	4
+counted	1	codex pull	anchor	candidate	cmd:ps -o lstart=	2
+counted	1	codex pull	anchor	candidate	cmd:ps -o pgid=	1
+counted	1	codex pull	anchor	candidate	cmd:python3	6
+counted	1	codex pull	anchor	candidate	cmd:rustc	2
+counted	1	codex pull	anchor	candidate	cmd:sh holding codex	1
+counted	1	codex pull	anchor	candidate	cmd:sw_vers	2
+counted	1	codex pull	anchor	candidate	cmd:uv	2
+counted	1	codex pull	anchor	candidate	cmd:xcrun	2
+counted	1	codex pull	anchor	candidate	cmd:yarn	2
+counted	1	codex pull	anchor	candidate	cpu_us	91241
+counted	1	codex pull	anchor	candidate	frees	23068
+counted	1	codex pull	anchor	candidate	fsync	67
+counted	1	codex pull	anchor	candidate	fullfsync	82
+counted	1	codex pull	anchor	candidate	malloc_bytes	8675981
+counted	1	codex pull	anchor	candidate	mallocs	28103
+counted	1	codex pull	anchor	candidate	opens	502
+counted	1	codex pull	anchor	candidate	read_bytes.ipc	9894
+counted	1	codex pull	anchor	candidate	read_bytes.jobs	16167
+counted	1	codex pull	anchor	candidate	read_bytes.outside	12852
+counted	1	codex pull	anchor	candidate	read_bytes.state	322
+counted	1	codex pull	anchor	candidate	read_bytes.store	23064
+counted	1	codex pull	anchor	candidate	read_calls.ipc	482
+counted	1	codex pull	anchor	candidate	read_calls.jobs	62
+counted	1	codex pull	anchor	candidate	read_calls.outside	33
+counted	1	codex pull	anchor	candidate	read_calls.state	8
+counted	1	codex pull	anchor	candidate	read_calls.store	189
+counted	1	codex pull	anchor	candidate	renames	29
+counted	1	codex pull	anchor	candidate	spawn:bun	2
+counted	1	codex pull	anchor	candidate	spawn:cargo	2
+counted	1	codex pull	anchor	candidate	spawn:claude	3
+counted	1	codex pull	anchor	candidate	spawn:codex	8
+counted	1	codex pull	anchor	candidate	spawn:defaults	6
+counted	1	codex pull	anchor	candidate	spawn:git	55
+counted	1	codex pull	anchor	candidate	spawn:id	2
+counted	1	codex pull	anchor	candidate	spawn:lsof	2
+counted	1	codex pull	anchor	candidate	spawn:node	8
+counted	1	codex pull	anchor	candidate	spawn:npm	2
+counted	1	codex pull	anchor	candidate	spawn:pnpm	4
+counted	1	codex pull	anchor	candidate	spawn:ps	3
+counted	1	codex pull	anchor	candidate	spawn:python3	6
+counted	1	codex pull	anchor	candidate	spawn:rustc	2
+counted	1	codex pull	anchor	candidate	spawn:sh	1
+counted	1	codex pull	anchor	candidate	spawn:sw_vers	2
+counted	1	codex pull	anchor	candidate	spawn:uv	2
+counted	1	codex pull	anchor	candidate	spawn:xcrun	2
+counted	1	codex pull	anchor	candidate	spawn:yarn	2
+counted	1	codex pull	anchor	candidate	spawns	114
+counted	1	codex pull	anchor	candidate	syncs.jobs	76
+counted	1	codex pull	anchor	candidate	syncs.ledger	10
+counted	1	codex pull	anchor	candidate	syncs.outside	45
+counted	1	codex pull	anchor	candidate	syncs.store	18
+counted	1	codex pull	anchor	candidate	unlinks	52
+counted	1	codex pull	anchor	candidate	write_bytes.ipc	4057
+counted	1	codex pull	anchor	candidate	write_bytes.jobs	11111
+counted	1	codex pull	anchor	candidate	write_bytes.ledger	1338
+counted	1	codex pull	anchor	candidate	write_bytes.outside	504
+counted	1	codex pull	anchor	candidate	write_bytes.state	1956
+counted	1	codex pull	anchor	candidate	write_bytes.store	50858
+counted	1	codex pull	anchor	candidate	write_calls.ipc	80
+counted	1	codex pull	anchor	candidate	write_calls.jobs	27
+counted	1	codex pull	anchor	candidate	write_calls.ledger	10
+counted	1	codex pull	anchor	candidate	write_calls.outside	11
+counted	1	codex pull	anchor	candidate	write_calls.state	11
+counted	1	codex pull	anchor	candidate	write_calls.store	33
+counted	1	codex pull	anchor	candidate	daemon_rss_kib.a	15472
+counted	1	codex pull	anchor	candidate	daemon_footprint_kib.a	6560
+counted	1	codex pull	anchor	candidate	daemon_rss_kib.b	15408
+counted	1	codex pull	anchor	candidate	daemon_footprint_kib.b	6688
+counted	1	cold start	candidate	candidate	cli_cpu_us	23280
+counted	1	cold start	candidate	candidate	cli_maxrss_kib	4176
+counted	1	cold start	candidate	candidate	cli_processes	4
+counted	1	cold start	candidate	candidate	cpu_us	41127
+counted	1	cold start	candidate	candidate	frees	2881
+counted	1	cold start	candidate	candidate	fsync	5
+counted	1	cold start	candidate	candidate	fullfsync	8
+counted	1	cold start	candidate	candidate	malloc_bytes	1396802
+counted	1	cold start	candidate	candidate	mallocs	4224
+counted	1	cold start	candidate	candidate	opens	21
+counted	1	cold start	candidate	candidate	read_bytes.ipc	44
+counted	1	cold start	candidate	candidate	read_bytes.state	50
+counted	1	cold start	candidate	candidate	read_bytes.store	45172
+counted	1	cold start	candidate	candidate	read_calls.ipc	1
+counted	1	cold start	candidate	candidate	read_calls.state	2
+counted	1	cold start	candidate	candidate	read_calls.store	16
+counted	1	cold start	candidate	candidate	renames	1
+counted	1	cold start	candidate	candidate	syncs.outside	1
+counted	1	cold start	candidate	candidate	syncs.state	1
+counted	1	cold start	candidate	candidate	syncs.store	11
+counted	1	cold start	candidate	candidate	unlinks	9
+counted	1	cold start	candidate	candidate	write_bytes.ipc	487
+counted	1	cold start	candidate	candidate	write_bytes.state	325
+counted	1	cold start	candidate	candidate	write_bytes.store	62180
+counted	1	cold start	candidate	candidate	write_calls.ipc	7
+counted	1	cold start	candidate	candidate	write_calls.state	4
+counted	1	cold start	candidate	candidate	write_calls.store	41
+counted	1	cold start	candidate	candidate	daemon_rss_kib.a	13792
+counted	1	cold start	candidate	candidate	daemon_footprint_kib.a	6480
+counted	1	cold start	candidate	candidate	daemon_rss_kib.b	13008
+counted	1	cold start	candidate	candidate	daemon_footprint_kib.b	5888
+counted	1	cold start	anchor	candidate	cli_cpu_us	32289
+counted	1	cold start	anchor	candidate	cli_maxrss_kib	5088
+counted	1	cold start	anchor	candidate	cli_processes	4
+counted	1	cold start	anchor	candidate	cpu_us	49956
+counted	1	cold start	anchor	candidate	frees	4389
+counted	1	cold start	anchor	candidate	fsync	5
+counted	1	cold start	anchor	candidate	fullfsync	8
+counted	1	cold start	anchor	candidate	malloc_bytes	1641705
+counted	1	cold start	anchor	candidate	mallocs	5854
+counted	1	cold start	anchor	candidate	opens	21
+counted	1	cold start	anchor	candidate	read_bytes.ipc	44
+counted	1	cold start	anchor	candidate	read_bytes.state	50
+counted	1	cold start	anchor	candidate	read_bytes.store	45172
+counted	1	cold start	anchor	candidate	read_calls.ipc	1
+counted	1	cold start	anchor	candidate	read_calls.state	2
+counted	1	cold start	anchor	candidate	read_calls.store	16
+counted	1	cold start	anchor	candidate	renames	1
+counted	1	cold start	anchor	candidate	syncs.outside	1
+counted	1	cold start	anchor	candidate	syncs.state	1
+counted	1	cold start	anchor	candidate	syncs.store	11
+counted	1	cold start	anchor	candidate	unlinks	9
+counted	1	cold start	anchor	candidate	write_bytes.ipc	487
+counted	1	cold start	anchor	candidate	write_bytes.state	325
+counted	1	cold start	anchor	candidate	write_bytes.store	62180
+counted	1	cold start	anchor	candidate	write_calls.ipc	7
+counted	1	cold start	anchor	candidate	write_calls.state	4
+counted	1	cold start	anchor	candidate	write_calls.store	41
+counted	1	cold start	anchor	candidate	daemon_rss_kib.a	15472
+counted	1	cold start	anchor	candidate	daemon_footprint_kib.a	6560
+counted	1	cold start	anchor	candidate	daemon_rss_kib.b	15376
+counted	1	cold start	anchor	candidate	daemon_footprint_kib.b	6688
+counted	1	restart	candidate	candidate	barrierfsync	3
+counted	1	restart	candidate	candidate	cli_cpu_us	22946
+counted	1	restart	candidate	candidate	cli_maxrss_kib	4304
+counted	1	restart	candidate	candidate	cli_processes	4
+counted	1	restart	candidate	candidate	cpu_us	37375
+counted	1	restart	candidate	candidate	frees	5684
+counted	1	restart	candidate	candidate	fullfsync	6
+counted	1	restart	candidate	candidate	malloc_bytes	2118558
+counted	1	restart	candidate	candidate	mallocs	8343
+counted	1	restart	candidate	candidate	opens	72
+counted	1	restart	candidate	candidate	read_bytes.ipc	44
+counted	1	restart	candidate	candidate	read_bytes.jobs	2622
+counted	1	restart	candidate	candidate	read_bytes.ledger	11209
+counted	1	restart	candidate	candidate	read_bytes.state	736
+counted	1	restart	candidate	candidate	read_bytes.store	267836
+counted	1	restart	candidate	candidate	read_calls.ipc	1
+counted	1	restart	candidate	candidate	read_calls.jobs	40
+counted	1	restart	candidate	candidate	read_calls.ledger	20
+counted	1	restart	candidate	candidate	read_calls.state	18
+counted	1	restart	candidate	candidate	read_calls.store	67
+counted	1	restart	candidate	candidate	renames	4
+counted	1	restart	candidate	candidate	syncs.jobs	3
+counted	1	restart	candidate	candidate	syncs.ledger	3
+counted	1	restart	candidate	candidate	syncs.outside	1
+counted	1	restart	candidate	candidate	syncs.state	1
+counted	1	restart	candidate	candidate	syncs.store	1
+counted	1	restart	candidate	candidate	unlinks	1
+counted	1	restart	candidate	candidate	write_bytes.ipc	1676
+counted	1	restart	candidate	candidate	write_bytes.jobs	487
+counted	1	restart	candidate	candidate	write_bytes.ledger	463
+counted	1	restart	candidate	candidate	write_bytes.state	4859
+counted	1	restart	candidate	candidate	write_bytes.store	8
+counted	1	restart	candidate	candidate	write_calls.ipc	25
+counted	1	restart	candidate	candidate	write_calls.jobs	3
+counted	1	restart	candidate	candidate	write_calls.ledger	3
+counted	1	restart	candidate	candidate	write_calls.state	22
+counted	1	restart	candidate	candidate	write_calls.store	8
+counted	1	restart	candidate	candidate	daemon_rss_kib.a	9696
+counted	1	restart	candidate	candidate	daemon_footprint_kib.a	3856
+counted	1	restart	candidate	candidate	daemon_rss_kib.b	13040
+counted	1	restart	candidate	candidate	daemon_footprint_kib.b	5904
+counted	1	restart	anchor	candidate	cli_cpu_us	64287
+counted	1	restart	anchor	candidate	cli_maxrss_kib	5280
+counted	1	restart	anchor	candidate	cli_processes	8
+counted	1	restart	anchor	candidate	cpu_us	83625
+counted	1	restart	anchor	candidate	frees	10877
+counted	1	restart	anchor	candidate	fullfsync	32
+counted	1	restart	anchor	candidate	malloc_bytes	3623858
+counted	1	restart	anchor	candidate	mallocs	14367
+counted	1	restart	anchor	candidate	opens	197
+counted	1	restart	anchor	candidate	read_bytes.ipc	44
+counted	1	restart	anchor	candidate	read_bytes.jobs	5042
+counted	1	restart	anchor	candidate	read_bytes.ledger	11209
+counted	1	restart	anchor	candidate	read_bytes.state	736
+counted	1	restart	anchor	candidate	read_bytes.store	263716
+counted	1	restart	anchor	candidate	read_calls.ipc	1
+counted	1	restart	anchor	candidate	read_calls.jobs	80
+counted	1	restart	anchor	candidate	read_calls.ledger	20
+counted	1	restart	anchor	candidate	read_calls.state	18
+counted	1	restart	anchor	candidate	read_calls.store	66
+counted	1	restart	anchor	candidate	renames	14
+counted	1	restart	anchor	candidate	syncs.jobs	26
+counted	1	restart	anchor	candidate	syncs.ledger	3
+counted	1	restart	anchor	candidate	syncs.outside	1
+counted	1	restart	anchor	candidate	syncs.state	1
+counted	1	restart	anchor	candidate	syncs.store	1
+counted	1	restart	anchor	candidate	unlinks	1
+counted	1	restart	anchor	candidate	write_bytes.ipc	2936
+counted	1	restart	anchor	candidate	write_bytes.jobs	1899
+counted	1	restart	anchor	candidate	write_bytes.ledger	463
+counted	1	restart	anchor	candidate	write_bytes.state	4859
+counted	1	restart	anchor	candidate	write_bytes.store	8
+counted	1	restart	anchor	candidate	write_calls.ipc	42
+counted	1	restart	anchor	candidate	write_calls.jobs	13
+counted	1	restart	anchor	candidate	write_calls.ledger	3
+counted	1	restart	anchor	candidate	write_calls.state	22
+counted	1	restart	anchor	candidate	write_calls.store	8
+counted	1	restart	anchor	candidate	daemon_rss_kib.a	10976
+counted	1	restart	anchor	candidate	daemon_footprint_kib.a	4016
+counted	1	restart	anchor	candidate	daemon_rss_kib.b	15472
+counted	1	restart	anchor	candidate	daemon_footprint_kib.b	6704

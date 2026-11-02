@@ -1,0 +1,9 @@
+{
+  "harness": {
+    "Acp": {
+      "program": "fabric-fake-agent",
+      "args": []
+    }
+  },
+  "session": "fake-1"
+}

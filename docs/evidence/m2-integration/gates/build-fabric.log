@@ -1,0 +1,4 @@
+   Compiling fabric-client v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-client)
+   Compiling fabricd v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabricd)
+   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.36s

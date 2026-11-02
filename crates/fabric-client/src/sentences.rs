@@ -18,8 +18,8 @@
 use std::borrow::Cow;
 
 use crate::api::{
-    CaptureGroup, CaptureNote, CarryFor, CarryLine, Event, HarnessSession, Outcome, PreflightRow,
-    RestoredClasses, Verdict, VerdictCount, Written,
+    CaptureGroup, CaptureNote, CarryFor, CarryLine, Event, HarnessSession, ManagedJob, Outcome,
+    PreflightRow, RestoredClasses, Verdict, VerdictCount, Written,
 };
 
 /// What a snapshot without harness state means for the conversation (gate finding F9).
@@ -329,7 +329,11 @@ fn lines(event: &Event) -> Vec<String> {
             "warning: links restored that point outside the tree they were restored into: {}; a harness that follows one reads or writes outside it",
             named(paths, *more)
         ),
-        Event::Unrecognized => return Vec::new(),
+        // The CLI acts on these and says nothing: the registered line
+        // follows the first, and `continuing_session` the second.
+        Event::HarnessRecorded { .. } | Event::SessionToContinue { .. } | Event::Unrecognized => {
+            return Vec::new();
+        }
     };
     vec![line]
 }
@@ -459,6 +463,37 @@ pub fn row(row: &PreflightRow) -> String {
         line.push(')');
     }
     line
+}
+
+/// The lines a managed job reads as: its id, revision, state and goal,
+/// then one line per task and per attempt, each with its control
+/// characters escaped.
+#[must_use]
+pub fn managed_job(job: &ManagedJob) -> Vec<String> {
+    let mut lines = vec![
+        job.job.to_string(),
+        format!(
+            "managed job at revision {}, {}, generation {}",
+            job.revision, job.state, job.generation
+        ),
+        format!("goal: {}", job.goal.lines().next().unwrap_or_default()),
+    ];
+    for task in &job.tasks {
+        lines.push(match &task.label {
+            Some(label) => format!("task {} ({label}): {}", task.task, task.state),
+            None => format!("task {} (primary): {}", task.task, task.state),
+        });
+    }
+    for attempt in &job.attempts {
+        lines.push(format!(
+            "attempt {} of task {} at generation {}: {}",
+            attempt.attempt, attempt.task, attempt.generation, attempt.status
+        ));
+    }
+    lines
+        .into_iter()
+        .map(|line| printable(&line).into_owned())
+        .collect()
 }
 
 #[cfg(test)]

@@ -1,13 +1,16 @@
 //! Harness versions, as `--version` prints them and as sessions record them.
 //!
-//! Invariant: a version is `MAJOR.MINOR.PATCH`, with an optional
+//! Invariant: a version is `MAJOR.MINOR.PATCH`, three numbers without a
+//! leading zero, with an optional
 //! pre-release after `-` and build metadata after `+`, each a list of
 //! dot-separated identifiers of ASCII letters, digits and `-`, and at most
 //! `MAX_LEN` bytes in all; two versions are ordered by semver precedence
 //! (semver.org 2.0.0, section 11): the three numbers, then a release
 //! above any of its pre-releases, then the pre-release identifiers one by
-//! one, numbers as numbers and below words, a longer list above its own
-//! prefix. Build metadata is checked and then ignored. Anything else does
+//! one, numbers as numbers of any length and below words, a longer list
+//! above its own prefix. A pre-release number with a leading zero, which
+//! semver forbids, still parses and orders by its value, so no version
+//! that parsed before stops parsing. Build metadata is checked and then ignored. Anything else does
 //! not parse, and a caller that cannot read a version refuses rather than
 //! guesses. A version comes from a file that travelled and is printed in
 //! a refusal, so the text a parsed version keeps holds no character a
@@ -57,10 +60,45 @@ fn identifiers(text: &str) -> bool {
 /// the semver order: a number ranks below a word.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Identifier {
-    /// Digits only, compared as a number.
-    Number(u64),
+    /// Digits only, compared as a number of any length.
+    Number(Digits),
     /// Letters, digits and `-`, compared in ASCII order.
     Word(String),
+}
+
+/// A pre-release number of any length, kept as its digits without leading
+/// zeros and ordered by value: more digits is larger, and the same count
+/// compares digit by digit. A `u64` would turn a number past its range
+/// into a word, which ranks above every number (semver 11.4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Digits(String);
+
+impl Digits {
+    /// `text` as a number, when it is non-empty and digits only.
+    fn parse(text: &str) -> Option<Self> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let trimmed = text.trim_start_matches('0');
+        Some(Digits(
+            if trimmed.is_empty() { "0" } else { trimmed }.to_owned(),
+        ))
+    }
+}
+
+impl Ord for Digits {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .len()
+            .cmp(&other.0.len())
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl PartialOrd for Digits {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// A harness version, ordered by semver precedence.
@@ -102,7 +140,8 @@ impl HarnessVersion {
             .into_iter()
             .flat_map(|p| p.split('.'))
             .map(|part| {
-                number(part).map_or_else(|| Identifier::Word(part.to_owned()), Identifier::Number)
+                Digits::parse(part)
+                    .map_or_else(|| Identifier::Word(part.to_owned()), Identifier::Number)
             })
             .collect();
         Ok(HarnessVersion {
@@ -126,8 +165,13 @@ impl HarnessVersion {
     }
 }
 
+/// A core component: digits only, without a leading zero unless it is
+/// `0` itself (semver 2), and within a `u64`.
 fn number(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
         return None;
     }
     text.parse().ok()
@@ -321,5 +365,20 @@ mod tests {
             let shown = HarnessVersion::parse(text).unwrap_err().to_string();
             assert!(!shown.contains('\u{1b}') && shown.len() < 200, "{shown:?}");
         }
+    }
+
+    /// CORE-L1: a numeric prerelease identifier too long for a `u64` is
+    /// still a number and orders by its value (semver 11.4.1), and a core
+    /// component with a leading zero is not a version.
+    #[test]
+    fn long_numeric_prerelease_identifiers_order_as_numbers() {
+        assert!(v("1.0.0-alpha.99999999999999999999") < v("1.0.0-alpha.100000000000000000000"));
+        assert!(v("1.0.0-alpha.100000000000000000000") < v("1.0.0-alpha.beta"));
+        assert!(v("1.0.0-alpha.9") < v("1.0.0-alpha.10"));
+        assert_eq!(v("1.0.0-alpha.007"), v("1.0.0-alpha.7"));
+        assert!(HarnessVersion::parse("01.0.0").is_err());
+        assert!(HarnessVersion::parse("1.00.0").is_err());
+        assert!(HarnessVersion::parse("1.0.01").is_err());
+        assert_eq!(v("0.0.0"), v("0.0.0"));
     }
 }

@@ -1,0 +1,9 @@
+{
+  "op": "managed_create",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "repo": "/Users/me/oss/some-repo",
+  "goal": "fix the flaky test",
+  "harness": {
+    "kind": "codex"
+  }
+}

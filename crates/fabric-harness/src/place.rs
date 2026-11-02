@@ -180,10 +180,11 @@ enum Step {
 /// What a destination was when restore planned it: its device, inode,
 /// length, modification and change times, or `None` when it was missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Seen(Option<[i64; 7]>);
+pub(crate) struct Seen(Option<[i64; 7]>);
 
 impl Seen {
-    fn of(path: &Path) -> Result<Self, HarnessError> {
+    /// Reads what `path` is now, without following a link.
+    pub(crate) fn of(path: &Path) -> Result<Self, HarnessError> {
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Seen(None)),
@@ -202,7 +203,7 @@ impl Seen {
     }
 
     /// Refuses `path` when it is no longer what was seen.
-    fn still(self, path: &Path) -> Result<(), HarnessError> {
+    pub(crate) fn still(self, path: &Path) -> Result<(), HarnessError> {
         if Seen::of(path)? == self {
             Ok(())
         } else {
@@ -264,6 +265,15 @@ fn copy_into(path: &Path, out: &mut dyn Write, skip: u64) -> Result<(), HarnessE
 /// an extension of, or an allowed replacement for what was there, and
 /// running the restore again converges. Returns every destination, placed
 /// or found equal, in order.
+///
+/// Each file is atomic across a power loss: a barrier orders its bytes
+/// before its rename, so a destination never holds a torn mix that would
+/// stop the next run as a divergence, or lose the local bytes an extension
+/// keeps. The files share the directory flushes: once the last is placed,
+/// or a write has stopped the run, each directory written into is flushed
+/// once, and one per device through the drive's cache, so what was placed
+/// is durable when this returns, with one full flush instead of one per
+/// file.
 pub(crate) fn place_all(
     placements: &[Placement],
     unchanged: Unchanged<'_>,
@@ -285,36 +295,47 @@ pub(crate) fn place_all(
         .iter()
         .map(|placement| plan(placement, unchanged))
         .collect::<Result<Vec<(Step, Seen)>, HarnessError>>()?;
-    for (index, (placement, (step, seen))) in placements.iter().zip(steps).enumerate() {
-        let dest = &placement.dest;
-        match step {
-            Step::Keep => {}
-            Step::Replace => {
-                durable::write_atomic_checked(
-                    dest,
-                    |w| copy_into(&placement.staged, w, 0),
-                    || seen.still(dest),
-                )?;
+    let mut renamed = durable::Renamed::default();
+    let placed = (|| {
+        for (index, (placement, (step, seen))) in placements.iter().zip(steps).enumerate() {
+            let dest = &placement.dest;
+            match step {
+                Step::Keep => {}
+                Step::Replace => {
+                    durable::write_ordered_checked(
+                        dest,
+                        |w| copy_into(&placement.staged, w, 0),
+                        || seen.still(dest),
+                        &mut renamed,
+                    )?;
+                }
+                Step::Extend { view_len } => {
+                    durable::write_ordered_checked(
+                        dest,
+                        |w| {
+                            copy_into(dest, w, 0)?;
+                            copy_into(&placement.staged, w, view_len)
+                        },
+                        || seen.still(dest),
+                        &mut renamed,
+                    )?;
+                }
             }
-            Step::Extend { view_len } => {
-                durable::write_atomic_checked(
-                    dest,
-                    |w| {
-                        copy_into(dest, w, 0)?;
-                        copy_into(&placement.staged, w, view_len)
-                    },
-                    || seen.still(dest),
-                )?;
-            }
+            crashpoint("place-after-file", index);
         }
-        crashpoint("place-after-file", index);
-    }
+        Ok::<(), HarnessError>(())
+    })();
+    // What was placed before a write stopped the run is made durable too.
+    let flushed = renamed.flush();
+    placed?;
+    flushed?;
     Ok(placements.iter().map(|p| p.dest.clone()).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::Flush;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
@@ -445,6 +466,116 @@ mod tests {
         );
         assert_eq!(fs::read(&transcript).unwrap(), b"one\nlive\n");
         assert_eq!(fs::read(&memory).unwrap(), b"old\n");
+    }
+
+    /// Each placed file keeps its barrier before its rename, and the restore
+    /// ends with one flush of each directory it wrote into, the last
+    /// through the drive's cache. Before, each file was a barrier and a full
+    /// flush of its directory.
+    #[test]
+    fn a_restore_orders_each_file_and_flushes_the_drive_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(home.join("p")).unwrap();
+        let placements = [
+            placement(
+                dir.path(),
+                "a",
+                &home.join("p/a.jsonl"),
+                b"a\n",
+                Content::Opaque,
+            ),
+            placement(
+                dir.path(),
+                "b",
+                &home.join("p/b.jsonl"),
+                b"b\n",
+                Content::Opaque,
+            ),
+            placement(
+                dir.path(),
+                "c",
+                &home.join("p/q/c.txt"),
+                b"c\n",
+                Content::Opaque,
+            ),
+        ];
+        let (placed, log) = durable::record::flushes(|| place_all(&placements, &never_left));
+        assert_eq!(placed.unwrap().len(), 3);
+        let at = |how, place: &str| (how, place.to_owned());
+        assert_eq!(
+            durable::record::shape(&log, dir.path()),
+            vec![
+                at(Flush::Barrier, "tmp:home/p"),
+                at(Flush::Barrier, "tmp:home/p"),
+                at(Flush::Plain, "home/p"),
+                at(Flush::Barrier, "tmp:home/p/q"),
+                at(Flush::Plain, "home/p"),
+                at(Flush::Full, "home/p/q"),
+            ]
+        );
+        assert_eq!(fs::read(home.join("p/q/c.txt")).unwrap(), b"c\n");
+    }
+
+    /// A restore of one file costs what an atomic write does: its barrier
+    /// and one full flush of its directory, nothing more.
+    #[test]
+    fn a_restore_of_one_file_flushes_as_an_atomic_write_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("t.jsonl");
+        let (placed, log) = durable::record::flushes(|| place_bytes(&dest, dir.path(), b"one\n"));
+        placed.unwrap();
+        assert_eq!(
+            durable::record::shape(&log, dir.path()),
+            vec![
+                (Flush::Barrier, "tmp:".to_owned()),
+                (Flush::Full, String::new())
+            ]
+        );
+    }
+
+    /// A destination that changed after it was planned stops the restore
+    /// after the files before it were placed, and those are flushed through
+    /// the drive's cache before the error returns, as they were before.
+    #[test]
+    fn a_restore_stopped_part_way_flushes_what_it_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.jsonl");
+        let second = dir.path().join("second.jsonl");
+        let memory = dir.path().join("MEMORY.md");
+        fs::write(&second, b"one\n").unwrap();
+        fs::write(&memory, b"old\n").unwrap();
+        let mut rewritable = placement(dir.path(), "m", &memory, b"new\n", Content::Opaque);
+        rewritable.mutability = Mutability::Replaceable;
+        let placements = [
+            placement(dir.path(), "f", &first, b"new\n", Content::Opaque),
+            placement(dir.path(), "s", &second, b"one\ntwo\n", Content::Opaque),
+            rewritable,
+        ];
+        // Asked while the last file is planned: a live turn lands in the
+        // second file after its plan and before its write.
+        let live_turn = |_: &Path| -> Result<bool, HarnessError> {
+            let mut file = fs::OpenOptions::new().append(true).open(&second).unwrap();
+            file.write_all(b"live\n").unwrap();
+            Ok(true)
+        };
+        let (placed, log) = durable::record::flushes(|| place_all(&placements, &live_turn));
+        let err = placed.unwrap_err();
+        assert!(
+            matches!(err, HarnessError::StateChanged { ref path } if path == &second),
+            "{err}"
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"new\n");
+        assert_eq!(fs::read(&memory).unwrap(), b"old\n");
+        let at = |how, place: &str| (how, place.to_owned());
+        assert_eq!(
+            durable::record::shape(&log, dir.path()),
+            vec![
+                at(Flush::Barrier, "tmp:"),
+                at(Flush::Barrier, "tmp:"),
+                at(Flush::Full, ""),
+            ]
+        );
     }
 
     #[test]

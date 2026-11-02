@@ -1067,8 +1067,7 @@ async fn launch_resumes_in_the_workspace_with_only_the_given_env() {
         .unwrap();
     assert_eq!(running.session().cloned(), Some(session()));
     assert_eq!(Some(running.pid().get()), running.child_mut().id());
-    // Under a terminal the launch is held until released; elsewhere this
-    // does nothing.
+    // Every launch is held until released.
     running.release().unwrap();
     let status = running.child_mut().wait().await.unwrap();
     assert!(status.success());
@@ -1100,6 +1099,7 @@ async fn launch_resumes_in_the_workspace_with_only_the_given_env() {
         .await
         .unwrap();
     let fresh = running.session().cloned().unwrap();
+    running.release().unwrap();
     running.child_mut().wait().await.unwrap();
     let seen = std::fs::read_to_string(&log).unwrap();
     assert!(
@@ -1171,6 +1171,7 @@ async fn a_launch_from_inside_a_claude_session_leaves_the_parent_markers_out() {
         )
         .await
         .unwrap();
+    running.release().unwrap();
     assert!(running.child_mut().wait().await.unwrap().success());
     let seen = std::fs::read_to_string(&log).unwrap();
     let names = env_names(&seen);
@@ -1268,6 +1269,7 @@ async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
         log.to_string_lossy().into_owned(),
     )];
     let mut running = adapter.launch(&work, resume(), &env).await.unwrap();
+    running.release().unwrap();
     running.child_mut().wait().await.unwrap();
     let seen = std::fs::read_to_string(&log).unwrap();
     assert!(
