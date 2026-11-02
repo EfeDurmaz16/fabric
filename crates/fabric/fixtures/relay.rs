@@ -112,7 +112,7 @@ fn bind_both() -> std::io::Result<(UdpSocket, TcpListener)> {
 
 /// Forwards datagrams from `front` to one upstream socket per client, and
 /// their answers back; every datagram is dropped while paused.
-fn serve_udp(relay: Arc<Relay>, front: UdpSocket) {
+fn serve_udp(relay: &Arc<Relay>, front: UdpSocket) {
     let front = Arc::new(front);
     let _ = front.set_read_timeout(Some(POLL));
     let mut clients: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
@@ -134,44 +134,8 @@ fn serve_udp(relay: Arc<Relay>, front: UdpSocket) {
             relay.count_udp(Way::Up, false);
             continue;
         }
-        let up = match clients.get(&client) {
-            Some(up) => Arc::clone(up),
-            None => {
-                let Ok(up) = UdpSocket::bind("127.0.0.1:0") else {
-                    continue;
-                };
-                if up.connect(relay.upstream).is_err() {
-                    continue;
-                }
-                let _ = up.set_read_timeout(Some(POLL));
-                let up = Arc::new(up);
-                clients.insert(client, Arc::clone(&up));
-                let (relay, front, up_reader) =
-                    (Arc::clone(&relay), Arc::clone(&front), Arc::clone(&up));
-                thread::spawn(move || {
-                    let mut buf = vec![0u8; DATAGRAM];
-                    loop {
-                        match up_reader.recv(&mut buf) {
-                            Ok(len) => {
-                                if relay.paused() {
-                                    relay.count_udp(Way::Down, false);
-                                    continue;
-                                }
-                                if front.send_to(&buf[..len], client).is_ok() {
-                                    relay.count_udp(Way::Down, true);
-                                }
-                            }
-                            Err(e)
-                                if matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                                ) => {}
-                            Err(_) => return,
-                        }
-                    }
-                });
-                up
-            }
+        let Some(up) = upstream_for(relay, &front, &mut clients, client) else {
+            continue;
         };
         if up.send(&buf[..len]).is_ok() {
             relay.count_udp(Way::Up, true);
@@ -179,9 +143,51 @@ fn serve_udp(relay: Arc<Relay>, front: UdpSocket) {
     }
 }
 
+/// The upstream socket that stands for `client`, made on its first
+/// datagram with a thread that carries the answers back.
+fn upstream_for(
+    relay: &Arc<Relay>,
+    front: &Arc<UdpSocket>,
+    clients: &mut HashMap<SocketAddr, Arc<UdpSocket>>,
+    client: SocketAddr,
+) -> Option<Arc<UdpSocket>> {
+    if let Some(up) = clients.get(&client) {
+        return Some(Arc::clone(up));
+    }
+    let up = UdpSocket::bind("127.0.0.1:0").ok()?;
+    up.connect(relay.upstream).ok()?;
+    let _ = up.set_read_timeout(Some(POLL));
+    let up = Arc::new(up);
+    clients.insert(client, Arc::clone(&up));
+    let (relay, front, up_reader) = (Arc::clone(relay), Arc::clone(front), Arc::clone(&up));
+    thread::spawn(move || {
+        let mut buf = vec![0u8; DATAGRAM];
+        loop {
+            match up_reader.recv(&mut buf) {
+                Ok(len) => {
+                    if relay.paused() {
+                        relay.count_udp(Way::Down, false);
+                        continue;
+                    }
+                    if front.send_to(&buf[..len], client).is_ok() {
+                        relay.count_udp(Way::Down, true);
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return,
+            }
+        }
+    });
+    Some(up)
+}
+
 /// Copies bytes one way between two TCP streams; bytes read while paused
 /// are discarded, so the connection stays open and the peers see silence.
-fn pipe(relay: Arc<Relay>, mut from: TcpStream, mut to: TcpStream, way: Way) {
+fn pipe(relay: &Relay, mut from: TcpStream, mut to: TcpStream, way: Way) {
     let _ = from.set_read_timeout(Some(POLL));
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -211,7 +217,7 @@ fn pipe(relay: Arc<Relay>, mut from: TcpStream, mut to: TcpStream, way: Way) {
     }
 }
 
-fn serve_tcp(relay: Arc<Relay>, listener: TcpListener) {
+fn serve_tcp(relay: &Arc<Relay>, listener: &TcpListener) {
     for client in listener.incoming().flatten() {
         let Ok(up) = TcpStream::connect(relay.upstream) else {
             continue;
@@ -219,10 +225,10 @@ fn serve_tcp(relay: Arc<Relay>, listener: TcpListener) {
         let (Ok(client_back), Ok(up_back)) = (client.try_clone(), up.try_clone()) else {
             continue;
         };
-        let r = Arc::clone(&relay);
-        thread::spawn(move || pipe(r, client, up, Way::Up));
-        let r = Arc::clone(&relay);
-        thread::spawn(move || pipe(r, up_back, client_back, Way::Down));
+        let r = Arc::clone(relay);
+        thread::spawn(move || pipe(&r, client, up, Way::Up));
+        let r = Arc::clone(relay);
+        thread::spawn(move || pipe(&r, up_back, client_back, Way::Down));
     }
 }
 
@@ -269,7 +275,7 @@ fn main() -> ExitCode {
         }
     });
     let r = Arc::clone(&relay);
-    thread::spawn(move || serve_tcp(r, tcp));
-    serve_udp(relay, udp);
+    thread::spawn(move || serve_tcp(&r, &tcp));
+    serve_udp(&relay, udp);
     ExitCode::SUCCESS
 }
