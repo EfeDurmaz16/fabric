@@ -61,3 +61,7 @@ Git stopped on three files. `tests/off_runtime.rs` and `tests/process.rs` confli
 `eada7d0` adds to the shutdown test an attach of a create the shutdown left unknown, after the worker exited: it is refused as shutting down. With attach left out of the shutting-down check it failed 2 of 2 runs with `Lost("the worker closed its output")`.
 
 The whole gate list ran once on `eada7d0`, at a load average of 5 to 12, nothing timed: `cargo fmt --all --check`; clippy with `-D warnings` for the workspace and for `fabric-harness` with no features and each of `acp`, `claude`, `codex`; `cargo test --workspace --locked -- --skip e2e_` (1222 passed, 23 ignored); `cargo test -p fabric --test e2e --locked` (70 passed, 5 ignored); `FABRIC_BUDGET=count` `budget::hot_paths`; `cargo doc` with `-D warnings`; `cargo deny check`; the hygiene, fixture and budget scripts and their self-tests against `origin/m3/capsule-bridge`; the TypeScript SDK install, typecheck, build and `bun test` against the node built here (62 passed). All passed on the first run.
+
+## Then
+
+Capsule `m4/reconciliation` landed the worker's attach. `../m4` runs every interop test, the three above included, against it through Node and as the executable, and moves the CI pin.
