@@ -1,0 +1,38 @@
+{
+  "case": "watch_missing_after",
+  "direction": "client_to_authority",
+  "given": {
+    "now_ms": 1762128000000,
+    "tokens": [
+      {
+        "token_id": "01K8W3A0000000000000000K01",
+        "bearer": "1111111111111111111111111111111111111111111111111111111111111111",
+        "actor": "efe-laptop",
+        "jobs": "any",
+        "resources": "any",
+        "expires_ms": 1762131600000,
+        "revoked_ms": null
+      }
+    ],
+    "jobs": [
+      {
+        "job": "01K8W3A00000000000000000J1",
+        "revision": "1",
+        "state": "active",
+        "live_attempt": false
+      }
+    ],
+    "operations": []
+  },
+  "message": {
+    "type": "watch",
+    "facade": 1,
+    "token": "1111111111111111111111111111111111111111111111111111111111111111",
+    "job": "01K8W3A00000000000000000J1"
+  },
+  "expect": {
+    "outcome": "reject",
+    "code": "bad_request",
+    "reason": "missing_field"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "case": "refused_valid",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "refused",
+    "facade": 1,
+    "code": "scope",
+    "reason": "job",
+    "message": "scope: job"
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}
