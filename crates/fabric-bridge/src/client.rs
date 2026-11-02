@@ -1039,10 +1039,12 @@ impl Bridge {
     }
 
     /// Asks the worker to stop waiting on the outstanding request
-    /// `request_id`. A request that is not outstanding is `NotFound`
-    /// without a frame; an action the profile does not cancel is
-    /// `Unsupported` without a frame. The request still answers on its
-    /// own: a cancel acknowledgement is not termination.
+    /// `request_id`. Once the worker is gone it is refused as `Lost`, like
+    /// everything else: no request is outstanding then, and each one that
+    /// was is `unknown`, not answered. A request that is not outstanding
+    /// is `NotFound` without a frame; an action the profile does not
+    /// cancel is `Unsupported` without a frame. The request still answers
+    /// on its own: a cancel acknowledgement is not termination.
     #[allow(
         clippy::unused_async,
         reason = "async like the rest of the client; it queues its frame, so it completes without waiting"
@@ -1050,6 +1052,12 @@ impl Bridge {
     pub async fn cancel(&self, request_id: &str) -> Result<Control<CancelState>, BridgeError> {
         let found = {
             let state = self.shared.lock();
+            // Losing the worker drains every waiter under this lock, so
+            // without this check a cancel after the loss would read as not
+            // found, as if the request had been answered.
+            if let Some(why) = &state.lost {
+                return Err(BridgeError::Lost(why.clone()));
+            }
             state
                 .waiters
                 .get(request_id)

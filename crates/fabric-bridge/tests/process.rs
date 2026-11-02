@@ -1401,3 +1401,39 @@ async fn a_request_refused_when_it_registers_has_recorded_the_late_locator() {
     );
     assert_eq!(bridge.late_answers(), 1);
 }
+
+/// Losing the worker empties the outstanding requests, so a cancel after
+/// the loss would find nothing and read as answered. It is refused as
+/// lost instead, like every other call, and the request it names settles
+/// as lost.
+#[tokio::test]
+async fn a_cancel_after_the_worker_is_lost_is_refused_as_lost_not_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let silent = bridge
+        .request(&mut journal, create(140, "double/silent"))
+        .await
+        .unwrap();
+    let crashed = bridge
+        .request(&mut journal, create(141, "double/crash"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert!(matches!(crashed.answer, Answer::Lost(_)), "{crashed:?}");
+    assert!(bridge.lost().is_some());
+    match bridge.cancel(silent.request_id()).await {
+        Err(BridgeError::Lost(_)) => {}
+        other => panic!("a cancel after the loss: {other:?}"),
+    }
+    match bridge.cancel("r-404").await {
+        Err(BridgeError::Lost(_)) => {}
+        other => panic!("a cancel of nothing after the loss: {other:?}"),
+    }
+    let outcome = silent.finish(&mut journal).await.unwrap();
+    assert!(matches!(outcome.answer, Answer::Lost(_)), "{outcome:?}");
+    assert_eq!(status(&journal, 140), Some(ProviderStatus::Unknown));
+    assert_eq!(bridge.close().await.unwrap().code(), Some(3));
+}
