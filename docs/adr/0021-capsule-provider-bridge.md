@@ -1,6 +1,6 @@
 # ADR 0021: Versioned provider bridge to a Capsule worker
 
-Status: proposed, 2026-10-27. The `provider_operations` journal table (schema version 2) was approved by Efe on 2026-10-29; the rest of this ADR stays proposed.
+Status: proposed, 2026-10-27; the bridge client and protocol v1 are on `main` since 2026-11-03 (PR #32). The `provider_operations` journal table (schema version 2) was approved by Efe on 2026-10-29; the rest of this ADR stays proposed.
 
 Adopts external drafts P09 ("Scoped provider identity and truthful operation outcomes") and P10 ("Capsule worker protocol and standalone distribution"), both of 2026-10-27 and both Proposed, with the handoff selections of the same date, for the M3 campaign. Draft P12 ("Provider-neutral conformance and layered evidence") sets the test layers. Draft P11 ("Unknown outcomes, reconciliation and cleanup authorization") is read only so that v1 does not block it; nothing in this ADR implements reconciliation. The protocol itself, its message catalogue and its fixtures are in [docs/bridge-protocol.md](../bridge-protocol.md) and [protocol/bridge/v1](../../protocol/bridge/v1).
 
