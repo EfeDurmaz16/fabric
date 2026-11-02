@@ -72,6 +72,10 @@ impl Kept {
         apply_observation(self.state.as_ref().unwrap(), observation).map(|t| self.commit(t))
     }
 
+    fn acknowledge(&mut self, ack: &CheckpointAck) -> Result<Transition, DomainError> {
+        acknowledge(self.state.as_ref().unwrap(), ack).map(|t| self.commit(t))
+    }
+
     fn mark(
         &mut self,
         operation: OperationId,
@@ -101,6 +105,7 @@ fn create() -> Command {
         },
         policy: JobPolicy {
             restart: RestartPolicy::ExplicitOnly,
+            recovery: RecoveryPolicy::Block,
         },
     }
 }
@@ -449,11 +454,16 @@ fn frames_and_answers_have_one_byte_form() {
     assert_eq!(bytes[0], MANAGED_FORMAT);
     assert_eq!(EventFrame::decode(&bytes).unwrap(), frame);
     let mut other = bytes.clone();
-    other[0] = 2;
+    other[0] = 3;
     assert!(matches!(
         EventFrame::decode(&other),
-        Err(FrameError::UnknownFormat(2))
+        Err(FrameError::UnknownFormat(3))
     ));
+    // Format 1 is read beside format 2: the bytes after the format byte
+    // are the same for everything an M2 to M5 job stored.
+    let mut earlier = bytes.clone();
+    earlier[0] = 1;
+    assert_eq!(EventFrame::decode(&earlier).unwrap(), frame);
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert!(EventFrame::decode(&trailing).is_err());
@@ -578,4 +588,680 @@ proptest! {
         }
         kept.replays();
     }
+}
+
+// M6 (ADR 0028): acknowledged checkpoints, the fence, loss as
+// availability, supersede and regrant, and the recovery policy.
+
+const OTHER_NODE: NodeId = NodeId::from_bytes([7; 32]);
+
+/// A job whose first attempt is running on `NODE`.
+fn running() -> Kept {
+    let mut kept = made();
+    let primary = kept.state().job.primary;
+    kept.submit("start-1", start(primary)).unwrap();
+    let first = kept.state().attempts[0].clone();
+    kept.mark(first.granted_by, OperationMark::Dispatched)
+        .unwrap();
+    kept.observe(&Observation::Started {
+        attempt: first.id,
+        generation: first.generation,
+    })
+    .unwrap();
+    kept
+}
+
+fn snapshot(n: u8) -> SnapshotId {
+    SnapshotId::of(&[n; 4])
+}
+
+fn cut(n: u8) -> CutDigest {
+    CutDigest::of(&[n; 8])
+}
+
+fn capture(kept: &mut Kept, n: u8) -> Result<Transition, DomainError> {
+    let a = kept.state().live_attempt().unwrap().clone();
+    kept.observe(&Observation::Captured {
+        attempt: a.id,
+        generation: a.generation,
+        snapshot: snapshot(n),
+        cut: cut(n),
+    })
+}
+
+fn ack_of(kept: &Kept, n: u8) -> CheckpointAck {
+    let c = kept.state().checkpoint(snapshot(n)).unwrap();
+    CheckpointAck {
+        attempt: c.attempt,
+        generation: c.generation,
+        snapshot: c.snapshot,
+        cut: c.cut,
+        manifests: 1,
+        chunks: 2,
+        bytes: 300,
+        fetched_from: NODE,
+    }
+}
+
+/// The running attempt goes silent: `unknown` by `ResourceUnavailable`.
+fn gone_silent(kept: &mut Kept) -> Attempt {
+    let a = kept.state().live_attempt().unwrap().clone();
+    kept.observe(&Observation::ResourceUnavailable {
+        attempt: a.id,
+        generation: a.generation,
+        last_heartbeat_ms: Some(40),
+        at_ms: 50,
+    })
+    .unwrap();
+    kept.state().attempt(a.id).unwrap().clone()
+}
+
+fn token(a: &Attempt) -> GrantToken {
+    GrantToken {
+        job: a.job,
+        attempt: a.id,
+        generation: a.generation,
+    }
+}
+
+#[test]
+fn a_captured_checkpoint_restarts_nothing_until_acknowledged() {
+    let mut kept = running();
+    let t = capture(&mut kept, 1).unwrap();
+    assert!(matches!(
+        t.events.as_slice(),
+        [ManagedEvent::CheckpointCaptured { .. }]
+    ));
+    let a = kept.state().attempts[0].clone();
+    assert_eq!(
+        a.status,
+        AttemptStatus::Running,
+        "the attempt keeps running"
+    );
+    assert_eq!(kept.state().acknowledged(), Vec::<&CheckpointAck>::new());
+    assert_eq!(
+        kept.state().captured_only(),
+        vec![(a.id, a.generation, snapshot(1))]
+    );
+    // The same capture again changes nothing; another cut for the same
+    // snapshot is refused.
+    assert!(capture(&mut kept, 1).unwrap().events.is_empty());
+    assert!(matches!(
+        kept.observe(&Observation::Captured {
+            attempt: a.id,
+            generation: a.generation,
+            snapshot: snapshot(1),
+            cut: cut(9),
+        }),
+        Err(DomainError::UnknownCheckpoint { .. })
+    ));
+    // Captured but not acknowledged: no restart point.
+    let a = gone_silent(&mut kept);
+    assert!(matches!(
+        kept.submit(
+            "recover-1",
+            Command::Recover {
+                attempt: a.id,
+                resource: ResourceRef::Node { node: OTHER_NODE },
+                from: snapshot(1),
+                reason: "test".into(),
+            }
+        ),
+        Err(DomainError::NotAcknowledged { .. })
+    ));
+    let decision = recovery_decision(
+        kept.state(),
+        a.id,
+        OutcomePolicy::Checkpoint,
+        &[],
+        Ok(ResourceRef::Node { node: OTHER_NODE }),
+    );
+    assert_eq!(decision, Err(RecoveryBlock::NoAcknowledgedCheckpoint));
+    // Acknowledged, and it is one.
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    assert_eq!(kept.state().acknowledged().len(), 1);
+    assert!(kept.state().captured_only().is_empty());
+    assert!(matches!(
+        recovery_decision(
+            kept.state(),
+            a.id,
+            OutcomePolicy::Checkpoint,
+            &[],
+            Ok(ResourceRef::Node { node: OTHER_NODE }),
+        ),
+        Ok(Command::Recover { from, .. }) if from == snapshot(1)
+    ));
+    kept.replays();
+}
+
+#[test]
+fn an_acknowledgement_names_the_reported_snapshot_and_cut() {
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    let good = ack_of(&kept, 1);
+    let unknown = CheckpointAck {
+        snapshot: snapshot(2),
+        ..good.clone()
+    };
+    assert!(matches!(
+        kept.acknowledge(&unknown),
+        Err(DomainError::UnknownCheckpoint { .. })
+    ));
+    let other_cut = CheckpointAck {
+        cut: cut(2),
+        ..good.clone()
+    };
+    assert!(matches!(
+        kept.acknowledge(&other_cut),
+        Err(DomainError::CutMismatch { .. })
+    ));
+    let other_generation = CheckpointAck {
+        generation: Generation::new(2).unwrap(),
+        ..good.clone()
+    };
+    assert!(matches!(
+        kept.acknowledge(&other_generation),
+        Err(DomainError::StaleGeneration { .. })
+    ));
+    let t = kept.acknowledge(&good).unwrap();
+    assert!(matches!(
+        t.events.as_slice(),
+        [ManagedEvent::CheckpointAcknowledged { .. }]
+    ));
+    assert!(kept.acknowledge(&good).unwrap().events.is_empty());
+    // An attempt that went silent after capturing still owns its checkpoint.
+    capture(&mut kept, 3).unwrap();
+    gone_silent(&mut kept);
+    kept.acknowledge(&ack_of(&kept, 3)).unwrap();
+    assert_eq!(kept.state().acknowledged()[0].snapshot, snapshot(3));
+    kept.replays();
+}
+
+#[test]
+fn unavailable_is_unknown_and_still_may_run() {
+    let mut kept = running();
+    let a = gone_silent(&mut kept);
+    assert_eq!(a.status, AttemptStatus::Unknown);
+    assert_eq!(a.unavailable_since_ms, Some(50));
+    assert!(a.status.may_run());
+    // The M2 wait rule holds: nothing grants, finishes or cancels behind it.
+    let primary = kept.state().job.primary;
+    assert!(matches!(
+        kept.submit("start-2", start(primary)),
+        Err(DomainError::AttemptStillLive { .. })
+    ));
+    assert!(matches!(
+        kept.submit(
+            "cancel",
+            Command::CancelJob {
+                reason: "no".into()
+            }
+        ),
+        Err(DomainError::AttemptStillLive { .. })
+    ));
+    // Unavailable again changes nothing; it never becomes lost by itself.
+    assert!(
+        kept.observe(&Observation::ResourceUnavailable {
+            attempt: a.id,
+            generation: a.generation,
+            last_heartbeat_ms: Some(40),
+            at_ms: 60,
+        })
+        .unwrap()
+        .events
+        .is_empty()
+    );
+    assert_eq!(
+        kept.state().attempt(a.id).unwrap().status,
+        AttemptStatus::Unknown
+    );
+    kept.replays();
+}
+
+#[test]
+fn reachable_returns_only_an_attempt_unavailable_made_unknown() {
+    let mut kept = running();
+    let a = kept.state().attempts[0].clone();
+    // Reachable while running: nothing.
+    assert!(
+        kept.observe(&Observation::ResourceReachable {
+            attempt: a.id,
+            generation: a.generation,
+        })
+        .unwrap()
+        .events
+        .is_empty()
+    );
+    gone_silent(&mut kept);
+    let t = kept
+        .observe(&Observation::ResourceReachable {
+            attempt: a.id,
+            generation: a.generation,
+        })
+        .unwrap();
+    assert!(matches!(
+        t.events.as_slice(),
+        [ManagedEvent::AttemptReachable { .. }]
+    ));
+    let back = kept.state().attempt(a.id).unwrap();
+    assert_eq!(back.status, AttemptStatus::Running);
+    assert_eq!(back.unavailable_since_ms, None);
+    // An ended attempt is neither.
+    kept.observe(&Observation::Exited {
+        attempt: a.id,
+        generation: a.generation,
+        outcome: ExitOutcome::Succeeded,
+    })
+    .unwrap();
+    assert!(matches!(
+        kept.observe(&Observation::ResourceUnavailable {
+            attempt: a.id,
+            generation: a.generation,
+            last_heartbeat_ms: None,
+            at_ms: 70,
+        }),
+        Err(DomainError::AttemptEnded { .. })
+    ));
+    kept.replays();
+}
+
+#[test]
+fn supersede_needs_an_unknown_attempt() {
+    let mut kept = running();
+    let a = kept.state().attempts[0].clone();
+    let supersede = |attempt| Command::Supersede {
+        attempt,
+        reason: "operator".into(),
+    };
+    assert!(matches!(
+        kept.submit("s-1", supersede(a.id)),
+        Err(DomainError::AttemptReachable { .. })
+    ));
+    assert!(matches!(
+        kept.submit("s-2", supersede(AttemptId::from_bytes([0xee; 16]))),
+        Err(DomainError::UnknownAttempt { .. })
+    ));
+    gone_silent(&mut kept);
+    let t = kept.submit("s-3", supersede(a.id)).unwrap();
+    assert!(matches!(
+        t.events.as_slice(),
+        [
+            ManagedEvent::CommandAccepted { .. },
+            ManagedEvent::GrantSuperseded { by: None, .. }
+        ]
+    ));
+    let s = kept.state();
+    assert_eq!(
+        s.attempt(a.id).unwrap().status,
+        AttemptStatus::Superseded { by: None }
+    );
+    assert_eq!(
+        s.job.generation, a.generation,
+        "the generation did not move"
+    );
+    assert_eq!(s.tasks[0].state, TaskState::Open);
+    assert!(s.live_attempt().is_none());
+    // The fence refuses it from now on, and its late exit is refused too.
+    assert_eq!(
+        fence(Some(s), &token(&a), Some(NODE)),
+        FenceVerdict::Superseded { by: None }
+    );
+    assert!(matches!(
+        kept.observe(&Observation::Exited {
+            attempt: a.id,
+            generation: a.generation,
+            outcome: ExitOutcome::Succeeded,
+        }),
+        Err(DomainError::AttemptEnded { .. })
+    ));
+    // A plain StartAttempt is admitted now, by the M2 rules.
+    let primary = kept.state().job.primary;
+    kept.submit("start-2", start(primary)).unwrap();
+    assert_eq!(kept.state().job.generation.get(), 2);
+    kept.replays();
+}
+
+#[test]
+fn recover_grants_the_next_generation_from_an_acknowledged_checkpoint_in_one_batch() {
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    let a = kept.state().attempts[0].clone();
+    let recover = Command::Recover {
+        attempt: a.id,
+        resource: ResourceRef::Node { node: OTHER_NODE },
+        from: snapshot(1),
+        reason: "the laptop lid".into(),
+    };
+    assert!(matches!(
+        kept.submit("r-0", recover.clone()),
+        Err(DomainError::AttemptReachable { .. })
+    ));
+    gone_silent(&mut kept);
+    let t = kept.submit("r-1", recover).unwrap();
+    assert_eq!(t.events.len(), 3);
+    assert!(matches!(
+        t.events.as_slice(),
+        [
+            ManagedEvent::CommandAccepted {
+                kind: CommandKind::Recover,
+                ..
+            },
+            ManagedEvent::GrantSuperseded { by: Some(_), .. },
+            ManagedEvent::AttemptGranted {
+                initial_checkpoint: Some(_),
+                ..
+            }
+        ]
+    ));
+    let s = kept.state();
+    let next = s.attempts[1].clone();
+    assert_eq!(next.generation.get(), 2);
+    assert_eq!(s.job.generation, next.generation);
+    assert_eq!(next.initial_checkpoint, Some(snapshot(1)));
+    assert_eq!(next.resource, ResourceRef::Node { node: OTHER_NODE });
+    assert_eq!(
+        s.attempt(a.id).unwrap().status,
+        AttemptStatus::Superseded {
+            by: Some(next.generation)
+        }
+    );
+    assert_eq!(s.live_attempt().map(|l| l.id), Some(next.id));
+    // The recover is a grant: it waits for its one dispatch.
+    assert!(s.grant_may_dispatch(next.granted_by));
+    assert_eq!(
+        s.operation(next.granted_by).unwrap().status,
+        OperationStatus::Accepted
+    );
+    kept.mark(next.granted_by, OperationMark::Dispatched)
+        .unwrap();
+    // The old attempt's late report is stale and recorded as such.
+    let late = kept
+        .observe(&Observation::Exited {
+            attempt: a.id,
+            generation: a.generation,
+            outcome: ExitOutcome::Succeeded,
+        })
+        .unwrap();
+    assert!(matches!(
+        late.events.as_slice(),
+        [ManagedEvent::StaleObservationRefused { .. }]
+    ));
+    assert_eq!(
+        fence(Some(kept.state()), &token(&a), Some(NODE)),
+        FenceVerdict::Superseded {
+            by: Some(next.generation)
+        }
+    );
+    kept.replays();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "every status, generation and node is walked in one place"
+)]
+fn fence_only_the_live_attempt_from_its_node_is_live() {
+    let mut kept = made();
+    let job = kept.state().job.id;
+    let ghost = GrantToken {
+        job,
+        attempt: AttemptId::from_bytes([0xee; 16]),
+        generation: Generation::FIRST,
+    };
+    assert_eq!(
+        fence(Some(kept.state()), &ghost, None),
+        FenceVerdict::UnknownAttempt
+    );
+    assert_eq!(
+        fence(
+            Some(kept.state()),
+            &GrantToken {
+                job: JobId::from_bytes([0xdd; 16]),
+                ..ghost
+            },
+            None
+        ),
+        FenceVerdict::UnknownJob
+    );
+    let primary = kept.state().job.primary;
+    kept.submit("start-1", start(primary)).unwrap();
+    let a = kept.state().attempts[0].clone();
+    // Granted: live from its node and from the authority's own host.
+    assert_eq!(
+        fence(Some(kept.state()), &token(&a), None),
+        FenceVerdict::Live
+    );
+    assert_eq!(
+        fence(Some(kept.state()), &token(&a), Some(NODE)),
+        FenceVerdict::Live
+    );
+    assert_eq!(
+        fence(Some(kept.state()), &token(&a), Some(OTHER_NODE)),
+        FenceVerdict::WrongNode {
+            granted: NODE,
+            from: OTHER_NODE
+        }
+    );
+    // A token at another generation for the same attempt is not its token.
+    let wrong_generation = GrantToken {
+        generation: Generation::new(2).unwrap(),
+        ..token(&a)
+    };
+    assert_eq!(
+        fence(Some(kept.state()), &wrong_generation, None),
+        FenceVerdict::UnknownAttempt
+    );
+    kept.mark(a.granted_by, OperationMark::Dispatched).unwrap();
+    kept.observe(&Observation::Started {
+        attempt: a.id,
+        generation: a.generation,
+    })
+    .unwrap();
+    assert_eq!(
+        fence(Some(kept.state()), &token(&a), Some(NODE)),
+        FenceVerdict::Live
+    );
+    // Unknown: not writable, not obsolete.
+    gone_silent(&mut kept);
+    let v = fence(Some(kept.state()), &token(&a), Some(NODE));
+    assert_eq!(
+        v,
+        FenceVerdict::NotWritable {
+            status: AttemptStatus::Unknown
+        }
+    );
+    assert!(!v.is_obsolete());
+    // Lost, and then a later grant: stale.
+    kept.observe(&Observation::Lost {
+        attempt: a.id,
+        generation: a.generation,
+    })
+    .unwrap();
+    assert_eq!(
+        fence(Some(kept.state()), &token(&a), Some(NODE)),
+        FenceVerdict::NotWritable {
+            status: AttemptStatus::Lost
+        }
+    );
+    kept.submit("start-2", start(primary)).unwrap();
+    let v = fence(Some(kept.state()), &token(&a), Some(NODE));
+    assert_eq!(
+        v,
+        FenceVerdict::Stale {
+            current: Generation::new(2).unwrap()
+        }
+    );
+    assert!(v.is_obsolete());
+    let b = kept.state().attempts[1].clone();
+    assert_eq!(
+        fence(Some(kept.state()), &token(&b), Some(NODE)),
+        FenceVerdict::Live
+    );
+    // Every ended status is not writable.
+    for (n, outcome) in [
+        ExitOutcome::Succeeded,
+        ExitOutcome::Failed { code: Some(1) },
+        ExitOutcome::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut k = running();
+        let a = k.state().attempts[0].clone();
+        k.observe(&Observation::Exited {
+            attempt: a.id,
+            generation: a.generation,
+            outcome,
+        })
+        .unwrap();
+        let v = fence(Some(k.state()), &token(&a), Some(NODE));
+        assert!(matches!(v, FenceVerdict::NotWritable { .. }), "{n}: {v:?}");
+    }
+    kept.replays();
+}
+
+#[test]
+fn block_is_the_default_and_format_1_decodes_to_it() {
+    assert_eq!(RecoveryPolicy::default(), RecoveryPolicy::Block);
+    let before = JobPolicy {
+        restart: RestartPolicy::ExplicitOnly,
+        recovery: RecoveryPolicy::Block,
+    };
+    // A Block policy's bytes are the bytes M2 to M5 wrote: one varint of
+    // the restart variant, so every stored digest of an older job holds.
+    let bytes = before.to_stored().unwrap();
+    assert_eq!(bytes, vec![MANAGED_FORMAT, 1]);
+    let format_1 = [1u8, 1];
+    assert_eq!(JobPolicy::from_stored(&format_1).unwrap(), before);
+    let format_1_block = [1u8, 0];
+    assert_eq!(
+        JobPolicy::from_stored(&format_1_block).unwrap(),
+        JobPolicy {
+            restart: RestartPolicy::Block,
+            recovery: RecoveryPolicy::Block,
+        }
+    );
+    let after = JobPolicy {
+        restart: RestartPolicy::ExplicitOnly,
+        recovery: RecoveryPolicy::RestartFromAcknowledged,
+    };
+    let bytes = after.to_stored().unwrap();
+    assert_eq!(bytes, vec![MANAGED_FORMAT, 3]);
+    assert_eq!(JobPolicy::from_stored(&bytes).unwrap(), after);
+    assert!(JobPolicy::from_stored(&[MANAGED_FORMAT, 4]).is_err());
+    // A create's request digest is the one an older binary computed: the
+    // journal fixture test replays an M2 create under its stored key.
+}
+
+#[test]
+fn restart_from_acknowledged_is_refused_for_an_opaque_primary() {
+    assert!(matches!(
+        admit_recovery(RecoveryPolicy::RestartFromAcknowledged, OutcomePolicy::Block),
+        Err(DomainError::RecoveryUnsupported { kind }) if kind == "block"
+    ));
+    for outcome in [OutcomePolicy::CancelAndRestart, OutcomePolicy::Checkpoint] {
+        admit_recovery(RecoveryPolicy::RestartFromAcknowledged, outcome).unwrap();
+        admit_recovery(RecoveryPolicy::Block, outcome).unwrap();
+    }
+    admit_recovery(RecoveryPolicy::Block, OutcomePolicy::Block).unwrap();
+    // The primary task of a managed job is a harness task, so a create
+    // with the policy is admitted and the policy is kept.
+    let mut kept = Kept::new();
+    let command = match create() {
+        Command::CreateJob { intent, source, .. } => Command::CreateJob {
+            intent,
+            source,
+            policy: JobPolicy {
+                restart: RestartPolicy::ExplicitOnly,
+                recovery: RecoveryPolicy::RestartFromAcknowledged,
+            },
+        },
+        other => other,
+    };
+    kept.submit("create", command).unwrap();
+    assert_eq!(
+        kept.state().job.policy.recovery,
+        RecoveryPolicy::RestartFromAcknowledged
+    );
+    kept.replays();
+}
+
+#[test]
+fn recovery_decision_falls_back_to_block_with_the_failed_condition() {
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    let a = gone_silent(&mut kept);
+    let here = Ok(ResourceRef::Node { node: OTHER_NODE });
+    assert_eq!(
+        recovery_decision(kept.state(), a.id, OutcomePolicy::Block, &[], here.clone()),
+        Err(RecoveryBlock::OutcomeBlocks {
+            kind: "block".into()
+        })
+    );
+    let blocker = OperationId::from_bytes([0xbb; 16]);
+    assert_eq!(
+        recovery_decision(
+            kept.state(),
+            a.id,
+            OutcomePolicy::Checkpoint,
+            &[blocker],
+            here.clone()
+        ),
+        Err(RecoveryBlock::ReplacementBlocked {
+            blockers: vec![blocker]
+        })
+    );
+    let exclusion = Exclusion {
+        node: NODE,
+        reason: "unavailable".into(),
+    };
+    assert_eq!(
+        recovery_decision(
+            kept.state(),
+            a.id,
+            OutcomePolicy::Checkpoint,
+            &[],
+            Err(vec![exclusion.clone()])
+        ),
+        Err(RecoveryBlock::NoEligibleNode {
+            exclusions: vec![exclusion]
+        })
+    );
+    let decided = recovery_decision(
+        kept.state(),
+        a.id,
+        OutcomePolicy::Checkpoint,
+        &[],
+        here.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &decided,
+        Command::Recover { attempt, from, resource, .. }
+            if *attempt == a.id && *from == snapshot(1) && *resource == ResourceRef::Node { node: OTHER_NODE }
+    ));
+    // The decision is a command the rules accept as is.
+    kept.submit("auto-recover", decided).unwrap();
+    assert_eq!(kept.state().job.generation.get(), 2);
+    // A cancel-and-restart task takes the job's newest acknowledged
+    // checkpoint, which another attempt may have made; a checkpoint task
+    // takes only its own.
+    let b = gone_silent(&mut kept);
+    assert_eq!(
+        recovery_decision(
+            kept.state(),
+            b.id,
+            OutcomePolicy::Checkpoint,
+            &[],
+            here.clone()
+        ),
+        Err(RecoveryBlock::NoAcknowledgedCheckpoint)
+    );
+    assert!(matches!(
+        recovery_decision(kept.state(), b.id, OutcomePolicy::CancelAndRestart, &[], here),
+        Ok(Command::Recover { from, .. }) if from == snapshot(1)
+    ));
+    kept.replays();
 }

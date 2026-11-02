@@ -1375,6 +1375,7 @@ impl From<&ManagedState> for ManagedJob {
                         AttemptStatus::Checkpointed { .. } => "checkpointed",
                         AttemptStatus::Lost => "lost",
                         AttemptStatus::Unknown => "unknown",
+                        AttemptStatus::Superseded { .. } => "superseded",
                     }
                     .to_owned(),
                     snapshot: match attempt.status {

@@ -15,8 +15,8 @@ use fabric_client::api::{
 };
 use fabric_core::id::JobId;
 use fabric_core::managed::{
-    Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, RestartPolicy, SourceBinding,
-    StoredResult,
+    Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, RecoveryPolicy, RestartPolicy,
+    SourceBinding, StoredResult,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::{Answer, CommitError};
@@ -57,6 +57,11 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::Exhausted => "exhausted",
         DomainError::Broken { .. } => "broken",
         DomainError::ReplacementBlocked { .. } => "replacement_blocked",
+        DomainError::UnknownCheckpoint { .. } => "unknown_checkpoint",
+        DomainError::CutMismatch { .. } => "cut_mismatch",
+        DomainError::NotAcknowledged { .. } => "not_acknowledged",
+        DomainError::AttemptReachable { .. } => "attempt_reachable",
+        DomainError::RecoveryUnsupported { .. } => "recovery_unsupported",
     }
 }
 
@@ -127,6 +132,7 @@ impl Node {
                         source: source(&repo)?,
                         policy: JobPolicy {
                             restart: RestartPolicy::ExplicitOnly,
+                            recovery: RecoveryPolicy::Block,
                         },
                     },
                 };

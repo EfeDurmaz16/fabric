@@ -7,8 +7,8 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
     AttemptStatus, Command, DomainError, Envelope, Generation, Intent, JobPolicy, ManagedEvent,
-    NewIds, Observation, OperationKey, OperationMark, OperationStatus, ResourceRef, RestartPolicy,
-    SourceBinding, StoredResult, TaskState, WorkRevision,
+    NewIds, Observation, OperationKey, OperationMark, OperationStatus, RecoveryPolicy, ResourceRef,
+    RestartPolicy, SourceBinding, StoredResult, TaskState, WorkRevision,
 };
 use fabric_core::path::AbsPath;
 use rusqlite::Connection;
@@ -85,6 +85,7 @@ pub(crate) fn create() -> Command {
         },
         policy: JobPolicy {
             restart: RestartPolicy::ExplicitOnly,
+            recovery: RecoveryPolicy::Block,
         },
     }
 }

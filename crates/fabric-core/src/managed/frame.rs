@@ -17,8 +17,14 @@ use super::model::{
 use crate::codec::{self, CodecError};
 use crate::id::JobId;
 
-/// The format byte of every managed frame and stored answer this crate writes.
-pub const MANAGED_FORMAT: u8 = 1;
+/// The format byte of every managed frame and stored answer this crate
+/// writes. Format 2 (ADR 0028) adds the recovery policy to `JobPolicy`
+/// and the M6 event kinds; format 1 is read beside it, and a format 1
+/// policy decodes with `recovery: Block`.
+pub const MANAGED_FORMAT: u8 = 2;
+
+/// The format bytes this crate reads: the one it writes and every earlier one.
+pub const READ_FORMATS: [u8; 2] = [1, MANAGED_FORMAT];
 
 /// The domain separator of a request digest.
 const COMMAND_DOMAIN: &[u8] = b"fabric.managed.command.v1\0";
@@ -75,7 +81,7 @@ fn decode_framed<T: Serialize + serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, FrameError> {
     let (&format, rest) = bytes.split_first().ok_or(FrameError::Empty)?;
-    if format != MANAGED_FORMAT {
+    if !READ_FORMATS.contains(&format) {
         return Err(FrameError::UnknownFormat(format));
     }
     Ok(codec::decode(rest)?)

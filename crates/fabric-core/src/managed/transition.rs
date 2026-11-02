@@ -8,13 +8,14 @@
 //! gives. Nothing here reads a clock or makes an id.
 
 use super::frame::request_digest;
-use super::ids::{Generation, OperationId, WorkRevision};
+use super::ids::{AttemptId, Generation, OperationId, WorkRevision};
 use super::model::{
-    Attempt, AttemptStatus, Command, CommandKind, Dedupe, DomainError, Envelope, ExitOutcome,
-    JobState, ManagedEvent, ManagedJob, ManagedState, NewIds, Observation, Operation,
-    OperationMark, OperationProgress, OperationStatus, Task, TaskKind, TaskState, Transition,
+    Attempt, AttemptStatus, Checkpoint, CheckpointAck, Command, CommandKind, Dedupe, DomainError,
+    Envelope, Exclusion, ExitOutcome, JobState, ManagedEvent, ManagedJob, ManagedState, NewIds,
+    Observation, Operation, OperationMark, OperationProgress, OperationStatus, OutcomePolicy,
+    RecoveryBlock, RecoveryPolicy, ResourceRef, Task, TaskKind, TaskState, Transition,
 };
-use crate::id::JobId;
+use crate::id::{JobId, SnapshotId};
 
 /// Decides what a command under a key that may have been seen gets.
 #[must_use]
@@ -67,6 +68,7 @@ pub fn accept_command(
         if envelope.job.is_some() || envelope.expected.is_some() || job.is_some() {
             return Err(DomainError::BadEnvelope);
         }
+        admit_recovery(policy.recovery, OutcomePolicy::of_primary(intent))?;
         return Ok(Transition {
             revision: WorkRevision::FIRST,
             events: vec![
@@ -108,21 +110,85 @@ pub fn accept_command(
         return Err(DomainError::JobClosed { job: named });
     }
     let revision = next_revision(state)?;
-    let event = command_event(state, &envelope.body, ids)?;
-    Ok(Transition {
-        revision,
-        events: vec![accepted, event],
-    })
+    let mut events = vec![accepted];
+    events.extend(command_events(state, &envelope.body, ids)?);
+    Ok(Transition { revision, events })
 }
 
-/// The event a command other than `CreateJob` makes on an active job.
-fn command_event(
+/// `RestartFromAcknowledged` is admitted only for a primary task the
+/// authority may restart by itself: never an `opaque` one (ADR 0028).
+pub fn admit_recovery(recovery: RecoveryPolicy, outcome: OutcomePolicy) -> Result<(), DomainError> {
+    match (recovery, outcome) {
+        (RecoveryPolicy::RestartFromAcknowledged, OutcomePolicy::Block) => {
+            Err(DomainError::RecoveryUnsupported {
+                kind: outcome.name().to_owned(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The `unknown` live attempt a `Supersede` or `Recover` names; a
+/// reachable one is handed over, never recovered (ADR 0028).
+fn unknown_attempt(state: &ManagedState, attempt: AttemptId) -> Result<&Attempt, DomainError> {
+    let found = state
+        .attempt(attempt)
+        .ok_or(DomainError::UnknownAttempt { attempt })?;
+    if found.status != AttemptStatus::Unknown || found.generation != state.job.generation {
+        return Err(DomainError::AttemptReachable {
+            attempt,
+            status: found.status.clone(),
+        });
+    }
+    Ok(found)
+}
+
+/// The events a command other than `CreateJob` makes on an active job.
+fn command_events(
     state: &ManagedState,
     body: &Command,
     ids: &NewIds,
-) -> Result<ManagedEvent, DomainError> {
-    Ok(match body {
+) -> Result<Vec<ManagedEvent>, DomainError> {
+    Ok(vec![match body {
         Command::CreateJob { .. } => return Err(DomainError::BadEnvelope),
+        Command::Supersede { attempt, reason } => {
+            let old = unknown_attempt(state, *attempt)?;
+            ManagedEvent::GrantSuperseded {
+                attempt: old.id,
+                generation: old.generation,
+                by: None,
+                reason: reason.clone(),
+            }
+        }
+        Command::Recover {
+            attempt,
+            resource,
+            from,
+            reason,
+        } => {
+            let old = unknown_attempt(state, *attempt)?;
+            if !state.acknowledged().iter().any(|a| a.snapshot == *from) {
+                return Err(DomainError::NotAcknowledged { snapshot: *from });
+            }
+            open_task(state, old.task)?;
+            let next = state.job.generation.next().ok_or(DomainError::Exhausted)?;
+            return Ok(vec![
+                ManagedEvent::GrantSuperseded {
+                    attempt: old.id,
+                    generation: old.generation,
+                    by: Some(next),
+                    reason: reason.clone(),
+                },
+                ManagedEvent::AttemptGranted {
+                    attempt: ids.attempt,
+                    task: old.task,
+                    resource: resource.clone(),
+                    generation: next,
+                    initial_checkpoint: Some(*from),
+                    operation: ids.operation,
+                },
+            ]);
+        }
         Command::StartAttempt {
             task,
             resource,
@@ -179,7 +245,7 @@ fn command_event(
                 reason: reason.clone(),
             }
         }
-    })
+    }])
 }
 
 fn open_task(state: &ManagedState, task: super::ids::TaskId) -> Result<&Task, DomainError> {
@@ -213,6 +279,22 @@ pub fn apply_observation(
         Observation::Unknown { operation } => {
             return mark_operation(job, *operation, OperationMark::Unknown);
         }
+        Observation::Captured {
+            attempt,
+            generation,
+            snapshot,
+            cut,
+        } => return captured(job, *attempt, *generation, *snapshot, *cut),
+        Observation::ResourceUnavailable {
+            attempt,
+            generation,
+            last_heartbeat_ms,
+            at_ms,
+        } => return unavailable(job, *attempt, *generation, *last_heartbeat_ms, *at_ms),
+        Observation::ResourceReachable {
+            attempt,
+            generation,
+        } => return reachable(job, *attempt, *generation),
         Observation::Started {
             attempt,
             generation,
@@ -232,15 +314,7 @@ pub fn apply_observation(
             attempt,
             generation,
             outcome,
-        } => (
-            *attempt,
-            *generation,
-            match outcome {
-                ExitOutcome::Succeeded => AttemptStatus::Succeeded,
-                ExitOutcome::Failed { .. } => AttemptStatus::Failed,
-                ExitOutcome::Cancelled => AttemptStatus::Cancelled,
-            },
-        ),
+        } => (*attempt, *generation, exit_status(*outcome)),
         Observation::Lost {
             attempt,
             generation,
@@ -249,28 +323,8 @@ pub fn apply_observation(
     let attempt = job.attempt(attempt_id).ok_or(DomainError::UnknownAttempt {
         attempt: attempt_id,
     })?;
-    let current = job.job.generation;
-    if generation > current {
-        return Err(DomainError::StaleGeneration {
-            given: generation,
-            current,
-        });
-    }
-    if generation < current {
-        return Ok(Transition {
-            revision: next_revision(job)?,
-            events: vec![ManagedEvent::StaleObservationRefused {
-                attempt: attempt_id,
-                generation,
-                current,
-            }],
-        });
-    }
-    if attempt.generation != generation {
-        return Err(DomainError::StaleGeneration {
-            given: generation,
-            current: attempt.generation,
-        });
+    if let Some(refused) = generation_check(job, attempt, generation)? {
+        return Ok(refused);
     }
     if attempt.status == status {
         return Ok(unchanged(job));
@@ -302,6 +356,241 @@ pub fn apply_observation(
     Ok(Transition {
         revision: next_revision(job)?,
         events,
+    })
+}
+
+fn exit_status(outcome: ExitOutcome) -> AttemptStatus {
+    match outcome {
+        ExitOutcome::Succeeded => AttemptStatus::Succeeded,
+        ExitOutcome::Failed { .. } => AttemptStatus::Failed,
+        ExitOutcome::Cancelled => AttemptStatus::Cancelled,
+    }
+}
+
+/// The M2 generation check of a report: a newer generation than the job's
+/// is refused, an older one is recorded as refused (replay rule 7), and
+/// the attempt's own generation must be the one named. `Ok(Some(..))` is
+/// the refusal to record; `Ok(None)` means the report is current.
+fn generation_check(
+    job: &ManagedState,
+    attempt: &Attempt,
+    generation: Generation,
+) -> Result<Option<Transition>, DomainError> {
+    let current = job.job.generation;
+    if generation > current {
+        return Err(DomainError::StaleGeneration {
+            given: generation,
+            current,
+        });
+    }
+    if generation < current {
+        return Ok(Some(Transition {
+            revision: next_revision(job)?,
+            events: vec![ManagedEvent::StaleObservationRefused {
+                attempt: attempt.id,
+                generation,
+                current,
+            }],
+        }));
+    }
+    if attempt.generation != generation {
+        return Err(DomainError::StaleGeneration {
+            given: generation,
+            current: attempt.generation,
+        });
+    }
+    Ok(None)
+}
+
+fn one(job: &ManagedState, event: ManagedEvent) -> Result<Transition, DomainError> {
+    Ok(Transition {
+        revision: next_revision(job)?,
+        events: vec![event],
+    })
+}
+
+/// `Captured`: the attempt keeps running; the checkpoint is recorded as
+/// captured, a restart point for nothing until acknowledged (ADR 0028).
+fn captured(
+    job: &ManagedState,
+    attempt_id: AttemptId,
+    generation: Generation,
+    snapshot: SnapshotId,
+    cut: super::model::CutDigest,
+) -> Result<Transition, DomainError> {
+    let attempt = job.attempt(attempt_id).ok_or(DomainError::UnknownAttempt {
+        attempt: attempt_id,
+    })?;
+    if let Some(refused) = generation_check(job, attempt, generation)? {
+        return Ok(refused);
+    }
+    if let Some(known) = job.checkpoint(snapshot) {
+        if known.attempt == attempt_id && known.cut == cut {
+            return Ok(unchanged(job));
+        }
+        return Err(DomainError::UnknownCheckpoint {
+            attempt: attempt_id,
+            snapshot,
+        });
+    }
+    if !attempt.status.may_run() {
+        return Err(DomainError::AttemptEnded {
+            attempt: attempt_id,
+        });
+    }
+    one(
+        job,
+        ManagedEvent::CheckpointCaptured {
+            attempt: attempt_id,
+            generation,
+            snapshot,
+            cut,
+        },
+    )
+}
+
+/// `ResourceUnavailable`: `granted` or `running` becomes `unknown`; an
+/// attempt already `unknown` is unchanged; an ended one is refused.
+fn unavailable(
+    job: &ManagedState,
+    attempt_id: AttemptId,
+    generation: Generation,
+    last_heartbeat_ms: Option<u64>,
+    at_ms: u64,
+) -> Result<Transition, DomainError> {
+    let attempt = job.attempt(attempt_id).ok_or(DomainError::UnknownAttempt {
+        attempt: attempt_id,
+    })?;
+    if let Some(refused) = generation_check(job, attempt, generation)? {
+        return Ok(refused);
+    }
+    match attempt.status {
+        AttemptStatus::Granted | AttemptStatus::Running => one(
+            job,
+            ManagedEvent::AttemptUnavailable {
+                attempt: attempt_id,
+                generation,
+                last_heartbeat_ms,
+                since_ms: at_ms,
+            },
+        ),
+        AttemptStatus::Unknown => Ok(unchanged(job)),
+        _ => Err(DomainError::AttemptEnded {
+            attempt: attempt_id,
+        }),
+    }
+}
+
+/// `ResourceReachable`: only an attempt `AttemptUnavailable` made
+/// `unknown` returns to `running`; any other `unknown` is unchanged.
+fn reachable(
+    job: &ManagedState,
+    attempt_id: AttemptId,
+    generation: Generation,
+) -> Result<Transition, DomainError> {
+    let attempt = job.attempt(attempt_id).ok_or(DomainError::UnknownAttempt {
+        attempt: attempt_id,
+    })?;
+    if let Some(refused) = generation_check(job, attempt, generation)? {
+        return Ok(refused);
+    }
+    match attempt.status {
+        AttemptStatus::Unknown if attempt.unavailable_since_ms.is_some() => one(
+            job,
+            ManagedEvent::AttemptReachable {
+                attempt: attempt_id,
+                generation,
+            },
+        ),
+        AttemptStatus::Granted | AttemptStatus::Running | AttemptStatus::Unknown => {
+            Ok(unchanged(job))
+        }
+        _ => Err(DomainError::AttemptEnded {
+            attempt: attempt_id,
+        }),
+    }
+}
+
+/// The authority's acceptance of a checkpoint it fetched and verified
+/// (ADR 0028): the fourth rule function. It refuses a snapshot the attempt
+/// never reported, a cut that differs from the reported one and a
+/// generation that is not the attempt's, and accepts an acknowledgement
+/// for an attempt in any status: the bytes of a checkpoint an attempt made
+/// before it became `unknown`, `superseded` or `lost` are still its
+/// checkpoint. The same acknowledgement twice changes nothing.
+pub fn acknowledge(job: &ManagedState, ack: &CheckpointAck) -> Result<Transition, DomainError> {
+    let attempt = job
+        .attempt(ack.attempt)
+        .ok_or(DomainError::UnknownAttempt {
+            attempt: ack.attempt,
+        })?;
+    if attempt.generation != ack.generation {
+        return Err(DomainError::StaleGeneration {
+            given: ack.generation,
+            current: attempt.generation,
+        });
+    }
+    let known = job
+        .checkpoint(ack.snapshot)
+        .filter(|c| c.attempt == ack.attempt)
+        .ok_or(DomainError::UnknownCheckpoint {
+            attempt: ack.attempt,
+            snapshot: ack.snapshot,
+        })?;
+    if known.cut != ack.cut {
+        return Err(DomainError::CutMismatch {
+            snapshot: ack.snapshot,
+            reported: known.cut,
+            verified: ack.cut,
+        });
+    }
+    if known.ack.is_some() {
+        return Ok(unchanged(job));
+    }
+    one(
+        job,
+        ManagedEvent::CheckpointAcknowledged { ack: ack.clone() },
+    )
+}
+
+/// The admission rule of `RestartFromAcknowledged`, pure (ADR 0028): given
+/// the job, the unavailable attempt, its task's outcome policy and what
+/// the authority found, either the `Recover` to submit or why not. A
+/// `cancel_and_restart` task restarts from the job's newest acknowledged
+/// checkpoint, a `checkpoint` task only from the attempt's own newest one,
+/// and a `block` task never.
+pub fn recovery_decision(
+    state: &ManagedState,
+    attempt: AttemptId,
+    outcome: OutcomePolicy,
+    blockers: &[OperationId],
+    placement: Result<ResourceRef, Vec<Exclusion>>,
+) -> Result<Command, RecoveryBlock> {
+    let from = match outcome {
+        OutcomePolicy::Block => {
+            return Err(RecoveryBlock::OutcomeBlocks {
+                kind: outcome.name().to_owned(),
+            });
+        }
+        OutcomePolicy::CancelAndRestart => state.acknowledged().first().map(|a| a.snapshot),
+        OutcomePolicy::Checkpoint => state
+            .acknowledged()
+            .iter()
+            .find(|a| a.attempt == attempt)
+            .map(|a| a.snapshot),
+    };
+    let from = from.ok_or(RecoveryBlock::NoAcknowledgedCheckpoint)?;
+    if !blockers.is_empty() {
+        return Err(RecoveryBlock::ReplacementBlocked {
+            blockers: blockers.to_vec(),
+        });
+    }
+    let resource = placement.map_err(|exclusions| RecoveryBlock::NoEligibleNode { exclusions })?;
+    Ok(Command::Recover {
+        attempt,
+        resource,
+        from,
+        reason: format!("automatic restart from acknowledged checkpoint {from}"),
     })
 }
 
@@ -337,7 +626,7 @@ pub fn mark_operation(
     // untouched grant; replay keeps the plain status rule, so stored
     // histories are read as before.
     if mark == OperationMark::Dispatched
-        && op.kind == CommandKind::StartAttempt
+        && op.kind.grants()
         && op.status == OperationStatus::Accepted
         && !job.grant_may_dispatch(operation)
     {
@@ -455,6 +744,7 @@ pub fn apply_batch(
                 tasks: Vec::new(),
                 attempts: Vec::new(),
                 operations: vec![op],
+                checkpoints: Vec::new(),
             });
             continue;
         }
@@ -526,7 +816,7 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
             if *generation != next_generation(s)? {
                 return Err(broken(format!("a grant at generation {generation}")));
             }
-            if s.operation(*operation).map(|o| o.kind) != Some(CommandKind::StartAttempt) {
+            if !s.operation(*operation).is_some_and(|o| o.kind.grants()) {
                 return Err(broken(format!("a grant by operation {operation}")));
             }
             s.attempts.push(Attempt {
@@ -538,6 +828,7 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 initial_checkpoint: *initial_checkpoint,
                 granted_by: *operation,
                 status: AttemptStatus::Granted,
+                unavailable_since_ms: None,
             });
             s.job.generation = *generation;
         }
@@ -553,13 +844,17 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 .ok_or_else(|| broken(format!("an observation of attempt {attempt}")))?;
             if found.generation != *generation
                 || !found.status.may_run()
-                || *status == AttemptStatus::Granted
+                || matches!(
+                    status,
+                    AttemptStatus::Granted | AttemptStatus::Superseded { .. }
+                )
             {
                 return Err(broken(format!(
                     "attempt {attempt} cannot become {status:?}"
                 )));
             }
             found.status = status.clone();
+            found.unavailable_since_ms = None;
         }
         ManagedEvent::TaskFinished { task, outcome } => {
             let primary = s.job.primary;
@@ -608,6 +903,124 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 )));
             }
             found.status = status.status();
+        }
+        ManagedEvent::CheckpointCaptured {
+            attempt,
+            generation,
+            snapshot,
+            cut,
+        } => {
+            let found = s
+                .attempt(*attempt)
+                .ok_or_else(|| broken(format!("a checkpoint of attempt {attempt}")))?;
+            if found.generation != *generation || !found.status.may_run() {
+                return Err(broken(format!("attempt {attempt} cannot capture")));
+            }
+            if s.checkpoint(*snapshot).is_some() {
+                return Err(broken(format!("checkpoint {snapshot} captured twice")));
+            }
+            s.checkpoints.push(Checkpoint {
+                attempt: *attempt,
+                generation: *generation,
+                snapshot: *snapshot,
+                cut: *cut,
+                ack: None,
+            });
+        }
+        ManagedEvent::CheckpointAcknowledged { ack } => {
+            let found = s
+                .checkpoints
+                .iter_mut()
+                .find(|c| c.snapshot == ack.snapshot && c.attempt == ack.attempt)
+                .ok_or_else(|| broken(format!("an acknowledgement of {}", ack.snapshot)))?;
+            if found.generation != ack.generation || found.cut != ack.cut || found.ack.is_some() {
+                return Err(broken(format!(
+                    "checkpoint {} cannot be acknowledged so",
+                    ack.snapshot
+                )));
+            }
+            found.ack = Some(ack.clone());
+        }
+        ManagedEvent::CoveredWriteRefused { verdict, .. } => {
+            if verdict.allows() {
+                return Err(broken("a refused covered write with a live verdict"));
+            }
+        }
+        ManagedEvent::AttemptUnavailable {
+            attempt,
+            generation,
+            since_ms,
+            ..
+        } => {
+            let found = s
+                .attempts
+                .iter_mut()
+                .find(|a| a.id == *attempt)
+                .ok_or_else(|| broken(format!("an unavailable attempt {attempt}")))?;
+            if found.generation != *generation
+                || !matches!(
+                    found.status,
+                    AttemptStatus::Granted | AttemptStatus::Running
+                )
+            {
+                return Err(broken(format!(
+                    "attempt {attempt} cannot become unavailable"
+                )));
+            }
+            found.status = AttemptStatus::Unknown;
+            found.unavailable_since_ms = Some(*since_ms);
+        }
+        ManagedEvent::AttemptReachable {
+            attempt,
+            generation,
+        } => {
+            let found = s
+                .attempts
+                .iter_mut()
+                .find(|a| a.id == *attempt)
+                .ok_or_else(|| broken(format!("a reachable attempt {attempt}")))?;
+            if found.generation != *generation
+                || found.status != AttemptStatus::Unknown
+                || found.unavailable_since_ms.is_none()
+            {
+                return Err(broken(format!("attempt {attempt} cannot become reachable")));
+            }
+            found.status = AttemptStatus::Running;
+            found.unavailable_since_ms = None;
+        }
+        ManagedEvent::GrantSuperseded {
+            attempt,
+            generation,
+            by,
+            ..
+        } => {
+            let current = s.job.generation;
+            let found = s
+                .attempts
+                .iter_mut()
+                .find(|a| a.id == *attempt)
+                .ok_or_else(|| broken(format!("a superseded attempt {attempt}")))?;
+            if found.generation != *generation
+                || found.generation != current
+                || found.status != AttemptStatus::Unknown
+                || by.is_some_and(|by| Some(by) != current.next())
+            {
+                return Err(broken(format!("attempt {attempt} cannot be superseded")));
+            }
+            found.status = AttemptStatus::Superseded { by: *by };
+            found.unavailable_since_ms = None;
+        }
+        ManagedEvent::RecoveryBlocked {
+            attempt,
+            generation,
+            ..
+        } => {
+            let found = s
+                .attempt(*attempt)
+                .ok_or_else(|| broken(format!("a blocked recovery of attempt {attempt}")))?;
+            if found.generation != *generation {
+                return Err(broken(format!("a blocked recovery of attempt {attempt}")));
+            }
         }
     }
     Ok(())

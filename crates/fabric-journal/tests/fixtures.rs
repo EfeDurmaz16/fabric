@@ -16,9 +16,9 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
     AttemptId, AttemptStatus, Command, Envelope, ExitOutcome, Intent, JobPolicy, JobState, NewIds,
-    Observation, OperationId, OperationKey, OperationMark, OperationStatus, ResourceRef,
-    RestartPolicy, SourceBinding, StoredResult, TaskId, TaskKind, TaskOutcome, TaskState,
-    WorkRevision,
+    Observation, OperationId, OperationKey, OperationMark, OperationStatus, RecoveryPolicy,
+    ResourceRef, RestartPolicy, SourceBinding, StoredResult, TaskId, TaskKind, TaskOutcome,
+    TaskState, WorkRevision,
 };
 use fabric_core::managed::{Generation, RequestDigest};
 use fabric_core::path::AbsPath;
@@ -68,6 +68,7 @@ fn create(goal: &str) -> Command {
         },
         policy: JobPolicy {
             restart: RestartPolicy::ExplicitOnly,
+            recovery: RecoveryPolicy::Block,
         },
     }
 }

@@ -110,6 +110,7 @@ pub(crate) fn attempt_status_name(status: &AttemptStatus) -> &'static str {
         AttemptStatus::Checkpointed { .. } => "checkpointed",
         AttemptStatus::Lost => "lost",
         AttemptStatus::Unknown => "unknown",
+        AttemptStatus::Superseded { .. } => "superseded",
     }
 }
 

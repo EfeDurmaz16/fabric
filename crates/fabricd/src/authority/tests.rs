@@ -11,7 +11,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
     Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, OperationMark,
-    OperationStatus, ResourceRef, RestartPolicy, SourceBinding, StoredResult,
+    OperationStatus, RecoveryPolicy, ResourceRef, RestartPolicy, SourceBinding, StoredResult,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::Answer;
@@ -44,6 +44,7 @@ fn create(key: &str) -> Envelope<Command> {
             },
             policy: JobPolicy {
                 restart: RestartPolicy::ExplicitOnly,
+                recovery: RecoveryPolicy::Block,
             },
         },
     }

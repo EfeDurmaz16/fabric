@@ -41,7 +41,7 @@
 //!     body: Command::CreateJob {
 //!         intent: Intent { goal: "fix the test".into(), harness: HarnessKind::Codex },
 //!         source: SourceBinding::Repository { path: AbsPath::parse("/src/repo")? },
-//!         policy: JobPolicy { restart: RestartPolicy::ExplicitOnly },
+//!         policy: JobPolicy { restart: RestartPolicy::ExplicitOnly, recovery: RecoveryPolicy::Block },
 //!     },
 //! };
 //! let made = accept_command(None, &create, &ids(2))?;
@@ -74,22 +74,27 @@
 //! # Ok(()) }
 //! ```
 
+mod fence;
 mod frame;
 mod ids;
 mod model;
 mod transition;
 
-pub use frame::{EventFrame, FrameError, MANAGED_FORMAT, StoredPart, request_digest};
+pub use fence::{CoveredPath, FenceVerdict, GrantToken, fence};
+pub use frame::{EventFrame, FrameError, MANAGED_FORMAT, READ_FORMATS, StoredPart, request_digest};
 pub use ids::{
     AttemptId, EventDigest, EventSeq, Generation, MAX_OPERATION_KEY, OperationId, OperationKey,
     OperationKeyError, ParseCounterError, RequestDigest, TaskId, WorkRevision,
 };
 pub use model::{
-    AcceptedOperation, Attempt, AttemptStatus, Command, CommandKind, Dedupe, DomainError, Envelope,
-    ExitOutcome, Intent, JobMode, JobPolicy, JobState, ManagedEvent, ManagedJob, ManagedState,
-    NewIds, Observation, Operation, OperationMark, OperationProgress, OperationStatus, ResourceRef,
-    RestartPolicy, SourceBinding, StoredResult, Task, TaskKind, TaskOutcome, TaskState, Transition,
+    AcceptedOperation, Attempt, AttemptStatus, Checkpoint, CheckpointAck, Command, CommandKind,
+    CutDigest, Dedupe, DomainError, Envelope, Exclusion, ExitOutcome, HEARTBEAT_INTERVAL_MS,
+    Intent, JobMode, JobPolicy, JobState, ManagedEvent, ManagedJob, ManagedState, NewIds,
+    Observation, Operation, OperationMark, OperationProgress, OperationStatus, OutcomePolicy,
+    RecoveryBlock, RecoveryPolicy, ResourceRef, RestartPolicy, SourceBinding, StoredResult, Task,
+    TaskKind, TaskOutcome, TaskState, Transition, UNAVAILABLE_AFTER_MS,
 };
 pub use transition::{
-    accept_command, apply_batch, apply_observation, dedupe, mark_operation, replay,
+    accept_command, acknowledge, admit_recovery, apply_batch, apply_observation, dedupe,
+    mark_operation, recovery_decision, replay,
 };
