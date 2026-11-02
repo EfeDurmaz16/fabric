@@ -903,6 +903,14 @@ fn observe_absent(observe: &Value) -> Value {
     answer
 }
 
+/// An `absent` answer whose `searched` is another project than the
+/// resource observed: a worker bound elsewhere, or one that misreports.
+fn observe_absent_elsewhere(observe: &Value) -> Value {
+    let mut answer = observe_absent(observe);
+    answer["error"]["searched"]["scope"]["project"] = json!("proj-2");
+    answer
+}
+
 /// The scope `observe_absent` says it searched, as the journal stores it.
 const SEARCHED: &str =
     r#"{"kind":"sandbox","provider":"fixture","scope":{"account":"acct-a","project":"proj-1"}}"#;
@@ -1006,6 +1014,50 @@ async fn a_not_found_destroy_is_unknown_until_an_observe_finds_its_resource_abse
     let job = common::scope().job;
     assert!(journal.replacement_blockers(job).unwrap().is_empty());
     assert_eq!(journal.residuals(job).unwrap(), vec![]);
+    assert_eq!(played.await.unwrap().len(), 3);
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// Absence settles the destroy only where the resource is: an observe of
+/// the `not_found` destroy answered `absent` for another scope than the
+/// destroy's target (a worker bound to another project, or one that
+/// misreports what it searched) is not evidence about that resource. The
+/// destroy stays `unknown`, nothing is stored as searched, the barrier
+/// and the residual stay, and the worker is not lost over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absent_observe_of_another_scope_does_not_settle_a_not_found_destroy() {
+    let (bridge, mut journal, played) = not_found_destroy(vec![observe_absent_elsewhere]).await;
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([2; 16]),
+            "sandbox.destroy",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut journal))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Unknown);
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(row.searched, None, "a search elsewhere is not about it");
+    assert_eq!(row.answer.reason.as_deref(), Some("not_found"));
+    let job = common::scope().job;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![fabric_journal::Blocker::StopNotConfirmed {
+            operation: OperationId::from_bytes([2; 16]),
+            status: ProviderStatus::Unknown,
+        }]
+    );
+    assert_eq!(journal.residuals(job).unwrap().len(), 1);
     assert_eq!(played.await.unwrap().len(), 3);
     assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
 }

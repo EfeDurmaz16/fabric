@@ -1697,7 +1697,12 @@ fn settle<L: OperationLog>(
     use ProviderStatus::{Attached, Cancelled, Dispatched, Failed, Observed, Rejected, Succeeded};
     let entry = log.entry(operation)?;
     let before = entry.as_ref().map_or(Dispatched, |e| e.status);
-    let destroy = entry.is_some_and(|e| e.effect == EffectClass::Destroy);
+    let destroy = entry
+        .as_ref()
+        .is_some_and(|e| e.effect == EffectClass::Destroy);
+    // The resource the operation acts on, as the journal holds it: the
+    // target of a destroy or an exec, else the locator a create was given.
+    let own = entry.and_then(|e| e.target.or(e.locator));
     if before.is_terminal() {
         return Ok(before);
     }
@@ -1719,13 +1724,21 @@ fn settle<L: OperationLog>(
         // An `absent` read: the worker found no resource in the scope it
         // searched. Of a destroy, that is the destroy done; of anything
         // else it settles nothing, and what was searched is kept for an
-        // operation still `unknown`.
+        // operation still `unknown`. An observe names a resource, and
+        // absence is evidence about it only when the worker searched
+        // where it is (its provider, scope and kind): a worker bound to
+        // another scope, or one that misreports, learns nothing for the
+        // journal, which owns identity and fencing and trusts the worker
+        // with neither.
         Said::Error {
             code: ErrorCode::Unknown,
             record,
             searched: Some(searched),
             ..
         } if kind != Kind::Request => {
+            if kind == Kind::Observe && !searched_own(&searched, own.as_ref()) {
+                return Ok(before);
+            }
             if kind == Kind::Observe && destroy {
                 log.absent(operation, &record, &searched)?;
                 return Ok(Succeeded);
@@ -1780,6 +1793,23 @@ fn settle<L: OperationLog>(
     };
     log.record(operation, status, &record, locator.as_ref())?;
     Ok(status)
+}
+
+/// Whether `searched`, the canonical scope an `absent` read searched, is
+/// where the resource `own` is: the same provider, scope and kind.
+fn searched_own(searched: &str, own: Option<&LocatorRecord>) -> bool {
+    let Some(own) = own else {
+        return false;
+    };
+    let (Ok(searched), Ok(resource)) = (
+        serde_json::from_str::<serde_json::Value>(searched),
+        serde_json::from_str::<serde_json::Value>(&own.text),
+    ) else {
+        return false;
+    };
+    ["provider", "scope", "kind"]
+        .iter()
+        .all(|field| searched[*field] == resource[*field])
 }
 
 /// The effect class of `action` in `profile`; an action outside it,
