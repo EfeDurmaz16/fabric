@@ -1,0 +1,17 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m6/crates/fabric)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.79s
+     Running tests/e2e/main.rs (<scratch>/target/debug/deps/e2e-3eac00a6b76b5bfe)
+
+running 5 tests
+test partition::old_runner_sigkill_then_restart ... ignored, needs the M5 executor on the runner node; see docs/evidence/m6-partition
+test partition::old_runner_sigstop_then_sigcont ... ignored, needs the M5 executor on the runner node; see docs/evidence/m6-partition
+test partition::relay_paused_runner_alive ... ignored, needs the M5 executor on the runner node; see docs/evidence/m6-partition
+test relay::the_relay_forwards_pauses_and_counts ... ok
+relay counters: RelayCounters { udp_forwarded: [64, 58], udp_dropped: [26, 19], tcp_forwarded: [0, 0], tcp_dropped: [0, 0] } (forwarded 122, dropped 45)
+test partition::two_daemons_talk_through_the_relay_and_lose_each_other_while_it_is_paused ... ok
+
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 75 filtered out; finished in 38.42s
+

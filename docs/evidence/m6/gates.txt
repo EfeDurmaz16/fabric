@@ -1,0 +1,22 @@
+Gates run once at the end of the proof step, 2026-11-02T22:20Z to 22:35Z UTC, on the working tree of the final commit of this directory, with CARGO_TARGET_DIR in a scratch directory and cargo -j 6. Load average 5 to 7 from other work. Each line: the command, its exit code, and its last line or count.
+
+cargo fmt --all --check                                                      exit 0
+cargo clippy --workspace --all-targets --locked -- -D warnings               exit 0
+cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features ""     exit 0
+cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features acp    exit 0
+cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features claude exit 0
+cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features codex  exit 0
+cargo test --workspace --locked -- --skip e2e_                               exit 0  (1252 passed, 0 failed across the workspace's test binaries)
+cargo test -p fabric --test e2e --locked                                     exit 0  (72 passed, 0 failed, 8 ignored, 91.80 s)
+cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture   exit 0  (1 passed, 56.10 s, count mode)
+cargo doc --workspace --no-deps --locked                                     exit 0
+cargo deny check                                                             exit 0  (advisories ok, bans ok, licenses ok, sources ok)
+scripts/check-hygiene.sh 5e38dfa                                             exit 0  (tracked files and the commit messages since the M4 head)
+scripts/test-check-hygiene.sh                                                exit 0
+scripts/check-budget.sh 5e38dfa                                              exit 0
+scripts/test-check-budget.sh                                                 exit 0
+scripts/check-fixtures.sh 5e38dfa                                            exit 0
+scripts/test-check-fixtures.sh                                               exit 0
+sdk/typescript: bun install --frozen-lockfile; bun run typecheck; bun run build; FABRIC_BIN=<target>/debug/fabric bun test   exit 0, 0, 0, 0  (62 pass, 0 fail)
+
+Not run here: GitHub CI (never waited for) and the Capsule worker interop jobs, which need the Capsule worktree this step does not touch.
