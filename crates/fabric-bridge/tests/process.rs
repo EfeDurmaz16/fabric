@@ -1696,8 +1696,8 @@ async fn a_refused_request_records_no_late_locator() {
     bridge.record_late(&mut journal).await.unwrap();
     assert_eq!(status(&journal, 120), Some(ProviderStatus::Unknown));
     assert_eq!(
-        locator(&journal, 120).map(|record| record.text),
-        Some(fx("key-120").to_value().to_string())
+        locator(&journal, 120),
+        Some(fabric_bridge::wire::locator_record(&fx("key-120")))
     );
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
@@ -1787,8 +1787,8 @@ async fn a_request_refused_when_it_registers_has_recorded_the_late_locator() {
     );
     assert_eq!(status(&journal, 130), Some(ProviderStatus::Unknown));
     assert_eq!(
-        locator(&journal, 130).map(|record| record.text),
-        Some(fx("key-130").to_value().to_string()),
+        locator(&journal, 130),
+        Some(fabric_bridge::wire::locator_record(&fx("key-130"))),
         "the late locator was not recorded before the request waited on the log"
     );
     assert_eq!(bridge.late_answers(), 1);
