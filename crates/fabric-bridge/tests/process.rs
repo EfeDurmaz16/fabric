@@ -1257,3 +1257,50 @@ async fn a_shutdown_refused_for_a_lost_worker_leaves_later_requests_lost() {
     assert!(bridge.lost().is_some());
     assert_eq!(bridge.close().await.unwrap().code(), Some(3));
 }
+
+/// A request refused before anything is done for it records nothing, not
+/// even the locator a late answer named: that waits for `record_late` or
+/// the next request, observe or step that is admitted.
+#[tokio::test]
+async fn a_refused_request_records_no_late_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let mut late = create(120, "double/late");
+    late.deadline_ms = 1;
+    let outcome = bridge
+        .request(&mut journal, late)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(outcome.answer, Answer::TimedOut);
+    let started = Instant::now();
+    while bridge.late_answers() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(locator(&journal, 120), None);
+    bridge.shutdown(1000).await.unwrap().wait().await.unwrap();
+    let refused = bridge
+        .request(&mut journal, create(121, "fixture/ok"))
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::ShuttingDown)),
+        "{refused:?}"
+    );
+    assert_eq!(bridge.late_answers(), 1);
+    assert_eq!(
+        locator(&journal, 120),
+        None,
+        "a refused request recorded the late locator"
+    );
+    bridge.record_late(&mut journal).await.unwrap();
+    assert_eq!(status(&journal, 120), Some(ProviderStatus::Unknown));
+    assert_eq!(
+        locator(&journal, 120),
+        Some(fx("key-120").to_value().to_string())
+    );
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}

@@ -633,7 +633,9 @@ impl Bridge {
 
     /// Answers that came after Fabric stopped waiting for them. Their
     /// status is not recorded; the locator a late answer to a request
-    /// names is, by `record_late` or the next call that is handed the log.
+    /// names is, by `record_late` or the next admitted call that is handed
+    /// the log. A request or an observe refused before anything is done
+    /// for it (shutting down, gone, busy) records none of them.
     #[must_use]
     pub fn late_answers(&self) -> u64 {
         self.shared.lock().late
@@ -641,8 +643,10 @@ impl Bridge {
 
     /// Records in `log` the locators that answers to requests Fabric
     /// stopped waiting on named since the last call; the status each
-    /// operation holds stays. `request`, `observe` and `InFlight::next` do
-    /// this first, so a caller only needs it while it makes none of those.
+    /// operation holds stays. `InFlight::next` does this first, and so do
+    /// `request` and `observe` once they are admitted; one refused as
+    /// shutting down, lost or busy records nothing, these included. A
+    /// caller needs it while it makes none of those, or after a refusal.
     pub async fn record_late<L: Recorder>(&self, log: &mut L) -> Result<(), BridgeError> {
         Ok(record_found(&self.shared, log).await?)
     }
