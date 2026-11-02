@@ -38,4 +38,4 @@ unsupported_capability: 6 wire steps, 4 checked elsewhere, 0 after advance
 worker_loss_is_not_cancellation: 6 wire steps, 4 checked elsewhere, 0 after advance
 test every_shared_scenario_over_the_workers_stdio ... ok
 test a_docker_create_lost_with_its_worker_is_attached_and_never_made_twice ... ok
-/private/tmp/claude-501/-Users-efebarandurmaz/30688fe4-db80-4e61-9285-b847fc7ab612/scratchpad/repro-full.sh: line 13: 50443 Terminated: 15          env -i HOME=$HOME PATH="$P:/usr/bin:/bin" CAPSULE_BRIDGE_WORKER=$W/worker CAPSULE_BRIDGE_DOCKER_IMAGE=debian:bookworm-slim /tmp/fabric-wt/m4/target/debug/deps/capsule_worker-622f0fab75be1039 --ignored --nocapture
+<scratch>/repro-full.sh: line 13: 50443 Terminated: 15          env -i HOME=$HOME PATH="$P:/usr/bin:/bin" CAPSULE_BRIDGE_WORKER=$W/worker CAPSULE_BRIDGE_DOCKER_IMAGE=debian:bookworm-slim /tmp/fabric-wt/m4/target/debug/deps/capsule_worker-622f0fab75be1039 --ignored --nocapture
