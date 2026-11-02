@@ -33,6 +33,8 @@ An executor sends a heartbeat for every live attempt it runs, every 2 s, over th
 
 What the heartbeat absence enables is one new command, `Recover`, which in one transaction supersedes the old grant (`GrantSuperseded`, status `superseded`, which does not `may_run`) and grants the next attempt at the next generation from an acknowledged checkpoint. The old attempt may be alive while this happens. That is safe because of the previous section: every covered write it makes from then on names a generation that is not the job's live grant and is refused, and its executor stops the attempt's process group when it reads a `superseded` verdict. A `Recover` is refused by the M4 replacement barrier like a `StartAttempt`, so a provider effect of the old attempt that may still act blocks it.
 
+`Recover`, and `Supersede` alone, take only an attempt that is `unknown`: a reachable attempt is handed over by the M5 planned handoff and never recovered (`AttemptReachable`). The heartbeat's answer carries the fence verdict of every token it named, so a reachable runner learns within one interval that an attempt of its was superseded and stops it.
+
 The two mechanisms are separate on purpose. Fencing is what keeps the job correct; the heartbeat only decides when the authority is allowed to act.
 
 ### Recovery policy per job, default block
@@ -64,8 +66,8 @@ The acceptance of M6 is a real partition and an old-runner wake. The proof runs 
 - An operator can tell, from the journal alone, which checkpoints the authority holds and which only the runner held.
 - A covered write from a runner that lost its grant is refused and recorded, whether the runner knows it lost it or not. The workspace's own files are not covered, and the specification says so.
 - A silent runner leaves its job `unknown` with a recorded reason, and under `block` nothing moves until someone decides. Under `restart_from_acknowledged` the authority moves the work itself, only within the conditions above, and records why it did or did not.
-- One more command (`Recover`, and `Supersede` as its half), one more policy field, two heartbeat messages and one report message on the facade protocol (unshipped, M5), a version 2 amendment with its fixture, and a test relay. No new dependency.
-- The executor stops an attempt's process group when a covered write of it is refused as `superseded`. A runner that never writes again is never told; its attempt stays `superseded` in the journal and its process keeps running until the node's own recovery on restart reads the verdict.
+- One more command (`Recover`, and `Supersede` as its half), one more policy field, two heartbeat messages on the node link and one more report (`Captured`), two facade commands on the unshipped M5 facade protocol, a version 2 amendment with its fixture, and a test relay. No new dependency.
+- The executor stops an attempt's process group when a covered write or a heartbeat of it is answered `superseded` or `stale`. A runner that is partitioned is never told; its attempt stays `superseded` in the journal and its process keeps running until the partition ends (its next heartbeat or covered write) or the node's own recovery on restart reads the verdict.
 
 ## Open questions
 
