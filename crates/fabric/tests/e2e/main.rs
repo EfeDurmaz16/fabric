@@ -23,7 +23,9 @@ mod client;
 mod headless;
 mod legacy;
 mod managed;
+mod partition;
 mod preflight;
+mod relay;
 mod terminal;
 mod world;
 

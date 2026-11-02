@@ -68,6 +68,16 @@ doc = false
 bench = false
 required-features = ["fixtures"]
 
+# The userspace relay of the M6 partition proof (ADR 0028): forwards UDP
+# and TCP between two loopback ports and drops everything while paused.
+[[bin]]
+name = "fabric-relay"
+path = "fixtures/relay.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fixtures"]
+
 [lib]
 path = "src/lib.rs"
 
