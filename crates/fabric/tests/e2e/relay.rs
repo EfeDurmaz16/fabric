@@ -270,7 +270,8 @@ fn the_relay_forwards_pauses_and_counts() -> Fallible {
         "forwarded again",
     )?;
     assert_eq!(c.udp_dropped, [1, 0]);
-    assert!(c.tcp_held[0] > 0 && c.tcp_held[1] == 0, "{c:?}");
+    // Both pipes polled while paused, whichever side had bytes waiting.
+    assert!(c.tcp_held.iter().all(|held| *held > 0), "{c:?}");
     relay.stop();
     Ok(())
 }
