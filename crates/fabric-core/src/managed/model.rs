@@ -66,7 +66,9 @@ pub enum RecoveryPolicy {
     /// Record it and wait for an operator's `Recover` or `Supersede`. The default.
     #[default]
     Block,
-    /// Issue `Recover` itself once the attempt is unavailable, when every
+    /// Issue `Recover` itself once the attempt has been `unknown` for
+    /// `UNAVAILABLE_AFTER_MS` (a silence of `UNAVAILABLE_AFTER_MS` made it
+    /// `unknown`, then as long again without a heartbeat), when every
     /// admission condition of `recovery_decision` holds.
     RestartFromAcknowledged,
 }
@@ -163,11 +165,24 @@ impl OutcomePolicy {
         }
     }
 
-    /// The outcome policy of a job's primary task: a harness task, so
-    /// `Checkpoint`, until the M5 task kinds land.
+    /// The outcome policy of a task, by its kind, until the M5 task kinds
+    /// land at the restack: the primary task is a harness task, so
+    /// `Checkpoint`; a child task declares no kind on this base, and a
+    /// task whose kind the authority does not know is never restarted by
+    /// the authority, so `Block`. The recovery decision judges the
+    /// unavailable attempt by its own task, never by the job's primary.
     #[must_use]
-    pub fn of_primary(_intent: &Intent) -> OutcomePolicy {
-        OutcomePolicy::Checkpoint
+    pub fn of_kind(kind: &TaskKind) -> OutcomePolicy {
+        match kind {
+            TaskKind::Primary => OutcomePolicy::Checkpoint,
+            TaskKind::Child { .. } => OutcomePolicy::Block,
+        }
+    }
+
+    /// `of_kind` for a task.
+    #[must_use]
+    pub fn of_task(task: &Task) -> OutcomePolicy {
+        OutcomePolicy::of_kind(&task.kind)
     }
 }
 
@@ -1111,7 +1126,9 @@ pub enum DomainError {
         /// What the authority verified.
         verified: CutDigest,
     },
-    /// A `Recover` names a snapshot no `CheckpointAcknowledged` covers.
+    /// A `Recover`, or a `StartAttempt` after the job's first attempt,
+    /// names a snapshot no `CheckpointAcknowledged` covers: a captured
+    /// checkpoint, or one the job never saw, is a restart point for nothing.
     #[error("checkpoint {snapshot} is not acknowledged by the authority")]
     NotAcknowledged {
         /// The snapshot.

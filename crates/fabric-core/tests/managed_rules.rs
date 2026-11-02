@@ -1265,3 +1265,156 @@ fn recovery_decision_falls_back_to_block_with_the_failed_condition() {
     ));
     kept.replays();
 }
+
+/// After a `Supersede`, a `StartAttempt` is admitted by the M2 rules, but
+/// it resumes only from a checkpoint the authority acknowledged: a
+/// captured-only snapshot, or one the job never saw, is refused the way
+/// `Recover` refuses it. The job's first attempt may start from any
+/// snapshot the operator names.
+#[test]
+fn a_start_after_the_first_attempt_resumes_only_from_an_acknowledged_checkpoint() {
+    let mut first = made();
+    let primary = first.state().job.primary;
+    first
+        .submit(
+            "start-any",
+            Command::StartAttempt {
+                task: primary,
+                resource: ResourceRef::Node { node: NODE },
+                initial_checkpoint: Some(snapshot(9)),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        first.state().attempts[0].initial_checkpoint,
+        Some(snapshot(9))
+    );
+
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    let a = gone_silent(&mut kept);
+    kept.submit(
+        "supersede",
+        Command::Supersede {
+            attempt: a.id,
+            reason: "operator".into(),
+        },
+    )
+    .unwrap();
+    assert!(kept.state().live_attempt().is_none());
+    let primary = kept.state().job.primary;
+    let start_from = |from: SnapshotId| Command::StartAttempt {
+        task: primary,
+        resource: ResourceRef::Node { node: NODE },
+        initial_checkpoint: Some(from),
+    };
+    // Captured on the runner, never verified by the authority: refused.
+    assert!(matches!(
+        kept.submit("start-captured", start_from(snapshot(1))),
+        Err(DomainError::NotAcknowledged { snapshot }) if snapshot == snapshot_of(1)
+    ));
+    // A snapshot the job never saw: refused the same way.
+    assert!(matches!(
+        kept.submit("start-unknown", start_from(snapshot(8))),
+        Err(DomainError::NotAcknowledged { snapshot }) if snapshot == snapshot_of(8)
+    ));
+    assert_eq!(kept.state().attempts.len(), 1, "nothing was granted");
+    // Acknowledged: the start is admitted from it.
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    kept.submit("start-acknowledged", start_from(snapshot(1)))
+        .unwrap();
+    let next = &kept.state().attempts[1];
+    assert_eq!(next.initial_checkpoint, Some(snapshot(1)));
+    assert_eq!(next.generation.get(), 2);
+    kept.replays();
+}
+
+fn snapshot_of(n: u8) -> SnapshotId {
+    snapshot(n)
+}
+
+/// The recovery decision judges an attempt by its own task's kind, never
+/// by the job's primary: on this base a child task declares no kind, so
+/// its outcome policy is `block` and the authority never restarts it by
+/// itself, while the primary is a harness task.
+#[test]
+fn an_attempt_is_judged_by_its_own_task_not_the_primary() {
+    assert_eq!(
+        OutcomePolicy::of_kind(&TaskKind::Primary),
+        OutcomePolicy::Checkpoint
+    );
+    assert_eq!(
+        OutcomePolicy::of_kind(&TaskKind::Child {
+            label: "build".into()
+        }),
+        OutcomePolicy::Block
+    );
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    let primary_attempt = kept.state().attempts[0].clone();
+    kept.observe(&Observation::Exited {
+        attempt: primary_attempt.id,
+        generation: primary_attempt.generation,
+        outcome: ExitOutcome::Succeeded,
+    })
+    .unwrap();
+    let primary = kept.state().job.primary;
+    kept.submit(
+        "register-child",
+        Command::RegisterTask {
+            parent: primary,
+            kind: TaskKind::Child {
+                label: "build".into(),
+            },
+            restart: RestartPolicy::ExplicitOnly,
+        },
+    )
+    .unwrap();
+    let child = kept.state().tasks[1].clone();
+    kept.submit("start-child", start(child.id)).unwrap();
+    let b = kept.state().live_attempt().unwrap().clone();
+    kept.mark(b.granted_by, OperationMark::Dispatched).unwrap();
+    kept.observe(&Observation::Started {
+        attempt: b.id,
+        generation: b.generation,
+    })
+    .unwrap();
+    let b = gone_silent(&mut kept);
+    assert_eq!(b.task, child.id);
+    let primary_task = kept.state().task(primary).unwrap().clone();
+    let child_task = kept.state().task(child.id).unwrap().clone();
+    assert_eq!(
+        OutcomePolicy::of_task(&primary_task),
+        OutcomePolicy::Checkpoint
+    );
+    assert_eq!(OutcomePolicy::of_task(&child_task), OutcomePolicy::Block);
+    // Judged by its own task, the child's attempt is blocked although the
+    // job holds an acknowledged checkpoint the primary's policy would use.
+    let here = Ok(ResourceRef::Node { node: OTHER_NODE });
+    assert_eq!(
+        recovery_decision(
+            kept.state(),
+            b.id,
+            OutcomePolicy::of_task(&child_task),
+            &[],
+            here.clone()
+        ),
+        Err(RecoveryBlock::OutcomeBlocks {
+            kind: "block".into()
+        })
+    );
+    // The same attempt under a cancel-and-restart kind would take the
+    // job's acknowledged checkpoint: the kind decides, not the job.
+    assert!(matches!(
+        recovery_decision(
+            kept.state(),
+            b.id,
+            OutcomePolicy::CancelAndRestart,
+            &[],
+            here
+        ),
+        Ok(Command::Recover { from, .. }) if from == snapshot(1)
+    ));
+    kept.replays();
+}

@@ -68,7 +68,7 @@ pub fn accept_command(
         if envelope.job.is_some() || envelope.expected.is_some() || job.is_some() {
             return Err(DomainError::BadEnvelope);
         }
-        admit_recovery(policy.recovery, OutcomePolicy::of_primary(intent))?;
+        admit_recovery(policy.recovery, OutcomePolicy::of_kind(&TaskKind::Primary))?;
         return Ok(Transition {
             revision: WorkRevision::FIRST,
             events: vec![
@@ -197,6 +197,19 @@ fn command_events(
             open_task(state, *task)?;
             if let Some(live) = state.live_attempt() {
                 return Err(DomainError::AttemptStillLive { attempt: live.id });
+            }
+            // The first attempt may start from any snapshot the operator
+            // names (M2). Once the job has had an attempt, a start resumes
+            // only from a checkpoint the authority acknowledged: a captured
+            // one, or one the job never saw, restarts nothing (ADR 0028),
+            // the same gate `Recover` runs.
+            if let Some(snapshot) = initial_checkpoint
+                && !state.attempts.is_empty()
+                && !state.acknowledged().iter().any(|a| a.snapshot == *snapshot)
+            {
+                return Err(DomainError::NotAcknowledged {
+                    snapshot: *snapshot,
+                });
             }
             ManagedEvent::AttemptGranted {
                 attempt: ids.attempt,
