@@ -9,14 +9,21 @@
 //! accepted message types is exactly the catalogue, so a command cannot
 //! lose its fixture without this test saying so.
 //!
-//! The parser checks against each case come with the M5 facade code; this
-//! file is the pin written with the contract.
+//! The parser checks run against each case too: a message a client sends
+//! is read as the authority reads it (`ClientMessage::from_json`), so a
+//! case the authority refuses before it asks its journal is refused here
+//! with the same code and reason, and an accepted one writes back to the
+//! same JSON; an answer is read as a client reads it
+//! (`FacadeAnswer::from_json`). The cases the authority refuses after the
+//! parse, by token, scope, key or domain, are the node's tests
+//! (`fabricd::facade::tests`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use fabric_client::facade::{ClientMessage, FacadeAnswer, RefusalCode};
 use serde_json::Value;
 
 mod support;
@@ -310,5 +317,92 @@ fn the_named_failure_modes_have_their_cases() -> Fallible<()> {
     ] {
         assert!(names.contains(required), "missing case {required}");
     }
+    Ok(())
+}
+
+/// Which refusals the parse alone decides: the schema and the version.
+/// Every other code needs the authority's journal.
+fn parse_decides(code: &str) -> bool {
+    matches!(code, "bad_request" | "unsupported_version")
+}
+
+#[test]
+fn every_client_message_reads_as_the_authority_reads_it() -> Fallible<()> {
+    let mut checked = 0;
+    for (name, case) in cases()? {
+        if case["direction"] != "client_to_authority" {
+            continue;
+        }
+        let expect = &case["expect"];
+        let parsed = ClientMessage::from_json(&case["message"]);
+        match expect["outcome"].as_str() {
+            Some("accept") => {
+                let message = parsed.map_err(|e| format!("{name}: refused as {e}"))?;
+                assert_eq!(message.to_json(), case["message"], "{name}: writes back");
+                assert_eq!(message.kind(), case["message"]["type"], "{name}: type");
+            }
+            Some("reject") => {
+                let code = expect["code"].as_str().ok_or("code")?;
+                let reason = expect["reason"].as_str().ok_or("reason")?;
+                if parse_decides(code) {
+                    let refusal = parsed.err().ok_or_else(|| format!("{name}: accepted"))?;
+                    assert_eq!(
+                        refusal.code.name(),
+                        code,
+                        "{name}: code ({})",
+                        refusal.message
+                    );
+                    assert_eq!(
+                        refusal.reason, reason,
+                        "{name}: reason ({})",
+                        refusal.message
+                    );
+                    assert_eq!(refusal.to_json()["code"], code, "{name}: refused answer");
+                } else {
+                    assert!(
+                        parsed.is_ok(),
+                        "{name}: the parse refused what the authority decides: {parsed:?}"
+                    );
+                }
+            }
+            other => panic!("{name}: outcome {other:?}"),
+        }
+        checked += 1;
+    }
+    assert!(checked >= 30, "client cases checked: {checked}");
+    Ok(())
+}
+
+#[test]
+fn every_answer_reads_as_a_client_reads_it() -> Fallible<()> {
+    let mut checked = 0;
+    for (name, case) in cases()? {
+        if case["direction"] != "authority_to_client" {
+            continue;
+        }
+        let expect = &case["expect"];
+        let parsed = FacadeAnswer::from_json(&case["message"]);
+        match expect["outcome"].as_str() {
+            Some("accept") => {
+                let answer = parsed.map_err(|e| format!("{name}: refused as {e}"))?;
+                assert_eq!(answer.to_json(), case["message"], "{name}: writes back");
+                if let FacadeAnswer::Refused(refusal) = &answer {
+                    assert!(
+                        RefusalCode::ALL.contains(&refusal.code),
+                        "{name}: code {}",
+                        refusal.code
+                    );
+                }
+            }
+            Some("reject") => {
+                let violation = parsed.err().ok_or_else(|| format!("{name}: accepted"))?;
+                assert_eq!(expect["code"], "protocol_violation", "{name}");
+                assert_eq!(violation.reason, expect["reason"], "{name}: {violation}");
+            }
+            other => panic!("{name}: outcome {other:?}"),
+        }
+        checked += 1;
+    }
+    assert!(checked >= 10, "answer cases checked: {checked}");
     Ok(())
 }

@@ -1,0 +1,12 @@
+{
+  "op": "managed_note",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "expected_revision": "3",
+  "note": {
+    "decision": {
+      "what": "Use the fake agent",
+      "reason": "the real one needs a login"
+    }
+  }
+}

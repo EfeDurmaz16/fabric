@@ -1,0 +1,11 @@
+{
+  "op": "managed_submit",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "goal": "Start from nothing",
+  "harness": {
+    "kind": "codex"
+  },
+  "source": {
+    "kind": "empty"
+  }
+}
