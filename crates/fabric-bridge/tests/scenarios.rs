@@ -14,9 +14,15 @@
 //! answer to it is only parsed. A `send` whose scope is not the journal's
 //! current live attempt (the scope check of `scope_retained` names a job
 //! the journal does not hold) is fenced before any effect, where the
-//! worker refuses it before any effect too. Each `journal` step is checked against the
-//! journal. Worker-side steps (`provider_calls`, `sandbox`, `advance`,
-//! `worker_exit`) belong to the Capsule run of the same fixtures.
+//! worker refuses it before any effect too. An `attach` is made through
+//! `Bridge::attach`, which sends the operation's identity as the journal
+//! holds it; an attach of an operation the journal does not hold is never
+//! written, and where the worker refuses it as `unsupported` Fabric's own
+//! profile check must refuse it the same way. The scenario's
+//! `journal_state` seeds the journal's provider operations before the
+//! run, as a journal an earlier run left. Each `journal` step is checked
+//! against the journal. Worker-side steps (`provider_calls`, `sandbox`,
+//! `advance`, `worker_exit`) belong to the Capsule run of the same fixtures.
 
 #![allow(
     clippy::unwrap_used,
@@ -38,14 +44,17 @@ use fabric_bridge::{
     Answer, Bridge, BridgeError, Config, Control, Effect, Event, InFlight, LogError, Pending,
 };
 use fabric_core::id::JobId;
-use fabric_core::managed::{AttemptId, AttemptStatus, OperationId};
+use fabric_core::managed::{AttemptId, AttemptStatus, OperationId, OperationKey, RequestDigest};
+use fabric_journal::{
+    EffectClass, Journal, ProviderAnswer, ProviderDispatch, ProviderStatus, Purpose,
+};
 use serde_json::Value;
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 use tokio::task::JoinHandle;
 
 mod common;
 
-use common::{Logged, journal};
+use common::{Logged, journal_for, scope};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/bridge/v1")
@@ -71,6 +80,9 @@ enum Local {
     Fenced,
     Cancel(CancelState),
     NotObservable,
+    /// An attach of an operation the journal does not hold, and what
+    /// Fabric's profile check says of its action and wait.
+    NotAttachable(Result<(), (&'static str, &'static str)>),
 }
 
 type Worker = (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>);
@@ -143,6 +155,39 @@ impl Run {
         )));
     }
 
+    /// An `attach`, made through `Bridge::attach` by the operation's id.
+    async fn attach(
+        &mut self,
+        message: &Value,
+        attach: &fabric_bridge::wire::Attach,
+        fixture_id: Option<String>,
+    ) {
+        let bridge = self.bridge.as_ref().unwrap();
+        match bridge
+            .attach(&mut self.journal, attach.operation_id, attach.wait_ms)
+            .await
+        {
+            Ok(flight) => {
+                let actual = flight.request_id().to_owned();
+                self.flights.insert(fixture_id.clone().unwrap(), flight);
+                self.written(message, fixture_id.as_deref(), Some(&actual))
+                    .await;
+            }
+            Err(BridgeError::RefusedLocally(r)) => {
+                self.local
+                    .insert(fixture_id.unwrap(), Local::Refused(r.code, r.reason));
+            }
+            Err(BridgeError::NotAttachable { .. }) => {
+                let own =
+                    fabric_bridge::wire::attachable(&attach.action, attach.wait_ms, &self.profile)
+                        .map_err(|r| (r.code, r.reason));
+                self.local
+                    .insert(fixture_id.unwrap(), Local::NotAttachable(own));
+            }
+            Err(e) => panic!("{}: attach refused: {e}", self.name),
+        }
+    }
+
     async fn send(&mut self, message: &Value) {
         let fixture_id = message["request_id"].as_str().map(str::to_owned);
         match ToWorker::from_value(message).unwrap() {
@@ -208,6 +253,7 @@ impl Run {
                     Err(e) => panic!("{}: observe refused: {e}", self.name),
                 }
             }
+            ToWorker::Attach(attach) => self.attach(message, &attach, fixture_id).await,
             ToWorker::Cancel(cancel) => {
                 let target = self
                     .ids
@@ -259,9 +305,24 @@ impl Run {
                 self.name,
                 e.error.code
             ),
-            // Fabric never sends an operation twice and never observes
-            // one its journal does not hold; the worker's answer is only parsed.
-            (Local::Used | Local::NotObservable, _) => {}
+            // An attach the worker refuses as unsupported, Fabric's
+            // profile check refuses the same way, whatever its journal holds.
+            (Local::NotAttachable(Err((code, reason))), ToFabric::Error(e)) => assert_eq!(
+                (*code, *reason),
+                (e.error.code.name(), e.error.reason.as_str()),
+                "{}: Fabric's attach check is not the worker's",
+                self.name
+            ),
+            (Local::NotAttachable(Ok(())), ToFabric::Error(e)) => assert_ne!(
+                e.error.code.name(),
+                "unsupported",
+                "{}: the worker refuses an attach Fabric's profile allows",
+                self.name
+            ),
+            // Fabric never sends an operation twice and never observes or
+            // attaches one its journal does not hold; the worker's answer
+            // is only parsed.
+            (Local::Used | Local::NotObservable | Local::NotAttachable(Ok(())), _) => {}
             (local, other) => panic!("{}: {local:?} against {other:?}", self.name),
         }
     }
@@ -394,12 +455,81 @@ impl Run {
     }
 }
 
+/// Seeds `journal` with the provider operations of the scenario's
+/// `journal_state`, each committed `dispatched` and then moved to its
+/// status along the reconciliation state machine.
+fn seed(journal: &mut Journal, scenario: &Value, profile: &Profile) {
+    let Some(rows) = scenario["journal_state"]["provider_operations"].as_array() else {
+        return;
+    };
+    for row in rows {
+        let operation: OperationId = row["operation_id"].as_str().unwrap().parse().unwrap();
+        let hex = row["digest"].as_str().unwrap();
+        let mut digest = [0u8; 32];
+        for (i, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        let scope = &row["scope"];
+        let action = row["action"].as_str().unwrap().to_owned();
+        let effect = match profile.action(&action).map(|spec| spec.effect) {
+            Some(fabric_bridge::wire::Effect::Create) => EffectClass::Create,
+            Some(fabric_bridge::wire::Effect::Destroy) => EffectClass::Destroy,
+            _ => EffectClass::Mutate,
+        };
+        let record = |value: &Value| {
+            (!value.is_null())
+                .then(|| fabric_bridge::wire::locator_record(&Locator::from_value(value).unwrap()))
+        };
+        let dispatch = ProviderDispatch {
+            operation,
+            key: OperationKey::parse(row["key"].as_str().unwrap()).unwrap(),
+            digest: RequestDigest::from_bytes(digest),
+            job: scope["job"].as_str().unwrap().parse().unwrap(),
+            task: scope["task"].as_str().unwrap().parse().unwrap(),
+            attempt: scope["attempt"].as_str().unwrap().parse().unwrap(),
+            generation: scope["generation"].as_str().unwrap().parse().unwrap(),
+            profile: profile.profile.clone(),
+            action,
+            effect,
+            purpose: Purpose::Effect,
+            target: record(&row["target"]),
+        };
+        journal.provider_begin(&dispatch, None, 1).unwrap();
+        let status = row["status"].as_str().unwrap();
+        let locator = record(&row["locator"]);
+        let path: &[ProviderStatus] = match status {
+            "dispatched" => &[],
+            "unknown" => &[ProviderStatus::Unknown],
+            "attached" => &[ProviderStatus::Unknown, ProviderStatus::Attached],
+            "observed" => &[ProviderStatus::Unknown, ProviderStatus::Observed],
+            "succeeded" => &[ProviderStatus::Succeeded],
+            "failed" => &[ProviderStatus::Failed],
+            "cancelled" => &[ProviderStatus::Cancelled],
+            other => panic!("journal_state status {other}"),
+        };
+        for step in path {
+            journal
+                .provider_record(
+                    operation,
+                    *step,
+                    &ProviderAnswer::default(),
+                    locator.as_ref(),
+                    2,
+                )
+                .unwrap();
+        }
+    }
+}
+
 async fn run(name: String, scenario: Value) {
     let dir = tempfile::tempdir().unwrap();
+    let profile = fixture_profile();
+    let mut seeded = journal_for(dir.path(), scope());
+    seed(&mut seeded, &scenario, &profile);
     let mut run = Run {
         name,
-        profile: fixture_profile(),
-        journal: journal(dir.path()),
+        profile,
+        journal: Logged::new(seeded),
         bridge: None,
         worker: None,
         connecting: None,
@@ -449,7 +579,7 @@ async fn fabric_runs_every_scenario_against_a_scripted_worker() {
         names.push(name);
     }
     names.sort();
-    assert_eq!(names.len(), 18, "{names:?}");
+    assert_eq!(names.len(), 25, "{names:?}");
 }
 
 /// The scenarios name their action through the profile; a sanity check

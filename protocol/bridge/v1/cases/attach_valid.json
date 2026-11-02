@@ -1,0 +1,22 @@
+{
+  "case": "attach_valid",
+  "direction": "fabric_to_worker",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "attach",
+    "request_id": "r-20",
+    "operation_id": "01K8W3A0000000000000000P30",
+    "key": "key-attach-1",
+    "scope": {
+      "job": "01K8W3A00000000000000000J1",
+      "task": "01K8W3A00000000000000000T1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "action": "sandbox.create",
+    "wait_ms": 5000
+  }
+}

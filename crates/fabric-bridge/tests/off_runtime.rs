@@ -17,13 +17,16 @@ use std::task::{Context, Wake, Waker};
 use std::time::Duration;
 
 use common::{create, double, journal_for, operation, scope};
+use fabric_bridge::wire::Scope;
 use fabric_bridge::wire::{Action, ExecParams, Locator};
 use fabric_bridge::{
     Answer, Bridge, BridgeError, Config, Effect, Entry, LogError, LogThread, MemoryLog,
     OperationLog,
 };
 use fabric_core::managed::OperationId;
-use fabric_journal::{Journal, ProviderAnswer, ProviderDispatch, ProviderStatus};
+use fabric_journal::{
+    CleanupRefusal, Journal, LocatorRecord, ProviderAnswer, ProviderDispatch, ProviderStatus,
+};
 
 /// What a [`Watched`] log saw: each call's kind and the thread it ran on.
 type Seen = Arc<Mutex<Vec<(&'static str, String)>>>;
@@ -56,13 +59,33 @@ impl OperationLog for Watched {
         operation: OperationId,
         status: ProviderStatus,
         answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
     ) -> Result<(), LogError> {
         self.note("record");
         self.journal.record(operation, status, answer, locator)
     }
 
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.note("searched");
+        self.journal.searched(operation, answer, searched)
+    }
+
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.note("absent");
+        self.journal.absent(operation, answer, searched)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         self.note("locate");
         self.journal.locate(operation, locator)
     }
@@ -70,6 +93,14 @@ impl OperationLog for Watched {
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         self.note("entry");
         self.journal.entry(operation)
+    }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        self.note("cleanup_target");
+        self.journal.cleanup_target(creating)
     }
 }
 
@@ -348,25 +379,51 @@ impl OperationLog for Slow {
         operation: OperationId,
         status: ProviderStatus,
         answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
     ) -> Result<(), LogError> {
         self.journal.record(operation, status, answer, locator)
     }
 
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.journal.searched(operation, answer, searched)
+    }
+
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.journal.absent(operation, answer, searched)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         self.journal.locate(operation, locator)
     }
 
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         self.journal.entry(operation)
     }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        self.journal.cleanup_target(creating)
+    }
 }
 
 /// Recording an operation and queueing its frame are one call on the log
 /// thread: a caller that stops waiting while the journal commits leaves
 /// the operation recorded and its frame sent whole. The worker answers it,
-/// late, and the locator it names is recorded; the status stays
-/// `dispatched`, as for any request whose caller dropped it.
+/// late, and the locator it names is recorded; the status is `unknown`,
+/// as for any request whose caller dropped it, so the journal refuses a
+/// second create of the job until it is settled.
 #[tokio::test]
 async fn a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent() {
     let dir = tempfile::tempdir().unwrap();
@@ -403,8 +460,30 @@ async fn a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_an
         })
         .await
         .unwrap();
-    assert_eq!(row.status, ProviderStatus::Dispatched);
-    assert_eq!(row.locator, Some(fx("key-1").to_value().to_string()));
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(
+        row.locator,
+        Some(fabric_bridge::wire::locator_record(&fx("key-1")))
+    );
+    let refused = bridge.request(&mut log, create(2, "fixture/ok")).await;
+    assert!(
+        matches!(refused, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{refused:?}"
+    );
+    let observed = bridge
+        .observe(
+            &mut log,
+            OperationId::from_bytes([1; 16]),
+            "sandbox.create",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut log)
+        .await
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
     // Nothing of the dropped request holds the worker's in-flight room.
     let next = bridge
         .request(&mut log, create(2, "fixture/ok"))

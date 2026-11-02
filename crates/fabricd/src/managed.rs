@@ -56,6 +56,7 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::OperationState { .. } => "operation_state",
         DomainError::Exhausted => "exhausted",
         DomainError::Broken { .. } => "broken",
+        DomainError::ReplacementBlocked { .. } => "replacement_blocked",
     }
 }
 

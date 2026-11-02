@@ -1,0 +1,297 @@
+{
+  "scenario": "cleanup_after_attach_needs_fresh_approval",
+  "summary": "A lost create is attached, then its sandbox is cleaned up. The destroy needs its own fresh grant: a create grant and an expired destroy grant are refused before any effect, and a fresh destroy grant for that sandbox destroys it.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-cleanup-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-attach-4",
+        "expired": false
+      },
+      {
+        "ref": "apr-cleanup-expired",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-attach-4",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-attach-4",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A0000000000000000P35",
+        "status": "ready"
+      }
+    ],
+    "script": []
+  },
+  "journal_state": {
+    "provider_operations": [
+      {
+        "operation_id": "01K8W3A0000000000000000P35",
+        "key": "key-attach-4",
+        "digest": "3535353535353535353535353535353535353535353535353535353535353535",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "target": null,
+        "status": "unknown",
+        "locator": null
+      }
+    ]
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "attach",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P35",
+        "key": "key-attach-4",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P35",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-4"
+        },
+        "output": {
+          "status": "ready"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P35",
+        "status": "succeeded"
+      }
+    },
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-2",
+        "operation": {
+          "id": "01K8W3A0000000000000000P36",
+          "key": "key-cleanup-1",
+          "digest": "3636363636363636363636363636363636363636363636363636363636363636"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-4"
+        },
+        "params": {},
+        "approval": {
+          "ref": "apr-create-only"
+        },
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A0000000000000000P36",
+        "error": {
+          "code": "denied",
+          "reason": "approval_scope",
+          "message": "denied: approval_scope",
+          "effect": "none"
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P36",
+        "status": "rejected"
+      }
+    },
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-3",
+        "operation": {
+          "id": "01K8W3A0000000000000000P37",
+          "key": "key-cleanup-2",
+          "digest": "3737373737373737373737373737373737373737373737373737373737373737"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-4"
+        },
+        "params": {},
+        "approval": {
+          "ref": "apr-cleanup-expired"
+        },
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-3",
+        "operation_id": "01K8W3A0000000000000000P37",
+        "error": {
+          "code": "denied",
+          "reason": "approval_expired",
+          "message": "denied: approval_expired",
+          "effect": "none"
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P37",
+        "status": "rejected"
+      }
+    },
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-4",
+        "operation": {
+          "id": "01K8W3A0000000000000000P38",
+          "key": "key-cleanup-3",
+          "digest": "3838383838383838383838383838383838383838383838383838383838383838"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-4"
+        },
+        "params": {},
+        "approval": {
+          "ref": "apr-cleanup-1"
+        },
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-4",
+        "operation_id": "01K8W3A0000000000000000P38",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-attach-4"
+        },
+        "output": {
+          "status": "destroyed"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P38",
+        "status": "succeeded"
+      }
+    },
+    {
+      "sandbox": {
+        "native_id": "fx-key-attach-4",
+        "status": "destroyed"
+      }
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+{
+  "scenario": "attach_absent_stays_unknown",
+  "summary": "No resource carries the operation's identity, though the job has another sandbox made by another operation. The attach answers absent with the scope it searched, and the create stays unknown: absence is not proof that nothing was made, and nothing is created again.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-create-1",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A00000000000000000P1",
+        "status": "ready"
+      }
+    ],
+    "script": []
+  },
+  "journal_state": {
+    "provider_operations": [
+      {
+        "operation_id": "01K8W3A0000000000000000P31",
+        "key": "key-attach-2",
+        "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "target": null,
+        "status": "unknown",
+        "locator": null
+      }
+    ]
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "attach",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P31",
+        "key": "key-attach-2",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P31",
+        "error": {
+          "code": "unknown",
+          "reason": "absent",
+          "message": "unknown: absent",
+          "effect": "unknown",
+          "observations": 1,
+          "deadline_ms": 1000,
+          "searched": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox"
+          }
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A0000000000000000P31",
+        "status": "unknown"
+      }
+    },
+    {
+      "sandbox": {
+        "native_id": "fx-key-create-1",
+        "status": "ready"
+      }
+    }
+  ]
+}

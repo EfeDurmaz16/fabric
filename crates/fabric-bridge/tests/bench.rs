@@ -271,7 +271,15 @@ async fn capsule_worker_latencies() {
         "binding": {"account": "acct-a", "project": "proj-1"},
         "policy": {"images": ["fixture/ok"]},
         "approvals": [],
-        "sandboxes": [{"native_id": "fx-seed", "project": "proj-1", "owner_job": common::JOB, "status": "ready"}],
+        // A seeded sandbox names the job and the create that made it
+        // together, as the worker's attach by identity needs.
+        "sandboxes": [{
+            "native_id": "fx-seed",
+            "project": "proj-1",
+            "owner_job": common::JOB,
+            "operation": OperationId::from_bytes([0x5e; 16]).to_string(),
+            "status": "ready"
+        }],
         "script": []
     });
     std::fs::write(&fixture, seed.to_string()).unwrap();
@@ -335,9 +343,21 @@ async fn capsule_worker_latencies() {
             };
             let _cleanup = Cleanup(format!("label=fabric.job={}", scope.job));
             let config = dir.path().join("docker.json");
+            // One grant per destroy: the worker binds a ref to the first
+            // operation it resolves for (protocol rule 7), so a ref shared
+            // by every destroy would be refused from the second on.
+            let grants: Vec<serde_json::Value> = (0..n)
+                .map(|i| {
+                    serde_json::json!({
+                        "ref": format!("apr-destroy-{i}"),
+                        "action": "sandbox.destroy",
+                        "native_id": null
+                    })
+                })
+                .collect();
             let worker = serde_json::json!({
                 "policy": {"images": [image]},
-                "approvals": [{"ref": "apr-destroy", "action": "sandbox.destroy", "native_id": null}]
+                "approvals": grants
             });
             std::fs::write(&config, worker.to_string()).unwrap();
             let server =
@@ -411,7 +431,7 @@ async fn capsule_worker_latencies() {
                     Action::Destroy {
                         target: created[i].clone(),
                     },
-                    Some("apr-destroy"),
+                    Some(&format!("apr-destroy-{i}")),
                 )
             })
             .await;

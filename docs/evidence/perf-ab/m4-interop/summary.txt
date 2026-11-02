@@ -1,0 +1,6 @@
+load at start: { 7.33 12.04 12.68 }
+node-docker: exit 0 (11 s) load { 7.74 11.91 12.62 } containers with fabric.job left: 0; test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.33s
+node-no-image: exit 0 (1 s) load { 7.74 11.91 12.62 } containers with fabric.job left: 0; test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+sea-docker: exit 0 (13 s) load { 7.57 11.66 12.52 } containers with fabric.job left: 0; test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.18s
+sea-no-image: exit 0 (1 s) load { 7.57 11.66 12.52 } containers with fabric.job left: 0; test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+DONE
