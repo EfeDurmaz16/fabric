@@ -505,9 +505,15 @@ fn a_broken_history_does_not_replay() {
     assert!(matches!(replay(job, &gap), Err(DomainError::Broken { .. })));
     // A grant at a generation that skips one.
     let mut skipped = kept.history.clone();
-    if let Some((_, ManagedEvent::AttemptGranted { generation, .. })) = skipped.last_mut() {
-        *generation = Generation::new(2).unwrap();
-    }
+    let grant = skipped
+        .iter_mut()
+        .rev()
+        .find_map(|(_, e)| match e {
+            ManagedEvent::AttemptGranted { generation, .. } => Some(generation),
+            _ => None,
+        })
+        .unwrap();
+    *grant = Generation::new(2).unwrap();
     assert!(matches!(
         replay(job, &skipped),
         Err(DomainError::Broken { .. })

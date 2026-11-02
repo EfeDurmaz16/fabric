@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
-    AttemptId, Command, DomainError, Envelope, ManagedState, NewIds, Observation, OperationId,
-    OperationMark, StoredResult, TaskId, Transition,
+    AttemptId, Command, CommandKind, DomainError, Envelope, ManagedState, NewIds, Observation,
+    OperationId, OperationMark, OperationStatus, StoredResult, TaskId, Transition,
 };
 use fabric_journal::{Answer, CommitError, FILE_NAME, Journal, Liveness, OpenError};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -95,18 +95,26 @@ type Reply<T> = oneshot::Sender<Result<T, AuthorityError>>;
 
 enum Call {
     Submit(Envelope<Command>, Reply<Answer>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 reports through it")
-    )]
     Observe(JobId, Observation, Reply<Transition>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
-    )]
     Mark(JobId, OperationId, OperationMark, Reply<Transition>),
     Job(JobId, Reply<Option<ManagedState>>),
     List(Reply<Vec<ManagedState>>),
+    Pending(Reply<Vec<PendingEffect>>),
+}
+
+/// An accepted operation whose effect the node has not asked for yet: a
+/// grant to launch, a create to place, or an M5 command to dispatch. The
+/// request an M5 command was asked with is in the job's state
+/// (`ManagedState::request`). Read anew from the journal every time, so a
+/// restart and a running daemon see the same list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingEffect {
+    /// The job.
+    pub job: JobId,
+    /// The operation.
+    pub operation: OperationId,
+    /// Its kind.
+    pub kind: CommandKind,
 }
 
 /// The managed ids as the standalone paths read them, without the queue.
@@ -248,9 +256,9 @@ impl Authority {
     }
 
     /// Records what an executor reports about an attempt or an operation.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 reports through it")
+    #[allow(
+        dead_code,
+        reason = "the node's M5 dispatch loop reports through it; until it lands only the tests call it"
     )]
     pub(crate) async fn observe(
         &self,
@@ -262,9 +270,9 @@ impl Authority {
     }
 
     /// Marks an operation, `Dispatched` right before its effect is asked for.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
+    #[allow(
+        dead_code,
+        reason = "the node's M5 dispatch loop marks through it; until it lands only the tests call it"
     )]
     pub(crate) async fn mark(
         &self,
@@ -290,6 +298,21 @@ impl Authority {
             return Ok(Vec::new());
         }
         self.call(Call::List).await
+    }
+
+    /// Every accepted operation whose effect was not asked for yet, oldest
+    /// job first: what the node's dispatch loop takes next, after a
+    /// restart as during a run. Each is dispatched once, after
+    /// `mark(Dispatched)` or, for a create or a continue, by its `Placed`.
+    #[allow(
+        dead_code,
+        reason = "the node's M5 dispatch loop reads it; until it lands only the tests call it"
+    )]
+    pub(crate) async fn pending(&self) -> Result<Vec<PendingEffect>, AuthorityError> {
+        if self.idle() {
+            return Ok(Vec::new());
+        }
+        self.call(Call::Pending).await
     }
 }
 
@@ -429,8 +452,33 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
             Call::List(reply) => {
                 let _ = reply.send(list(&holder));
             }
+            Call::Pending(reply) => {
+                let _ = reply.send(list(&holder).map(|jobs| pending(&jobs)));
+            }
         }
     }
+}
+
+/// The accepted effects of `jobs`: grants that may still be dispatched
+/// and M5 commands still `accepted`.
+fn pending(jobs: &[ManagedState]) -> Vec<PendingEffect> {
+    let mut out = Vec::new();
+    for state in jobs {
+        for op in &state.operations {
+            let waits = match op.kind {
+                CommandKind::StartAttempt => state.grant_may_dispatch(op.id),
+                _ => op.status == OperationStatus::Accepted,
+            };
+            if waits {
+                out.push(PendingEffect {
+                    job: state.job.id,
+                    operation: op.id,
+                    kind: op.kind,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The open journal; with none yet, `job` is a job the authority does not have.

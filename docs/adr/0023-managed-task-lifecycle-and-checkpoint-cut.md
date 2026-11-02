@@ -1,6 +1,6 @@
 # ADR 0023: Managed task lifecycle, containment and the checkpoint cut
 
-Status: proposed, 2026-11-03.
+Status: proposed 2026-11-03, built 2026-11-03 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request).
 
 Adopts the external draft P03 ("Managed task lifecycle and checkpoint cut", 2026-10-25, Proposed) for the M5 campaign. Draft P03 left five choices open: containment profiles, drain budgets, outcome policies per task kind, parent and child outcomes, and terminal attachment. Each is selected below. The selections were selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe, and Efe can veto any of them at the pull request. The types and signatures are in [docs/managed-jobs.md](../managed-jobs.md), section "Placement and planned continuity (M5)", part "Task lifecycle (P03)". It builds on ADR 0019 (tasks and attempts), ADR 0020 (one authority, grants and generations) and ADR 0022 (provider effects that may still act block a replacement).
 
@@ -66,3 +66,7 @@ The CLI attaches to a task's terminal through the existing path (`fabric run`, t
 
 - Containment on platforms other than macOS and Linux, and under a provider resource (draft P09), where the group is the worker's and the receipt is the provider's.
 - Whether a harness class can ever be cancel-and-restart (a turn that made no tool call), which needs the adapter to say so per turn.
+
+## As built (M5)
+
+Built on 2026-11-03 by owner A. Where the code differs from the decision above, docs/managed-jobs.md, "As built (M5): P03 to P05", says how and why. In short: the task class and the drain budget are as decided; the executor's leaves-before-parents order is the reverse spawn order, since it keeps no parent map; a quiescence never signals a harness task (the `Capturer` trait is the suspend path) and never signals an opaque task; an escaped child is listed by process group through `ps` and an uncontrolled writer through `lsof`; the cut's evidence refs are the receipts by digest; the launch boundaries are the two states of a durable launch record that `Executor::recover` clears. The `CommandAccepted` event now says whether a command has an effect, and an accepted effect is kept as `EffectRequested`, so a cancel that stops a live attempt (new in M5) and a checkpoint that leaves it running are both replayable.
