@@ -138,11 +138,31 @@ enum Writer {
     Idle(StateDir, NodeId),
     /// The thread runs.
     Running {
-        /// The queue it takes calls from.
+        /// The queue it takes calls from. Declared before `thread`, so the
+        /// last handle's drop closes the queue, which ends the thread,
+        /// before it joins it.
         calls: mpsc::Sender<Call>,
         /// The ids it publishes outside the queue.
         ids: watch::Receiver<Ids>,
+        /// The thread, joined when the last handle drops, so a dropped
+        /// authority has closed its journal: `SQLite` unlinks the WAL and
+        /// shm beside the journal on the last close, and a caller that
+        /// looks at the state directory after the drop must not race it.
+        _thread: JoinOnDrop,
     },
+}
+
+/// A thread joined when dropped.
+#[derive(Debug)]
+struct JoinOnDrop(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for JoinOnDrop {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            // A panic in the thread already failed the call it served.
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Authority {
@@ -174,7 +194,7 @@ impl Authority {
     fn running(&self) -> std::io::Result<(mpsc::Sender<Call>, watch::Receiver<Ids>)> {
         let mut writer = crate::node::lock(&self.writer);
         let place = match &*writer {
-            Writer::Running { calls, ids } => return Ok((calls.clone(), ids.clone())),
+            Writer::Running { calls, ids, .. } => return Ok((calls.clone(), ids.clone())),
             Writer::Idle(state, node) => Place {
                 dir: managed_dir(state),
                 jobs: state.jobs(),
@@ -183,7 +203,7 @@ impl Authority {
         };
         let (calls, queue) = mpsc::channel(QUEUE);
         let (publish, ids) = watch::channel(Ids::Loading);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("fabric-authority".into())
             .spawn(move || serve(&place, queue, &publish))?;
         #[cfg(test)]
@@ -192,6 +212,7 @@ impl Authority {
         *writer = Writer::Running {
             calls: calls.clone(),
             ids: ids.clone(),
+            _thread: JoinOnDrop(Some(thread)),
         };
         Ok((calls, ids))
     }

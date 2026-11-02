@@ -1,7 +1,8 @@
 //! The client's writes against an in-process worker: a caller that gives
 //! up on a request whose frame does not fit the pipe leaves no part of a
-//! frame behind, so the worker reads every frame whole and in order, and
-//! a request admitted before a shutdown is never written after it.
+//! frame behind, so the worker reads every frame whole and in order, a
+//! request admitted before a shutdown is never written after it, and one
+//! made after it is refused as shutting down before anything else.
 
 #![allow(
     clippy::unwrap_used,
@@ -15,14 +16,15 @@ mod common;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
-use common::{create, operation};
-use fabric_bridge::wire::{Action, Scope};
+use common::{Logged, create, journal, operation};
+use fabric_bridge::wire::{Action, CreateParams, ExecParams, Locator, Scope};
 use fabric_bridge::{
-    Bridge, BridgeError, Config, Entry, LogError, LogThread, MemoryLog, OperationLog, frames,
+    Bridge, BridgeError, Config, Effect, Entry, LogError, LogThread, MemoryLog, OperationLog,
+    frames,
 };
-use fabric_core::managed::OperationId;
+use fabric_core::managed::{Generation, OperationId};
 use fabric_journal::{
-    CleanupRefusal, LocatorRecord, ProviderAnswer, ProviderDispatch, ProviderStatus,
+    CleanupRefusal, Journal, LocatorRecord, ProviderAnswer, ProviderDispatch, ProviderStatus,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -425,4 +427,296 @@ async fn a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lo
     assert_eq!(entry.status, ProviderStatus::Unknown);
     assert_eq!(entry.locator, None);
     let _reader = script.await.unwrap();
+}
+
+/// A worker that answers the handshake, then reads every frame until its
+/// input closes and answers none of them but a `shutdown`. That one it
+/// answers once the test lets it exit: an empty `shutdown_ack`, then the
+/// end of its output, as a worker that exits.
+struct Draining {
+    exit: Option<oneshot::Sender<()>>,
+    script: tokio::task::JoinHandle<Vec<String>>,
+}
+
+impl Draining {
+    /// The worker, and a bridge connected to it under `config`.
+    async fn start(config: Config) -> (Draining, Bridge) {
+        let (fabric, worker) = tokio::io::duplex(64 << 10);
+        let (from_worker, to_worker) = tokio::io::split(fabric);
+        let (mut reader, mut writer) = tokio::io::split(worker);
+        let (exit, exited) = oneshot::channel::<()>();
+        let script = tokio::spawn(async move {
+            let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+            let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+            frames::write(&mut writer, &frame).await.unwrap();
+            let mut exited = Some(exited);
+            let mut read = Vec::new();
+            while let Some(frame) = frames::read(&mut reader, 1 << 20).await.unwrap() {
+                read.push(frame["type"].as_str().unwrap().to_owned());
+                if frame["type"] == "shutdown" {
+                    // A test that failed before it let the worker exit.
+                    if let Some(exited) = exited.take()
+                        && exited.await.is_err()
+                    {
+                        return read;
+                    }
+                    let ack = json!({
+                        "type": "shutdown_ack",
+                        "request_id": frame["request_id"],
+                        "unresolved": [],
+                    });
+                    let frame = frames::encode(&ack, 1 << 20).unwrap();
+                    frames::write(&mut writer, &frame).await.unwrap();
+                    writer.shutdown().await.unwrap();
+                }
+            }
+            read
+        });
+        let bridge = Bridge::connect(from_worker, Box::new(to_worker), config)
+            .await
+            .unwrap();
+        let draining = Draining {
+            exit: Some(exit),
+            script,
+        };
+        (draining, bridge)
+    }
+
+    /// Lets the worker answer the shutdown and exit, and waits until the
+    /// bridge has read the end of its output.
+    async fn exit(&mut self, bridge: &Bridge) {
+        if let Some(exit) = self.exit.take() {
+            exit.send(()).unwrap();
+        }
+        let started = std::time::Instant::now();
+        while bridge.lost().is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the worker never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The type of every frame the worker read after the handshake, once
+    /// Fabric closed its input.
+    async fn read(self, bridge: Bridge) -> Vec<String> {
+        assert_eq!(bridge.close().await, None);
+        self.script.await.unwrap()
+    }
+}
+
+fn status(journal: &Journal, n: u8) -> Option<ProviderStatus> {
+    journal
+        .provider_operation(OperationId::from_bytes([n; 16]))
+        .unwrap()
+        .map(|op| op.status)
+}
+
+/// A `sandbox.snapshot`, which the fixture profile does not offer, as
+/// operation `n`.
+fn snapshot(n: u8) -> Effect {
+    let mut effect = create(n, "fixture/ok");
+    effect.action = Action::Other {
+        name: "sandbox.snapshot".into(),
+        target: None,
+        params: serde_json::Map::new(),
+    };
+    effect
+}
+
+/// Asks for each of `effects` and checks it is refused as shutting down
+/// with its journal row as it was: whatever else would refuse it, nothing
+/// is recorded and nothing is sent once the bridge is shutting down.
+async fn refused_as_shutting_down(bridge: &Bridge, journal: &mut Logged, effects: Vec<Effect>) {
+    for effect in effects {
+        let n = effect.operation.id.to_bytes()[0];
+        let before = status(journal, n);
+        let result = bridge.request(journal, effect).await;
+        assert!(
+            matches!(result, Err(BridgeError::ShuttingDown)),
+            "{n}: {result:?}"
+        );
+        assert_eq!(status(journal, n), before, "{n}");
+    }
+}
+
+/// After `shutdown`, a request for an action outside the profile is
+/// refused as shutting down, while the worker drains and once it has
+/// exited, as every other request is: nothing is recorded, though Fabric
+/// records such a request `rejected` while the bridge is up, and nothing
+/// is written after the shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_outside_the_profile_after_a_shutdown_is_refused_as_shutting_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (mut worker, bridge) = Draining::start(config()).await;
+    let shutdown = bridge.shutdown(5000).await.unwrap();
+    refused_as_shutting_down(&bridge, &mut journal, vec![snapshot(1)]).await;
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+    worker.exit(&bridge).await;
+    assert_eq!(shutdown.wait().await.unwrap(), []);
+    refused_as_shutting_down(&bridge, &mut journal, vec![snapshot(2)]).await;
+    assert_eq!(worker.read(bridge).await, ["shutdown"]);
+}
+
+/// After `shutdown`, a request over one of the profile's limits, one the
+/// encoding rules refuse, and one whose frame is over the request cap are
+/// refused as shutting down, while the worker drains and once it has
+/// exited, with nothing recorded and nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_that_fails_validation_after_a_shutdown_is_refused_as_shutting_down() {
+    let invalid = |base: u8| {
+        let mut late = create(base, "fixture/ok");
+        late.deadline_ms = 600_001;
+        let mut nul = create(base + 1, "fixture/ok");
+        nul.action = Action::Exec {
+            target: Locator::from_value(&json!({
+                "provider": "fixture",
+                "scope": {"account": "acct-a", "project": "proj-1"},
+                "kind": "sandbox",
+                "native_id": "fx-key-1",
+            }))
+            .unwrap(),
+            params: ExecParams {
+                argv: vec!["echo".into(), "a\0b".into()],
+                stdin: None,
+                cwd: None,
+                timeout_ms: 1000,
+                max_output_bytes: 1024,
+                secret_names: Vec::new(),
+            },
+        };
+        let mut huge = create(base + 2, "fixture/ok");
+        huge.action = Action::Create(CreateParams {
+            image: "fixture/ok".into(),
+            labels: (0..300)
+                .map(|i| (format!("l{i}"), "x".repeat(4000)))
+                .collect(),
+            ..CreateParams::default()
+        });
+        vec![late, nul, huge]
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (mut worker, bridge) = Draining::start(config()).await;
+    let shutdown = bridge.shutdown(5000).await.unwrap();
+    refused_as_shutting_down(&bridge, &mut journal, invalid(1)).await;
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+    worker.exit(&bridge).await;
+    assert_eq!(shutdown.wait().await.unwrap(), []);
+    refused_as_shutting_down(&bridge, &mut journal, invalid(4)).await;
+    assert_eq!(worker.read(bridge).await, ["shutdown"]);
+}
+
+/// After `shutdown`, a request the journal would fence, or refuse for a
+/// key it holds, is refused as shutting down before the journal is asked,
+/// whether or not it is in the profile: the journal is unchanged and
+/// nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_the_journal_would_refuse_after_a_shutdown_is_refused_as_shutting_down() {
+    let stale = |effect: Effect| Effect {
+        scope: Scope {
+            generation: Generation::new(2).unwrap(),
+            ..effect.scope
+        },
+        ..effect
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (mut worker, bridge) = Draining::start(config()).await;
+    // Recorded `rejected` while the bridge is up: its key is held.
+    let held = bridge.request(&mut journal, snapshot(9)).await;
+    assert!(
+        matches!(held, Err(BridgeError::RefusedLocally(_))),
+        "{held:?}"
+    );
+    assert_eq!(status(&journal, 9), Some(ProviderStatus::Rejected));
+    let shutdown = bridge.shutdown(5000).await.unwrap();
+    let refused = |a: u8, b: u8| {
+        vec![
+            stale(create(a, "fixture/ok")),
+            stale(snapshot(b)),
+            snapshot(9),
+        ]
+    };
+    refused_as_shutting_down(&bridge, &mut journal, refused(1, 2)).await;
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+    worker.exit(&bridge).await;
+    assert_eq!(shutdown.wait().await.unwrap(), []);
+    refused_as_shutting_down(&bridge, &mut journal, refused(3, 4)).await;
+    assert_eq!(worker.read(bridge).await, ["shutdown"]);
+}
+
+/// At the worker's in-flight limit, a request outside the profile is
+/// refused as busy with nothing recorded, so it may be asked again later;
+/// after `shutdown` it is refused as shutting down, while the worker drains
+/// and once it has exited. Only the admitted request and the shutdown are
+/// written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_outside_the_profile_at_the_in_flight_limit_is_refused_as_busy() {
+    let mut config = config();
+    config.limits.max_in_flight = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (mut worker, bridge) = Draining::start(config).await;
+    let flight = bridge
+        .request(&mut journal, create(1, "fixture/ok"))
+        .await
+        .unwrap();
+    let busy = bridge.request(&mut journal, snapshot(2)).await;
+    assert!(matches!(busy, Err(BridgeError::Busy(1))), "{busy:?}");
+    assert_eq!(status(&journal, 2), None, "a busy refusal records nothing");
+    let shutdown = bridge.shutdown(5000).await.unwrap();
+    refused_as_shutting_down(&bridge, &mut journal, vec![snapshot(2)]).await;
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+    worker.exit(&bridge).await;
+    assert_eq!(shutdown.wait().await.unwrap(), []);
+    let outcome = flight.finish(&mut journal).await.unwrap();
+    assert_eq!(outcome.status, ProviderStatus::Unknown);
+    refused_as_shutting_down(&bridge, &mut journal, vec![snapshot(2), snapshot(3)]).await;
+    assert_eq!(worker.read(bridge).await, ["request", "shutdown"]);
+}
+
+/// After `shutdown`, an observe is refused as shutting down, while the
+/// worker drains and once it has exited, before the profile or the journal
+/// is read: of an action the profile does not observe, and of an operation
+/// the journal does not hold. Nothing is written after the shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_observe_after_a_shutdown_is_refused_as_shutting_down() {
+    let resource = Locator::from_value(&json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+        "native_id": "fx-key-1",
+    }))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (mut worker, bridge) = Draining::start(config()).await;
+    let shutdown = bridge.shutdown(5000).await.unwrap();
+    for exited in [false, true] {
+        if exited {
+            worker.exit(&bridge).await;
+        } else {
+            assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+        }
+        for action in ["sandbox.snapshot", "sandbox.create"] {
+            let result = bridge
+                .observe(
+                    &mut journal,
+                    OperationId::from_bytes([1; 16]),
+                    action,
+                    resource.clone(),
+                    1000,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(BridgeError::ShuttingDown)),
+                "{action}, exited {exited}: {result:?}"
+            );
+        }
+    }
+    assert_eq!(shutdown.wait().await.unwrap(), []);
+    assert_eq!(worker.read(bridge).await, ["shutdown"]);
 }
