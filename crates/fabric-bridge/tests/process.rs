@@ -12,17 +12,22 @@
 
 mod common;
 
+use std::future::Future;
 use std::os::unix::process::ExitStatusExt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{create, double, journal, operation, scope};
 use fabric_bridge::wire::{
     Action, CancelState, CreateParams, ErrorCode, ExecParams, Locator, ResultState, Versions,
 };
-use fabric_bridge::{Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError};
+use fabric_bridge::{
+    Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError, Recorder, Slot,
+};
 use fabric_core::managed::OperationId;
 use fabric_journal::{Journal, ProviderStatus};
 use rustix::process::Pid;
+use tokio::sync::Notify;
 
 fn config() -> Config {
     let mut config = Config::new("fixture");
@@ -1303,4 +1308,96 @@ async fn a_refused_request_records_no_late_locator() {
         Some(fx("key-120").to_value().to_string())
     );
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// A recorder that parks its `n`th `reserve` until the test lets it go,
+/// and says when it is parked.
+struct Gated<'a> {
+    inner: &'a mut common::Logged,
+    at: u32,
+    calls: u32,
+    parked: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Recorder for Gated<'_> {
+    type Log = Journal;
+
+    fn reserve(&mut self) -> impl Future<Output = Result<Slot<'_, Journal>, LogError>> + Send {
+        self.calls += 1;
+        let park = self.calls == self.at;
+        let parked = Arc::clone(&self.parked);
+        let release = Arc::clone(&self.release);
+        async move {
+            if park {
+                parked.notify_one();
+                release.notified().await;
+            }
+            self.inner.reserve().await
+        }
+    }
+}
+
+/// A request passes its first check, records the locator a late answer
+/// named, then waits on the log; a worker lost meanwhile refuses it when
+/// it registers. It is refused as lost, and the locator stays recorded:
+/// what the first check refuses records nothing, what the second refuses
+/// already has.
+#[tokio::test]
+async fn a_request_refused_when_it_registers_has_recorded_the_late_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let mut late = create(130, "double/late");
+    late.deadline_ms = 1;
+    let outcome = bridge
+        .request(&mut journal, late)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(outcome.answer, Answer::TimedOut);
+    let started = Instant::now();
+    while bridge.late_answers() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(locator(&journal, 130), None);
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    // The first reserve records the late locator; the second is the
+    // request's own, where it is parked until the worker is gone.
+    let mut log = Gated {
+        inner: &mut journal,
+        at: 2,
+        calls: 0,
+        parked: Arc::clone(&parked),
+        release: Arc::clone(&release),
+    };
+    let lose = async {
+        parked.notified().await;
+        bridge.kill().await;
+        let started = Instant::now();
+        while bridge.lost().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(5), "not lost");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        release.notify_one();
+    };
+    let (refused, ()) = tokio::join!(bridge.request(&mut log, create(131, "fixture/ok")), lose);
+    assert!(matches!(refused, Err(BridgeError::Lost(_))), "{refused:?}");
+    assert_eq!(log.calls, 2);
+    assert_eq!(
+        status(&journal, 131),
+        None,
+        "a refused request was recorded"
+    );
+    assert_eq!(status(&journal, 130), Some(ProviderStatus::Unknown));
+    assert_eq!(
+        locator(&journal, 130),
+        Some(fx("key-130").to_value().to_string()),
+        "the late locator was not recorded before the request waited on the log"
+    );
+    assert_eq!(bridge.late_answers(), 1);
 }
