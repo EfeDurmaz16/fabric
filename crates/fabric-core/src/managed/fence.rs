@@ -132,8 +132,10 @@ impl FenceVerdict {
 }
 
 /// The one rule every covered path runs before it writes anything. `from`
-/// is the authenticated peer the write arrived from, `None` for a write
-/// made on the authority's own host.
+/// is the node the write came from; with `None` the node is not checked.
+/// The authority never passes `None`: a write made on its own host is
+/// checked as from its own node, so an attempt granted elsewhere is not
+/// written by a local path either (ADR 0028).
 #[must_use]
 pub fn fence(
     state: Option<&ManagedState>,

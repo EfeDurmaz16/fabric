@@ -128,6 +128,21 @@ pub fn admit_recovery(recovery: RecoveryPolicy, outcome: OutcomePolicy) -> Resul
     }
 }
 
+/// The snapshot a `StartAttempt` resumes from. The first attempt may start
+/// from any snapshot the operator names (M2). Once the job has had an
+/// attempt, a start resumes only from a checkpoint the authority
+/// acknowledged: a captured one, or one the job never saw, restarts
+/// nothing (ADR 0028), the same gate `Recover` runs.
+fn resume_point(state: &ManagedState, from: Option<SnapshotId>) -> Result<(), DomainError> {
+    if let Some(snapshot) = from
+        && !state.attempts.is_empty()
+        && !state.acknowledged().iter().any(|a| a.snapshot == snapshot)
+    {
+        return Err(DomainError::NotAcknowledged { snapshot });
+    }
+    Ok(())
+}
+
 /// The `unknown` live attempt a `Supersede` or `Recover` names; a
 /// reachable one is handed over, never recovered (ADR 0028).
 fn unknown_attempt(state: &ManagedState, attempt: AttemptId) -> Result<&Attempt, DomainError> {
@@ -198,19 +213,7 @@ fn command_events(
             if let Some(live) = state.live_attempt() {
                 return Err(DomainError::AttemptStillLive { attempt: live.id });
             }
-            // The first attempt may start from any snapshot the operator
-            // names (M2). Once the job has had an attempt, a start resumes
-            // only from a checkpoint the authority acknowledged: a captured
-            // one, or one the job never saw, restarts nothing (ADR 0028),
-            // the same gate `Recover` runs.
-            if let Some(snapshot) = initial_checkpoint
-                && !state.attempts.is_empty()
-                && !state.acknowledged().iter().any(|a| a.snapshot == *snapshot)
-            {
-                return Err(DomainError::NotAcknowledged {
-                    snapshot: *snapshot,
-                });
-            }
+            resume_point(state, *initial_checkpoint)?;
             ManagedEvent::AttemptGranted {
                 attempt: ids.attempt,
                 task: *task,
