@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::managed::{
-    AttemptId, AttemptStatus, Generation, JobState, ManagedState, OperationId, OperationKey,
-    TaskId, TaskKind, TaskState, WorkRevision,
+    AttemptId, AttemptStatus, EventSeq, Generation, JobState, ManagedState, OperationId,
+    OperationKey, TaskId, TaskKind, TaskState, WorkRevision,
 };
 use fabric_core::session::SessionId;
 use fabric_core::version::HarnessVersion;
@@ -139,11 +139,29 @@ pub enum Op {
     JobRepair,
     /// [`Request::JobExport`].
     JobExport,
+    /// [`Request::ManagedNote`].
+    ManagedNote,
+    /// [`Request::ManagedCheckpoint`].
+    ManagedCheckpoint,
+    /// [`Request::ManagedContinue`].
+    ManagedContinue,
+    /// [`Request::ManagedInspect`].
+    ManagedInspect,
+    /// [`Request::ManagedSubmit`].
+    ManagedSubmit,
+    /// [`Request::ManagedImport`].
+    ManagedImport,
+    /// [`Request::FacadeMint`].
+    FacadeMint,
+    /// [`Request::FacadeRevoke`].
+    FacadeRevoke,
+    /// [`Request::FacadeCall`].
+    FacadeCall,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 25] = [
+    pub const ALL: [Op; 34] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -169,6 +187,15 @@ impl Op {
         Op::ManagedList,
         Op::JobRepair,
         Op::JobExport,
+        Op::ManagedNote,
+        Op::ManagedCheckpoint,
+        Op::ManagedContinue,
+        Op::ManagedInspect,
+        Op::ManagedSubmit,
+        Op::ManagedImport,
+        Op::FacadeMint,
+        Op::FacadeRevoke,
+        Op::FacadeCall,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -200,6 +227,15 @@ impl Op {
             Op::ManagedList => "managed_list",
             Op::JobRepair => "job_repair",
             Op::JobExport => "job_export",
+            Op::ManagedNote => "managed_note",
+            Op::ManagedCheckpoint => "managed_checkpoint",
+            Op::ManagedContinue => "managed_continue",
+            Op::ManagedInspect => "managed_inspect",
+            Op::ManagedSubmit => "managed_submit",
+            Op::ManagedImport => "managed_import",
+            Op::FacadeMint => "facade_mint",
+            Op::FacadeRevoke => "facade_revoke",
+            Op::FacadeCall => "facade_call",
         }
     }
 }
@@ -224,7 +260,7 @@ impl fmt::Display for Op {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-enum HarnessDef {
+pub(crate) enum HarnessDef {
     // Written with braces so serde refuses a field next to the tag; it
     // skips any field of a unit variant.
     ClaudeCode {},
@@ -605,8 +641,46 @@ pub enum Request {
         /// The harness the primary task runs under.
         #[serde(with = "launchable")]
         harness: HarnessKind,
+        /// What the work must satisfy, in the user's words (M5); empty when
+        /// the caller gave none.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "null_as_default"
+        )]
+        acceptance: Vec<String>,
+        /// The job's policy (M5); every field takes its default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<ManagedPolicy>,
     },
-    /// Cancels a managed job none of whose attempts may still run.
+    /// Makes a managed job from a source that is not a repository on this
+    /// node (M5): a git revision, a snapshot, a directory the node imports
+    /// first, or nothing. `managed_create` keeps its required `repo` for a
+    /// repository, so api 1 stays additive; this op carries the rest.
+    ManagedSubmit {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The goal in the user's words.
+        #[serde(deserialize_with = "launchable::argument")]
+        goal: String,
+        /// The harness the primary task runs under.
+        #[serde(with = "launchable")]
+        harness: HarnessKind,
+        /// What the work must satisfy, in the user's words.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "null_as_default"
+        )]
+        acceptance: Vec<String>,
+        /// Where the workspace comes from.
+        source: ManagedSource,
+        /// The job's policy; every field takes its default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<ManagedPolicy>,
+    },
+    /// Cancels a managed job, or one task of it (M5). With a live attempt
+    /// the cancel is accepted and dispatched to stop it.
     ManagedCancel {
         /// The caller's name for this command.
         operation_key: OperationKey,
@@ -623,6 +697,125 @@ pub enum Request {
         expected_revision: Option<WorkRevision>,
         /// Why, for the job's history.
         reason: String,
+        /// The task to cancel; the whole job when absent (M5).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        task: Option<TaskId>,
+    },
+    /// Records a note on a managed job's history (M5): a decision with its
+    /// reason, a question, or an answer.
+    ManagedNote {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+        /// The note.
+        note: NoteWire,
+    },
+    /// Takes a checkpoint cut of the job's live attempt (M5); the attempt
+    /// goes on afterwards.
+    ManagedCheckpoint {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+    },
+    /// The planned handoff (M5): a quiescence and a cut of the live
+    /// attempt, a placement, and a new attempt at the fidelity achieved.
+    ManagedContinue {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+        /// The fidelities this continuation may achieve; the job's
+        /// allowance when absent. Never empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fidelity: Option<Vec<FidelityName>>,
+        /// The one node the new attempt may be placed on, when the caller pins one.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        pin: Option<NodeId>,
+    },
+    /// Everything the journal holds about one managed job (M5; the read
+    /// surface ADR 0022 carried): the job, its placements, continuations,
+    /// notes, provider operations, blockers and residuals. Writes nothing
+    /// and asks no worker.
+    ManagedInspect {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
+    /// Captures a directory on this node into a snapshot a managed job can
+    /// start from, leaving the directory untouched (M5).
+    ManagedImport {
+        /// The directory, an absolute path on the node.
+        path: SystemPath,
+        /// The workspace paths that may leave the node in the snapshot
+        /// although they look like secrets; empty by default.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "null_as_default"
+        )]
+        export_allowlist: Vec<String>,
+    },
+    /// Mints a facade token on this node's authority (ADR 0027): the
+    /// bearer comes back once and is never stored.
+    FacadeMint {
+        /// Who acts under the token: 1 to 64 characters of `[A-Za-z0-9._-]`.
+        actor: String,
+        /// The jobs the token may act on.
+        jobs: JobScopeWire,
+        /// The nodes the token may pin or place on.
+        resources: ResourceScopeWire,
+        /// When the token stops working, in Unix milliseconds.
+        expires_ms: u64,
+    },
+    /// Revokes a facade token by its id; immediate for new messages, and an
+    /// open watch under it ends within one delivery.
+    FacadeRevoke {
+        /// The token.
+        token_id: String,
+    },
+    /// Sends one facade message (docs/facade-protocol.md) to the authority
+    /// node named, over the node link, and answers with the authority's
+    /// answer unchanged. This node's own id names its own authority.
+    FacadeCall {
+        /// The authority node.
+        #[serde(with = "text")]
+        authority: NodeId,
+        /// The facade message, as the client wrote it.
+        message: serde_json::Value,
     },
     /// One managed job.
     ManagedStatus {
@@ -734,6 +927,15 @@ impl Request {
             | Request::ManagedCancel { .. }
             | Request::ManagedStatus { .. }
             | Request::ManagedList
+            | Request::ManagedSubmit { .. }
+            | Request::ManagedNote { .. }
+            | Request::ManagedCheckpoint { .. }
+            | Request::ManagedContinue { .. }
+            | Request::ManagedInspect { .. }
+            | Request::ManagedImport { .. }
+            | Request::FacadeMint { .. }
+            | Request::FacadeRevoke { .. }
+            | Request::FacadeCall { .. }
             | Request::JobRepair { .. } => None,
         }
     }
@@ -767,6 +969,15 @@ impl Request {
             Request::ManagedList => Op::ManagedList,
             Request::JobRepair { .. } => Op::JobRepair,
             Request::JobExport { .. } => Op::JobExport,
+            Request::ManagedNote { .. } => Op::ManagedNote,
+            Request::ManagedCheckpoint { .. } => Op::ManagedCheckpoint,
+            Request::ManagedContinue { .. } => Op::ManagedContinue,
+            Request::ManagedInspect { .. } => Op::ManagedInspect,
+            Request::ManagedSubmit { .. } => Op::ManagedSubmit,
+            Request::ManagedImport { .. } => Op::ManagedImport,
+            Request::FacadeMint { .. } => Op::FacadeMint,
+            Request::FacadeRevoke { .. } => Op::FacadeRevoke,
+            Request::FacadeCall { .. } => Op::FacadeCall,
         }
     }
 }
@@ -1136,6 +1347,24 @@ pub enum Reply {
     JobRepair(Repaired),
     /// For [`Request::JobExport`].
     JobExport(Exported),
+    /// For [`Request::ManagedNote`].
+    ManagedNote(Box<ManagedOperation>),
+    /// For [`Request::ManagedCheckpoint`].
+    ManagedCheckpoint(Box<ManagedOperation>),
+    /// For [`Request::ManagedContinue`].
+    ManagedContinue(Box<ManagedOperation>),
+    /// For [`Request::ManagedInspect`].
+    ManagedInspect(Box<Inspection>),
+    /// For [`Request::ManagedSubmit`].
+    ManagedSubmit(Box<ManagedOperation>),
+    /// For [`Request::ManagedImport`].
+    ManagedImport(Imported),
+    /// For [`Request::FacadeMint`].
+    FacadeMint(Minted),
+    /// For [`Request::FacadeRevoke`].
+    FacadeRevoke(Revoked),
+    /// For [`Request::FacadeCall`].
+    FacadeCall(FacadeEnvelope),
 }
 
 impl Reply {
@@ -1168,6 +1397,15 @@ impl Reply {
             Reply::ManagedList(_) => Op::ManagedList,
             Reply::JobRepair(_) => Op::JobRepair,
             Reply::JobExport(_) => Op::JobExport,
+            Reply::ManagedNote(_) => Op::ManagedNote,
+            Reply::ManagedCheckpoint(_) => Op::ManagedCheckpoint,
+            Reply::ManagedContinue(_) => Op::ManagedContinue,
+            Reply::ManagedInspect(_) => Op::ManagedInspect,
+            Reply::ManagedSubmit(_) => Op::ManagedSubmit,
+            Reply::ManagedImport(_) => Op::ManagedImport,
+            Reply::FacadeMint(_) => Op::FacadeMint,
+            Reply::FacadeRevoke(_) => Op::FacadeRevoke,
+            Reply::FacadeCall(_) => Op::FacadeCall,
         }
     }
 }
@@ -1270,6 +1508,13 @@ pub struct ManagedTask {
     pub label: Option<String>,
     /// `open`, `succeeded`, `failed` or `cancelled`.
     pub state: String,
+    /// `build`, `test`, `harness` or `opaque` (M5); absent from a node
+    /// before M5, which ran every task as a harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// The task's last receipt (M5), when an executor reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ReceiptWire>,
 }
 
 /// One attempt of a managed job.
@@ -1325,6 +1570,465 @@ pub struct ManagedJobs {
     pub left_out: u64,
 }
 
+/// Where a managed job's workspace comes from, as the client API writes it (M5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManagedSource {
+    /// A repository on the node; local socket only, never over the facade.
+    Repository {
+        /// Its absolute path.
+        path: SystemPath,
+    },
+    /// A published snapshot.
+    Snapshot {
+        /// The snapshot.
+        #[serde(with = "text")]
+        snapshot: SnapshotId,
+    },
+    /// A git repository at an exact revision.
+    Git {
+        /// The URI: https, ssh, git+ssh or file, with no userinfo.
+        uri: String,
+        /// The commit, 40 or 64 lowercase hex characters.
+        commit: String,
+    },
+    /// No source: the workspace starts empty.
+    Empty,
+    /// A directory on the node, imported into a snapshot first; local socket only.
+    Directory {
+        /// Its absolute path.
+        path: SystemPath,
+    },
+}
+
+/// How a continuation may carry a session (ADR 0024), from highest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FidelityName {
+    /// The same native session, on a node with the same harness and layout.
+    NativeSession,
+    /// A new native session started from the work package.
+    NewNativeSessionWithPackage,
+    /// The workspace alone; an explicit opt-in.
+    WorkspaceOnly,
+}
+
+impl FidelityName {
+    /// Every fidelity a policy can allow, from highest.
+    pub const ALL: [FidelityName; 3] = [
+        FidelityName::NativeSession,
+        FidelityName::NewNativeSessionWithPackage,
+        FidelityName::WorkspaceOnly,
+    ];
+
+    /// The name on the wire.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            FidelityName::NativeSession => "native_session",
+            FidelityName::NewNativeSessionWithPackage => "new_native_session_with_package",
+            FidelityName::WorkspaceOnly => "workspace_only",
+        }
+    }
+}
+
+/// A secret a job's tasks need by name (ADR 0025), resolved on the node
+/// that runs them and never carried by the job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRefWire {
+    /// `[A-Z0-9_]{1,64}`.
+    pub name: String,
+    /// `any` or `current`: which attempts may read it.
+    pub attempt: String,
+    /// The resource kinds that may resolve it; `node` in M5.
+    pub resource_kinds: Vec<String>,
+}
+
+/// A managed job's policy as the client API writes it (M5): every field
+/// optional, each taking its default on the node.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedPolicy {
+    /// How long a quiescence may take, 1000 to 600000 ms; 30000 by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_budget_ms: Option<u32>,
+    /// The fidelities a continuation may achieve; never empty when given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_fidelity: Option<Vec<FidelityName>>,
+    /// The secrets the job's tasks need; at most 32.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<SecretRefWire>>,
+    /// Workspace paths that may leave the node although they look like secrets; at most 256.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_allowlist: Option<Vec<String>>,
+    /// The free disk a node needs to run the job; 2 GiB by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
+    /// The one node the job may run on; written as `null` when none, so
+    /// the slot is visible, as docs/facade-protocol.md asks.
+    #[serde(default, with = "text::option")]
+    pub pin: Option<NodeId>,
+}
+
+/// A note on a managed job's history (ADR 0024). On the wire it is an
+/// object with one key naming its kind, `decision`, `question` or
+/// `answer`; a reader skips a key it does not know beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteWire {
+    /// A decision, with the reason it was taken.
+    Decision {
+        /// What was decided.
+        what: String,
+        /// Why; never empty.
+        reason: String,
+    },
+    /// A question left open.
+    Question {
+        /// The question.
+        text: String,
+    },
+    /// An answer to a question recorded at `question`.
+    Answer {
+        /// The revision the question was recorded at.
+        #[serde(with = "text")]
+        question: WorkRevision,
+        /// The answer.
+        text: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for NoteWire {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Decision {
+            what: String,
+            reason: String,
+        }
+        #[derive(Deserialize)]
+        struct Question {
+            text: String,
+        }
+        #[derive(Deserialize)]
+        struct AnswerBody {
+            #[serde(with = "text")]
+            question: WorkRevision,
+            text: String,
+        }
+        #[derive(Deserialize)]
+        struct Keys {
+            #[serde(default)]
+            decision: Option<Decision>,
+            #[serde(default)]
+            question: Option<Question>,
+            #[serde(default)]
+            answer: Option<AnswerBody>,
+        }
+        let keys = Keys::deserialize(d)?;
+        match (keys.decision, keys.question, keys.answer) {
+            (Some(d), None, None) => Ok(NoteWire::Decision {
+                what: d.what,
+                reason: d.reason,
+            }),
+            (None, Some(q), None) => Ok(NoteWire::Question { text: q.text }),
+            (None, None, Some(a)) => Ok(NoteWire::Answer {
+                question: a.question,
+                text: a.text,
+            }),
+            _ => Err(serde::de::Error::custom(
+                "a note is exactly one of decision, question or answer",
+            )),
+        }
+    }
+}
+
+/// One recorded note with the revision it was recorded at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteAt {
+    /// The revision.
+    #[serde(with = "text")]
+    pub revision: WorkRevision,
+    /// The note.
+    #[serde(flatten)]
+    pub note: NoteWire,
+}
+
+/// A task receipt as the client API shows it (ADR 0023). Statuses and
+/// classes this client does not know are kept as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptWire {
+    /// `running`, `exited`, `interrupted`, `checkpointed` or `blocked`.
+    pub status: String,
+    /// The exit code, for `exited`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    /// Whether the task was cut short; an interrupted test never passed.
+    pub interrupted: bool,
+    /// The snapshot a `checkpointed` receipt left.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub snapshot: Option<SnapshotId>,
+    /// Why a `blocked` receipt is blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One reason a node ranked where it did (ADR 0026): a bare name, or an
+/// object with the value compared, such as `{ "load": 120 }` with the
+/// 1-minute load in thousandths. A reason this client does not know is
+/// kept as it came, as is every field of one it knows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RankWire {
+    /// `current_healthy`, `bundle_chain`, `workspace` or `identity`.
+    Named(String),
+    /// A reason with the value compared, keyed by its name.
+    Detailed(serde_json::Map<String, serde_json::Value>),
+}
+
+/// One reason a node was excluded (ADR 0026): a bare name, or an object
+/// with the values compared. A reason this client does not know is kept
+/// as it came.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExclusionWire {
+    /// `no_answer`.
+    Named(String),
+    /// A reason with the values compared, keyed by its name.
+    Detailed(serde_json::Map<String, serde_json::Value>),
+}
+
+/// A node's verdict in a placement: an object with one key, `eligible`
+/// or `excluded`; a reader skips a key it does not know beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictWire {
+    /// It may run the job; its rank reasons, in order.
+    Eligible {
+        /// Why it ranks where it does.
+        rank: Vec<RankWire>,
+    },
+    /// It may not; every reason.
+    Excluded {
+        /// Why not.
+        reasons: Vec<ExclusionWire>,
+    },
+}
+
+impl<'de> Deserialize<'de> for VerdictWire {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Eligible {
+            rank: Vec<RankWire>,
+        }
+        #[derive(Deserialize)]
+        struct Excluded {
+            reasons: Vec<ExclusionWire>,
+        }
+        #[derive(Deserialize)]
+        struct Keys {
+            #[serde(default)]
+            eligible: Option<Eligible>,
+            #[serde(default)]
+            excluded: Option<Excluded>,
+        }
+        match Keys::deserialize(d)? {
+            Keys {
+                eligible: Some(e),
+                excluded: None,
+            } => Ok(VerdictWire::Eligible { rank: e.rank }),
+            Keys {
+                eligible: None,
+                excluded: Some(x),
+            } => Ok(VerdictWire::Excluded { reasons: x.reasons }),
+            _ => Err(serde::de::Error::custom(
+                "a verdict is exactly one of eligible or excluded",
+            )),
+        }
+    }
+}
+
+/// One node a placement considered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateWire {
+    /// The node.
+    #[serde(with = "text")]
+    pub node: NodeId,
+    /// Its verdict.
+    pub verdict: VerdictWire,
+}
+
+/// One placement decision as the journal recorded it (ADR 0026).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementWire {
+    /// The event that recorded it.
+    #[serde(with = "text")]
+    pub seq: EventSeq,
+    /// `initial`, `planned_handoff` or `failover`.
+    pub kind: String,
+    /// The node chosen; `null` when the job was parked.
+    #[serde(with = "text::option")]
+    pub chosen: Option<NodeId>,
+    /// Every candidate, eligible ones first in rank order.
+    pub candidates: Vec<CandidateWire>,
+}
+
+/// One continuation as the journal recorded it (ADR 0024).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationWire {
+    /// The new attempt.
+    #[serde(with = "text")]
+    pub attempt: AttemptId,
+    /// The attempt it continued.
+    #[serde(with = "text")]
+    pub from: AttemptId,
+    /// The fidelity achieved: `native_session`, `new_native_session_with_package` or `workspace_only`.
+    pub achieved: String,
+    /// The work package's digest, as 64 lowercase hex, when one was built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+}
+
+/// One provider operation as the journal holds it (ADR 0021, ADR 0022).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOperationWire {
+    /// The operation.
+    #[serde(with = "text")]
+    pub operation: OperationId,
+    /// The attempt it was dispatched under.
+    #[serde(with = "text")]
+    pub attempt: AttemptId,
+    /// The generation it was dispatched under.
+    #[serde(with = "text")]
+    pub generation: Generation,
+    /// The worker profile.
+    pub profile: String,
+    /// The action.
+    pub action: String,
+    /// `create`, `mutate` or `destroy`.
+    pub effect: String,
+    /// Where it is in the reconciliation state machine.
+    pub status: String,
+    /// The resource it acts on or made, as the worker names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+    /// The operation it cleans up after, for a cleanup.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub cleans: Option<OperationId>,
+}
+
+/// One reason no replacement attempt may be granted (ADR 0022).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockerWire {
+    /// `create_unresolved`, `exec_may_run` or `stop_not_confirmed`.
+    pub kind: String,
+    /// The provider operation.
+    #[serde(with = "text")]
+    pub operation: OperationId,
+    /// Its status.
+    pub status: String,
+}
+
+/// A provider resource that may still exist (ADR 0022).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidualWire {
+    /// The create that made it.
+    #[serde(with = "text")]
+    pub creating: OperationId,
+    /// The create's status.
+    pub status: String,
+    /// Where the resource is, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+}
+
+/// Everything the journal holds about one managed job (M5): the body of
+/// `managed_inspect` and of the facade's `inspection`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inspection {
+    /// The job, each task with its class and last receipt.
+    pub job: ManagedJob,
+    /// Whether the job waits for a placement: active, primary open, no attempt.
+    pub parked: bool,
+    /// Its placement decisions, oldest first.
+    pub placements: Vec<PlacementWire>,
+    /// Its continuations, oldest first.
+    pub continuations: Vec<ContinuationWire>,
+    /// Its notes, oldest first.
+    pub notes: Vec<NoteAt>,
+    /// Its provider operations.
+    pub provider_operations: Vec<ProviderOperationWire>,
+    /// What blocks a replacement attempt.
+    pub blockers: Vec<BlockerWire>,
+    /// Provider resources that may still exist.
+    pub residuals: Vec<ResidualWire>,
+}
+
+/// The jobs a facade token may act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JobScopeWire {
+    /// Every job of the owner: the string `any`.
+    Any(AnyWord),
+    /// These jobs.
+    Jobs(#[serde(with = "text::list")] Vec<JobId>),
+}
+
+/// The nodes a facade token may pin or place on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResourceScopeWire {
+    /// Every node: the string `any`.
+    Any(AnyWord),
+    /// These nodes.
+    Nodes(#[serde(with = "text::list")] Vec<NodeId>),
+}
+
+/// The one word `any`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnyWord {
+    /// `any`.
+    Any,
+}
+
+/// A facade token just minted; the bearer is shown once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Minted {
+    /// The token's id, its revocation handle.
+    pub token_id: String,
+    /// The bearer, 64 lowercase hex characters, never stored by the node.
+    pub bearer: String,
+}
+
+/// Whether a revoke found a live token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revoked {
+    /// `false` when the id was unknown or already revoked.
+    pub revoked: bool,
+}
+
+/// A facade message or answer carried on the client API unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FacadeEnvelope {
+    /// The message.
+    pub message: serde_json::Value,
+}
+
+/// What an import captured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Imported {
+    /// The snapshot, which a `managed_submit` with a `snapshot` source starts from.
+    #[serde(with = "text")]
+    pub snapshot: SnapshotId,
+}
+
 impl From<&ManagedState> for ManagedJob {
     fn from(state: &ManagedState) -> Self {
         ManagedJob {
@@ -1357,6 +2061,8 @@ impl From<&ManagedState> for ManagedJob {
                         TaskState::Cancelled => "cancelled",
                     }
                     .to_owned(),
+                    class: None,
+                    receipt: None,
                 })
                 .collect(),
             attempts: state

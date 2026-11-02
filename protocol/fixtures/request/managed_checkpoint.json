@@ -1,0 +1,6 @@
+{
+  "op": "managed_checkpoint",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "expected_revision": "3"
+}

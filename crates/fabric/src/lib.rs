@@ -78,9 +78,12 @@ enum Command {
     /// Make, run, suspend, move and resume jobs.
     #[command(subcommand)]
     Job(JobCommand),
-    /// Make, cancel and read managed jobs (ADR 0019).
+    /// Make, cancel and read managed jobs (ADR 0019), and the M5 operations on them.
     #[command(subcommand)]
     Managed(managed::ManagedCommand),
+    /// Mint and revoke facade tokens; reach a job's authority from any of your nodes (ADR 0027).
+    #[command(subcommand)]
+    Facade(managed::FacadeCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
     Doctor {
         /// The node to compare with.
@@ -531,6 +534,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Job(command) => job(&state, &home, command).await,
+        Command::Facade(command) => managed::run_facade(&client, command)
+            .await
+            .map(|_| ExitCode::SUCCESS),
         Command::Managed(command) => managed::run(&client, command)
             .await
             .map(|_| ExitCode::SUCCESS),

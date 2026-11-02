@@ -100,6 +100,14 @@ enum Call {
     Job(JobId, Reply<Option<ManagedState>>),
     List(Reply<Vec<ManagedState>>),
     Pending(Reply<Vec<PendingEffect>>),
+    /// Work on the open journal by the facade and the inspect read (owner
+    /// B, M5): the closure answers its own caller. `create` makes the
+    /// journal when there is none yet, as a first `CreateJob` does, for a
+    /// token minted before any job.
+    With {
+        create: bool,
+        work: JournalWork,
+    },
 }
 
 /// An accepted operation whose effect the node has not asked for yet: a
@@ -116,6 +124,10 @@ pub(crate) struct PendingEffect {
     /// Its kind.
     pub kind: CommandKind,
 }
+
+/// Work the facade or a read runs inside the authority's thread; it
+/// answers its own caller.
+type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
 
 /// The managed ids as the standalone paths read them, without the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +162,9 @@ enum Writer {
         calls: mpsc::Sender<Call>,
         /// The ids it publishes outside the queue.
         ids: watch::Receiver<Ids>,
+        /// How many calls have changed the journal; a watcher of the
+        /// facade waits on it (M5).
+        commits: watch::Receiver<u64>,
     },
 }
 
@@ -182,7 +197,7 @@ impl Authority {
     fn running(&self) -> std::io::Result<(mpsc::Sender<Call>, watch::Receiver<Ids>)> {
         let mut writer = crate::node::lock(&self.writer);
         let place = match &*writer {
-            Writer::Running { calls, ids } => return Ok((calls.clone(), ids.clone())),
+            Writer::Running { calls, ids, .. } => return Ok((calls.clone(), ids.clone())),
             Writer::Idle(state, node) => Place {
                 dir: managed_dir(state),
                 jobs: state.jobs(),
@@ -191,17 +206,53 @@ impl Authority {
         };
         let (calls, queue) = mpsc::channel(QUEUE);
         let (publish, ids) = watch::channel(Ids::Loading);
+        let (committed, commits) = watch::channel(0_u64);
         std::thread::Builder::new()
             .name("fabric-authority".into())
-            .spawn(move || serve(&place, queue, &publish))?;
+            .spawn(move || serve(&place, queue, &publish, &committed))?;
         #[cfg(test)]
         self.spawned
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *writer = Writer::Running {
             calls: calls.clone(),
             ids: ids.clone(),
+            commits,
         };
         Ok((calls, ids))
+    }
+
+    /// A counter of the calls that changed the journal, for a facade watch
+    /// that waits for the next event (M5): it starts the thread when none
+    /// runs, so a watch on an empty authority waits on a live counter.
+    pub(crate) fn commits(&self) -> Result<watch::Receiver<u64>, AuthorityError> {
+        self.running()
+            .map_err(|e| AuthorityError::Unavailable(format!("its thread did not start: {e}")))?;
+        match &*crate::node::lock(&self.writer) {
+            Writer::Running { commits, .. } => Ok(commits.clone()),
+            Writer::Idle(..) => Err(AuthorityError::Unavailable(
+                "its thread did not start".into(),
+            )),
+        }
+    }
+
+    /// Runs `work` on the journal inside the authority's thread, after
+    /// the calls before it (M5, owner B: the facade's token rows and
+    /// reads, the inspect read). With `create`, a journal is made when
+    /// there is none, as a first `CreateJob` makes it; without it, an
+    /// absent journal is `UnknownJob` for the job the work names, or
+    /// unavailable for work that names none.
+    pub(crate) async fn with_journal<T: Send + 'static>(
+        &self,
+        create: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        self.call(|reply: Reply<T>| Call::With {
+            create,
+            work: Box::new(move |journal| {
+                let _ = reply.send(journal.and_then(work));
+            }),
+        })
+        .await
     }
 
     /// Whether no thread runs: no journal at start and no command since,
@@ -409,12 +460,38 @@ fn stopped(e: &dyn std::fmt::Display) -> Holder {
 }
 
 /// The authority's thread: recovery first, then one call at a time.
-fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids>) {
+fn serve(
+    place: &Place,
+    mut queue: mpsc::Receiver<Call>,
+    ids: &watch::Sender<Ids>,
+    committed: &watch::Sender<u64>,
+) {
     let mut holder = open_existing(place, ids);
+    let tick = || committed.send_modify(|n| *n = n.wrapping_add(1));
     while let Some(call) = queue.blocking_recv() {
         match call {
+            Call::With { create, work } => {
+                if create && matches!(holder, Holder::Absent) {
+                    match self::create(place) {
+                        Ok(journal) => holder = Holder::Open(journal),
+                        Err(e) => {
+                            work(Err(e));
+                            continue;
+                        }
+                    }
+                }
+                work(match &mut holder {
+                    Holder::Open(journal) => Ok(journal),
+                    Holder::Absent => {
+                        Err(AuthorityError::Unavailable("no managed journal yet".into()))
+                    }
+                    Holder::Stopped(reason) => Err(AuthorityError::Unavailable(reason.clone())),
+                });
+                tick();
+            }
             Call::Submit(envelope, reply) => {
                 let answer = submit(place, &mut holder, &envelope);
+                tick();
                 // Published before the answer, so no caller that saw the
                 // job made can look its id up and miss it.
                 if let Ok(Answer {
@@ -435,12 +512,14 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                     open(&mut holder, job)
                         .and_then(|j| Ok(j.observe(job, &observation, now_ms())?)),
                 );
+                tick();
             }
             Call::Mark(job, operation, mark, reply) => {
                 let _ = reply.send(
                     open(&mut holder, job)
                         .and_then(|j| Ok(j.mark(job, operation, mark, now_ms())?)),
                 );
+                tick();
             }
             Call::Job(job, reply) => {
                 let _ = reply.send(match &holder {

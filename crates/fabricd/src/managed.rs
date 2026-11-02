@@ -121,6 +121,7 @@ impl Node {
                 repo,
                 goal,
                 harness,
+                ..
             } => {
                 // As for a standalone job: a secret in an ACP argument is
                 // refused before the append-only journal records it.
@@ -147,6 +148,7 @@ impl Node {
                 job,
                 expected_revision,
                 reason,
+                ..
             } => {
                 let envelope = Envelope {
                     key: operation_key,
@@ -191,7 +193,7 @@ impl Node {
         }
     }
 
-    async fn managed_job(&self, job: JobId) -> Result<ManagedJob, NodeError> {
+    pub(crate) async fn managed_job(&self, job: JobId) -> Result<ManagedJob, NodeError> {
         match self.authority.job(job).await? {
             Some(state) => Ok(ManagedJob::from(&state)),
             None if self.cfg.state.job(job).ledger().exists() => {
@@ -201,7 +203,7 @@ impl Node {
         }
     }
 
-    async fn managed_submit(
+    pub(crate) async fn managed_submit(
         &self,
         envelope: Envelope<Command>,
     ) -> Result<ManagedOperation, NodeError> {

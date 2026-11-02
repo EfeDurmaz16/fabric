@@ -90,6 +90,7 @@ mod ids;
 pub mod lifecycle;
 mod model;
 pub mod package;
+pub mod place;
 pub mod placement;
 pub mod secret_ref;
 pub mod source;
@@ -118,6 +119,7 @@ pub use package::{
     AllowedFidelity, Fidelity, FidelityRefusal, PACKAGE_MAX_BYTES, PACKAGE_VERSION, PackageDigest,
     PackageError, PackageInput, TEXT_MAX_BYTES, WorkPackage, build_package, offered_fidelity,
 };
+pub use place::place;
 pub use placement::{NodeAdvert, PlacementDecision, PlacementKind};
 pub use secret_ref::{SECRET_ENV_PREFIX, SecretName, SecretRef, SecretScope, SecretValue};
 pub use source::{CommitId, GitUri, SourceError};

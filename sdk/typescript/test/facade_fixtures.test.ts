@@ -8,6 +8,9 @@
 // the catalogue. The parser checks come with the M5 facade code.
 
 import { describe, expect, test } from "bun:test";
+
+import { FacadeRefusal, ProtocolViolation, readAnswer, readClientMessage, writeAnswer, writeClientMessage } from "../src/facade.ts";
+import { decodeJson } from "../src/frame.ts";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -117,7 +120,8 @@ function cases(): Array<[string, { [key: string]: Json }]> {
     .filter((name) => name.endsWith(".json"))
     .sort()
     .map((name) => {
-      const parsed = JSON.parse(readFileSync(join(ROOT, "cases", name), "utf8")) as Json;
+      // Read as a frame's body is, so an integer written as a float is a symbol no reader takes.
+      const parsed = decodeJson(readFileSync(join(ROOT, "cases", name))) as Json;
       if (!isObject(parsed)) throw new Error(`${name}: not an object`);
       return [name.slice(0, -".json".length), parsed];
     });
@@ -221,5 +225,64 @@ describe("facade protocol v1 fixtures", () => {
     for (const required of REQUIRED_CASES) {
       expect(names.has(required), `missing case ${required}`).toBe(true);
     }
+  });
+
+  // The parse alone decides the schema and the version; every other code needs the authority's journal.
+  const parseDecides = (code: string): boolean => code === "bad_request" || code === "unsupported_version";
+
+  test("every client message reads as the authority reads it", () => {
+    let checked = 0;
+    for (const [name, c] of cases()) {
+      if (c["direction"] !== "client_to_authority") continue;
+      const expected = c["expect"];
+      if (!isObject(expected)) throw new Error(`${name}: expect`);
+      let message: ReturnType<typeof readClientMessage> | undefined;
+      let refusal: FacadeRefusal | undefined;
+      try {
+        message = readClientMessage(c["message"]);
+      } catch (e) {
+        if (!(e instanceof FacadeRefusal)) throw e;
+        refusal = e;
+      }
+      if (expected["outcome"] === "accept") {
+        expect(refusal?.message, `${name}: refused`).toBeUndefined();
+        if (message === undefined) throw new Error(name);
+        expect(writeClientMessage(message) as Json, `${name}: writes back`).toStrictEqual(c["message"] as Json);
+      } else if (parseDecides(String(expected["code"]))) {
+        expect(refusal?.refusal.code, `${name}: code`).toBe(String(expected["code"]) as never);
+        expect(refusal?.refusal.reason, `${name}: reason`).toBe(String(expected["reason"]));
+      } else {
+        expect(refusal?.message, `${name}: the parse refused what the authority decides`).toBeUndefined();
+      }
+      checked += 1;
+    }
+    expect(checked).toBeGreaterThanOrEqual(30);
+  });
+
+  test("every answer reads as a client reads it", () => {
+    let checked = 0;
+    for (const [name, c] of cases()) {
+      if (c["direction"] !== "authority_to_client") continue;
+      const expected = c["expect"];
+      if (!isObject(expected)) throw new Error(`${name}: expect`);
+      let answer: ReturnType<typeof readAnswer> | undefined;
+      let violation: ProtocolViolation | undefined;
+      try {
+        answer = readAnswer(c["message"]);
+      } catch (e) {
+        if (!(e instanceof ProtocolViolation)) throw e;
+        violation = e;
+      }
+      if (expected["outcome"] === "accept") {
+        expect(violation?.message, `${name}: refused`).toBeUndefined();
+        if (answer === undefined) throw new Error(name);
+        expect(writeAnswer(answer) as Json, `${name}: writes back`).toStrictEqual(c["message"] as Json);
+      } else {
+        expect(expected["code"], name).toBe("protocol_violation");
+        expect(violation?.reason, `${name}: reason`).toBe(String(expected["reason"]));
+      }
+      checked += 1;
+    }
+    expect(checked).toBeGreaterThanOrEqual(10);
   });
 });

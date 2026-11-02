@@ -159,7 +159,12 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             .collect(),
         Reply::HarnessStarted(registered) => vec![self::registered(registered)],
         Reply::HarnessSession(recorded) => vec![session_recorded(recorded)],
-        Reply::ManagedCreate(operation) | Reply::ManagedCancel(operation) => {
+        Reply::ManagedCreate(operation)
+        | Reply::ManagedCancel(operation)
+        | Reply::ManagedSubmit(operation)
+        | Reply::ManagedNote(operation)
+        | Reply::ManagedCheckpoint(operation)
+        | Reply::ManagedContinue(operation) => {
             let mut lines = fabric_client::sentences::managed_job(&operation.job);
             if operation.replayed {
                 lines.push(format!(
@@ -170,6 +175,25 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             lines
         }
         Reply::ManagedStatus(job) => fabric_client::sentences::managed_job(job),
+        Reply::ManagedInspect(inspection) => inspection_lines(inspection),
+        Reply::ManagedImport(imported) => vec![format!("imported snapshot {}", imported.snapshot)],
+        Reply::FacadeMint(minted) => vec![
+            format!("token {}", minted.token_id),
+            format!(
+                "bearer {} (shown once; the node keeps only its digest)",
+                minted.bearer
+            ),
+        ],
+        Reply::FacadeRevoke(revoked) => vec![if revoked.revoked {
+            "revoked; new facade messages under it are refused and an open watch ends".to_owned()
+        } else {
+            "nothing revoked: the token is unknown or was already revoked".to_owned()
+        }],
+        // One line: the answer as the authority wrote it, compact, since a
+        // printed line keeps no newline of its own.
+        Reply::FacadeCall(envelope) => {
+            vec![serde_json::to_string(&envelope.message).unwrap_or_default()]
+        }
         Reply::ManagedList(list) => list
             .jobs
             .iter()
@@ -424,6 +448,108 @@ fn ledger_event(event: &LedgerEvent) -> String {
         LedgerEvent::Note { text } => format!("Note: {text}"),
         LedgerEvent::Unrecognized => "a record of a kind this fabric does not know".to_owned(),
     }
+}
+
+/// The lines an inspection prints after the job's own: whether it waits
+/// for a placement, each placement with its chosen node and why the rest
+/// were excluded, each continuation with the fidelity achieved, the
+/// notes, and what provider operations block or may remain.
+fn inspection_lines(inspection: &fabric_client::api::Inspection) -> Vec<String> {
+    use fabric_client::api::{ExclusionWire, RankWire, VerdictWire};
+    let mut lines = fabric_client::sentences::managed_job(&inspection.job);
+    if inspection.parked {
+        lines.push("parked: no node was eligible at the last placement; nothing runs".to_owned());
+    }
+    for placement in &inspection.placements {
+        lines.push(match placement.chosen {
+            Some(node) => format!(
+                "placement {} ({}): chose {node}",
+                placement.seq, placement.kind
+            ),
+            None => format!(
+                "placement {} ({}): no eligible node",
+                placement.seq, placement.kind
+            ),
+        });
+        for candidate in &placement.candidates {
+            let verdict = match &candidate.verdict {
+                VerdictWire::Eligible { rank } => format!(
+                    "eligible ({})",
+                    rank.iter()
+                        .map(|r| match r {
+                            RankWire::Named(name) => name.clone(),
+                            RankWire::Detailed(map) =>
+                                serde_json::to_string(map).unwrap_or_default(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                VerdictWire::Excluded { reasons } => format!(
+                    "excluded ({})",
+                    reasons
+                        .iter()
+                        .map(|r| match r {
+                            ExclusionWire::Named(name) => name.clone(),
+                            ExclusionWire::Detailed(map) =>
+                                serde_json::to_string(map).unwrap_or_default(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            lines.push(format!("  {}: {verdict}", candidate.node));
+        }
+    }
+    for continuation in &inspection.continuations {
+        lines.push(format!(
+            "continuation: attempt {} continued {} at fidelity {}{}",
+            continuation.attempt,
+            continuation.from,
+            continuation.achieved,
+            continuation
+                .package
+                .as_deref()
+                .map_or(String::new(), |p| format!(" with package {p}"))
+        ));
+    }
+    for note in &inspection.notes {
+        lines.push(format!(
+            "note at revision {}: {}",
+            note.revision,
+            serde_json::to_string(&note.note).unwrap_or_default()
+        ));
+    }
+    for op in &inspection.provider_operations {
+        lines.push(format!(
+            "provider operation {}: {} {} {} ({}){}",
+            op.operation,
+            op.profile,
+            op.action,
+            op.effect,
+            op.status,
+            op.locator
+                .as_deref()
+                .map_or(String::new(), |l| format!(" at {l}"))
+        ));
+    }
+    for blocker in &inspection.blockers {
+        lines.push(format!(
+            "blocks a replacement: {} {} ({})",
+            blocker.kind, blocker.operation, blocker.status
+        ));
+    }
+    for residual in &inspection.residuals {
+        lines.push(format!(
+            "may remain: the resource of {} ({}){}",
+            residual.creating,
+            residual.status,
+            residual
+                .locator
+                .as_deref()
+                .map_or(String::new(), |l| format!(" at {l}"))
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]

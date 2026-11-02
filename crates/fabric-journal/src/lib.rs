@@ -19,6 +19,7 @@
 //! verify; an operation left `accepted` is returned for its one dispatch.
 
 mod crashpoint;
+mod facade;
 mod project;
 mod provider;
 mod schema;

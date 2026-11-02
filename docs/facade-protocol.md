@@ -154,6 +154,14 @@ At most 256 events, in sequence order, all after `after`. `next` is the sequence
 | `refused` | a domain refusal's snake-case name (`attempt_still_live`, `task_closed`, `replacement_blocked`, `fidelity`, `not_live`, `unsupported_source`, `bad_policy`, ...) | the authority's domain refused the command; stored under the key |
 | `unavailable` | `authority`, `link` | the authority is not open or the link to it failed; nothing is known about the command, and a repeat with the same key tells |
 
+## Placements in an inspection
+
+`placements[]` is `{ "seq", "kind", "chosen", "candidates": [ { "node", "verdict" } ] }`, with `kind` one of `initial`, `planned_handoff`, `failover` and `chosen` the node or `null`. A verdict is `{ "eligible": { "rank": [...] } }` or `{ "excluded": { "reasons": [...] } }`. A rank reason is a name, `current_healthy`, `bundle_chain`, `workspace` or `identity`, or `{ "load": <thousandths> }`. An exclusion reason is the name `no_answer`, or an object keyed by its name with the values compared: `{ "stale": { "age_ms" } }`, `{ "platform": { "need": { "os", "arch" }, "have": { ... } } }`, `{ "harness_missing": { "harness": <the client API's harness form> } }`, `{ "harness_version": { "harness": ..., "need", "have" } }`, `{ "layout": { "need": { "home", "root" }, "have": { ... } } }`, `{ "secret": { "name" } }`, `{ "disk": { "need", "free" } }`, `{ "pin": { "pinned": <node> } }`. A client keeps a reason it does not know as it came. The same forms are in `protocol/fixtures/reply/managed_inspect.json`.
+
+## As built (M5)
+
+Built on 2026-11-03 by owner B against the text above; the fixtures are unchanged. A message that is not JSON is `bad_request`/`bad_string`. A command's key is stored on the authority under the token's actor (ADR 0027, As built). `events.next` is `null` only when the job has no event after a `null` cursor; a watch with nothing after its cursor on a finished or cancelled job answers `closed: "finished"`. A `checkpoint` of a job with no attempt at all is `refused`/`not_live` without a stored key. A `continue` acts on the live attempt's task, or the primary task when none is live. The local node forwards a facade message over the link with a deadline of the message's `wait_ms` (the default when absent) plus five seconds, and answers `unavailable`/`link` when the link fails.
+
 ## Fixtures
 
 [`protocol/facade/v1`](../protocol/facade/v1) holds one kind of file and a manifest:

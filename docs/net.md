@@ -66,6 +66,20 @@ named, instead of misreading a request. Version 4 added the question a push
 asks its target for the facts of the job's harness (ADR 0013, amended
 2026-10-27), so a node updated past it pairs only with nodes updated too.
 
+Version 4 has not shipped, and M5 adds two more messages to it (ADR 0026,
+ADR 0027). `Advertise` asks a peer what it offers for the placement of one
+managed job and is answered with `Advert`: platform, harnesses with versions,
+path layout, load and free disk, warmth for the job, the time measured, and
+the job's secrets the peer cannot resolve. `Facade` carries one facade
+message, JSON of at most 1 MiB that the link does not read, to the peer's
+managed authority, and is answered with `Facade`, the authority's answer of at
+most 16 MiB, unchanged (docs/facade-protocol.md). A facade message runs under
+the per-peer job work cap like a per-job message, so a watch holds one slot
+for at most its wait, and its answer alone is read under the facade's own
+frame bound; every other control message keeps the control frame's. A peer
+that serves neither answers a fault, which the asking node records as that
+peer's exclusion or answers its client as `unavailable`.
+
 ## Wires
 
 Both transports listen on one port, and the node holds them as one

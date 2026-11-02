@@ -56,6 +56,10 @@ Initial placement (at submit), planned handoff (`continue`, after a quiescence a
 - A pinned job can be parked when its pin is ineligible, with the exclusion naming why.
 - `ResourceRef::Node` stays the one form an attempt is granted on in M5.
 
+## As built (M5)
+
+Built on 2026-11-03 by owner B. Where the code differs from the decision above, docs/managed-jobs.md, "As built (M5): P06 and P07", says how and why. In short: `fabric_core::managed::place` is the pure function of the decision, with a property test over the order of the probes; `fabricd::placement` measures this node's advert now (the platform and harness versions from the facts, the job's root as it would be here, the 1-minute load from the kernel, the free bytes of the state directory's volume, warmth from the store and the job root, and the secrets the executor's own resolver cannot read), probes every paired peer in parallel within the 5 s bound, and decides. The known-writer version check is not a placement filter: the placement input carries no writer, and the fidelity a target can offer is decided at the continuation (`offered_fidelity`), so `Exclusion::HarnessVersion` is defined and unused by `place`. An ACP agent found on the target's `PATH` is advertised at the placeholder version `0.0.0`, since an agent reports none. The authority's dispatch of a create's and a continue's placement through `Node::place_job` is owner A's wiring and had not landed when this was written; the decision's recording (`PlacementDecided`) and its reading (`inspect`) are in place.
+
 ## Open questions
 
 - Budget inputs beyond disk and load (cost, data placement permissions) once a provider resource can be placed.
