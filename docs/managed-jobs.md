@@ -1,6 +1,6 @@
 # Managed jobs: identity, journal v1, operation states and replay
 
-Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; its "As built (M4)" notes record where the code differs.
+Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; its "As built (M4)" notes record where the code differs. The section "Placement and planned continuity (M5)" was added 2026-11-03 with ADRs 0023 to 0027 as the contract the M5 owners build against; it holds types and signatures only until the code lands.
 
 ## Identity
 
@@ -833,3 +833,586 @@ M4 exposes provider operations as library calls only (ADR 0022, selection 6). Ef
 | Acceptance (M5) | Surfaces | Tests |
 |---|---|---|
 | A client reads, for one managed job, every provider operation as the journal holds it (its status, with `unknown`, `attached`, `observed` and `abandoned` shown as they are and never folded into another; its action, effect class, purpose and the create a cleanup cleans; its target and locator; the scope its last absent attach searched; its abandonment reason), the job's replacement blockers (`CreateUnresolved`, `ExecMayRun`, `StopNotConfirmed`, each with its operation and status, from `Journal::replacement_blockers`) and its residuals (each create's locator, or the scope an absent attach searched, from `Journal::residuals`). The read writes nothing and sends nothing to a worker. | one read op of the node's client API beside `managed_status`; the matching `fabric-client` method; the TypeScript SDK method beside `managedStatus`; a `fabric managed` subcommand beside `status` | written first and failing on the M4 code: a node test over a journal seeded with an operation in each of `unknown` (with and without a searched scope), `attached`, `observed` and `abandoned`, a blocker of each kind and a residual of each kind, answered through the client API with each value as the journal holds it and the journal unchanged after the read; the TypeScript SDK test of the same op against the node built in the same run; a CLI test of the subcommand's sentences for each status, blocker and residual |
+
+## Placement and planned continuity (M5)
+
+Status: proposed with ADRs 0023 to 0027, 2026-11-03. This section is the M5 contract: the types and signatures the two implementation owners build against, written before any M5 code. Its selections were selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02 and are recorded in each ADR; none was approved by Efe. The code is the authority on signatures once it lands, and each part gains an "As built (M5)" note where the code differs. The facade's wire contract is [docs/facade-protocol.md](facade-protocol.md) with its fixtures in [protocol/facade/v1](../protocol/facade/v1).
+
+Acceptance (roadmap M5): submit without choosing a machine; the same job observed after a reconnect; a planned handoff with child-task outcomes and the fidelity actually achieved.
+
+### What M2 to M4 already provide
+
+M5 adds only what is missing. These exist, are tested, and do not change:
+
+| Need | Existing mechanism | Where |
+| --- | --- | --- |
+| Durable job, task, attempt and operation identity; dedupe by key; expected revision; replay | ADR 0019 domain, `accept_command`, `dedupe`, `apply_batch`, `replay` | `crates/fabric-core/src/managed/`, `managed_rules.rs` |
+| `JobPolicy` (restart policy), `Intent`, `SourceBinding` (`Repository`, `Snapshot`), `TaskKind`, `RestartPolicy` | ADR 0019 model | `crates/fabric-core/src/managed/model.rs` |
+| One authority, one writer; grants with a `Generation`; `StaleGeneration` refused; no grant while an attempt may run | ADR 0020 | `crates/fabricd/src/authority.rs`, `fabric-journal` |
+| The journal: versioned SQLite, hash-chained events, projections, `verify`, `recover`, `events(job, after, limit)` with `EventSeq` | ADR 0020, schema versions 1 and 2 | `crates/fabric-journal/` |
+| Provider effects fenced on the live grant, `unknown` on loss, attach, the replacement barrier, cleanup with fresh approval, residuals | ADR 0021, ADR 0022 | `crates/fabric-bridge`, `fabric-journal/src/provider.rs` |
+| Capture of a workspace and a harness session into a content-addressed snapshot (bundle chain, private index, carry keys), restore in place or fresh, the `Clean`/`Dirty`/`Suspending`/`Restoring` marker | ADR 0004, ADR 0012, ADR 0014 | `crates/fabric-store/src/capture.rs`, `restore.rs`; `fabric-harness` adapters' `capture` and `restore` |
+| The suspend path that stops a harness cleanly and publishes a snapshot; Claude Code and Codex tombstones; headless launch and hold | ADR 0006, ADR 0015, M2 group A | `crates/fabricd/src/job.rs`, `local.rs`, `fabric-harness` |
+| A harness process group the node records and signals; what leaves the group is out of reach and reported | `local.rs`, the harness record | `crates/fabricd/src/local.rs` |
+| Facts a node measures about itself per operation, with no cache: user, home, os, arch, tool versions, logins as yes or no; a peer asks with `FactsFor { harness, tools }` within a budget | ADR 0008, ADR 0013 amended | `crates/fabricd/src/facts.rs`, `fabric-net/src/wire.rs` |
+| Known-writer rule: the newest harness version that wrote a session, compared with the target's | ADR 0006 | `fabric-core/src/version.rs`, `fabricd/src/doctor.rs` |
+| Same root and home on every node | ADR 0011 | `fabric-harness` restore refusals, `doctor.rs` |
+| Peers: the peer book of paired node ids and addresses, pinned identities on QUIC and TCP with TLS, one stream per request, budgets, per-peer caps, protocol 4 (unshipped) | ADR 0005, ADR 0013 | `crates/fabric-net/src/peers.rs`, `endpoint.rs`, `rpc.rs`, `wire.rs` |
+| Snapshot transfer between nodes: `WantSnapshot`, `WantChunks`, chunks trusted after hashing | ADR 0013 | `fabric-net`, `fabricd/src/transfer.rs` |
+| Secret paths that never leave a node, growing per job, with consent for a tracked secret (`TrackedSecrets`); credential-shaped text detection | ADR 0004, ADR 0007 | `fabric-core/src/secret.rs`, `credential.rs` |
+| The client API: length-prefixed JSON, api 1 additive, fixtures under `protocol/fixtures`, `managed_create`, `managed_cancel`, `managed_status`, `managed_list` with operation keys; the Rust client and the TypeScript SDK | ADR 0018, M2 | `crates/fabric-client`, `sdk/typescript` |
+| The bridge fixture discipline: a fixture set shared by two implementations, a sorted `manifest.sha256`, a pin test on each side | ADR 0021 | `protocol/bridge/v1`, `crates/fabric-client/tests/bridge_fixtures.rs` |
+
+What is missing, and which part adds it:
+
+| Gap after M4 | M5 addition | Part |
+| --- | --- | --- |
+| A task has no behavioral class; an interrupted test is indistinguishable from a finished one | `TaskClass`, `OutcomePolicy`, `TaskReceipt` with `interrupted` | P03 |
+| Nothing bounds quiescence or reports an escaped child or a foreign writer | the executor, `DrainBudget`, `Quiescence`, `HandoffBlocker` | P03 |
+| A checkpoint is a snapshot without receipts, facts or evidence | `CheckpointCut`, `CheckpointCutRecorded` | P03 |
+| Nothing portable survives a harness change | `WorkPackage`, `Note`, `RecordNote` | P04 |
+| Continuation has one fidelity and no record of it | `Fidelity`, `AllowedFidelity`, `ContinuationRecorded` | P04 |
+| A source must be a path on the authority | `SourceBinding::Git`, `Empty`, import through capture | P05 |
+| A task cannot say which secret it needs; nothing checks it before launch | `SecretRef`, the local resolver, the `Secret` exclusion | P05 |
+| Secret paths leave or stay by pattern alone | `export_allowlist` as the capture's consent | P05 |
+| The user names the machine | `NodeAdvert`, `place`, `PlacementDecision`, `PlacementDecided`, parking | P06 |
+| The authority answers only its local socket | the facade over the node link, `FacadeTokenRecord`, `facade_call` | P07 |
+| Provider operations have no read surface (ADR 0022, selection 6) | `managed_inspect` and the facade's `inspect` | P07 |
+
+### Codec and schema version 3
+
+Every shape below that is stored in the journal is carried by codec format byte `2`. The frame reader dispatches on the byte: `1` decodes with the M2 shapes, frozen in `fabric_core::managed::frame::v1`, and widens them with the M2 defaults (`JobPolicy::m2_defaults`, `TaskClass::Harness` for every task, `acceptance` empty); `2` decodes the shapes below. A format 1 frame keeps its bytes and its digest, so no chain changes, and `v1.sqlite` and `v2.sqlite` still verify. `request_digest` is computed over the format 2 bytes of a command; a key stored under a format 1 digest answers a repeat of that command as `OperationConflict`, which no shipped journal can hold. New command and event kinds are new `kind` strings.
+
+Schema version 3 (migration `2 -> 3`, one transaction, tested from `tests/fixtures/v2.sqlite`; `tests/fixtures/v3.sqlite` is the new fixture):
+
+```sql
+PRAGMA user_version = 3;
+
+ALTER TABLE tasks ADD COLUMN class TEXT NOT NULL DEFAULT 'harness'
+  CHECK (class IN ('build','test','harness','opaque'));
+
+-- operations.kind is checked against the command kinds; SQLite cannot widen a
+-- CHECK in place, so the migration rebuilds the table with the kinds
+-- 'record_note', 'checkpoint', 'continue' and 'cancel_task' added and copies
+-- every row.
+
+CREATE TABLE facade_tokens (
+  token_id   BLOB PRIMARY KEY CHECK (length(token_id) = 16),
+  digest     BLOB NOT NULL UNIQUE CHECK (length(digest) = 32),
+  actor      TEXT NOT NULL,
+  jobs       BLOB NOT NULL,        -- framed JobScope
+  resources  BLOB NOT NULL,        -- framed ResourceScope
+  minted_ms  INTEGER NOT NULL,
+  expires_ms INTEGER NOT NULL,
+  revoked_ms INTEGER
+) STRICT;
+
+CREATE TABLE placements (
+  seq        INTEGER PRIMARY KEY REFERENCES events(seq),
+  job_id     BLOB NOT NULL REFERENCES jobs(job_id),
+  task_id    BLOB NOT NULL REFERENCES tasks(task_id),
+  kind       TEXT NOT NULL CHECK (kind IN ('initial','planned_handoff','failover')),
+  chosen     BLOB CHECK (chosen IS NULL OR length(chosen) = 32),
+  decided_ms INTEGER NOT NULL
+) STRICT;
+CREATE INDEX placements_by_job ON placements (job_id, seq);
+
+CREATE TABLE continuations (
+  attempt_id   BLOB PRIMARY KEY REFERENCES attempts(attempt_id),
+  from_attempt BLOB NOT NULL REFERENCES attempts(attempt_id),
+  achieved     TEXT NOT NULL CHECK (achieved IN ('native_session','new_native_session_with_package','workspace_only')),
+  package      BLOB CHECK (package IS NULL OR length(package) = 32),
+  seq          INTEGER NOT NULL REFERENCES events(seq)
+) STRICT;
+```
+
+`placements` and `continuations` are projections of the events `PlacementDecided` and `ContinuationRecorded`, written by `write_transition` in the same transaction, and `verify` rebuilds them as it does the others. `facade_tokens` is authority state, not job history: it has no event, and a backup carries it as it is. Notes are read from the events (`NoteRecorded`), with no projection.
+
+### Shared types in fabric-core (`managed` module)
+
+Pure: no IO, no clock, no randomness. Everything below is additive to the M2 types of this page; a type named there and not here is unchanged.
+
+```rust
+// model.rs (owner A)
+
+pub struct Intent {
+    pub goal: String,                       // M2
+    pub harness: HarnessKind,               // M2
+    pub acceptance: Vec<String>,            // M5: each at most TEXT_MAX_BYTES
+}
+
+pub enum SourceBinding {
+    Repository { path: AbsPath },           // M2; local socket only
+    Snapshot { snapshot: SnapshotId },      // M2; also what an import becomes
+    Git { uri: GitUri, commit: CommitId },   // M5
+    Empty,                                  // M5
+}
+
+pub struct JobPolicy {
+    pub restart: RestartPolicy,             // M2
+    pub drain_budget_ms: u32,               // DrainBudget::MIN_MS ..= MAX_MS; default DEFAULT_MS
+    pub allowed_fidelity: AllowedFidelity,  // default AllowedFidelity::DEFAULT
+    pub secrets: Vec<SecretRef>,            // default empty; at most 32
+    pub export_allowlist: Vec<RelPath>,     // default empty; at most 256
+    pub placement: PlacementPolicy,         // default PlacementPolicy::DEFAULT
+}
+impl JobPolicy {
+    pub fn m2_defaults(restart: RestartPolicy) -> JobPolicy;
+    pub fn check(&self) -> Result<(), DomainError>;   // BadPolicy { field } on any bound broken
+}
+
+pub struct PlacementPolicy {
+    pub platform: Option<Platform>,         // None: any; a snapshot source fills it from the manifest when the caller gave none
+    pub disk_bytes: u64,                    // default DEFAULT_DISK_BYTES (2 GiB)
+    pub pin: Option<NodeId>,
+}
+
+pub struct Task {
+    // M2 fields, and:
+    pub class: TaskClass,
+}
+
+pub enum Command {
+    CreateJob { intent: Intent, source: SourceBinding, policy: JobPolicy },   // M2; in M5 its dispatch is the initial placement
+    StartAttempt { task: TaskId, resource: ResourceRef, initial_checkpoint: Option<SnapshotId> }, // M2
+    RegisterTask { parent: TaskId, kind: TaskKind, restart: RestartPolicy, class: TaskClass },   // class added
+    FinishTask { task: TaskId, outcome: TaskOutcome },                        // M2
+    CancelJob { reason: String },            // M2; in M5 accepted while an attempt is live and dispatched to stop it
+    CancelTask { task: TaskId, reason: String },                              // M5
+    RecordNote { note: Note },                                                // M5
+    Checkpoint { attempt: AttemptId },                                        // M5: quiescence and a cut, the attempt stays live
+    Continue { task: TaskId, fidelity: AllowedFidelity, pin: Option<NodeId> }, // M5: the planned handoff
+}
+
+pub enum Observation {
+    // M2 kinds, with Checkpointed widened:
+    Checkpointed { attempt: AttemptId, generation: Generation, snapshot: SnapshotId, cut: CheckpointCut },
+    Receipts { attempt: AttemptId, generation: Generation, receipts: Vec<TaskReceipt> },
+    HandoffBlocked { attempt: AttemptId, generation: Generation, blockers: Vec<HandoffBlocker> },
+    Placed { operation: OperationId, task: TaskId, decision: PlacementDecision },
+    Continued { attempt: AttemptId, generation: Generation, from: AttemptId, achieved: Fidelity, package: Option<PackageDigest> },
+}
+
+pub enum ManagedEvent {
+    // M2 kinds, and:
+    NoteRecorded { note: Note },
+    ReceiptsRecorded { attempt: AttemptId, receipts: Vec<TaskReceipt> },
+    CheckpointCutRecorded { attempt: AttemptId, snapshot: SnapshotId, cut: CutDigest, receipts: Vec<TaskReceipt> },
+    HandoffBlocked { attempt: AttemptId, blockers: Vec<HandoffBlocker> },
+    PlacementDecided { task: TaskId, decision: PlacementDecision },
+    ContinuationRecorded { attempt: AttemptId, from: AttemptId, requested: AllowedFidelity, achieved: Fidelity, package: Option<PackageDigest> },
+}
+
+pub enum DomainError {
+    // M2 and M4 kinds, and:
+    BadPolicy { field: &'static str },
+    UnsupportedSource { reason: &'static str },   // "adoption", "repository_over_facade"
+    FidelityRefused { allowed: AllowedFidelity, offered: Vec<Fidelity> },
+    NotLive { attempt: AttemptId },                // Checkpoint of an attempt that is not granted or running
+    NoteTooLong { bytes: usize },
+}
+
+pub enum Note {
+    Decision { what: String, reason: String },     // reason required, non-empty
+    Question { text: String },
+    Answer { question: WorkRevision, text: String }, // the revision the question was recorded at
+}
+```
+
+Rules the transition functions keep:
+
+- `CreateJob` is `accepted` at commit and `dispatched` when the authority starts the initial placement; `Placed` records the decision and, when a node was chosen, grants the primary task's first attempt there in the same batch (`AttemptGranted`, generation 1, `initial_checkpoint` from a snapshot source). With no chosen node the job is parked: active, primary open, no attempt, the decision recorded; the operation is `succeeded`.
+- `Continue` is refused `UnknownTask` or `TaskClosed` as `StartAttempt` is, and `FidelityRefused` when `fidelity` allows nothing. Its dispatch: a quiescence and a cut of the live attempt (a `Checkpointed` observation, the attempt ends `checkpointed`), then `Placed` with kind `planned_handoff`; when a node is chosen, `AttemptGranted` at the next generation with the cut's snapshot as `initial_checkpoint`; `Continued` once the new attempt's executor reports what it achieved. `HandoffBlocked` ends the dispatch with the operation `failed` and the old attempt still live. The replacement barrier of ADR 0022 applies to the new grant as to any.
+- `Checkpoint` needs a live attempt (`NotLive` otherwise); its dispatch is a quiescence and a cut after which the attempt continues; the operation is `succeeded` at `Checkpointed` and `failed` at `HandoffBlocked`.
+- `CancelJob` and `CancelTask` with a live attempt are `accepted` and `dispatched`; the executor stops the attempt's groups (SIGTERM, the drain budget, SIGKILL) and reports `Exited` with `Cancelled` and the receipts `interrupted`; the job or task is then `cancelled` and the operation `succeeded`. With no live attempt they are `succeeded` at commit as in M2. A cancel never writes an outcome for a provider operation (ADR 0022).
+- `RecordNote` is `succeeded` at commit; a text over `TEXT_MAX_BYTES` is `NoteTooLong`.
+- A parent task cannot `FinishTask` while a registered child of it is `open` (`BadParent` is reused with the child named).
+
+```rust
+// lifecycle.rs (owner A), P03
+
+pub enum TaskClass { Build, Test, Harness, Opaque }
+pub enum OutcomePolicy { CancelAndRestart, Checkpoint, Block }
+impl TaskClass { pub fn outcome_policy(self) -> OutcomePolicy; }
+
+pub struct DrainBudget(u32);
+impl DrainBudget {
+    pub const MIN_MS: u32 = 1_000;
+    pub const DEFAULT_MS: u32 = 30_000;
+    pub const MAX_MS: u32 = 600_000;
+    pub fn new(ms: u32) -> Result<Self, DomainError>;
+}
+
+pub enum ReceiptStatus {
+    Running,
+    Exited,
+    Interrupted,                              // cut by a cancel or a quiescence; never passed, never failed
+    Checkpointed { snapshot: SnapshotId },
+    Blocked { reason: String },
+}
+pub struct TaskReceipt {
+    pub task: TaskId,
+    pub class: TaskClass,
+    pub status: ReceiptStatus,
+    pub exit: Option<i32>,                    // Some only for Exited
+    pub interrupted: bool,                    // true exactly for Interrupted and for a harness Checkpointed mid-turn
+    pub workspace: Option<WorkspaceRevision>,
+}
+
+pub struct WorkspaceRevision {
+    pub bundle_head: SnapshotId,              // the snapshot whose manifest names the bundle chain head
+    pub ledger_head: EventDigest,             // the digest of the job's latest journal event at the cut
+}
+pub struct EventDigest(pub [u8; 32]);
+
+pub enum EvidenceKind { Checkpoint, Exit, Receipt }
+pub struct EvidenceRef { pub digest: [u8; 32], pub attempt: AttemptId, pub kind: EvidenceKind }
+
+pub struct CheckpointCut {
+    pub snapshot: SnapshotId,
+    pub receipts: Vec<TaskReceipt>,
+    pub facts: Vec<(String, String)>,         // the node's facts for the job, as `NodeFacts::iter` gives them
+    pub evidence: Vec<EvidenceRef>,
+}
+pub struct CutDigest(pub [u8; 32]);
+impl CheckpointCut {
+    pub fn canonical_json(&self) -> Vec<u8>;  // keys sorted, counters as decimal strings
+    pub fn digest(&self) -> CutDigest;        // blake3 of "fabric.managed.cut.v1\0" and the canonical JSON
+}
+
+pub enum HandoffBlocker {
+    EscapedChild { pid: u32, group: u32 },
+    UncontrolledWriter { pid: u32, path: RelPath },
+    CheckpointFailed { task: TaskId, reason: String },
+    Opaque { task: TaskId },
+    UnknownEffect { operation: OperationId },  // a provider operation dispatched or unknown (ADR 0022)
+}
+```
+
+```rust
+// package.rs (owner A), P04
+
+pub const PACKAGE_VERSION: u32 = 1;
+pub const PACKAGE_MAX_BYTES: usize = 256 * 1024;
+pub const TEXT_MAX_BYTES: usize = 16 * 1024;
+
+pub struct WorkPackage {
+    pub version: u32,
+    pub job: JobId,
+    pub revision: WorkRevision,
+    pub intent: Intent,
+    pub decisions: Vec<Decision>,
+    pub tasks: Vec<TaskSummary>,
+    pub workspace: WorkspaceRevision,
+    pub evidence: Vec<EvidenceRef>,          // this attempt's accepted evidence, then prior attempts' by digest
+    pub questions: Vec<Question>,            // open questions: each Question with no Answer naming its revision
+    pub artifacts: Vec<ArtifactRef>,
+    pub next_actions: Vec<NextAction>,
+}
+pub struct Decision { pub what: String, pub reason: String, pub revision: WorkRevision }
+pub struct Question { pub text: String, pub revision: WorkRevision }
+pub struct TaskSummary { pub task: TaskId, pub class: TaskClass, pub state: TaskState, pub receipt: Option<TaskReceipt> }
+pub struct ArtifactRef { pub name: String, pub digest: [u8; 32], pub bytes: u64 }
+pub enum NextAction { Continue, Checkpoint, Cancel, FinishTask { task: TaskId }, RegisterTask { parent: TaskId } }
+pub struct PackageDigest(pub [u8; 32]);
+
+pub enum PackageError {
+    TooLarge { bytes: usize },
+    TextTooLong { field: &'static str, bytes: usize },
+    CredentialLike { field: &'static str },  // fabric_core::credential::looks_like_credential on any text
+}
+pub struct PackageInput<'a> {
+    pub state: &'a ManagedState,
+    pub notes: &'a [(WorkRevision, Note)],
+    pub receipts: &'a [TaskReceipt],
+    pub workspace: WorkspaceRevision,
+    pub evidence: &'a [EvidenceRef],
+    pub artifacts: &'a [ArtifactRef],
+}
+pub fn build_package(input: &PackageInput<'_>) -> Result<WorkPackage, PackageError>;
+impl WorkPackage {
+    pub fn canonical_json(&self) -> Vec<u8>;
+    pub fn digest(&self) -> PackageDigest;    // blake3 of "fabric.managed.package.v1\0" and the canonical JSON
+}
+
+pub enum Fidelity { NativeSession, NewNativeSessionWithPackage, WorkspaceOnly, Unsupported }
+pub struct AllowedFidelity {
+    pub native_session: bool,
+    pub new_native_session_with_package: bool,
+    pub workspace_only: bool,                // opt-in
+}
+impl AllowedFidelity {
+    pub const DEFAULT: AllowedFidelity = AllowedFidelity { native_session: true, new_native_session_with_package: true, workspace_only: false };
+    pub fn is_empty(&self) -> bool;
+    /// The highest fidelity both allowed and offered; `Unsupported` is never allowed.
+    pub fn highest(&self, offered: &[Fidelity]) -> Result<Fidelity, FidelityRefusal>;
+}
+pub struct FidelityRefusal { pub allowed: AllowedFidelity, pub offered: Vec<Fidelity> }
+
+/// What a target can offer for a session captured under `source`:
+/// `NativeSession` when the target has the same harness kind, version-compatible under the
+/// known-writer rule, and the same layout; `NewNativeSessionWithPackage` when it has any
+/// harness that launches with a prompt; `WorkspaceOnly` always. Pure; the adapter's own
+/// restore refusals still apply at launch.
+pub fn offered_fidelity(source: &HarnessKind, known_writer: Option<&HarnessVersion>, target: &NodeAdvert, same_layout: bool) -> Vec<Fidelity>;
+```
+
+```rust
+// source.rs and secret_ref.rs (owner A), P05
+
+pub struct GitUri(String);      // 1 to 2048 bytes; scheme https, ssh, git+ssh or file; no userinfo (CredentialInUri); no control character
+pub struct CommitId(String);    // 40 or 64 lowercase hex characters; never a ref name
+pub enum SourceError { BadUri { reason: &'static str }, CredentialInUri, NotACommitId, Adoption, RepositoryOverFacade }
+impl GitUri { pub fn parse(text: &str) -> Result<Self, SourceError>; pub fn as_str(&self) -> &str; }
+impl CommitId { pub fn parse(text: &str) -> Result<Self, SourceError>; pub fn as_str(&self) -> &str; }
+
+pub struct SecretName(String);  // 1 to 64 characters of [A-Z0-9_]
+pub enum AttemptScope { Any, Current }
+pub enum ResourceKind { Node }  // grows with ResourceRef
+pub struct SecretScope { pub attempt: AttemptScope, pub resource_kinds: Vec<ResourceKind> }
+pub struct SecretRef { pub name: SecretName, pub scope: SecretScope }
+pub const SECRET_ENV_PREFIX: &str = "FABRIC_SECRET_";
+
+/// A resolved value. No Serialize, no Clone; Debug and Display print "<redacted>";
+/// the bytes are overwritten with zero on drop (by hand, no new crate).
+pub struct SecretValue(Vec<u8>);
+impl SecretValue { pub fn expose(&self) -> &[u8]; }
+```
+
+```rust
+// placement.rs (owner A: the types; owner B: place.rs with the function), P06
+
+pub const PROBE_BOUND_MS: u32 = 5_000;
+pub const MAX_CANDIDATES: usize = 64;
+pub const DEFAULT_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+pub struct HarnessInventory { pub kind: HarnessKind, pub version: HarnessVersion }
+pub struct PathLayout { pub home: AbsPath, pub root: AbsPath }
+pub struct Capacity { pub load_1m_milli: u32, pub free_disk_bytes: u64 }
+pub struct Warmth { pub bundle_chain: bool, pub workspace: bool }
+pub struct NodeAdvert {
+    pub node: NodeId,
+    pub platform: Platform,
+    pub harnesses: Vec<HarnessInventory>,
+    pub layout: PathLayout,
+    pub capacity: Capacity,
+    pub warmth: Warmth,
+    pub measured_at_ms: u64,
+}
+
+pub enum PlacementKind { Initial, PlannedHandoff, Failover }
+pub struct CurrentPlacement { pub node: NodeId, pub healthy: bool }
+pub struct Probe {
+    pub node: NodeId,
+    pub advert: Option<NodeAdvert>,          // None: no answer within PROBE_BOUND_MS
+    pub secrets_unresolved: Vec<SecretName>, // from the node's own resolver, asked in the same probe
+    pub probe_ms: u32,
+}
+pub struct PlacementInput<'a> {
+    pub job: &'a ManagedJob,
+    pub task: TaskId,
+    pub kind: PlacementKind,
+    pub required_layout: Option<PathLayout>, // the captured root and home when native_session is allowed
+    pub current: Option<CurrentPlacement>,
+    pub candidates: Vec<Probe>,              // at most MAX_CANDIDATES
+    pub now_ms: u64,
+}
+pub enum Exclusion {
+    NoAnswer { within_ms: u32 },
+    Stale { age_ms: u64 },                   // measured_at_ms older than now_ms minus PROBE_BOUND_MS
+    Platform { need: Platform, have: Platform },
+    HarnessMissing { kind: HarnessKind },
+    HarnessVersion { kind: HarnessKind, need: HarnessVersion, have: HarnessVersion },
+    Layout { need: PathLayout, have: PathLayout },
+    Secret { name: SecretName },
+    Disk { need: u64, free: u64 },
+    Pin { pinned: NodeId },
+}
+pub enum RankReason { CurrentHealthy, BundleChain, Workspace, Load { milli: u32 }, Identity }
+pub enum Verdict { Eligible { rank: Vec<RankReason> }, Excluded { reasons: Vec<Exclusion> } }
+pub struct Candidate { pub node: NodeId, pub verdict: Verdict }
+pub struct PlacementDecision {
+    pub kind: PlacementKind,
+    pub decided_at_ms: u64,
+    pub candidates: Vec<Candidate>,          // every probe, in rank order then exclusions, each with every reason
+    pub chosen: Option<NodeId>,
+}
+
+// place.rs (owner B)
+/// Deterministic: the same input gives the same decision. Filters first, every
+/// exclusion of a node listed; then ranks the eligible set by CurrentHealthy,
+/// BundleChain, Workspace, lowest Load, then Identity.
+pub fn place(input: &PlacementInput<'_>) -> PlacementDecision;
+```
+
+```rust
+// facade.rs (owner A: token types and the check; owner B: everything on the wire), P07
+
+pub struct TokenId([u8; 16]);               // a ULID; the revocation id
+pub struct TokenDigest([u8; 32]);
+pub struct Actor(String);                   // 1 to 64 characters of [A-Za-z0-9._-]
+pub enum JobScope { AnyOwned, Jobs(Vec<JobId>) }
+pub enum ResourceScope { Any, Nodes(Vec<NodeId>) }
+pub struct FacadeTokenRecord {
+    pub id: TokenId,
+    pub digest: TokenDigest,
+    pub actor: Actor,
+    pub jobs: JobScope,
+    pub resources: ResourceScope,
+    pub minted_ms: u64,
+    pub expires_ms: u64,
+    pub revoked_ms: Option<u64>,
+}
+pub const BEARER_BYTES: usize = 32;
+pub fn token_digest(bearer: &[u8; BEARER_BYTES]) -> TokenDigest;  // blake3 of "fabric.facade.token.v1\0" and the bearer
+pub enum TokenCheck { Ok, Unknown, Revoked, Expired, OutOfScope { what: ScopeKind } }
+pub enum ScopeKind { Job, Resource }
+/// In this order: unknown, revoked, expired, job scope, resource scope.
+pub fn check_token(record: Option<&FacadeTokenRecord>, now_ms: u64, job: Option<JobId>, resource: Option<NodeId>) -> TokenCheck;
+
+pub const WATCH_WINDOW: usize = 256;
+pub const WATCH_MAX_WAIT_MS: u32 = 25_000;
+pub const WATCH_DEFAULT_WAIT_MS: u32 = 10_000;
+```
+
+### Journal (owner A, `fabric-journal`)
+
+```rust
+impl Journal {
+    // M2 to M4, unchanged, and:
+    pub fn notes(&self, job: JobId) -> Result<Vec<(WorkRevision, Note)>, CommitError>;
+    pub fn placements(&self, job: JobId) -> Result<Vec<(EventSeq, PlacementDecision)>, CommitError>;
+    pub fn continuations(&self, job: JobId) -> Result<Vec<(AttemptId, AttemptId, Fidelity, Option<PackageDigest>)>, CommitError>;
+    pub fn receipts(&self, attempt: AttemptId) -> Result<Vec<TaskReceipt>, CommitError>;
+}
+// src/facade.rs (owner B), rows of facade_tokens
+impl Journal {
+    pub fn token_mint(&mut self, record: &FacadeTokenRecord) -> Result<(), CommitError>;  // refuses a known id or digest
+    pub fn token_by_digest(&self, digest: &TokenDigest) -> Result<Option<FacadeTokenRecord>, CommitError>;
+    pub fn token_revoke(&mut self, id: TokenId, at_ms: u64) -> Result<bool, CommitError>;  // false when unknown or already revoked
+}
+```
+
+`Journal::events(job, after, limit)` is the watch's cursor read; `limit` is at most `WATCH_WINDOW`.
+
+### fabricd (owner A: executor, secrets, sources; owner B: placement, facade)
+
+```rust
+// executor.rs (owner A)
+pub struct Executor { /* the attempts this node runs, their groups and registered children */ }
+pub struct Spawned { pub pid: u32, pub group: u32, pub task: TaskId }
+pub enum ExecutorError { Spawn(std::io::Error), NotRunning { attempt: AttemptId }, Frozen { attempt: AttemptId }, Secret(SecretError), Source(SourceError) }
+pub struct Quiescence { pub receipts: Vec<TaskReceipt>, pub blockers: Vec<HandoffBlocker> }
+impl Executor {
+    /// Spawns `command` for `task` in a group of its own, with the job's secrets in its
+    /// environment under their names, and registers it. Refused while the attempt is frozen.
+    pub fn spawn(&self, attempt: AttemptId, task: TaskId, class: TaskClass, command: std::process::Command) -> Result<Spawned, ExecutorError>;
+    /// Freezes spawning for the attempt, settles leaves before parents under each task's
+    /// policy within `budget`, and reports receipts and blockers. Never kills a harness task:
+    /// it goes through the suspend path and comes back Checkpointed or CheckpointFailed.
+    pub async fn quiesce(&self, attempt: AttemptId, budget: DrainBudget) -> Result<Quiescence, ExecutorError>;
+    /// Stops every group of the attempt: SIGTERM, `budget`, SIGKILL; every receipt Interrupted.
+    pub async fn stop(&self, attempt: AttemptId, budget: DrainBudget) -> Result<Vec<TaskReceipt>, ExecutorError>;
+    /// Processes in the attempt's groups that no registered task owns, and writers under the
+    /// root outside every group (lsof, where the facts found it).
+    pub fn blockers(&self, attempt: AttemptId, root: &AbsPath) -> Vec<HandoffBlocker>;
+    /// The cut: the capture through the existing path, then the document and its digest.
+    pub async fn cut(&self, attempt: AttemptId, quiescence: &Quiescence) -> Result<CheckpointCut, ExecutorError>;
+}
+
+// secrets.rs (owner A)
+pub struct LocalResolver { /* the daemon's environment and <config>/secrets */ }
+pub enum SecretError { Missing { name: SecretName }, FileMode { name: SecretName, mode: u32 }, FileOwner { name: SecretName }, NotUtf8 { name: SecretName }, OutOfScope { name: SecretName } }
+impl LocalResolver {
+    pub fn open(config_dir: &Path) -> LocalResolver;
+    /// Which refs this node cannot resolve right now; read anew every call, cached never.
+    pub fn unresolved(&self, refs: &[SecretRef]) -> Vec<SecretName>;
+    pub fn resolve(&self, job: JobId, attempt: AttemptId, secret: &SecretRef) -> Result<SecretValue, SecretError>;
+}
+
+// sources.rs (owner A)
+pub enum Prepared { Cloned { root: AbsPath, commit: CommitId }, Restored { root: AbsPath, snapshot: SnapshotId }, Empty { root: AbsPath } }
+pub async fn prepare(node: &Node, job: JobId, source: &SourceBinding) -> Result<Prepared, SourceError>;
+/// Captures `directory` into a snapshot through the existing capture path without touching it.
+pub async fn import(node: &Node, directory: &AbsPath, allowlist: &[RelPath]) -> Result<SnapshotId, SourceError>;
+
+// placement.rs (owner B)
+pub struct Placer { /* the peer book, the endpoint, this node's own advert */ }
+impl Placer {
+    /// This node's advert for `job`, measured now.
+    pub fn own_advert(&self, job: &ManagedJob, root: &AbsPath) -> NodeAdvert;
+    /// Asks every peer with `Advertise` within PROBE_BOUND_MS, in parallel, and runs `place`.
+    pub async fn place(&self, input_without_candidates: PlacementInput<'_>, secrets: &[SecretRef]) -> PlacementDecision;
+}
+
+// facade.rs (owner B)
+pub struct Facade { /* the authority handle, the journal's token rows, one bounded broadcast of WATCH_WINDOW events per watched job */ }
+impl Facade {
+    /// Checks version, token and scope in that order, then serves one message; never blocks the authority's writer.
+    pub async fn serve(&self, message: FacadeRequest, now_ms: u64) -> FacadeResponse;
+    pub fn mint(&self, actor: Actor, jobs: JobScope, resources: ResourceScope, expires_ms: u64, now_ms: u64) -> Result<(TokenId, [u8; BEARER_BYTES]), NodeError>;
+    pub fn revoke(&self, id: TokenId, now_ms: u64) -> Result<bool, NodeError>;  // ends open watches of the token
+}
+```
+
+### fabric-net (owner B), protocol 4, additive
+
+```rust
+pub enum RequestBody {
+    // existing, and:
+    /// Asks the peer for its advert for a job; answered with `Advert`.
+    Advertise { job: JobId, harness: HarnessKind, root: AbsPath, snapshot: Option<SnapshotId>, secrets: Vec<SecretName> },
+    /// One facade message, JSON, at most MAX_REQUEST bytes; answered with `Facade`.
+    Facade(FacadeBytes),
+}
+pub enum ResponseBody {
+    // existing, and:
+    Advert(AdvertWire),   // NodeAdvert plus `secrets_unresolved: Vec<SecretName>`
+    Facade(FacadeBytes),  // at most MAX_FRAME bytes
+}
+pub struct FacadeBytes(Vec<u8>);
+```
+
+A facade request runs under the per-peer caps of ADR 0013 like a per-job request; a watch holds one of them for at most `WATCH_MAX_WAIT_MS`.
+
+### Client API (owner B), api 1, additive
+
+| Op | Request fields | Reply |
+| --- | --- | --- |
+| `managed_create` | M2 fields, and optional `source` (`repository`, `snapshot`, `git`, `empty`, or `directory { path }`, which the node imports first), `acceptance`, `policy` (the `JobPolicy` fields, each optional) | `ManagedOperation`, whose job carries the placement decision |
+| `managed_cancel` | M2 fields, and optional `task` | `ManagedOperation` |
+| `managed_note` | `operation_key`, `job`, optional `expected_revision`, `note` | `ManagedOperation` |
+| `managed_checkpoint` | `operation_key`, `job`, optional `expected_revision` | `ManagedOperation` |
+| `managed_continue` | `operation_key`, `job`, optional `expected_revision`, optional `fidelity`, optional `pin` | `ManagedOperation` |
+| `managed_inspect` | `job` | `Inspection`: the `ManagedJob` of M2 with each task's `class` and last receipt, `placements`, `continuations`, `provider_operations`, `blockers`, `residuals`, `notes`, `parked: bool`; the read writes nothing and sends nothing to a worker (ADR 0022, selection 6) |
+| `managed_import` | `path`, optional `export_allowlist` | `{ snapshot }` |
+| `facade_mint` | `actor`, `jobs`, `resources`, `expires_ms` | `{ token_id, bearer }`; the bearer is shown once and never stored |
+| `facade_revoke` | `token_id` | `{ revoked }` |
+| `facade_call` | `authority` (a node id; this node's own is allowed), `message` (one facade request as docs/facade-protocol.md defines it) | `{ message }`: the authority's answer, unchanged |
+
+The same `Inspection` object is the body of the facade's `inspection`. Every counter travels as a canonical decimal string. CLI: `fabric managed create` gains `--git <uri> --commit <id>`, `--snapshot <id>`, `--empty`, `--import <dir>`, `--acceptance <text>` (repeatable), `--drain-budget <ms>`, `--allow-fidelity <name>` (repeatable), `--secret <NAME>` (repeatable), `--export <path>` (repeatable), `--pin <node>`; `fabric managed cancel [--task <id>]`, `note`, `checkpoint`, `continue`, `inspect`; `fabric facade mint|revoke|submit|inspect|watch|cancel|checkpoint|continue --authority <node>`.
+
+### M5 acceptance mapped to tests
+
+Each test is written first and fails on the M4 code. Names are what the implementation uses; a name below that the code changes is recorded under "As built (M5)".
+
+| Acceptance | Tests |
+| --- | --- |
+| Submit without choosing a machine | `fabricd` `placement::tests::{two_eligible_nodes_rank_the_same_every_time, no_eligible_node_parks_the_submit_with_every_exclusion, a_pin_to_an_ineligible_node_parks_naming_the_pin, a_silent_or_stale_node_is_excluded_for_this_placement_only, a_healthy_current_placement_is_never_moved_for_a_warmer_node, an_unresolvable_secret_excludes_before_launch, warmth_never_admits_an_incompatible_node}`; `fabric-core` `managed_place.rs` property test (`place` is a pure function of its input); e2e `managed::e2e_a_submit_runs_on_the_eligible_node_without_naming_it` (two daemons on this host, separate state roots, the submit on one, the attempt on the other, the decision in `inspect`) |
+| The same job observed after a reconnect | `fabricd` `facade::tests::{a_token_out_of_scope_is_refused_before_the_authority_is_asked, an_unknown_expired_or_revoked_token_is_refused_in_that_order, a_revoked_token_ends_an_open_watch_within_one_delivery, a_duplicate_key_reconciles_one_operation, the_same_key_with_another_request_is_a_conflict, a_lagged_reader_gets_a_resume_cursor_and_the_authority_holds_no_more_than_the_window, a_disconnect_leaves_the_operation_running, a_cancel_is_a_command_with_its_own_outcome, an_authority_restart_keeps_the_cursor}`; `fabric-client` `facade_fixtures.rs` and the TypeScript `facade_fixtures.test.ts` (the pins, this contract step), later each side's parser against every case; e2e `facade::e2e_the_same_job_is_observed_after_a_reconnect_from_another_node` (watch, kill the client, resume from the cursor, every event once); the TypeScript `facade.test.ts` against the node built in the same run; `e2e_a_socket_only_op_on_a_managed_job_is_refused_as_managed_job` |
+| A planned handoff with child-task outcomes and the fidelity achieved | `fabricd` `executor::tests::{an_interrupted_test_is_recorded_interrupted_never_passed, an_interrupted_build_is_restarted_not_resumed, a_harness_task_is_checkpointed_by_the_suspend_path, a_failed_harness_checkpoint_blocks_the_handoff, an_opaque_task_blocks, an_escaped_child_blocks_a_strong_handoff_and_fails_nothing, an_uncontrolled_writer_blocks, a_parent_waits_for_its_leaves, the_drain_budget_bounds_quiescence_not_the_task, a_client_killed_at_each_launch_boundary_leaves_no_task_running}` (crash points `managed_launch.before_record`, `managed_launch.after_record`); `fabric-core` `managed_package.rs::{a_package_over_a_limit_is_refused_naming_the_field, planted_credentials_and_approvals_never_enter_a_package, evidence_is_by_digest_only, a_refusal_is_never_lowered, the_highest_allowed_and_offered_fidelity_wins}`; e2e `continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved` (a Claude Code job with a registered test task, continued under the fake ACP agent with the package: different native session ids, the same intent, decisions, evidence refs and open tasks, the test recorded `interrupted`, `achieved: new_native_session_with_package`), `e2e_a_native_session_continues_on_a_node_with_the_same_layout` (`achieved: native_session`) |
+| Source bindings and secrets | `fabricd` `sources::tests::{a_git_source_is_cloned_at_its_exact_revision, an_import_leaves_the_directory_untouched, an_empty_source_is_empty, adoption_is_refused_with_its_reason, a_credential_in_a_uri_is_refused, a_secret_path_leaves_only_when_the_allowlist_names_it}`; `secrets::tests::{env_then_file_then_missing, a_file_not_0600_or_not_owned_is_refused, a_value_reaches_the_task_environment_and_nothing_else, eligibility_is_read_anew_every_call}`; e2e `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log` |
+| Codec and schema | `fabric-core` `managed_frame.rs::a_format_1_frame_decodes_and_widens_to_the_m2_defaults`; `fabric-journal` `tests/fixtures.rs` opens `v1`, `v2` and the new `v3.sqlite`, migrates `v2 -> 3` and verifies; `crash_tests` at the new fault points (`placement.after_commit`, `continue.after_cut`) |
+| The read surface for provider operations (carried from M4) | as the row under "Carried to M5": the node test over a seeded journal, the TypeScript test of `managedInspect`, the CLI test of `fabric managed inspect` |
+| Counters, not time | the facade: one journal read per `inspect` and `watch`, one commit per command; a placement: one probe round per decision; the executor: no fsync beyond the capture's own; `tests/off_runtime.rs` unchanged. Time is the Perf step's alone |
+
+### Owners and files
+
+Two owners, disjoint files. Owner A lands the model commit (`fabric-core` types, format byte 2, schema version 3 DDL) first; owner B's first commit that uses it merges `m5` after that commit. Merge commits only.
+
+| Owner | Scope | Files |
+| --- | --- | --- |
+| A | P03 task lifecycle and executor, P04 work package and fidelity, P05 source bindings and the local secret resolver | `crates/fabric-core/src/managed/{mod,model,transition,frame,ids}.rs`, new `{lifecycle,package,source,secret_ref,placement,facade}.rs` (the last two: types only), `crates/fabric-core/tests/managed_*.rs` except `managed_place.rs`; `crates/fabric-journal/*` except `src/facade.rs`; `crates/fabricd/src/{executor,secrets,sources}.rs` (new), `authority.rs`, `authority/*`, `managed.rs`, `harnesses.rs`, `local.rs`; `crates/fabric-harness/*`; `crates/fabric-store/*`; ADRs 0023 to 0025 and this section's parts P03 to P05 for their "As built (M5)" notes |
+| B | P06 placement, P07 facade, the client surfaces for every M5 op | `crates/fabric-core/src/managed/place.rs` (new) and `tests/managed_place.rs`, plus the one `pub mod place;` line; `crates/fabric-journal/src/facade.rs` (new) plus its `mod` line; `crates/fabric-net/*`; `crates/fabricd/src/{placement,facade}.rs` (new), `ops.rs`, `control.rs`, `node.rs`, `error.rs`, `service.rs`; `crates/fabric-client/*`; `sdk/typescript/*`; `crates/fabric/*`; `protocol/fixtures/*`, `protocol/required.txt`, `protocol/facade/v1/*`; `docs/facade-protocol.md`, `docs/net.md`, ADRs 0026 and 0027 and this section's parts P06 and P07 |
+
+A file not listed is touched by neither without a note in the commit saying why.
