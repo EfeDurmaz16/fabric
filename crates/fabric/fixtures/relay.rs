@@ -1,9 +1,13 @@
 //! A userspace relay for the M6 partition proof (ADR 0028): forwards UDP
 //! datagrams (QUIC) and TCP bytes (the TLS fallback) between one loopback
-//! port it owns and an upstream address, and drops everything in both
-//! directions while a flag file exists. It touches no firewall and no
-//! system setting: a partition made with it is two processes on one host
-//! that stop hearing each other, nothing more.
+//! port it owns and an upstream address. While a flag file exists it
+//! drops every datagram in both directions and stops reading from the TCP
+//! sockets, so bytes wait in the kernel's buffers and the sender is held
+//! by flow control; resumed, the datagrams flow again and the held bytes
+//! are forwarded in order. A TCP stream therefore sees silence, never a
+//! gap, and a TLS record stream resumes where it stopped. It touches no
+//! firewall and no system setting: a partition made with it is two
+//! processes on one host that stop hearing each other, nothing more.
 //!
 //! Usage: `fabric-relay <upstream host:port> <pause flag path> <counters path>`
 //!
@@ -11,9 +15,9 @@
 //! output, serves until it is killed, and rewrites the counters file every
 //! 200 ms as `key=value` lines: `udp_forwarded_up`, `udp_forwarded_down`,
 //! `udp_dropped_up`, `udp_dropped_down`, `tcp_forwarded_up`,
-//! `tcp_forwarded_down`, `tcp_dropped_up`, `tcp_dropped_down`, where `up`
-//! is toward the upstream and `down` toward the client. No dependency
-//! beyond std.
+//! `tcp_forwarded_down`, `tcp_held_up`, `tcp_held_down`, where `up` is
+//! toward the upstream and `down` toward the client, and `tcp_held` counts
+//! the polls a stream spent waiting while paused. No dependency beyond std.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -36,7 +40,7 @@ struct Counters {
     udp_forwarded: [AtomicU64; 2],
     udp_dropped: [AtomicU64; 2],
     tcp_forwarded: [AtomicU64; 2],
-    tcp_dropped: [AtomicU64; 2],
+    tcp_held: [AtomicU64; 2],
 }
 
 /// Toward the upstream, or toward the client.
@@ -66,28 +70,29 @@ impl Relay {
         slot[way as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    fn count_tcp(&self, way: Way, forwarded: bool, bytes: u64) {
+    /// Counts bytes forwarded, or polls a stream spent held while paused.
+    fn count_tcp(&self, way: Way, forwarded: bool, count: u64) {
         let slot = if forwarded {
             &self.counters.tcp_forwarded
         } else {
-            &self.counters.tcp_dropped
+            &self.counters.tcp_held
         };
-        slot[way as usize].fetch_add(bytes, Ordering::Relaxed);
+        slot[way as usize].fetch_add(count, Ordering::Relaxed);
     }
 
     fn write_counters(&self, path: &Path) {
         let c = &self.counters;
         let text = format!(
             "udp_forwarded_up={}\nudp_forwarded_down={}\nudp_dropped_up={}\nudp_dropped_down={}\n\
-             tcp_forwarded_up={}\ntcp_forwarded_down={}\ntcp_dropped_up={}\ntcp_dropped_down={}\n",
+             tcp_forwarded_up={}\ntcp_forwarded_down={}\ntcp_held_up={}\ntcp_held_down={}\n",
             c.udp_forwarded[0].load(Ordering::Relaxed),
             c.udp_forwarded[1].load(Ordering::Relaxed),
             c.udp_dropped[0].load(Ordering::Relaxed),
             c.udp_dropped[1].load(Ordering::Relaxed),
             c.tcp_forwarded[0].load(Ordering::Relaxed),
             c.tcp_forwarded[1].load(Ordering::Relaxed),
-            c.tcp_dropped[0].load(Ordering::Relaxed),
-            c.tcp_dropped[1].load(Ordering::Relaxed),
+            c.tcp_held[0].load(Ordering::Relaxed),
+            c.tcp_held[1].load(Ordering::Relaxed),
         );
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, text).is_ok() {
@@ -185,12 +190,19 @@ fn upstream_for(
     Some(up)
 }
 
-/// Copies bytes one way between two TCP streams; bytes read while paused
-/// are discarded, so the connection stays open and the peers see silence.
+/// Copies bytes one way between two TCP streams. While paused it does not
+/// read: the bytes wait in the socket's buffer and TCP's flow control
+/// holds the sender, so nothing is lost and the stream resumes in order;
+/// the connection stays open and the peers see silence.
 fn pipe(relay: &Relay, mut from: TcpStream, mut to: TcpStream, way: Way) {
     let _ = from.set_read_timeout(Some(POLL));
     let mut buf = vec![0u8; 16 * 1024];
     loop {
+        if relay.paused() {
+            relay.count_tcp(way, false, 1);
+            thread::sleep(POLL);
+            continue;
+        }
         match from.read(&mut buf) {
             Ok(0) => {
                 let _ = to.shutdown(std::net::Shutdown::Write);
@@ -198,10 +210,6 @@ fn pipe(relay: &Relay, mut from: TcpStream, mut to: TcpStream, way: Way) {
             }
             Ok(n) => {
                 let bytes = u64::try_from(n).unwrap_or(u64::MAX);
-                if relay.paused() {
-                    relay.count_tcp(way, false, bytes);
-                    continue;
-                }
                 if to.write_all(&buf[..n]).is_err() {
                     return;
                 }

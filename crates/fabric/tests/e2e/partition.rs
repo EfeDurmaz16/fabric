@@ -85,15 +85,18 @@ fn two_daemons_talk_through_the_relay_and_lose_each_other_while_it_is_paused() -
     let first = new_job(&p.runner)?;
     p.runner
         .ok(&["job", "move", &first, "--to", &p.authority.id])?;
-    let before = p.relay.wait_until(
+    p.relay.wait_until(
         Duration::from_secs(10),
         |c| c.udp_forwarded[0] > 0 && c.udp_forwarded[1] > 0,
         "a session through the relay",
     )?;
     // Paused: the runner's datagrams to the authority are dropped, a move
     // cannot complete, and the authority still takes a managed command of
-    // its own.
+    // its own. The baseline is taken after the pause, once the counters
+    // stand still, so a datagram forwarded between the last reading and
+    // the flag is not mistaken for one that crossed the paused relay.
     p.relay.pause()?;
+    let before = p.relay.settled(Duration::from_secs(10))?;
     let second = new_job(&p.runner)?;
     let refused = p
         .runner
@@ -114,7 +117,7 @@ fn two_daemons_talk_through_the_relay_and_lose_each_other_while_it_is_paused() -
     assert!(!created.trim().is_empty(), "{created}");
     let paused = p.relay.wait_until(
         Duration::from_secs(10),
-        |c| c.dropped() > 0,
+        |c| c.dropped() > before.dropped(),
         "dropped datagrams while paused",
     )?;
     assert_eq!(

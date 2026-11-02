@@ -12,14 +12,14 @@ use std::time::{Duration, Instant};
 
 use crate::world::{Env, Fallible};
 
-/// Datagrams and bytes forwarded and dropped per direction, `[up, down]`
-/// where up is toward the upstream.
+/// Datagrams forwarded and dropped, TCP bytes forwarded and TCP polls held
+/// while paused, per direction, `[up, down]` where up is toward the upstream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RelayCounters {
     pub udp_forwarded: [u64; 2],
     pub udp_dropped: [u64; 2],
     pub tcp_forwarded: [u64; 2],
-    pub tcp_dropped: [u64; 2],
+    pub tcp_held: [u64; 2],
 }
 
 impl RelayCounters {
@@ -37,8 +37,8 @@ impl RelayCounters {
                 "udp_dropped_down" => c.udp_dropped[1] = value,
                 "tcp_forwarded_up" => c.tcp_forwarded[0] = value,
                 "tcp_forwarded_down" => c.tcp_forwarded[1] = value,
-                "tcp_dropped_up" => c.tcp_dropped[0] = value,
-                "tcp_dropped_down" => c.tcp_dropped[1] = value,
+                "tcp_held_up" => c.tcp_held[0] = value,
+                "tcp_held_down" => c.tcp_held[1] = value,
                 _ => {}
             }
         }
@@ -50,9 +50,9 @@ impl RelayCounters {
         self.udp_forwarded.iter().chain(&self.tcp_forwarded).sum()
     }
 
-    /// Dropped in both directions, UDP and TCP together.
+    /// Datagrams dropped in both directions while paused.
     pub fn dropped(&self) -> u64 {
-        self.udp_dropped.iter().chain(&self.tcp_dropped).sum()
+        self.udp_dropped.iter().sum()
     }
 }
 
@@ -98,8 +98,8 @@ impl Relay {
         })
     }
 
-    /// Drops every datagram and byte in both directions from now on; the
-    /// sockets stay open.
+    /// Drops every datagram and holds every TCP byte in both directions
+    /// from now on; the sockets stay open.
     pub fn pause(&self) -> Fallible {
         std::fs::write(&self.flag, b"paused\n")?;
         // The relay looks at the flag per datagram; give its readers one poll.
@@ -124,6 +124,26 @@ impl Relay {
         Ok(RelayCounters::parse(&std::fs::read_to_string(
             &self.counters,
         )?))
+    }
+
+    /// The counters once two consecutive readings agree: a baseline that
+    /// no datagram still in flight when it was taken can move, or a
+    /// failure after `timeout`.
+    pub fn settled(&self, timeout: Duration) -> Fallible<RelayCounters> {
+        let start = Instant::now();
+        let mut last = self.counters()?;
+        loop {
+            let next = self.counters()?;
+            if next == last {
+                return Ok(next);
+            }
+            if start.elapsed() > timeout {
+                return Err(
+                    format!("the relay's counters never settled: {last:?} then {next:?}").into(),
+                );
+            }
+            last = next;
+        }
     }
 
     /// Waits until `what` holds of the counters, or fails after `timeout`.
@@ -212,10 +232,11 @@ fn the_relay_forwards_pauses_and_counts() -> Fallible {
     )?;
     assert_eq!(c.dropped(), 0);
 
-    // Paused: nothing comes back, both are counted dropped, sockets stay open.
+    // Paused: nothing comes back. The datagram is dropped and counted;
+    // the TCP bytes are held, not read, and the stream is counted held.
     relay.pause()?;
     client.send_to(b"lost", relay.addr)?;
-    stream.write_all(b"gone\n")?;
+    stream.write_all(b"hold!\n")?;
     assert!(
         client.recv_from(&mut buf).is_err(),
         "a datagram crossed a paused relay"
@@ -226,26 +247,30 @@ fn the_relay_forwards_pauses_and_counts() -> Fallible {
     );
     let c = relay.wait_until(
         Duration::from_secs(3),
-        |c| c.udp_dropped[0] == 1 && c.tcp_dropped[0] == 5,
-        "dropped",
+        |c| c.udp_dropped[0] == 1 && c.tcp_held[0] > 0,
+        "paused",
     )?;
     assert_eq!(c.udp_forwarded, [1, 1]);
+    assert_eq!(c.tcp_forwarded, [6, 6], "bytes crossed a paused relay");
 
-    // Resumed: the same sockets carry traffic again.
+    // Resumed: the same sockets carry traffic again, and the held bytes
+    // arrive first, in order, so a record stream resumes where it stopped.
     relay.resume()?;
     client.send_to(b"back", relay.addr)?;
     let (n, _) = client.recv_from(&mut buf)?;
     assert_eq!(&buf[..n], b"back");
+    stream.read_exact(&mut back)?;
+    assert_eq!(&back, b"hold!\n", "the held bytes were lost");
     stream.write_all(b"again\n")?;
     stream.read_exact(&mut back)?;
     assert_eq!(&back, b"again\n");
     let c = relay.wait_until(
         Duration::from_secs(3),
-        |c| c.udp_forwarded == [2, 2] && c.tcp_forwarded == [12, 12],
+        |c| c.udp_forwarded == [2, 2] && c.tcp_forwarded == [18, 18],
         "forwarded again",
     )?;
     assert_eq!(c.udp_dropped, [1, 0]);
-    assert_eq!(c.tcp_dropped, [5, 0]);
+    assert!(c.tcp_held[0] > 0 && c.tcp_held[1] == 0, "{c:?}");
     relay.stop();
     Ok(())
 }
