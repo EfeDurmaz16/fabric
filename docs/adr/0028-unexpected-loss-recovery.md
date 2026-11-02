@@ -1,6 +1,6 @@
 # ADR 0028: Capability-gated unexpected-loss recovery
 
-Status: proposed, 2026-11-02. Every selection below was selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02 ("kararları sen verebilirsin"). None was approved by Efe; he can veto any of them at the PR.
+Status: proposed, 2026-11-02; implemented on the M6 branch on 2026-11-03 against the M4 base (docs/managed-jobs.md, "As built (M6)" records where the code differs and what waits for the M5 executor). Every selection below was selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02 ("kararları sen verebilirsin"). None was approved by Efe; he can veto any of them at the PR.
 
 Adopts the M6 row of the roadmap ("Capability-gated unexpected-loss recovery") and the parts of the external drafts P02 ("Independent authority and fencing", 2026-10-25) and P03 ("Managed task lifecycle and checkpoint cut", 2026-10-25) that M5 left open: what makes a checkpoint independent of the runner that made it, which writes the authority fences, and what happens when a runner stops answering. It builds on ADR 0020 (one authority, one generation per grant, a report at an older generation refused), ADR 0022 (the replacement barrier) and the M5 decisions of ADR 0023 to 0027 (task kinds and outcome policies, the checkpoint cut, placement of registered nodes, the facade protocol). The types, the rules and the proof harness are in [docs/managed-jobs.md](../managed-jobs.md), section "Unexpected-loss recovery (M6)".
 
