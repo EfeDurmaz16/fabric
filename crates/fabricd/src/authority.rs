@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
     AttemptId, AttemptStatus, CheckpointAck, Command, CoveredPath, DomainError, Envelope,
-    FenceVerdict, GrantToken, HEARTBEAT_INTERVAL_MS, ManagedEvent, ManagedState, NewIds,
+    Exclusion, FenceVerdict, GrantToken, HEARTBEAT_INTERVAL_MS, ManagedEvent, ManagedState, NewIds,
     Observation, OperationId, OperationKey, OperationMark, OutcomePolicy, RecoveryBlock,
     RecoveryPolicy, ResourceRef, StoredResult, TaskId, Transition, fence, recovery_decision,
 };
@@ -45,7 +45,7 @@ use fabric_net::wire::{Heartbeat, HeartbeatAnswer};
 use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
 
-use crate::clock::now_ms;
+use crate::clock::{mono_ms, now_ms};
 use crate::paths::StateDir;
 
 mod presence;
@@ -101,6 +101,14 @@ impl AuthorityError {
 
 type Reply<T> = oneshot::Sender<Result<T, AuthorityError>>;
 
+/// What the fence said for a covered write: the verdict, or why it could
+/// not be run.
+type Fenced = Result<Result<(), FenceVerdict>, AuthorityError>;
+
+/// The write behind a fence, run on the authority's thread with what the
+/// fence said; it answers the caller itself.
+type Write = Box<dyn FnOnce(Fenced) + Send>;
+
 enum Call {
     Submit(Envelope<Command>, Reply<Answer>),
     #[cfg_attr(
@@ -127,13 +135,11 @@ enum Call {
         Observation,
         Reply<Result<Transition, FenceVerdict>>,
     ),
-    /// The fence alone, for a covered write other than a journal operation.
-    Fence(
-        GrantToken,
-        CoveredPath,
-        Option<NodeId>,
-        Reply<Result<(), FenceVerdict>>,
-    ),
+    /// A covered write other than a journal operation: the fence, then the
+    /// write itself, on the authority's thread, so nothing commits between
+    /// the two. The closure gets the fence's answer and does the write for
+    /// `Ok(Ok(()))`, and answers the caller itself.
+    Fenced(GrantToken, CoveredPath, Option<NodeId>, Write),
     /// The authority's acceptance of a checkpoint it fetched and verified.
     #[cfg_attr(
         not(test),
@@ -177,8 +183,9 @@ pub(crate) struct Authority {
 enum Writer {
     /// No journal at start and no managed command since: no thread, no
     /// queue and no published ids, since there are none. Holds the state
-    /// directory the thread will work in.
-    Idle(StateDir, NodeId),
+    /// directory the thread will work in, the node, and whether this node
+    /// runs managed attempts.
+    Idle(StateDir, NodeId, bool),
     /// The thread runs.
     Running {
         /// The queue it takes calls from.
@@ -191,13 +198,31 @@ enum Writer {
 impl Authority {
     /// The authority for `state`, on node `node`. Returns at once: with a
     /// journal, its thread starts now and recovers it before any call;
-    /// without one, no thread starts until a managed command.
+    /// without one, no thread starts until a managed command. No node runs
+    /// managed attempts on this base (the M5 executor does), so the
+    /// authority's own automatic `Recover` finds no eligible node and
+    /// records `RecoveryBlocked` instead of granting onto this node.
     pub(crate) fn start(state: &StateDir, node: NodeId) -> std::io::Result<Authority> {
+        Authority::start_with(state, node, false)
+    }
+
+    /// `start` for a node that runs managed attempts, so the automatic
+    /// `Recover` may place the next attempt on this node: the shape the
+    /// M5 placement takes at the restack, for the tests of that path.
+    #[cfg(test)]
+    pub(crate) fn start_with_executor(
+        state: &StateDir,
+        node: NodeId,
+    ) -> std::io::Result<Authority> {
+        Authority::start_with(state, node, true)
+    }
+
+    fn start_with(state: &StateDir, node: NodeId, executor: bool) -> std::io::Result<Authority> {
         // A journal whose presence cannot be read is left to the thread,
         // which fails closed on it.
         let journal = !matches!(managed_dir(state).join(FILE_NAME).try_exists(), Ok(false));
         let authority = Authority {
-            writer: Arc::new(Mutex::new(Writer::Idle(state.clone(), node))),
+            writer: Arc::new(Mutex::new(Writer::Idle(state.clone(), node, executor))),
             #[cfg(test)]
             spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -218,10 +243,11 @@ impl Authority {
         let mut writer = crate::node::lock(&self.writer);
         let place = match &*writer {
             Writer::Running { calls, ids } => return Ok((calls.clone(), ids.clone())),
-            Writer::Idle(state, node) => Place {
+            Writer::Idle(state, node, executor) => Place {
                 dir: managed_dir(state),
                 jobs: state.jobs(),
                 node: *node,
+                executor: *executor,
             },
         };
         let (calls, queue) = mpsc::channel(QUEUE);
@@ -322,7 +348,11 @@ impl Authority {
     }
 
     /// Records an executor's report behind the fence: `token` is the grant
-    /// it acts under and `from` the peer it came from (ADR 0028).
+    /// it acts under and `from` the peer it came from, `None` for a report
+    /// made on this node, which the fence reads as this node (ADR 0028). A
+    /// report from the node an `unknown` attempt was granted to is
+    /// presence: the attempt is observed reachable first. With no managed
+    /// journal the verdict is `UnknownJob`, as a heartbeat gets.
     #[cfg_attr(
         not(test),
         expect(
@@ -336,20 +366,51 @@ impl Authority {
         from: Option<NodeId>,
         observation: Observation,
     ) -> Result<Result<Transition, FenceVerdict>, AuthorityError> {
+        if self.idle() {
+            return Ok(Err(FenceVerdict::UnknownJob));
+        }
         self.call(|reply| Call::Report(token, from, observation, reply))
             .await
     }
 
-    /// Runs the fence for a covered write other than a journal operation;
-    /// a refusal is recorded and returned (ADR 0028).
-    pub(crate) async fn fence(
+    /// A covered write other than a journal operation (a ledger append, a
+    /// bundle publish, a facade outcome), behind the fence (ADR 0028):
+    /// `write` runs on the authority's thread right after the fence
+    /// answered `Live`, before any other call, so no `Recover`, tick or
+    /// command can commit between the check and the write it guards. A
+    /// refusal is recorded, returned, and `write` never runs. `from` is
+    /// the peer the write came from, `None` for a write made on this node.
+    /// With no managed journal the verdict is `UnknownJob`.
+    pub(crate) async fn fenced_write<T: Send + 'static>(
         &self,
         token: GrantToken,
         path: CoveredPath,
         from: Option<NodeId>,
-    ) -> Result<Result<(), FenceVerdict>, AuthorityError> {
-        self.call(|reply| Call::Fence(token, path, from, reply))
+        write: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<Result<T, FenceVerdict>, AuthorityError> {
+        if self.idle() {
+            return Ok(Err(FenceVerdict::UnknownJob));
+        }
+        let (calls, _) = self
+            .running()
+            .map_err(|e| AuthorityError::Unavailable(format!("its thread did not start: {e}")))?;
+        let (reply, answer) = oneshot::channel();
+        let call = Call::Fenced(
+            token,
+            path,
+            from,
+            Box::new(move |fenced| {
+                let out = fenced.map(|fenced| fenced.map(|()| write()));
+                let _ = reply.send(out);
+            }),
+        );
+        calls
+            .send(call)
             .await
+            .map_err(|_| AuthorityError::Unavailable("its thread ended".into()))?;
+        answer
+            .await
+            .map_err(|_| AuthorityError::Unavailable("its thread ended".into()))?
     }
 
     /// Commits a checkpoint the authority fetched and verified (ADR 0028).
@@ -387,15 +448,16 @@ impl Authority {
         self.call(|reply| Call::Heartbeat(from, beat, reply)).await
     }
 
-    /// One tick of the authority's clock at `now_ms`: every tracked attempt
-    /// silent for `UNAVAILABLE_AFTER_MS` becomes `unknown`, and the job's
-    /// recovery policy runs for each unavailable attempt. Returns what
-    /// became unavailable on this tick.
-    pub(crate) async fn tick(&self, now_ms: u64) -> Result<Vec<Overdue>, AuthorityError> {
+    /// One tick of the authority's monotonic clock at `now` (`mono_ms`):
+    /// every tracked attempt silent for `UNAVAILABLE_AFTER_MS` becomes
+    /// `unknown`, and the job's recovery policy runs for each attempt that
+    /// has been unavailable for `UNAVAILABLE_AFTER_MS`. Returns what became
+    /// unavailable on this tick.
+    pub(crate) async fn tick(&self, now: u64) -> Result<Vec<Overdue>, AuthorityError> {
         if self.idle() {
             return Ok(Vec::new());
         }
-        self.call(|reply| Call::Tick(now_ms, reply)).await
+        self.call(|reply| Call::Tick(now, reply)).await
     }
 
     /// Ticks every `HEARTBEAT_INTERVAL_MS` until the authority is gone.
@@ -406,7 +468,7 @@ impl Authority {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match self.tick(now_ms()).await {
+            match self.tick(mono_ms()).await {
                 Ok(overdue) => {
                     for o in overdue {
                         tracing::warn!(job = %o.job, attempt = %o.attempt, "an attempt's resource is unavailable: no heartbeat");
@@ -440,6 +502,27 @@ struct Place {
     dir: PathBuf,
     jobs: PathBuf,
     node: NodeId,
+    /// Whether this node runs managed attempts, so the automatic `Recover`
+    /// may place one here. No node does on this base; the M5 placement
+    /// replaces this at the restack.
+    executor: bool,
+}
+
+impl Place {
+    /// The placement of the automatic `Recover` (ADR 0028): this node when
+    /// it runs managed attempts, and otherwise no eligible node, with this
+    /// node's exclusion named, so the job falls back to `block` with the
+    /// reason recorded and the old grant is kept.
+    fn placement(&self) -> Result<ResourceRef, Vec<Exclusion>> {
+        if self.executor {
+            Ok(ResourceRef::Node { node: self.node })
+        } else {
+            Err(vec![Exclusion {
+                node: self.node,
+                reason: "no executor: this node runs no managed attempt".to_owned(),
+            }])
+        }
+    }
 }
 
 impl Place {
@@ -536,7 +619,7 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
     let mut holder = open_existing(place, ids);
     let mut presence = Presence::default();
     if let Holder::Open(journal) = &holder {
-        track_live(place, journal, &mut presence, now_ms());
+        track_live(place, journal, &mut presence, mono_ms());
     }
     while let Some(call) = queue.blocking_recv() {
         match call {
@@ -559,7 +642,7 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                         &mut presence,
                         accepted.job,
                         &accepted.events,
-                        now_ms(),
+                        mono_ms(),
                     );
                 }
                 let _ = reply.send(answer);
@@ -568,7 +651,7 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                 let answer = open(&mut holder, job)
                     .and_then(|j| Ok(j.observe_authority(job, &observation, now_ms())?));
                 if let Ok(t) = &answer {
-                    note(place, &mut presence, job, &t.events, now_ms());
+                    note(place, &mut presence, job, &t.events, mono_ms());
                 }
                 let _ = reply.send(answer);
             }
@@ -579,18 +662,30 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                 );
             }
             Call::Report(token, from, observation, reply) => {
-                let answer = open(&mut holder, token.job)
-                    .and_then(|j| Ok(j.observe(&token, from, &observation, now_ms())?));
+                let from = from.unwrap_or(place.node);
+                let answer = match &mut holder {
+                    Holder::Absent => Ok(Err(FenceVerdict::UnknownJob)),
+                    _ => open(&mut holder, token.job).and_then(|j| {
+                        presence_of(place, j, &mut presence, from, &token);
+                        Ok(j.observe(&token, Some(from), &observation, now_ms())?)
+                    }),
+                };
                 if let Ok(Ok(t)) = &answer {
-                    note(place, &mut presence, token.job, &t.events, now_ms());
+                    note(place, &mut presence, token.job, &t.events, mono_ms());
                 }
                 let _ = reply.send(answer);
             }
-            Call::Fence(token, path, from, reply) => {
-                let _ = reply.send(
-                    open(&mut holder, token.job)
-                        .and_then(|j| Ok(j.fence(&token, path, from, now_ms())?)),
-                );
+            Call::Fenced(token, path, from, write) => {
+                let from = from.unwrap_or(place.node);
+                let fenced = match &mut holder {
+                    Holder::Absent => Ok(Err(FenceVerdict::UnknownJob)),
+                    _ => open(&mut holder, token.job).and_then(|j| {
+                        presence_of(place, j, &mut presence, from, &token);
+                        Ok(j.fence(&token, path, Some(from), now_ms())?)
+                    }),
+                };
+                // The write runs here, before the next call is taken.
+                write(fenced);
             }
             Call::Acknowledge(job, ack, reply) => {
                 let _ = reply.send(
@@ -598,7 +693,7 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                 );
             }
             Call::Heartbeat(from, beat, reply) => {
-                let _ = reply.send(heartbeat(&mut holder, &mut presence, from, &beat));
+                let _ = reply.send(heartbeat(place, &mut holder, &mut presence, from, &beat));
             }
             Call::Tick(now, reply) => {
                 let _ = reply.send(tick(place, &mut holder, &mut presence, now));
@@ -647,8 +742,11 @@ fn ulid() -> [u8; 16] {
 }
 
 /// Tracks every live attempt of a remote node the journal holds, at the
-/// authority's start: each is overdue `UNAVAILABLE_AFTER_MS` from now
-/// unless a heartbeat arrives first (ADR 0028).
+/// authority's start (`now` on the monotonic clock): each is overdue
+/// `UNAVAILABLE_AFTER_MS` from now unless a heartbeat arrives first, and
+/// one the journal says is `unknown` for want of heartbeats is tracked as
+/// unavailable, so its heartbeat brings it back and its recovery policy
+/// still runs after the restart (ADR 0028).
 fn track_live(place: &Place, journal: &Journal, presence: &mut Presence, now: u64) {
     let Ok(jobs) = journal.jobs() else {
         return;
@@ -659,7 +757,12 @@ fn track_live(place: &Place, journal: &Journal, presence: &mut Presence, now: u6
         };
         for attempt in state.attempts.iter().filter(|a| a.status.may_run()) {
             let ResourceRef::Node { node } = attempt.resource;
-            if node != place.node {
+            if node == place.node {
+                continue;
+            }
+            if attempt.status == AttemptStatus::Unknown && attempt.unavailable_since_ms.is_some() {
+                presence.track_unavailable(job, attempt.id, attempt.generation, node, now);
+            } else {
                 presence.track(job, attempt.id, attempt.generation, node, now);
             }
         }
@@ -667,8 +770,8 @@ fn track_live(place: &Place, journal: &Journal, presence: &mut Presence, now: u6
 }
 
 /// Keeps the presence in step with what a committed transition did to the
-/// job's attempts: a grant to a remote node is tracked from now; an
-/// attempt that ended or lost its grant is forgotten.
+/// job's attempts: a grant to a remote node is tracked from `now` (on the
+/// monotonic clock); an attempt that ended or lost its grant is forgotten.
 fn note(place: &Place, presence: &mut Presence, job: JobId, events: &[ManagedEvent], now: u64) {
     for event in events {
         match event {
@@ -689,16 +792,78 @@ fn note(place: &Place, presence: &mut Presence, job: JobId, events: &[ManagedEve
     }
 }
 
-/// Answers a heartbeat: the attempts it brings back from `unknown` are
-/// observed `ResourceReachable`, then every token gets its fence verdict
+/// A heartbeat token or a covered write from `from` for `token` is
+/// presence (ADR 0028). An attempt the authority made `unknown` for want
+/// of heartbeats, granted to `from` at the job's generation, is observed
+/// `ResourceReachable` first, so the write or the fence that follows meets
+/// a `running` attempt: `unknown` means the authority could not tell, and
+/// the node it granted to is telling it now. A reachable tracked attempt
+/// has its presence refreshed without a read; a live grant the start scan
+/// did not see (one made while the journal was stopped) is tracked from
+/// here. A write from this node is never presence: nothing on this node
+/// heartbeats. Writes nothing else; a failed observation is logged and
+/// the fence then answers as the journal stands.
+fn presence_of(
+    place: &Place,
+    journal: &mut Journal,
+    presence: &mut Presence,
+    from: NodeId,
+    token: &GrantToken,
+) {
+    if from == place.node {
+        return;
+    }
+    let (now, wall) = (mono_ms(), now_ms());
+    if presence.seen(from, token, now, wall) {
+        return;
+    }
+    // Not tracked, or unavailable: the journal decides.
+    let state = match journal.job(token.job) {
+        Ok(Some(state)) => state,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(job = %token.job, error = %e, "a write's presence was not read");
+            return;
+        }
+    };
+    let Some(attempt) = state.attempt(token.attempt) else {
+        return;
+    };
+    let ResourceRef::Node { node } = attempt.resource;
+    if node != from
+        || attempt.generation != token.generation
+        || attempt.generation != state.job.generation
+    {
+        return;
+    }
+    match attempt.status {
+        AttemptStatus::Unknown if attempt.unavailable_since_ms.is_some() => {
+            let back = Observation::ResourceReachable {
+                attempt: token.attempt,
+                generation: token.generation,
+            };
+            if let Err(e) = journal.observe_authority(token.job, &back, wall) {
+                tracing::warn!(job = %token.job, attempt = %token.attempt, error = %e, "a returned attempt was not recorded");
+                return;
+            }
+        }
+        AttemptStatus::Granted | AttemptStatus::Running => {}
+        _ => return,
+    }
+    presence.track(token.job, token.attempt, token.generation, from, now);
+    presence.returned(token.attempt, now, wall);
+}
+
+/// Answers a heartbeat: each token from the node its attempt was granted
+/// to is presence (`presence_of`), then every token gets its fence verdict
 /// from the projection. No other write.
 fn heartbeat(
+    place: &Place,
     holder: &mut Holder,
     presence: &mut Presence,
     from: NodeId,
     beat: &Heartbeat,
 ) -> Result<HeartbeatAnswer, AuthorityError> {
-    let now = now_ms();
     let journal = match holder {
         Holder::Open(journal) => journal,
         Holder::Absent => {
@@ -711,32 +876,19 @@ fn heartbeat(
         }
         Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
     };
-    for (job, attempt, generation) in presence.seen(from, beat, now) {
-        let back = Observation::ResourceReachable {
-            attempt,
-            generation,
-        };
-        if let Err(e) = journal.observe_authority(job, &back, now) {
-            tracing::warn!(%job, %attempt, error = %e, "a returned heartbeat was not recorded");
-        }
-    }
     let mut verdicts = Vec::with_capacity(beat.attempts().len());
     for token in beat.attempts() {
+        presence_of(place, journal, presence, from, token);
         let state = journal.job(token.job)?;
-        let verdict = fence(state.as_ref(), token, Some(from));
-        if verdict.allows() && !presence.tracks(token.attempt) {
-            // A grant the start scan did not see, such as one made while
-            // the journal was stopped: tracked from this heartbeat on.
-            presence.track(token.job, token.attempt, token.generation, from, now);
-            let _ = presence.seen(from, beat, now);
-        }
-        verdicts.push((token.attempt, verdict));
+        verdicts.push((token.attempt, fence(state.as_ref(), token, Some(from))));
     }
     Ok(HeartbeatAnswer { verdicts })
 }
 
-/// One tick: every overdue attempt is observed `ResourceUnavailable`, and
-/// the recovery policy of each unavailable attempt's job runs.
+/// One tick at `now` on the monotonic clock: every overdue attempt is
+/// observed `ResourceUnavailable` (the record carries the wall clock), and
+/// the recovery policy runs for each attempt that has been unavailable for
+/// `UNAVAILABLE_AFTER_MS`.
 fn tick(
     place: &Place,
     holder: &mut Holder,
@@ -748,25 +900,26 @@ fn tick(
         Holder::Absent => return Ok(Vec::new()),
         Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
     };
+    let wall = now_ms();
     let mut out = Vec::new();
     for o in presence.overdue(now) {
         let unavailable = Observation::ResourceUnavailable {
             attempt: o.attempt,
             generation: o.generation,
             last_heartbeat_ms: o.last_heartbeat_ms,
-            at_ms: now,
+            at_ms: wall,
         };
-        match journal.observe_authority(o.job, &unavailable, now) {
+        match journal.observe_authority(o.job, &unavailable, wall) {
             Ok(_) => {
-                presence.mark_unavailable(o.attempt);
+                presence.mark_unavailable(o.attempt, now);
                 out.push(o);
             }
             Err(CommitError::Domain(_)) => presence.forget(o.attempt),
             Err(e) => return Err(e.into()),
         }
     }
-    for o in presence.unavailable() {
-        recover(place, journal, presence, &o, now)?;
+    for o in presence.unavailable(now) {
+        recover(place, journal, presence, &o, now, wall)?;
     }
     Ok(out)
 }
@@ -788,17 +941,21 @@ fn unreachable_key() -> OperationKey {
     OperationKey::parse("r").unwrap_or_else(|_| std::process::abort())
 }
 
-/// Runs the recovery policy for one unavailable attempt (ADR 0028): under
-/// `Block` nothing; under `RestartFromAcknowledged` the pure decision,
-/// then the `Recover` it names under its derived key, or the reason it
-/// did not restart, recorded once per silence and reason. Placement is
-/// this node until the M5 placement lands at the restack.
+/// Runs the recovery policy for one attempt that has been unavailable for
+/// the threshold (ADR 0028): under `Block` nothing; under
+/// `RestartFromAcknowledged` the pure decision, judged by the attempt's
+/// own task, then the `Recover` it names under its derived key, or the
+/// reason it did not restart, recorded once per silence and reason.
+/// Placement is `Place::placement`: no eligible node on this base, this
+/// node when it runs managed attempts, the M5 placement at the restack.
+/// `now` is the monotonic clock, `wall` the time the records carry.
 fn recover(
     place: &Place,
     journal: &mut Journal,
     presence: &mut Presence,
     o: &Overdue,
     now: u64,
+    wall: u64,
 ) -> Result<(), AuthorityError> {
     let Some(state) = journal.job(o.job)? else {
         presence.forget(o.attempt);
@@ -815,14 +972,17 @@ fn recover(
     if state.job.policy.recovery != RecoveryPolicy::RestartFromAcknowledged {
         return Ok(());
     }
-    let outcome = OutcomePolicy::of_primary(&state.job.intent);
+    let Some(task) = state.task(attempt.task) else {
+        presence.forget(o.attempt);
+        return Ok(());
+    };
+    let outcome = OutcomePolicy::of_task(task);
     let blockers: Vec<OperationId> = journal
         .replacement_blockers(o.job)?
         .iter()
         .map(Blocker::operation)
         .collect();
-    let placement = Ok(ResourceRef::Node { node: place.node });
-    let decided = recovery_decision(&state, o.attempt, outcome, &blockers, placement);
+    let decided = recovery_decision(&state, o.attempt, outcome, &blockers, place.placement());
     let reason = match decided {
         Ok(command) => {
             let envelope = Envelope {
@@ -836,7 +996,7 @@ fn recover(
                 task: TaskId::from_bytes(ulid()),
                 attempt: AttemptId::from_bytes(ulid()),
                 operation: OperationId::from_bytes(ulid()),
-                at_ms: now,
+                at_ms: wall,
             };
             match journal.submit(&envelope, ids)?.result {
                 StoredResult::Accepted(accepted) => {
@@ -860,7 +1020,7 @@ fn recover(
         Err(reason) => reason,
     };
     if presence.block_changed(o.attempt, &reason) {
-        journal.recovery_blocked(o.job, o.attempt, reason, now)?;
+        journal.recovery_blocked(o.job, o.attempt, reason, wall)?;
     }
     Ok(())
 }

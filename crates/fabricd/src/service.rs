@@ -208,17 +208,19 @@ impl Service for Node {
                     job_request_name(&body)
                 )));
             };
+            // The append itself runs inside `fenced_write`, on the
+            // authority's thread right after the fence, so no regrant can
+            // commit between the check and the write. The ledger a managed
+            // attempt appends to lands with the M5 executor at the
+            // restack; until then this node holds none, and the runner is
+            // told so rather than told its records were kept.
             match self
                 .authority
-                .fence(token, CoveredPath::LedgerAppend, Some(peer))
+                .fenced_write(token, CoveredPath::LedgerAppend, Some(peer), || ())
                 .await
                 .map_err(|e| internal(&e))?
             {
                 Err(verdict) => Ok(JobResponse::GrantRefused { verdict }),
-                // The grant is live. The ledger a managed attempt appends
-                // to lands with the M5 executor at the restack; until then
-                // this node holds none, and the runner is told so rather
-                // than told its records were kept.
                 Ok(()) => Err(bad(
                     &"this node holds no ledger for a managed job yet; the grant is live",
                 )),

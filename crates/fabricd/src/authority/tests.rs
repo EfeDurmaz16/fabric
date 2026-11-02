@@ -474,8 +474,8 @@ async fn presence_marks_overdue_on_the_authority_clock_and_writes_no_heartbeat()
         )]
     );
     assert_eq!(revision(&authority, job).await, before);
-    // Silence short of the threshold on the authority's clock: nothing.
-    let now = now_ms();
+    // Silence short of the threshold on the authority's monotonic clock: nothing.
+    let now = mono_ms();
     assert!(authority.tick(now).await.unwrap().is_empty());
     assert_eq!(status(&authority, token).await, AttemptStatus::Running);
     // Past it: unknown, with the state visible; the job waits under Block.
@@ -505,51 +505,19 @@ async fn presence_marks_overdue_on_the_authority_clock_and_writes_no_heartbeat()
     // A restarted authority tracks the live remote attempt again.
     drop(authority);
     let authority = Authority::start(&state, NODE).unwrap();
-    assert!(authority.tick(now_ms()).await.unwrap().is_empty());
+    assert!(authority.tick(mono_ms()).await.unwrap().is_empty());
     let overdue = authority
-        .tick(now_ms() + UNAVAILABLE_AFTER_MS)
+        .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
         .await
         .unwrap();
     assert_eq!(overdue.len(), 1);
     assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
 }
 
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the whole loss, restart and wake reads best as one scenario"
-)]
-async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_runner() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = state(dir.path());
-    let authority = Authority::start(&state, NODE).unwrap();
-    let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
-    let now = now_ms();
-    // Silent with nothing acknowledged: blocked, recorded once.
-    authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
-    let kinds = |s: &fabric_core::managed::ManagedState| s.job.revision.get();
-    let s = authority.job(job).await.unwrap().unwrap();
-    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
-    assert_eq!(
-        s.job.generation,
-        Generation::FIRST,
-        "nothing to restart from"
-    );
-    let after_block = kinds(&s);
-    authority
-        .tick(now + UNAVAILABLE_AFTER_MS + 2_000)
-        .await
-        .unwrap();
-    assert_eq!(
-        revision(&authority, job).await,
-        after_block,
-        "the same reason is not recorded twice"
-    );
-    // The runner comes back, captures a checkpoint, and the authority
-    // acknowledges it after its own fetch (the fetch is M5's executor
-    // path; the acknowledgement is what recovery reads).
-    authority.heartbeat(RUNNER, beat(token)).await.unwrap();
-    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+/// The runner captures a checkpoint and the authority acknowledges it
+/// after its own fetch (the fetch is M5's executor path; the
+/// acknowledgement is what recovery reads).
+async fn acknowledged(authority: &Authority, job: JobId, token: GrantToken) -> SnapshotId {
     let snapshot = SnapshotId::of(b"the runner's checkpoint");
     let cut = CutDigest::of(b"its cut");
     authority
@@ -582,9 +550,79 @@ async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_ru
         )
         .await
         .unwrap();
-    // Silent again: recovered onto this node from the acknowledged checkpoint.
-    let later = now_ms() + UNAVAILABLE_AFTER_MS;
+    snapshot
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the whole loss, restart and wake reads best as one scenario"
+)]
+async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_runner() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    // This node runs managed attempts, so the placement may name it.
+    let authority = Authority::start_with_executor(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
+    let now = mono_ms();
+    // Silent: unknown after the threshold; the policy waits as long again.
+    authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    assert_eq!(s.job.generation, Generation::FIRST);
+    let unknown_at = s.job.revision.get();
+    // Unknown for the threshold with nothing acknowledged: blocked,
+    // recorded once, and not again on the next tick.
+    authority
+        .tick(now + 2 * UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(
+        s.job.generation,
+        Generation::FIRST,
+        "nothing to restart from"
+    );
+    assert_eq!(
+        s.job.revision.get(),
+        unknown_at + 1,
+        "the block is recorded"
+    );
+    authority
+        .tick(now + 2 * UNAVAILABLE_AFTER_MS + 2_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        revision(&authority, job).await,
+        unknown_at + 1,
+        "the same reason is not recorded twice"
+    );
+    // The runner comes back and a checkpoint of its is acknowledged.
+    authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+    let snapshot = acknowledged(&authority, job, token).await;
+    // Silent again: unknown at the threshold, still the same grant while
+    // it dwells, and recovered onto this node from the acknowledged
+    // checkpoint once it has been unknown for the threshold.
+    let later = mono_ms() + UNAVAILABLE_AFTER_MS;
     authority.tick(later).await.unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    assert_eq!(
+        s.job.generation,
+        Generation::FIRST,
+        "no restart before the dwell"
+    );
+    let dwelling = s.job.revision.get();
+    authority.tick(later + 2_000).await.unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation, Generation::FIRST);
+    assert_eq!(
+        s.job.revision.get(),
+        dwelling,
+        "a tick inside the dwell writes nothing"
+    );
+    authority.tick(later + UNAVAILABLE_AFTER_MS).await.unwrap();
     let s = authority.job(job).await.unwrap().unwrap();
     assert_eq!(s.job.generation.get(), 2);
     assert_eq!(
@@ -627,10 +665,11 @@ async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_ru
         .unwrap_err();
     assert!(matches!(refused, FenceVerdict::Superseded { .. }));
     let refused = authority
-        .fence(
+        .fenced_write(
             token,
             fabric_core::managed::CoveredPath::LedgerAppend,
             Some(RUNNER),
+            || panic!("a refused write ran"),
         )
         .await
         .unwrap()
@@ -643,7 +682,7 @@ async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_ru
     // The new attempt is local: no heartbeat, never unavailable this way.
     assert!(
         authority
-            .tick(later + 3 * UNAVAILABLE_AFTER_MS)
+            .tick(later + 4 * UNAVAILABLE_AFTER_MS)
             .await
             .unwrap()
             .is_empty()
@@ -657,8 +696,312 @@ async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_ru
     // A restart replays the authority's recover under its derived key
     // rather than granting again.
     drop(authority);
-    let authority = Authority::start(&state, NODE).unwrap();
+    let authority = Authority::start_with_executor(&state, NODE).unwrap();
     let s = authority.job(job).await.unwrap().unwrap();
     assert_eq!(s.attempts.len(), 2);
     assert_eq!(s.job.generation.get(), 2);
+}
+
+/// On this base no node runs managed attempts, so the authority's own
+/// `Recover` finds no eligible node: the job falls back to `block` with
+/// `NoEligibleNode` recorded once per silence, the old grant is kept, and
+/// the runner that returns is live again. Nothing is granted onto a node
+/// that could not run it.
+#[tokio::test]
+async fn without_an_executor_the_automatic_restart_is_blocked_and_the_grant_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
+    acknowledged(&authority, job, token).await;
+    let now = mono_ms();
+    authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    let unknown_at = revision(&authority, job).await;
+    authority
+        .tick(now + 2 * UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation, Generation::FIRST, "nothing was granted");
+    assert_eq!(s.attempts.len(), 1);
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    assert_eq!(
+        s.job.revision.get(),
+        unknown_at + 1,
+        "the block is recorded"
+    );
+    authority
+        .tick(now + 3 * UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(revision(&authority, job).await, unknown_at + 1);
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(answer.verdicts, vec![(token.attempt, FenceVerdict::Live)]);
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+}
+
+/// An attempt that was `unknown` when the authority restarted is not
+/// wedged: its returning heartbeat makes it `running` and live, its
+/// covered writes are taken, and under `RestartFromAcknowledged` the
+/// recovery policy still runs, with the dwell counted from the restart.
+#[tokio::test]
+async fn an_attempt_unknown_at_a_restart_comes_back_on_its_heartbeat_and_still_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    authority
+        .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    drop(authority);
+    let authority = Authority::start(&state, NODE).unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    let before = revision(&authority, job).await;
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(answer.verdicts, vec![(token.attempt, FenceVerdict::Live)]);
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+    assert_eq!(revision(&authority, job).await, before + 1, "one reachable");
+    let written = authority
+        .fenced_write(
+            token,
+            fabric_core::managed::CoveredPath::LedgerAppend,
+            Some(RUNNER),
+            || 7,
+        )
+        .await
+        .unwrap();
+    assert_eq!(written, Ok(7));
+    // Silence again after the restart is counted from the restart.
+    assert!(authority.tick(mono_ms() + 1_000).await.unwrap().is_empty());
+
+    // Under RestartFromAcknowledged the restart does not lose the policy:
+    // the attempt dwells from the restart and is then recovered.
+    let dir = tempfile::tempdir().unwrap();
+    let state = self::state(dir.path());
+    let authority = Authority::start_with_executor(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
+    acknowledged(&authority, job, token).await;
+    authority
+        .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    drop(authority);
+    let authority = Authority::start_with_executor(&state, NODE).unwrap();
+    // The start scan runs on the thread before its first answer; the
+    // dwell counts from then.
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    let at = mono_ms();
+    authority.tick(at).await.unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation, Generation::FIRST, "the dwell runs again");
+    authority.tick(at + UNAVAILABLE_AFTER_MS).await.unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation.get(), 2, "recovered after the restart");
+    assert_eq!(s.attempts[1].resource, ResourceRef::Node { node: NODE });
+}
+
+/// A covered write from the node an `unknown` attempt was granted to is
+/// presence: the attempt is observed reachable first and the write is
+/// taken, so a report that arrives before the healing heartbeat is not
+/// lost. From any other node an `unknown` attempt stays not writable.
+#[tokio::test]
+async fn a_covered_write_from_the_granted_node_brings_an_unknown_attempt_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    authority
+        .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    let exited = Observation::Exited {
+        attempt: token.attempt,
+        generation: token.generation,
+        outcome: fabric_core::managed::ExitOutcome::Succeeded,
+    };
+    let refused = authority
+        .report(token, Some(OTHER), exited.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        FenceVerdict::NotWritable {
+            status: AttemptStatus::Unknown
+        }
+    );
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    let before = revision(&authority, job).await;
+    authority
+        .report(token, Some(RUNNER), exited)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Succeeded);
+    assert_eq!(
+        revision(&authority, job).await,
+        before + 2,
+        "reachable, then the exit"
+    );
+
+    // The same for a covered write other than a report.
+    let dir = tempfile::tempdir().unwrap();
+    let state = self::state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (_, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    authority
+        .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    let written = authority
+        .fenced_write(
+            token,
+            fabric_core::managed::CoveredPath::LedgerAppend,
+            Some(RUNNER),
+            || "kept",
+        )
+        .await
+        .unwrap();
+    assert_eq!(written, Ok("kept"));
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+}
+
+/// A covered write made on the authority's own host (`from: None`) is
+/// checked against the node the attempt was granted to, like one from
+/// any peer: it is this node's write, and the attempt lives elsewhere.
+#[tokio::test]
+async fn a_write_made_on_this_node_is_checked_against_the_granted_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (_, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let refused = authority
+        .report(
+            token,
+            None,
+            Observation::Exited {
+                attempt: token.attempt,
+                generation: token.generation,
+                outcome: fabric_core::managed::ExitOutcome::Succeeded,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        FenceVerdict::WrongNode {
+            granted: RUNNER,
+            from: NODE
+        }
+    );
+    let refused = authority
+        .fenced_write(
+            token,
+            fabric_core::managed::CoveredPath::LedgerAppend,
+            None,
+            || panic!("a refused write ran"),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(refused, FenceVerdict::WrongNode { .. }));
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+}
+
+/// With no managed journal every covered path tells the runner the same
+/// thing a heartbeat does, `UnknownJob`, rather than an internal fault,
+/// and starts no thread for it.
+#[tokio::test]
+async fn with_no_journal_a_covered_write_is_unknown_job_and_starts_no_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let token = GrantToken {
+        job: JobId::from_bytes([3; 16]),
+        attempt: fabric_core::managed::AttemptId::from_bytes([4; 16]),
+        generation: Generation::FIRST,
+    };
+    let fenced = authority
+        .fenced_write(
+            token,
+            fabric_core::managed::CoveredPath::LedgerAppend,
+            Some(RUNNER),
+            || panic!("a refused write ran"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fenced, Err(FenceVerdict::UnknownJob));
+    let reported = authority
+        .report(
+            token,
+            Some(RUNNER),
+            Observation::Started {
+                attempt: token.attempt,
+                generation: token.generation,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reported.unwrap_err(), FenceVerdict::UnknownJob);
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(
+        answer.verdicts,
+        vec![(token.attempt, FenceVerdict::UnknownJob)]
+    );
+    assert_eq!(authority.threads(), 0, "a refused write started the thread");
+}
+
+/// The write a fence guards runs on the authority's thread right after
+/// the fence, before the next call is taken: a tick, and so a `Recover`,
+/// cannot commit between the check and the write.
+#[tokio::test]
+async fn a_fenced_write_runs_inside_the_authority_s_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (_, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let writer = tokio::spawn({
+        let authority = authority.clone();
+        let order = Arc::clone(&order);
+        async move {
+            authority
+                .fenced_write(
+                    token,
+                    fabric_core::managed::CoveredPath::LedgerAppend,
+                    Some(RUNNER),
+                    move || {
+                        gate.recv().unwrap();
+                        order.lock().unwrap().push("write");
+                        5
+                    },
+                )
+                .await
+        }
+    });
+    // The write holds the authority's turn; a tick queued behind it waits.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let ticker = tokio::spawn({
+        let authority = authority.clone();
+        let order = Arc::clone(&order);
+        async move {
+            let ticked = authority.tick(mono_ms()).await;
+            order.lock().unwrap().push("tick");
+            ticked
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!ticker.is_finished(), "a tick ran during a fenced write");
+    release.send(()).unwrap();
+    assert_eq!(writer.await.unwrap().unwrap(), Ok(5));
+    ticker.await.unwrap().unwrap();
+    assert_eq!(*order.lock().unwrap(), ["write", "tick"]);
 }
