@@ -2,7 +2,7 @@
 //! with separate state roots, a real QUIC link between them through the
 //! userspace relay of `relay.rs`, and the relay paused and resumed. This
 //! is a two-process partition on one host, not two hosts; no firewall and
-//! no system setting is touched (docs/evidence/m6-partition).
+//! no system setting is touched (docs/evidence/m6).
 //!
 //! What runs here on this base: the two daemons pair and talk through the
 //! relay, the relay drops their datagrams while paused and forwards again
@@ -140,14 +140,14 @@ fn two_daemons_talk_through_the_relay_and_lose_each_other_while_it_is_paused() -
     Ok(())
 }
 
-const BLOCKED: &str = "needs an attempt that runs on the runner node and heartbeats to the authority: the M5 executor, landed at the restack (docs/evidence/m6-partition)";
+const BLOCKED: &str = "needs an attempt that runs on the runner node and heartbeats to the authority: the M5 executor, landed at the restack (docs/evidence/m6)";
 
 /// Acknowledged checkpoint; relay paused; past `UNAVAILABLE_AFTER_MS` the
 /// authority recovers; relay resumed: the old runner's later writes are
 /// refused and recorded, the authority's checkpoint head is unchanged,
 /// the new attempt starts from the acknowledged snapshot.
 #[test]
-#[ignore = "needs the M5 executor on the runner node; see docs/evidence/m6-partition"]
+#[ignore = "needs the M5 executor on the runner node; see docs/evidence/m6"]
 fn relay_paused_runner_alive() -> Fallible {
     Err(BLOCKED.into())
 }
@@ -156,7 +156,7 @@ fn relay_paused_runner_alive() -> Fallible {
 /// attempt's group; the authority recovers; `SIGCONT`: the woken runner's
 /// first heartbeat is answered superseded and its group stopped.
 #[test]
-#[ignore = "needs the M5 executor on the runner node; see docs/evidence/m6-partition"]
+#[ignore = "needs the M5 executor on the runner node; see docs/evidence/m6"]
 fn old_runner_sigstop_then_sigcont() -> Fallible {
     Err(BLOCKED.into())
 }
@@ -165,7 +165,7 @@ fn old_runner_sigstop_then_sigcont() -> Fallible {
 /// recovers; the runner's daemon starts again in the same state root,
 /// reads its marker, is told superseded and stops the orphan group.
 #[test]
-#[ignore = "needs the M5 executor on the runner node; see docs/evidence/m6-partition"]
+#[ignore = "needs the M5 executor on the runner node; see docs/evidence/m6"]
 fn old_runner_sigkill_then_restart() -> Fallible {
     Err(BLOCKED.into())
 }

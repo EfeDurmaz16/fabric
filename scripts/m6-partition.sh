@@ -12,7 +12,7 @@
 # them anyway and see the reason they are blocked.
 #
 # Usage: scripts/m6-partition.sh [--all] [<evidence dir>]
-# The evidence dir defaults to docs/evidence/m6-partition/runs/<date>.
+# The evidence dir defaults to docs/evidence/m6/runs/<date>.
 set -eu
 
 all=0
@@ -21,7 +21,7 @@ if [ "${1:-}" = "--all" ]; then
   shift
 fi
 root=$(cd "$(dirname "$0")/.." && pwd)
-out=${1:-"$root/docs/evidence/m6-partition/runs/$(date -u +%Y%m%dT%H%M%SZ)"}
+out=${1:-"$root/docs/evidence/m6/runs/$(date -u +%Y%m%dT%H%M%SZ)"}
 mkdir -p "$out"
 
 cd "$root"
