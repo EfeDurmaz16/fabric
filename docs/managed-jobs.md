@@ -872,3 +872,448 @@ What is missing, and what M6 adds:
 | No policy says what the authority may do by itself | `JobPolicy.recovery: RecoveryPolicy { Block, RestartFromAcknowledged }`, default `Block`, with its admission rule and its fallback |
 | The executor never learns it lost its grant | the `Fenced` answer on every covered path, and the executor's stop of the attempt's group on `superseded` |
 | No proof under a real partition | the relay, the two-daemon harness and the three scenarios of "Proof harness" |
+
+### Checkpoint acknowledgement
+
+A checkpoint has two states and the journal keeps them apart. Captured: the runner published the bundle chain into its own store and reported it; the bytes may exist only there. Acknowledged: the authority node fetched the chain through the existing store transfer, verified it, and committed what it verified. Only an acknowledged checkpoint is a restart point.
+
+```rust
+// fabric-core, managed::model
+/// The digest of a checkpoint cut (ADR 0024): the receipts, facts and
+/// evidence refs the cut names, canonically encoded and hashed with blake3.
+pub struct CutDigest([u8; 32]);
+
+pub enum Observation {
+    // M2 kinds, and:
+    /// The attempt captured a checkpoint and keeps running. `Checkpointed`
+    /// stays the report of an attempt that ended at one.
+    Captured { attempt: AttemptId, generation: Generation, snapshot: SnapshotId, cut: CutDigest },
+}
+
+/// What the authority verified before it accepted a checkpoint as the
+/// job's. Written to the journal as `CheckpointAcknowledged`, never to the
+/// store: the store's row says the bytes are complete on this node, the
+/// event says the authority accepted them under the generation that made them.
+pub struct CheckpointAck {
+    pub attempt: AttemptId,
+    pub generation: Generation,
+    pub snapshot: SnapshotId,
+    /// Equal to the `cut` the runner reported in `Captured`.
+    pub cut: CutDigest,
+    /// How many manifests `fetch_snapshot` published and how many chunks it
+    /// kept, each after its bytes hashed to the id asked for (ADR 0014).
+    pub manifests: u32,
+    pub chunks: u64,
+    pub bytes: u64,
+    /// The node the bytes were fetched from: the attempt's resource.
+    pub fetched_from: NodeId,
+}
+
+pub enum ManagedEvent {
+    // M2 to M4 kinds, and:
+    CheckpointAcknowledged { ack: CheckpointAck },
+}
+
+pub enum DomainError {
+    // M2 to M4 kinds, and:
+    /// `Captured` or an acknowledgement names a snapshot the attempt did not report.
+    UnknownCheckpoint { attempt: AttemptId, snapshot: SnapshotId },
+    /// The acknowledgement's cut digest is not the one the runner reported.
+    CutMismatch { snapshot: SnapshotId, reported: CutDigest, verified: CutDigest },
+    /// A `Recover` names a snapshot no `CheckpointAcknowledged` covers.
+    NotAcknowledged { snapshot: SnapshotId },
+}
+
+impl ManagedState {
+    /// Every acknowledged checkpoint of the job, newest first, each with
+    /// the attempt and generation that made it.
+    pub fn acknowledged(&self) -> Vec<&CheckpointAck>;
+    /// Checkpoints reported `Captured` and never acknowledged; listed, and
+    /// a restart point for nothing.
+    pub fn captured_only(&self) -> Vec<(AttemptId, Generation, SnapshotId)>;
+}
+```
+
+- `apply_observation(Captured)` runs the M2 generation check first (a stale report is `StaleObservationRefused`, replay rule 7), then records `AttemptObserved` with the status unchanged and an `evidence` row of kind `checkpoint` whose `ref` is the snapshot id and whose `digest` is the cut. The attempt stays `running`.
+- The acknowledgement is an authority-side rule, `acknowledge(state, ack) -> Result<Transition, DomainError>`, the fourth rule function beside `accept_command`, `apply_observation` and `mark_operation`. It refuses a snapshot the attempt never reported (`UnknownCheckpoint`), a cut that differs from the reported one (`CutMismatch`) and a generation that is not the attempt's (`StaleGeneration`). It accepts an acknowledgement for an attempt in any status: the bytes of a checkpoint an attempt made before it became `unknown`, `superseded` or `lost` are still its checkpoint. It writes `CheckpointAcknowledged` and an `evidence` row of kind `checkpoint_ack` (`ref` the snapshot id, `digest` the cut), and sets the projection column `attempts.last_acknowledged`.
+
+```rust
+// fabric-journal
+impl Journal {
+    /// Commits `CheckpointAcknowledged` for `ack` in its own transaction
+    /// after the core rule accepted it; the evidence row and the projection
+    /// column are written in the same transaction (`write_transition`).
+    pub fn acknowledge(&mut self, job: JobId, ack: &CheckpointAck, at_ms: u64) -> Result<Transition, CommitError>;
+    /// The job's acknowledged checkpoints, newest first, from the projection.
+    pub fn acknowledged(&self, job: JobId) -> Result<Vec<CheckpointAck>, CommitError>;
+}
+
+// fabricd, authority: one more call on the writer's queue
+pub enum Call {
+    // M2 to M4 calls, and:
+    Acknowledge(JobId, CheckpointAck, Reply<Transition>),
+}
+
+// fabricd, recovery (new module): the fetch runs on a tokio task, never on
+// the writer thread; only the commit goes through `Call::Acknowledge`.
+pub struct Verifier { /* the node's store and its peer sessions */ }
+impl Verifier {
+    /// For a `Captured` the authority committed: opens a session to the
+    /// attempt's node, runs `transfer::fetch_snapshot` for the chain, reads
+    /// the cut from the published manifest, recomputes its digest, and
+    /// returns the ack to commit, or why it cannot.
+    pub async fn verify(&self, job: JobId, attempt: &Attempt, snapshot: SnapshotId, reported: CutDigest) -> Result<CheckpointAck, VerifyError>;
+}
+pub enum VerifyError {
+    /// The attempt's node did not answer within the bound; retried on the
+    /// next heartbeat, never recorded as a refusal.
+    Unreachable { node: NodeId },
+    /// A chunk or manifest did not hash to its id, or the published id is
+    /// not the asked id (`fetch_snapshot`'s own refusals); recorded as
+    /// `CoveredWriteRefused` on the bundle publish path.
+    Corrupt { snapshot: SnapshotId, reason: String },
+    CutMismatch { reported: CutDigest, verified: CutDigest },
+    Store(StoreError),
+}
+```
+
+The verifier is driven by the authority's event stream: every committed `Captured` queues one verification; a verification that fails `Unreachable` is retried when the attempt's next heartbeat arrives and dropped when the attempt is superseded or ends. The M5 facade `checkpoint` command and the harness drain of ADR 0023 are the two sources of `Captured` in M6; a timer that takes checkpoints is a later gate (ADR 0028, open questions).
+
+### Covered writes and the fence
+
+```rust
+// fabric-core, managed::fence (new module, pure)
+/// What a runner presents with every covered write for a managed job: the
+/// grant it acts under. The managed counterpart of `FencingToken`; an
+/// epoch is never written for a managed job (ADR 0019).
+pub struct GrantToken { pub job: JobId, pub attempt: AttemptId, pub generation: Generation }
+
+/// The covered write set. Exactly these four; a test lists them and fails
+/// when a variant is added without a path.
+pub enum CoveredPath {
+    /// An `Append` to a managed job's ledger (fabric-net, per-job request).
+    LedgerAppend,
+    /// A bundle publish the authority accepts as the job's checkpoint
+    /// (the `Captured` report and the verifier's fetch).
+    BundlePublish,
+    /// A journal operation an executor reports: every observation,
+    /// acknowledgement and operation mark.
+    JournalOperation,
+    /// The outcome of a facade command (ADR 0027).
+    FacadeOutcome,
+}
+
+pub enum FenceVerdict {
+    /// The token names the job's live attempt at the job's generation, in
+    /// status `granted` or `running`, from the node it was granted to.
+    Live,
+    /// The token's generation is older than the job's.
+    Stale { current: Generation },
+    /// The token's attempt was superseded by a later grant.
+    Superseded { by: Generation },
+    /// The attempt is the job's but may not write: `unknown`, or ended.
+    NotWritable { status: AttemptStatus },
+    /// The write came over the node link from a node other than the
+    /// attempt's resource.
+    WrongNode { granted: NodeId, from: NodeId },
+    UnknownAttempt,
+    UnknownJob,
+}
+
+impl FenceVerdict {
+    /// `Live` alone.
+    pub fn allows(&self) -> bool;
+    /// `Stale` and `Superseded`: the executor stops the attempt's group.
+    pub fn is_obsolete(&self) -> bool;
+}
+
+/// The one rule every covered path runs before it writes anything. `from`
+/// is the authenticated peer the write arrived from, `None` for a write
+/// made on the authority's own host.
+pub fn fence(state: Option<&ManagedState>, token: &GrantToken, from: Option<NodeId>) -> FenceVerdict;
+
+pub enum ManagedEvent {
+    // and:
+    /// A covered write other than a report was refused; a refused report
+    /// stays `StaleObservationRefused`.
+    CoveredWriteRefused { path: CoveredPath, attempt: AttemptId, generation: Generation, verdict: FenceVerdict },
+}
+```
+
+An `unknown` attempt gets `NotWritable`, not `Live`: a runner that was unavailable writes again only after a heartbeat moved it back to `running` (next section). Its write is refused with the status, recorded, and the executor retries after its next heartbeat answer; nothing is stopped by a `NotWritable` verdict.
+
+```rust
+// fabric-journal
+impl Journal {
+    /// Runs `fence` against the job's projection in the write's own
+    /// transaction. `Live` returns `Ok(())` and the caller writes; any
+    /// other verdict commits `CoveredWriteRefused` (or, for a report,
+    /// `StaleObservationRefused`) and returns the verdict. Nothing else changes.
+    pub fn fence(&mut self, token: &GrantToken, path: CoveredPath, from: Option<NodeId>, at_ms: u64) -> Result<Result<(), FenceVerdict>, CommitError>;
+    /// `observe` and `mark` gain the token and the peer and run `fence`
+    /// first; the M2 generation check inside `apply_observation` stays as
+    /// the second check and is what a replay re-runs.
+    pub fn observe(&mut self, token: &GrantToken, from: Option<NodeId>, observation: &Observation, at_ms: u64) -> Result<Result<Transition, FenceVerdict>, CommitError>;
+    pub fn mark(&mut self, token: &GrantToken, from: Option<NodeId>, operation: OperationId, mark: OperationMark, at_ms: u64) -> Result<Result<Transition, FenceVerdict>, CommitError>;
+    /// The authority's own observations (`ResourceUnavailable`,
+    /// `ResourceReachable`, and `Lost` from `recover`): no runner presents a
+    /// grant, so no fence runs; the M2 generation check still does.
+    pub fn observe_authority(&mut self, job: JobId, observation: &Observation, at_ms: u64) -> Result<Transition, CommitError>;
+}
+
+// fabric-net, wire: a per-job request for a managed job carries the grant
+// in place of the epoch, and its answer carries the verdict.
+pub enum JobToken { Standalone(FencingToken), Managed(GrantToken) }
+pub enum Fenced<T> {
+    // ADR 0003 kinds, for a standalone epoch, and:
+    /// The receiver's authority refused the grant. Never answered to a
+    /// standalone request, as `StaleEpoch` and `AheadOfUs` are never
+    /// answered to a managed one.
+    GrantRefused { verdict: FenceVerdict },
+}
+
+// fabricd, executor: what a runner does with a verdict.
+impl Executor {
+    /// `Stale` or `Superseded`: stops the attempt's process group (SIGTERM,
+    /// then SIGKILL at the stop bound), records the verdict beside the
+    /// attempt's local marker, and reports nothing more for it. `NotWritable`
+    /// or `WrongNode`: holds the write and retries after the next heartbeat
+    /// answer. Never a journal write: the authority already recorded it.
+    pub async fn on_verdict(&self, attempt: AttemptId, verdict: &FenceVerdict) -> Result<(), ExecutorError>;
+}
+```
+
+Bundle publish is covered at the authority, not at the runner: a runner publishes into its own store freely (that is local capture), and the write that counts is the authority's acceptance, which runs `fence` on the `Captured` report before the verifier fetches anything and again in `acknowledge`. The harness's own files inside the workspace (the working tree, git refs, the harness state directory) are not covered, and nothing in Fabric prevents a superseded runner that is alive from editing them until its executor stops it; those bytes reach the job only through a bundle publish.
+
+### Loss as an availability observation
+
+```rust
+// fabric-core, managed::model
+pub const HEARTBEAT_INTERVAL_MS: u64 = 2_000;
+pub const UNAVAILABLE_AFTER_MS: u64 = 10_000;
+
+pub enum Observation {
+    // and, made by the authority itself, never by a reporter:
+    /// No heartbeat for the attempt in `UNAVAILABLE_AFTER_MS`. Moves
+    /// `granted` or `running` to `unknown`; says nothing about whether the
+    /// attempt stopped.
+    ResourceUnavailable { attempt: AttemptId, generation: Generation, last_heartbeat_ms: Option<u64> },
+    /// A heartbeat returned for an attempt `unknown` by `ResourceUnavailable`
+    /// and nothing else happened to it. Moves it back to `running`.
+    ResourceReachable { attempt: AttemptId, generation: Generation },
+}
+
+pub enum ManagedEvent {
+    // and:
+    AttemptUnavailable { attempt: AttemptId, generation: Generation, last_heartbeat_ms: Option<u64> },
+    AttemptReachable { attempt: AttemptId, generation: Generation },
+}
+
+// fabric-net, wire: one message each way, every HEARTBEAT_INTERVAL_MS per
+// executor node, not per attempt. Not a per-job request: no `JobToken`.
+pub struct Heartbeat { pub attempts: Vec<GrantToken> }
+pub struct HeartbeatAnswer { pub verdicts: Vec<(AttemptId, FenceVerdict)> }
+pub enum RequestBody { /* and */ Heartbeat(Heartbeat) }
+pub enum ResponseBody { /* and */ Heartbeat(HeartbeatAnswer) }
+
+// fabricd, authority: the last heartbeat per live attempt, in memory.
+pub struct Presence { /* attempt -> (generation, last_seen_ms, node) */ }
+impl Presence {
+    /// Records the heartbeat and returns the attempts whose status should
+    /// change: `unknown` ones now reachable. Writes nothing.
+    pub fn seen(&mut self, from: NodeId, beat: &Heartbeat, now_ms: u64) -> Vec<AttemptId>;
+    /// The live attempts not heard from for `UNAVAILABLE_AFTER_MS`; the
+    /// caller observes each `ResourceUnavailable`. Run every
+    /// `HEARTBEAT_INTERVAL_MS` on the authority's clock.
+    pub fn overdue(&self, now_ms: u64) -> Vec<(JobId, AttemptId, Generation, Option<u64>)>;
+}
+```
+
+- A heartbeat is not a journal write. The authority answers it with the verdict of each token (`fence` with `from` the peer), so a reachable runner learns within one interval that an attempt of its is superseded, and stops it. A heartbeat from a node for an attempt granted to another node is answered `WrongNode` and otherwise ignored.
+- `unknown` still `may_run`, so the M2 wait rule is unchanged: `StartAttempt`, `FinishTask` and `CancelJob` wait behind it (`AttemptStillLive`). What the status enables is `Recover` and `Supersede` below.
+- `AttemptUnavailable` carries the last heartbeat time the authority holds, `None` for an attempt `granted` and never heard from. The projection column `attempts.unavailable_since_ms` is set by `AttemptUnavailable` and cleared by `AttemptReachable`.
+- On authority restart `Presence` is empty: every `granted` or `running` attempt of a remote node becomes overdue `UNAVAILABLE_AFTER_MS` after the restart unless a heartbeat arrives first. `Journal::recover` is unchanged and still probes only the authority's own host; an attempt on the authority's own node never heartbeats and never becomes `unknown` this way (replay rule 4 covers it).
+- `Observation::Lost` stays a verified stop and is never produced from a missed heartbeat.
+
+### Supersede and regrant
+
+```rust
+// fabric-core, managed::model
+pub enum AttemptStatus {
+    // and:
+    /// Its grant was taken away by a later grant while it may have been
+    /// alive. Does not `may_run`; the task stays open.
+    Superseded { by: Generation },
+}
+
+pub enum Command {
+    // and:
+    /// Takes the grant away from an `unknown` attempt and grants nothing.
+    Supersede { attempt: AttemptId, reason: String },
+    /// `Supersede` and `StartAttempt` in one transaction: the next attempt
+    /// at the next generation, placed on `resource` by the M5 rules, from
+    /// the acknowledged checkpoint `from`.
+    Recover { attempt: AttemptId, resource: ResourceRef, from: SnapshotId, reason: String },
+}
+
+pub enum ManagedEvent {
+    // and:
+    GrantSuperseded { attempt: AttemptId, generation: Generation, by: Option<Generation>, reason: String },
+}
+
+pub enum DomainError {
+    // and:
+    /// `Supersede` or `Recover` on an attempt that is not `unknown`: a
+    /// reachable attempt is handed over by the M5 planned handoff, never recovered.
+    AttemptReachable { attempt: AttemptId, status: AttemptStatus },
+}
+```
+
+- `Supersede` is accepted only for the job's live attempt in status `unknown` (`AttemptReachable` otherwise, `UnknownAttempt` for any other attempt). It records `GrantSuperseded { by: None }`; the job's generation does not move; the task stays `open`; the job now has no live attempt, so a later `StartAttempt` is admitted by the M2 rules.
+- `Recover` runs the `Supersede` checks, then `NotAcknowledged` unless `from` is in `acknowledged()`, then the M4 replacement barrier exactly as `StartAttempt` does (`ReplacementBlocked` with the blockers; a provider effect of the old attempt that may still act blocks it). It records `GrantSuperseded { by: Some(next) }` and `AttemptGranted` at `next` with `initial_checkpoint: Some(from)` in one batch at one revision. `UNIQUE (job_id, generation)` holds as before.
+- Operation kinds `supersede` and `recover` join `operations.kind`. Both take the operation key and expected revision like every command; a repeat with the same key replays, the same key with another request conflicts.
+- Nothing resumes under an old generation: a superseded attempt's every covered write is refused `Superseded { by }` and recorded, and `GrantSuperseded` is never undone. An attempt that was `superseded` and later reports `Exited` has its report refused and recorded the same way; its local exit is in the executor's marker, not in the journal.
+
+### Recovery policy
+
+```rust
+// fabric-core, managed::model
+pub struct JobPolicy {
+    pub restart: RestartPolicy,
+    // M5 fields (ADR 0023, ADR 0024), and:
+    pub recovery: RecoveryPolicy,
+}
+/// What the authority may do by itself when an attempt is unavailable.
+pub enum RecoveryPolicy {
+    /// Record it and wait for an operator's `Recover` or `Supersede`. The default.
+    Block,
+    /// Issue `Recover` itself once the attempt has been `unknown` for
+    /// `UNAVAILABLE_AFTER_MS`, when every admission condition holds.
+    RestartFromAcknowledged,
+}
+impl Default for RecoveryPolicy { fn default() -> Self { RecoveryPolicy::Block } }
+
+/// Why an automatic restart did not happen; the job stays under `Block`
+/// with this recorded, never under a weaker restart.
+pub enum RecoveryBlock {
+    /// The task's outcome policy (ADR 0023) is `block`: an `opaque` task.
+    OutcomeBlocks { kind: String },
+    /// Nothing acknowledged to restart from: for a `checkpoint` task, no
+    /// acknowledged checkpoint of this attempt; for a `cancel_and_restart`
+    /// task, none of the job. An operator may still `Supersede` and
+    /// `StartAttempt` from the source binding by hand.
+    NoAcknowledgedCheckpoint,
+    ReplacementBlocked { blockers: Vec<Blocker> },
+    /// M5 placement found no eligible node with the unavailable node excluded.
+    NoEligibleNode { exclusions: Vec<Exclusion> },
+}
+
+pub enum ManagedEvent {
+    // and:
+    RecoveryBlocked { attempt: AttemptId, generation: Generation, reason: RecoveryBlock },
+}
+
+pub enum DomainError {
+    // and:
+    /// `CreateJob` with `RestartFromAcknowledged` for a primary task whose
+    /// outcome policy is `block` (an `opaque` task). Refused at admission.
+    RecoveryUnsupported { kind: String },
+}
+
+/// The admission rule, pure: given the job, the unavailable attempt, its
+/// task's outcome policy and what the authority found, either the
+/// `Recover` to submit or why not.
+pub fn recovery_decision(state: &ManagedState, attempt: AttemptId, outcome: OutcomePolicy, blockers: &[Blocker], placement: Result<ResourceRef, Vec<Exclusion>>) -> Result<Command, RecoveryBlock>;
+```
+
+- `OutcomePolicy` is the M5 type of ADR 0023 (`cancel_and_restart` for build and test, `checkpoint` for harness, `block` for opaque); `Exclusion` is the M5 placement exclusion of ADR 0026. The M6 PR takes their names as the M5 code lands them at the restack.
+- `recovery_decision` restarts a `cancel_and_restart` task from the newest acknowledged checkpoint of the job (the task's own work is interrupted and recorded so, never passed or failed, as ADR 0023 says), and a `checkpoint` task only from the newest acknowledged checkpoint of the unavailable attempt; with none, `NoAcknowledgedCheckpoint`. A `block` task is never restarted automatically. Under `Block` the decision never runs and nothing but `AttemptUnavailable` is recorded.
+- The authority runs the decision once per overdue attempt whose job's policy is `RestartFromAcknowledged`, right after it committed `AttemptUnavailable`, and again whenever a new acknowledgement or a settled blocker changes an input. A `Recover` it submits carries an operation key derived from `(job, attempt, generation)`, so a restart after an authority crash replays the same operation and never grants twice.
+- `MANAGED_FORMAT` becomes `2` for every managed frame M6 writes. Format `1` is read beside it ("Versioning and migration"): a format `1` `JobPolicy`, inside a `JobCreated` event or the `jobs.policy` blob, decodes through its M5 shape and maps to `recovery: Block`. A stored event's bytes and digest never change, so the chain of an M2 to M5 job verifies as before. A format `2` frame read by an M5 binary is `FrameError::UnknownFormat(2)`, and that binary lists the job with its policy unreadable and runs nothing of it.
+
+### Journal schema, version 2 amended for M6
+
+Version 2 has not shipped (ADR 0020, ADR 0022), so M6 amends it in place under the rule Efe set on 2026-10-29. The DDL differences from the M4 text:
+
+```sql
+-- attempts: one status, two projection columns
+status             TEXT NOT NULL CHECK (status IN ('granted','running','succeeded','failed','cancelled',
+                     'checkpointed','lost','unknown','superseded')),
+last_acknowledged  BLOB CHECK (last_acknowledged IS NULL OR length(last_acknowledged) = 32),
+unavailable_since_ms INTEGER,
+
+-- evidence: one kind
+kind        TEXT NOT NULL CHECK (kind IN ('checkpoint','exit','checkpoint_ack')),
+
+-- operations: two command kinds
+kind              TEXT NOT NULL CHECK (kind IN ('create_job','start_attempt','register_task','finish_task',
+                     'cancel_job','supersede','recover')),
+```
+
+- The new event kinds (`checkpoint_acknowledged`, `covered_write_refused`, `attempt_unavailable`, `attempt_reachable`, `grant_superseded`, `recovery_blocked`) are new `kind` strings in `events`; no DDL.
+- `crates/fabric-journal/tests/fixtures/v2-pre-m6.sqlite` is the M4 `v2.sqlite`, renamed and kept. `Journal::open` refuses it with `OpenError::DraftSchema { version: 2, amendment: "m6" }`, reading the `attempts` CHECK text from `sqlite_master`, and writes nothing; `tests/fixtures.rs` asserts the refusal and that the file's bytes are unchanged after it. `DraftSchema` gains the `amendment` field; the M3 draft is `amendment: "m4"`.
+- `v2.sqlite` is regenerated with the amended tables, with one job that holds a `captured` and an `acknowledged` checkpoint, a `superseded` attempt and a `recovered` one, so `verify` replays every new kind.
+- `verify` replays the new events through `apply_batch` and compares `last_acknowledged`, `unavailable_since_ms` and the `superseded` status like every other projection column.
+
+### Proof harness
+
+The acceptance of M6 is a real partition and an old-runner wake, run locally with what this repository has: two `fabricd` processes on one host with separate state roots (the e2e `Env` of `crates/fabric/tests/e2e/world.rs`, one `FABRIC_HOME` per node), paired through the existing peer book, and a userspace relay the test owns. The evidence note (`docs/evidence/m6-partition/`) states plainly that this is a two-process partition on one host, not two hosts, and that no firewall or system setting was touched.
+
+```rust
+// crates/fabric/tests/e2e/relay.rs (test code only; no new dependency)
+/// Forwards UDP datagrams (QUIC) and TCP bytes (the TLS fallback) between
+/// a loopback port it owns and `upstream`. Paused, it drops every datagram
+/// and byte in both directions and keeps the sockets open; resumed, it
+/// forwards again. The runner node's peer book names the relay's address
+/// as the authority's; the authority dials the runner directly.
+pub struct Relay { pub addr: SocketAddr }
+pub struct RelayCounters { pub forwarded: [u64; 2], pub dropped: [u64; 2] }
+impl Relay {
+    pub fn start(upstream: SocketAddr) -> Fallible<Relay>;
+    pub fn pause(&self);
+    pub fn resume(&self);
+    /// Datagrams and bytes forwarded and dropped per direction, for the evidence.
+    pub fn counters(&self) -> RelayCounters;
+    pub fn stop(self);
+}
+
+// crates/fabric/tests/e2e/partition.rs
+/// The two nodes, the relay and one managed job whose attempt runs on the
+/// runner with a fake harness that writes a ledger record every 500 ms and
+/// captures a checkpoint on `SIGUSR1`.
+pub struct Partition { pub authority: Node, pub runner: Node, pub relay: Relay, pub job: JobId }
+impl Partition {
+    pub fn start(env: &Arc<Env>, policy: RecoveryPolicy) -> Fallible<Partition>;
+    /// Waits for `Captured` and then `CheckpointAcknowledged` on the authority.
+    pub fn acknowledged_checkpoint(&self) -> Fallible<SnapshotId>;
+    /// The authority's event list for the job after `after`.
+    pub fn events(&self, after: Option<EventSeq>) -> Fallible<Vec<StoredEvent>>;
+    /// The runner's process group of the attempt, for the stop assertions.
+    pub fn runner_group(&self) -> Fallible<ProcessGroup>;
+}
+```
+
+Three scenarios, each under `Block` (an operator `Recover` through the CLI) and under `RestartFromAcknowledged` (the authority's own `Recover`):
+
+| Scenario | Steps | Evidence asserted |
+|---|---|---|
+| `relay_paused_runner_alive` | acknowledged checkpoint; `relay.pause()`; wait past `UNAVAILABLE_AFTER_MS`; `Recover` (operator or automatic); `relay.resume()` | `AttemptUnavailable`, `GrantSuperseded`, `AttemptGranted` at the next generation on the authority; after resume, the old runner's ledger appends and its `Exited` answered `Superseded` and recorded `CoveredWriteRefused` or `StaleObservationRefused`; the authority's checkpoint head and the job's ledger head unchanged by anything the old runner sent after the supersede; the old runner's group gone within the stop bound; the new attempt starts from the acknowledged snapshot |
+| `old_runner_sigstop_then_sigcont` | acknowledged checkpoint; `SIGSTOP` to the runner's `fabricd` and the attempt's group; wait; `Recover`; `SIGCONT` to both | the same event list; the woken runner's first heartbeat answered `Superseded` and the group stopped; every write it had buffered refused; no second `AttemptGranted` at the same generation (the `UNIQUE` holds) |
+| `old_runner_sigkill_then_restart` | acknowledged checkpoint; `SIGKILL` to the runner's `fabricd` (its attempt's group survives as orphans); wait; `Recover`; start the runner's `fabricd` again in the same state root | the restarted runner reads its local marker, asks the authority and gets `Superseded`, stops the orphan group, and reports nothing; the orphan group's ledger records written while no `fabricd` ran are not in the job's ledger on the authority |
+
+Each scenario also asserts the negative: with no acknowledged checkpoint (`captured_only` not empty, `acknowledged` empty) a `Recover` is refused `NotAcknowledged` and an automatic one records `RecoveryBlocked { NoAcknowledgedCheckpoint }`; with the runner reachable, `Recover` is refused `AttemptReachable`; with a provider destroy of the old attempt `unknown`, `Recover` is refused `ReplacementBlocked`. The relay's counters go into the evidence note so a reader can see bytes were dropped and later forwarded.
+
+### M6 acceptance mapped to tests
+
+Each test is written first and fails on the M5 code. Names are the ones the implementation uses.
+
+| Acceptance | Tests |
+|---|---|
+| Independent acknowledged checkpoint | `fabric-core` `managed_rules::a_captured_checkpoint_restarts_nothing_until_acknowledged`, `managed_rules::an_acknowledgement_names_the_reported_snapshot_and_cut`; `fabric-journal` `tests::acknowledge_writes_the_event_the_evidence_and_the_column`; `fabricd` `recovery::tests::a_corrupt_chunk_is_never_acknowledged` (a chunk's bytes altered on the runner: `fetch_snapshot` refuses, `CoveredWriteRefused { BundlePublish }`); e2e `partition::acknowledged_checkpoint_survives_the_runner` (the runner's store deleted after the ack, the new attempt starts from the authority's copy) |
+| Fencing coverage stated and enforced | `fabric-core` `fence::tests::the_covered_write_set_is_exactly_four` (matches on `CoveredPath`), `fence::tests::only_the_live_attempt_from_its_node_is_live` (every status, stale and later generations, wrong node); `fabric-journal` `tests::a_refused_covered_write_changes_nothing_else`; `fabric-net` `wire::tests::a_managed_request_carries_a_grant_and_never_an_epoch`; e2e the three partition scenarios' refused-write assertions |
+| Termination coverage stated | e2e `partition::old_runner_sigstop_then_sigcont` and `old_runner_sigkill_then_restart` assert the old group gone within the stop bound; `fabricd` `executor::tests::an_obsolete_verdict_stops_the_group_and_a_not_writable_one_holds`; the ADR and this section say the workspace's own files are not covered |
+| Loss is an availability observation | `fabric-core` `managed_rules::unavailable_is_unknown_and_still_may_run`, `managed_rules::reachable_returns_only_an_attempt_unavailable_made_unknown`; `fabricd` `authority::tests::presence_marks_overdue_on_the_authority_clock_and_writes_no_heartbeat`; `fabric-journal` `tests::recover_never_marks_lost_from_a_missed_heartbeat` |
+| Recovery policies per job | `fabric-core` `managed_rules::block_is_the_default_and_format_1_decodes_to_it`, `managed_rules::restart_from_acknowledged_is_refused_for_an_opaque_primary`, `managed_rules::recovery_decision_falls_back_to_block_with_the_failed_condition`; `fabric-journal` `tests::an_automatic_recover_replays_under_its_derived_key`; e2e each scenario under both policies |
+| Supersede and regrant | `fabric-core` `managed_rules::supersede_needs_an_unknown_attempt`, `managed_rules::recover_grants_the_next_generation_from_an_acknowledged_checkpoint_in_one_batch`; `fabric-journal` `provider::tests::a_recover_is_blocked_like_a_start_attempt` |
+| Version 2 amendment | `fabric-journal` `tests/fixtures.rs` opens `v2-pre-m6.sqlite` and gets `DraftSchema { version: 2, amendment: "m6" }` with the file unchanged, opens the regenerated `v2.sqlite` and `verify` passes with every new kind present |
+| No hot-path regression | the perf phase alone: a covered write costs one `fence` read inside the transaction it already had; `tests/off_runtime.rs` counters unchanged at one write to dispatch and one read and one write to settle; the heartbeat costs no journal write (`authority::tests` counter) |
