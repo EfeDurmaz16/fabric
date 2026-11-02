@@ -1226,3 +1226,34 @@ async fn an_exec_answered_running_is_settled_by_observe() {
         "{again:?}"
     );
 }
+
+/// A shutdown the bridge refuses because the worker is already gone sent
+/// nothing, so it changes nothing: what comes next is refused as lost,
+/// which is what happened, not as shutting down, which never began.
+#[tokio::test]
+async fn a_shutdown_refused_for_a_lost_worker_leaves_later_requests_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let outcome = bridge
+        .request(&mut journal, create(110, "double/crash"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert!(matches!(outcome.answer, Answer::Lost(_)), "{outcome:?}");
+    assert!(bridge.lost().is_some());
+    match bridge.shutdown(1000).await {
+        Err(BridgeError::Lost(_)) => {}
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("sent a shutdown to a worker that is gone"),
+    }
+    let next = bridge
+        .request(&mut journal, create(111, "fixture/ok"))
+        .await;
+    assert!(matches!(next, Err(BridgeError::Lost(_))), "{next:?}");
+    assert_eq!(status(&journal, 111), None);
+    assert!(bridge.lost().is_some());
+    assert_eq!(bridge.close().await.unwrap().code(), Some(3));
+}

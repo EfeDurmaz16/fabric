@@ -1089,7 +1089,10 @@ impl Bridge {
     /// worker drains and after it has exited. A request admitted before
     /// this whose frame is not queued yet is never written after the
     /// shutdown's (`request`). The outstanding requests still answer on
-    /// their own.
+    /// their own. A shutdown that is refused (the worker is gone, the
+    /// queue is full) sent nothing and changes nothing: a later request is
+    /// refused for what refused the shutdown, [`BridgeError::Lost`] for a
+    /// worker that is gone, never `ShuttingDown`.
     #[allow(
         clippy::unused_async,
         reason = "async like the rest of the client; it queues its frame, so it completes without waiting"
@@ -1109,18 +1112,22 @@ impl Bridge {
         let reserved = self.reserve();
         // The flag is set and the frame queued under one lock, the one a
         // request's or an observe's frame is queued under once the flag
-        // was read, so no such frame is ever written after this one.
+        // was read, so no such frame is ever written after this one. It is
+        // set only once the frame is queued: a refused shutdown sent
+        // nothing, and the state it found, such as a lost worker, is what
+        // later requests must see.
         let mut state = self.shared.lock();
-        state.shutting_down = true;
         let frame = frame.map_err(BridgeError::Frame)?;
         let rx = self.admit(&mut state, &request_id, None, None, Kind::Control)?;
-        match reserved {
-            Ok(permit) => permit.send(Write { frame, deadline }),
+        let permit = match reserved {
+            Ok(permit) => permit,
             Err(e) => {
                 state.waiters.remove(&request_id);
                 return Err(e);
             }
-        }
+        };
+        state.shutting_down = true;
+        permit.send(Write { frame, deadline });
         drop(state);
         Ok(Pending {
             request_id,
