@@ -132,12 +132,16 @@
                 },
                 {
                   "harness_missing": {
-                    "kind": "codex"
+                    "harness": {
+                      "kind": "codex"
+                    }
                   }
                 },
                 {
                   "harness_version": {
-                    "kind": "claude_code",
+                    "harness": {
+                      "kind": "claude_code"
+                    },
                     "need": "2.1.0",
                     "have": "2.0.0"
                   }
