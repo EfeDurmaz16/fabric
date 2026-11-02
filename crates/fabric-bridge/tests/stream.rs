@@ -720,3 +720,48 @@ async fn an_observe_after_a_shutdown_is_refused_as_shutting_down() {
     assert_eq!(shutdown.wait().await.unwrap(), []);
     assert_eq!(worker.read(bridge).await, ["shutdown"]);
 }
+
+/// After `shutdown`, an attach and a cleanup are refused as shutting down
+/// before anything else is looked at, as a request and an observe are:
+/// an attach of an operation the journal does not hold and with a wait of
+/// 0, a cleanup of a create it does not hold. Nothing is written after
+/// the shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_and_a_cleanup_after_a_shutdown_are_refused_as_shutting_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (mut worker, bridge) = Draining::start(config()).await;
+    let shutdown = bridge.shutdown(5000).await.unwrap();
+    for exited in [false, true] {
+        if exited {
+            worker.exit(&bridge).await;
+        } else {
+            assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+        }
+        let attach = bridge
+            .attach(&mut journal, OperationId::from_bytes([1; 16]), 0)
+            .await;
+        assert!(
+            matches!(attach, Err(BridgeError::ShuttingDown)),
+            "attach, exited {exited}: {attach:?}"
+        );
+        let cleanup = bridge
+            .cleanup(
+                &mut journal,
+                fabric_bridge::Cleanup {
+                    creating: OperationId::from_bytes([1; 16]),
+                    id: OperationId::from_bytes([2; 16]),
+                    key: fabric_core::managed::OperationKey::parse("cleanup-key").unwrap(),
+                    approval: "apr-1".into(),
+                    deadline_ms: 1000,
+                },
+            )
+            .await;
+        assert!(
+            matches!(cleanup, Err(BridgeError::ShuttingDown)),
+            "cleanup, exited {exited}: {cleanup:?}"
+        );
+    }
+    assert_eq!(shutdown.wait().await.unwrap(), []);
+    assert_eq!(worker.read(bridge).await, ["shutdown"]);
+}

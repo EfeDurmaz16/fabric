@@ -1132,7 +1132,9 @@ impl Bridge {
     /// operation's identity, waiting at most `wait_ms` (docs/bridge-protocol.md,
     /// Reconciliation). It only reads: nothing is created again.
     ///
-    /// Refused before anything is sent: a `wait_ms` of 0 or over the
+    /// Refused first, as `request` is, when the bridge is shutting down,
+    /// the worker is gone or at its in-flight limit. Refused before
+    /// anything is sent: a `wait_ms` of 0 or over the
     /// profile's, and an action the profile does not attach, as the worker
     /// would (`RefusedLocally`); an operation the log does not hold as
     /// `unknown` with no target and no locator, or dispatched under
@@ -1146,6 +1148,7 @@ impl Bridge {
         operation: OperationId,
         wait_ms: u64,
     ) -> Result<InFlight, BridgeError> {
+        self.admission(Kind::Attach)?;
         catch_up(&self.shared, log).await?;
         if wait_ms == 0 || wait_ms > self.profile.limits.max_observe_wait_ms {
             return Err(BridgeError::RefusedLocally(Refusal {
@@ -1221,7 +1224,9 @@ impl Bridge {
     /// the attempt ended and after the job closed; the log records which
     /// create it cleans.
     ///
-    /// Refused before anything is written with `Cleanup` when the log's
+    /// Refused first, as `request` is, when the bridge is shutting down,
+    /// the worker is gone or at its in-flight limit. Refused before
+    /// anything is written with `Cleanup` when the log's
     /// rules refuse it (no such create, no locator, still dispatched,
     /// destroyed already, a destroy of it in flight); then as `request`.
     pub async fn cleanup<L: Recorder>(
@@ -1229,6 +1234,7 @@ impl Bridge {
         log: &mut L,
         cleanup: Cleanup,
     ) -> Result<InFlight, BridgeError> {
+        self.admission(Kind::Request)?;
         catch_up(&self.shared, log).await?;
         let creating = cleanup.creating;
         let target = log
