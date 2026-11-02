@@ -1497,9 +1497,13 @@ async fn the_docker_profile_on_the_local_engine() {
     assert_eq!(result(&nonzero).output["exit_code"], 7);
 
     // An exec still running at its deadline is answered running and stays
-    // dispatched; observe by its original id reads how it ended.
-    let mut slow = run(12, &["sh", "-c", "sleep 2; echo done"], 1024);
-    slow.deadline_ms = 500;
+    // dispatched; observe by its original id reads how it ended. The
+    // deadline also covers the worker's checks before the exec (an inspect
+    // through the docker CLI), which took over 500 ms on a loaded host and
+    // made the worker refuse before any effect; 3 s leaves them room while
+    // the exec still outlives the deadline.
+    let mut slow = run(12, &["sh", "-c", "sleep 6; echo done"], 1024);
+    slow.deadline_ms = 3_000;
     let slow_id = slow.operation.id;
     let answered = bridge
         .request(&mut journal, slow)
