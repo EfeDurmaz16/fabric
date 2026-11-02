@@ -189,8 +189,10 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
         } else {
             "nothing revoked: the token is unknown or was already revoked".to_owned()
         }],
+        // One line: the answer as the authority wrote it, compact, since a
+        // printed line keeps no newline of its own.
         Reply::FacadeCall(envelope) => {
-            vec![serde_json::to_string_pretty(&envelope.message).unwrap_or_default()]
+            vec![serde_json::to_string(&envelope.message).unwrap_or_default()]
         }
         Reply::ManagedList(list) => list
             .jobs
