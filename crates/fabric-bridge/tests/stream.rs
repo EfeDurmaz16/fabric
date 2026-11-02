@@ -251,6 +251,131 @@ async fn a_request_admitted_before_a_shutdown_is_never_written_after_it() {
     assert_eq!(script.await.unwrap(), ["shutdown:r-2"]);
 }
 
+fn fx(key: &str) -> fabric_bridge::wire::Locator {
+    fabric_bridge::wire::Locator::from_value(&json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+        "native_id": format!("fx-{key}"),
+    }))
+    .unwrap()
+}
+
+/// An error frame answering `request_id` for `operation_id`.
+fn error(
+    request_id: &Value,
+    operation_id: &Value,
+    code: &str,
+    reason: &str,
+    effect: &str,
+) -> Value {
+    json!({
+        "type": "error",
+        "request_id": request_id,
+        "operation_id": operation_id,
+        "error": {
+            "code": code,
+            "reason": reason,
+            "message": format!("{code}: {reason}"),
+            "effect": effect,
+        },
+    })
+}
+
+/// A worker reads an exec, and before it has sent the exec anywhere
+/// Fabric observes it: the worker knows nothing of it yet and answers
+/// `unknown`/`observation_failed`. A read that learned nothing changes
+/// nothing, so the exec stays `dispatched` and the request's own answer,
+/// a refusal before any effect, settles it `rejected`. Were the observe
+/// to move it `unknown`, the refusal could not be recorded and the exec
+/// would block the job's replacement although nothing ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_observe_that_learned_nothing_leaves_a_dispatched_request_to_its_answer() {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let request = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(request["type"], "request", "{request}");
+        let observe = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(observe["type"], "observe", "{observe}");
+        let mut answer = error(
+            &observe["request_id"],
+            &observe["operation_id"],
+            "unknown",
+            "observation_failed",
+            "unknown",
+        );
+        answer["error"]["resource"] = observe["resource"].clone();
+        let frame = frames::encode(&answer, 16 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let refusal = error(
+            &request["request_id"],
+            &request["operation"]["id"],
+            "denied",
+            "policy_denied",
+            "none",
+        );
+        let frame = frames::encode(&refusal, 16 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        (reader, writer)
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let target = fx("key-9");
+    let exec = fabric_bridge::Effect {
+        operation: operation(1),
+        scope: common::scope(),
+        action: Action::Exec {
+            target: target.clone(),
+            params: fabric_bridge::wire::ExecParams {
+                argv: vec!["true".into()],
+                stdin: None,
+                cwd: None,
+                timeout_ms: 1000,
+                max_output_bytes: 1024,
+                secret_names: Vec::new(),
+            },
+        },
+        approval: None,
+        policy: None,
+        deadline_ms: 5000,
+    };
+    let running = bridge.request(&mut log, exec).await.unwrap();
+    let observed = bridge
+        .observe(
+            &mut log,
+            OperationId::from_bytes([1; 16]),
+            "sandbox.exec",
+            target,
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut log))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Dispatched);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), running.finish(&mut log))
+        .await
+        .expect("the request was never answered");
+    let outcome = outcome.unwrap_or_else(|e| panic!("the refusal was not recorded: {e}"));
+    assert_eq!(outcome.status, ProviderStatus::Rejected);
+    let entry = log
+        .entry(OperationId::from_bytes([1; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.status, ProviderStatus::Rejected);
+    let _streams = script.await.unwrap();
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
 /// A caller drops a create before its answer, and the worker is then
 /// lost with it in flight. Nothing waits on it, so no answer or loss can
 /// settle it; the next call handed the log records it `unknown`, as the

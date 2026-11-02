@@ -580,6 +580,8 @@ CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
 | observe `error` `pending` | `unknown`, `attached`, `observed` | `observed`, locator stored |
 | observe `error` `pending` | `dispatched` | `dispatched`, locator stored (M3, unchanged) |
 | observe or attach refused, `unknown` without a new locator, worker lost or timed out during the read | any | unchanged: a read that learned nothing changes nothing |
+| observe `error` `unknown`, or the observe lost or timed out, of a `dispatched` operation whose request is in flight on this bridge | `dispatched` | unchanged: that request's own answer, deadline or loss settles it, and a refusal it answers is still recorded `rejected` (`tests/stream.rs` `an_observe_that_learned_nothing_leaves_a_dispatched_request_to_its_answer`) |
+| observe `error` `unknown`, or the observe lost or timed out, of a `dispatched` operation with no request in flight (one answered `running`) | `dispatched` | `unknown` (M3, scenario `exec_observe_after_worker_loss`) |
 | `provider_abandon` with a matching approval | `unknown`, `attached`, `observed` | `abandoned` |
 
 Meaning of the new states:

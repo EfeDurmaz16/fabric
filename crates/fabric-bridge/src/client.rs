@@ -24,7 +24,7 @@
 //!   admitted before it whose frame was not queued yet is recorded
 //!   `rejected` (`unavailable`, `shutting_down`) and never sent.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -245,6 +245,11 @@ struct State {
     found: HashMap<OperationId, Locator>,
     /// Requests whose caller stopped waiting, not yet recorded `unknown`.
     dropped: Vec<OperationId>,
+    /// Operations whose request is in flight here, from its dispatch
+    /// until its `InFlight` settled it or was dropped: that request's own
+    /// answer, deadline or loss settles the operation, so a read of it
+    /// that learned nothing changes nothing meanwhile.
+    open: HashSet<OperationId>,
     lost: Option<String>,
     shutting_down: bool,
     late: u64,
@@ -305,6 +310,12 @@ impl Shared {
         if by_caller {
             state.dropped.push(operation);
         }
+    }
+
+    /// Whether a request of `operation` is in flight here, not yet
+    /// settled by its own `InFlight`.
+    fn request_open(&self, operation: OperationId) -> bool {
+        self.lock().open.contains(&operation)
     }
 
     /// Whether `catch_up` has anything to record.
@@ -953,6 +964,7 @@ impl Bridge {
                 return Err(e);
             }
         };
+        self.shared.lock().open.insert(dispatch.operation);
         let wait = Duration::from_millis(request.deadline_ms) + self.config.grace;
         let mut flight = InFlight {
             request_id: request.request_id,
@@ -1473,6 +1485,9 @@ impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.done {
             self.shared.give_up(&self.request_id);
+            if self.kind == Kind::Request {
+                self.shared.lock().open.remove(&self.operation);
+            }
         }
     }
 }
@@ -1533,8 +1548,13 @@ impl InFlight {
             },
         };
         let (kind, said) = (self.kind, Said::of(&answer));
-        let settled = slot.run(move |log| settle(log, operation, kind, said));
+        // A read settles nothing a request in flight here will settle.
+        let request_open = kind != Kind::Request && self.shared.request_open(operation);
+        let settled = slot.run(move |log| settle(log, operation, kind, request_open, said));
         self.done = true;
+        if kind == Kind::Request {
+            self.shared.lock().open.remove(&operation);
+        }
         let status = settled.await??;
         Ok(Event::Done(Outcome { status, answer }))
     }
@@ -1598,11 +1618,17 @@ impl Said {
 /// attach) or `observed` (an observe). A read that learned nothing, a
 /// refusal, an `absent` attach or a read lost or timed out, changes no
 /// status: an `absent` attach stores what it searched, an `unknown` with
-/// a locator stores the locator.
+/// a locator stores the locator. One exception: an observe of a
+/// `dispatched` operation whose request was answered under way (M3's
+/// `exec_observe_after_worker_loss`) that learns nothing, or is lost or
+/// timed out, makes it `unknown`, since no answer is coming for it; not
+/// while its request is in flight here (`request_open`), whose own
+/// answer, deadline or loss settles it.
 fn settle<L: OperationLog>(
     log: &mut L,
     operation: OperationId,
     kind: Kind,
+    request_open: bool,
     said: Said,
 ) -> Result<ProviderStatus, LogError> {
     use ProviderStatus::{Attached, Cancelled, Dispatched, Failed, Observed, Rejected, Succeeded};
@@ -1643,7 +1669,9 @@ fn settle<L: OperationLog>(
                     }
                     Attached
                 }
-                (ErrorCode::Unknown, _) if before == Dispatched => ProviderStatus::Unknown,
+                (ErrorCode::Unknown, _) if before == Dispatched && !request_open => {
+                    ProviderStatus::Unknown
+                }
                 (ErrorCode::Unknown, _) if locator.is_some() => before,
                 (code, Kind::Request) if code.is_refusal() => Rejected,
                 (ErrorCode::ProviderFailed, Kind::Request) => Failed,
@@ -1653,7 +1681,7 @@ fn settle<L: OperationLog>(
             };
             (status, record, locator)
         }
-        Said::Nothing if before == Dispatched => {
+        Said::Nothing if before == Dispatched && !request_open => {
             (ProviderStatus::Unknown, ProviderAnswer::default(), None)
         }
         Said::Nothing => return Ok(before),
