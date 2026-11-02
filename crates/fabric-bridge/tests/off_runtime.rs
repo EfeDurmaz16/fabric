@@ -75,6 +75,16 @@ impl OperationLog for Watched {
         self.journal.searched(operation, answer, searched)
     }
 
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.note("absent");
+        self.journal.absent(operation, answer, searched)
+    }
+
     fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         self.note("locate");
         self.journal.locate(operation, locator)
@@ -381,6 +391,15 @@ impl OperationLog for Slow {
         searched: &str,
     ) -> Result<(), LogError> {
         self.journal.searched(operation, answer, searched)
+    }
+
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.journal.absent(operation, answer, searched)
     }
 
     fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {

@@ -1633,7 +1633,7 @@ enum Said {
     /// A `result` in this state, naming this locator.
     Result(ResultState, LocatorRecord),
     /// An `error`: what the log keeps of it, the locator it named, and the
-    /// scope an `absent` attach searched.
+    /// scope an `absent` read searched.
     Error {
         code: ErrorCode,
         record: ProviderAnswer,
@@ -1669,18 +1669,24 @@ impl Said {
 /// Records what `said` asks for `operation`, an answer to a `kind`, and
 /// returns the status the log holds after it (docs/managed-jobs.md, the
 /// transition table). A request's answer moves a `dispatched` operation
-/// on. A read (an observe or an attach) settles what it saw terminal; of
-/// an operation it found after its answer was lost (`unknown`,
-/// `attached`, `observed`), what it saw under way makes it `attached` (an
-/// attach) or `observed` (an observe). A read that learned nothing, a
-/// refusal, an `absent` attach or a read lost or timed out, changes no
-/// status: an `absent` attach stores what it searched, an `unknown` with
-/// a locator stores the locator. One exception: an observe of a
-/// `dispatched` operation whose request was answered under way (M3's
-/// `exec_observe_after_worker_loss`) that learns nothing, or is lost or
-/// timed out, makes it `unknown`, since no answer is coming for it; not
-/// while its request is in flight here (`request_open`), whose own
-/// answer, deadline or loss settles it.
+/// on; a destroy answered `provider_failed`/`not_found` goes `unknown`,
+/// not `failed`, with the answer on its row, since the provider did not
+/// find the resource and nothing says it is gone from the scope. A read
+/// (an observe or an attach) settles what it saw terminal; of an
+/// operation it found after its answer was lost (`unknown`, `attached`,
+/// `observed`), what it saw under way makes it `attached` (an attach) or
+/// `observed` (an observe). An observe of a destroy's resource answered
+/// `absent` settles the destroy `succeeded` with the scope it searched:
+/// absence in that scope is what the destroy was to bring about. A read
+/// that learned nothing, a refusal, an `absent` attach or absent observe
+/// of anything but a destroy, or a read lost or timed out, changes no
+/// status: an `absent` read of an `unknown` operation stores what it
+/// searched, an `unknown` with a locator stores the locator. One
+/// exception: an observe of a `dispatched` operation whose request was
+/// answered under way (M3's `exec_observe_after_worker_loss`) that learns
+/// nothing, or is lost or timed out, makes it `unknown`, since no answer
+/// is coming for it; not while its request is in flight here
+/// (`request_open`), whose own answer, deadline or loss settles it.
 fn settle<L: OperationLog>(
     log: &mut L,
     operation: OperationId,
@@ -1689,7 +1695,9 @@ fn settle<L: OperationLog>(
     said: Said,
 ) -> Result<ProviderStatus, LogError> {
     use ProviderStatus::{Attached, Cancelled, Dispatched, Failed, Observed, Rejected, Succeeded};
-    let before = log.entry(operation)?.map_or(Dispatched, |e| e.status);
+    let entry = log.entry(operation)?;
+    let before = entry.as_ref().map_or(Dispatched, |e| e.status);
+    let destroy = entry.is_some_and(|e| e.effect == EffectClass::Destroy);
     if before.is_terminal() {
         return Ok(before);
     }
@@ -1708,19 +1716,35 @@ fn settle<L: OperationLog>(
             };
             (status, ProviderAnswer::default(), Some(locator))
         }
+        // An `absent` read: the worker found no resource in the scope it
+        // searched. Of a destroy, that is the destroy done; of anything
+        // else it settles nothing, and what was searched is kept for an
+        // operation still `unknown`.
+        Said::Error {
+            code: ErrorCode::Unknown,
+            record,
+            searched: Some(searched),
+            ..
+        } if kind != Kind::Request => {
+            if kind == Kind::Observe && destroy {
+                log.absent(operation, &record, &searched)?;
+                return Ok(Succeeded);
+            }
+            if kind == Kind::Attach || before == ProviderStatus::Unknown {
+                log.searched(operation, &record, &searched)?;
+            }
+            return Ok(before);
+        }
         Said::Error {
             code,
             record,
             locator,
-            searched,
+            searched: _,
         } => {
+            let not_found = record.reason.as_deref() == Some("not_found");
             let status = match (code, kind) {
                 (ErrorCode::Pending, _) => under_way,
                 (ErrorCode::Unknown, Kind::Attach) => {
-                    if let Some(searched) = searched {
-                        log.searched(operation, &record, &searched)?;
-                        return Ok(before);
-                    }
                     if locator.is_none() {
                         return Ok(before);
                     }
@@ -1731,6 +1755,17 @@ fn settle<L: OperationLog>(
                 }
                 (ErrorCode::Unknown, _) if locator.is_some() => before,
                 (code, Kind::Request) if code.is_refusal() => Rejected,
+                // The provider did not find the resource a destroy names:
+                // that says nothing about where it went, so the destroy
+                // is `unknown` with the reason on its row until an observe
+                // finds the resource absent.
+                (ErrorCode::ProviderFailed, Kind::Request) if destroy && not_found => {
+                    if before == Dispatched {
+                        ProviderStatus::Unknown
+                    } else {
+                        before
+                    }
+                }
                 (ErrorCode::ProviderFailed, Kind::Request) => Failed,
                 // A refused or failed read, or one that learned nothing,
                 // says nothing new about the operation it read.
@@ -1947,8 +1982,8 @@ fn route(shared: &Shared, message: ToFabric) -> Result<(), String> {
     let absent = matches!(&message, ToFabric::Error(e)
         if e.error.code == ErrorCode::Unknown && e.error.reason == "absent");
     let fits = match (&message, waiter.kind) {
-        // Only an attach is answered absent.
-        _ if absent => waiter.kind == Kind::Attach,
+        // Only a read, an attach or an observe, is answered absent.
+        _ if absent => matches!(waiter.kind, Kind::Attach | Kind::Observe),
         // A terminal-only action answers a result only once terminal.
         (ToFabric::Result(r), Kind::Request) => {
             !(waiter.terminal_only

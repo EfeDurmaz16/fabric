@@ -169,6 +169,15 @@ impl OperationLog for Gated {
         self.log.searched(operation, answer, searched)
     }
 
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.log.absent(operation, answer, searched)
+    }
+
     fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         self.log.locate(operation, locator)
     }
@@ -764,4 +773,266 @@ async fn an_attach_and_a_cleanup_after_a_shutdown_are_refused_as_shutting_down()
     }
     assert_eq!(shutdown.wait().await.unwrap(), []);
     assert_eq!(worker.read(bridge).await, ["shutdown"]);
+}
+
+/// A `sandbox.destroy` of `target` as operation `n`, under approval `ref`.
+fn destroy_of(n: u8, target: &fabric_bridge::wire::Locator, approval: &str) -> Effect {
+    Effect {
+        operation: operation(n),
+        scope: common::scope(),
+        action: Action::Destroy {
+            target: target.clone(),
+        },
+        approval: Some(approval.to_owned()),
+        policy: None,
+        deadline_ms: 5000,
+    }
+}
+
+/// A `result` `completed` answering a request for `resource`.
+fn completed(request: &Value, resource: &Value, output: &Value) -> Value {
+    json!({
+        "type": "result",
+        "request_id": request["request_id"],
+        "operation_id": request["operation"]["id"],
+        "state": "completed",
+        "resource": resource,
+        "output": output,
+        "replayed": false,
+        "receipts": [],
+    })
+}
+
+/// A worker that acknowledges `hello`, then reads session frames and
+/// answers each in turn with what `answers` makes of it, in order, and
+/// hands back the frames it read once the script ran out.
+fn play(
+    mut reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    mut writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    answers: Vec<fn(&Value) -> Value>,
+) -> tokio::task::JoinHandle<Vec<Value>> {
+    tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let mut read = Vec::new();
+        for answer in answers {
+            let frame = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+            let reply = answer(&frame);
+            read.push(frame);
+            let encoded = frames::encode(&reply, 16 << 20).unwrap();
+            frames::write(&mut writer, &encoded).await.unwrap();
+        }
+        // Kept open until the test is done with the bridge.
+        std::mem::forget((reader, writer));
+        read
+    })
+}
+
+/// The fixture locator of `fx-key-1` as JSON.
+fn fx_key_1() -> Value {
+    json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+        "native_id": "fx-key-1",
+    })
+}
+
+fn create_done(request: &Value) -> Value {
+    assert_eq!(request["type"], "request", "{request}");
+    assert_eq!(request["action"], "sandbox.create", "{request}");
+    completed(request, &fx_key_1(), &json!({"status": "ready"}))
+}
+
+fn destroy_not_found(request: &Value) -> Value {
+    assert_eq!(request["type"], "request", "{request}");
+    assert_eq!(request["action"], "sandbox.destroy", "{request}");
+    error(
+        &request["request_id"],
+        &request["operation"]["id"],
+        "provider_failed",
+        "not_found",
+        "none",
+    )
+}
+
+fn observe_failed(observe: &Value) -> Value {
+    assert_eq!(observe["type"], "observe", "{observe}");
+    let mut answer = error(
+        &observe["request_id"],
+        &observe["operation_id"],
+        "unknown",
+        "observation_failed",
+        "unknown",
+    );
+    answer["error"]["resource"] = observe["resource"].clone();
+    answer
+}
+
+fn observe_absent(observe: &Value) -> Value {
+    assert_eq!(observe["type"], "observe", "{observe}");
+    let mut answer = error(
+        &observe["request_id"],
+        &observe["operation_id"],
+        "unknown",
+        "absent",
+        "unknown",
+    );
+    answer["error"]["observations"] = json!(1);
+    answer["error"]["deadline_ms"] = observe["wait_ms"].clone();
+    answer["error"]["searched"] = json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+    });
+    answer
+}
+
+/// The scope `observe_absent` says it searched, as the journal stores it.
+const SEARCHED: &str =
+    r#"{"kind":"sandbox","provider":"fixture","scope":{"account":"acct-a","project":"proj-1"}}"#;
+
+/// A job's create succeeded, then its destroy is answered `not_found`.
+/// Returns the bridge, the journal and the script, with the destroy
+/// `unknown`, its answer on the row and the barrier up.
+async fn not_found_destroy(
+    answers: Vec<fn(&Value) -> Value>,
+) -> (Bridge, Logged, tokio::task::JoinHandle<Vec<Value>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    std::mem::forget(dir);
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (reader, writer) = tokio::io::split(worker);
+    let mut script = vec![create_done as fn(&Value) -> Value, destroy_not_found];
+    script.extend(answers);
+    let played = play(reader, writer, script);
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let made = bridge
+        .request(&mut journal, create(1, "fixture/ok"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(made.status, ProviderStatus::Succeeded);
+    let stop = bridge
+        .request(&mut journal, destroy_of(2, &fx("key-1"), "apr-destroy-1"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(
+        stop.status,
+        ProviderStatus::Unknown,
+        "not_found says the provider did not find it, not where it went"
+    );
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.answer,
+        ProviderAnswer {
+            code: Some("provider_failed".into()),
+            reason: Some("not_found".into()),
+            effect: Some("none".into()),
+        },
+        "the reason stays visible"
+    );
+    assert_eq!(row.searched, None);
+    let job = common::scope().job;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![fabric_journal::Blocker::StopNotConfirmed {
+            operation: OperationId::from_bytes([2; 16]),
+            status: ProviderStatus::Unknown,
+        }]
+    );
+    assert_eq!(journal.residuals(job).unwrap().len(), 1);
+    (bridge, journal, played)
+}
+
+/// A destroy the worker answers `provider_failed`/`not_found` is
+/// recorded `unknown`, not `failed`: the provider did not find the
+/// resource, and nothing says it is gone from the scope. It keeps the
+/// replacement barrier with its reason on the row. An observe of the
+/// resource that answers `unknown`/`absent` with the scope it searched
+/// is the evidence that lifts it: the destroy settles `succeeded`, the
+/// searched scope is stored, and the create is no residual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_destroy_is_unknown_until_an_observe_finds_its_resource_absent() {
+    let (bridge, mut journal, played) = not_found_destroy(vec![observe_absent]).await;
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([2; 16]),
+            "sandbox.destroy",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut journal))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Succeeded);
+    assert_eq!(row.searched.as_deref(), Some(SEARCHED));
+    assert_eq!(row.answer.reason.as_deref(), Some("absent"));
+    let job = common::scope().job;
+    assert!(journal.replacement_blockers(job).unwrap().is_empty());
+    assert_eq!(journal.residuals(job).unwrap(), vec![]);
+    assert_eq!(played.await.unwrap().len(), 3);
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// Without absent evidence the barrier stays: an observe of the
+/// `not_found` destroy that cannot read the resource
+/// (`unknown`/`observation_failed`) learns nothing, so the destroy stays
+/// `unknown`, blocks a replacement and keeps its residual listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_destroy_keeps_the_barrier_while_nothing_finds_its_resource_absent() {
+    let (bridge, mut journal, played) = not_found_destroy(vec![observe_failed]).await;
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([2; 16]),
+            "sandbox.destroy",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut journal))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Unknown);
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(row.searched, None, "nothing was searched");
+    let job = common::scope().job;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![fabric_journal::Blocker::StopNotConfirmed {
+            operation: OperationId::from_bytes([2; 16]),
+            status: ProviderStatus::Unknown,
+        }]
+    );
+    assert_eq!(journal.residuals(job).unwrap().len(), 1);
+    assert_eq!(played.await.unwrap().len(), 3);
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
 }
