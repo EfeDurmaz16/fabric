@@ -59,6 +59,10 @@ The Rust client (`fabric-client`) and the TypeScript SDK test against the same f
 - A revoked or expired token ends every open watch; a test proves it within one delivery.
 - The operation key's scope becomes `(principal, key)` as ADR 0020 foresaw: a facade command's key is stored under the token's actor.
 
+## As built (M5)
+
+Built on 2026-11-03 by owner B. Where the code differs from the decision above, docs/managed-jobs.md, "As built (M5): P06 and P07", says how and why. In short: the facade's parsers live in `fabric_client::facade` and `sdk/typescript/src/facade.ts`, each tested against every case of `protocol/facade/v1`; the authority side (`fabricd::facade`) checks in the order above, stores a command's key as `<actor>:<key>` (or `<actor>:h:<digest>` when the pair is too long for one key), and answers `accepted` after the commit. The watch keeps no per-job broadcast: the journal is the queue, a reader waits on the authority's commit counter and reads again when it moves, so a slow reader costs no memory and an answer carries at most the window with `lagged` when more was behind the cursor; a watch on a finished or cancelled job with nothing after its cursor closes `finished`. The bearer is 32 bytes from the kernel's random device, shown once; a token can be minted before any job exists, which makes the journal. The local socket's `managed_create` keeps its required `repo` (pinned by `protocol/required.txt` under api 1), so a source that is not a repository on the node travels in a new `managed_submit` op with the same body as the facade's `submit`.
+
 ## Open questions
 
 - Who may mint a token for another actor, and how a token for a principal that is not the owner is signed and audited.
