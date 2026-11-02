@@ -1573,17 +1573,18 @@ pub fn fits_request(request: &Request, profile: &Profile) -> Result<(), Refusal>
         }
         // The bounds the profile advertises in `hello_ack` for what an exec
         // may ask of a command: a request above either is refused before
-        // it is sent, as the worker refuses it on reading.
+        // it is sent, as the worker refuses it on reading, `limit` like
+        // every other value over a profile limit.
         if params.timeout_ms > l.max_timeout_ms {
             return Err(bad(
-                "out_of_range",
+                "limit",
                 "params.timeout_ms above the profile's max_timeout_ms",
             )
             .code("invalid"));
         }
         if params.max_output_bytes > l.max_output_bytes {
             return Err(bad(
-                "out_of_range",
+                "limit",
                 "params.max_output_bytes above the profile's max_output_bytes",
             )
             .code("invalid"));
@@ -1726,7 +1727,6 @@ impl ErrorCode {
                 "bad_string",
                 "bad_locator",
                 "limit",
-                "out_of_range",
                 "duplicate_request_id",
                 "idempotency_conflict",
             ],

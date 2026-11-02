@@ -1092,7 +1092,7 @@ fn exec_bounds() -> (u64, u64) {
 /// An exec whose `timeout_ms` or `max_output_bytes` is above the bound
 /// the profile advertises in `hello_ack`, and a destroy or an exec whose
 /// target has an empty `native_id`, are refused before sending with the
-/// code and reason the worker would answer, `invalid`/`out_of_range` and
+/// code and reason the worker would answer, `invalid`/`limit` and
 /// `invalid`/`missing_field`, and recorded `rejected`: the first frame the
 /// worker reads is the request within the bounds that follows them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1119,14 +1119,8 @@ async fn a_request_above_the_profile_bounds_or_at_no_resource_is_refused_before_
     let mut unnamed = target.clone();
     unnamed.native_id = String::new();
     let refused = [
-        (
-            exec_of(1, &target, max_timeout_ms + 1, 1024),
-            "out_of_range",
-        ),
-        (
-            exec_of(2, &target, 1000, max_output_bytes + 1),
-            "out_of_range",
-        ),
+        (exec_of(1, &target, max_timeout_ms + 1, 1024), "limit"),
+        (exec_of(2, &target, 1000, max_output_bytes + 1), "limit"),
         (exec_of(3, &unnamed, 1000, 1024), "missing_field"),
         (destroy_of(4, &unnamed, "apr-destroy-1"), "missing_field"),
     ];
