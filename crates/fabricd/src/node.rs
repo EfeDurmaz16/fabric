@@ -212,6 +212,9 @@ impl Node {
             .take()
             .ok_or_else(|| NodeError::Task("the node is already running".to_owned()))?;
         tokio::spawn(Arc::clone(&self).recover());
+        // The authority's clock (ADR 0028): a tick every heartbeat
+        // interval; nothing runs while no managed job exists.
+        tokio::spawn(self.authority.clone().run_ticker());
         loop {
             tokio::select! {
                 accepted = self.endpoint.accept() => match accepted {

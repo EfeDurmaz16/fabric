@@ -8,13 +8,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{JobId, NodeId};
+use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
-    Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, OperationMark,
+    AttemptStatus, CheckpointAck, Command, CutDigest, DomainError, Envelope, FenceVerdict,
+    Generation, GrantToken, Intent, JobPolicy, Observation, OperationKey, OperationMark,
     OperationStatus, RecoveryPolicy, ResourceRef, RestartPolicy, SourceBinding, StoredResult,
+    UNAVAILABLE_AFTER_MS,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::Answer;
+use fabric_net::wire::Heartbeat;
 
 use super::*;
 
@@ -358,4 +361,304 @@ async fn a_journal_that_cannot_be_looked_at_refuses_every_id() {
         "{held:?}"
     );
     assert_eq!(authority.threads(), 1);
+}
+
+// M6 (ADR 0028): heartbeats, presence and the recovery policy in the daemon.
+
+const RUNNER: NodeId = NodeId::from_bytes([7; 32]);
+const OTHER: NodeId = NodeId::from_bytes([8; 32]);
+
+fn create_with(key: &str, recovery: RecoveryPolicy) -> Envelope<Command> {
+    let mut envelope = create(key);
+    if let Command::CreateJob { policy, .. } = &mut envelope.body {
+        policy.recovery = recovery;
+    }
+    envelope
+}
+
+/// A job whose first attempt runs on `RUNNER`, as its executor reported.
+async fn running_on_runner(authority: &Authority, recovery: RecoveryPolicy) -> (JobId, GrantToken) {
+    let made = authority
+        .submit(create_with("create-1", recovery))
+        .await
+        .unwrap();
+    let job = job_of(&made);
+    let primary = authority.job(job).await.unwrap().unwrap().job.primary;
+    let start = Envelope {
+        key: OperationKey::parse("start-1").unwrap(),
+        job: Some(job),
+        expected: None,
+        body: Command::StartAttempt {
+            task: primary,
+            resource: ResourceRef::Node { node: RUNNER },
+            initial_checkpoint: None,
+        },
+    };
+    let granted = authority.submit(start).await.unwrap();
+    let StoredResult::Accepted(grant) = &granted.result else {
+        panic!("the grant was refused");
+    };
+    authority
+        .mark_authority(job, grant.operation, OperationMark::Dispatched)
+        .await
+        .unwrap();
+    let attempt = authority.job(job).await.unwrap().unwrap().attempts[0].clone();
+    let token = GrantToken {
+        job,
+        attempt: attempt.id,
+        generation: attempt.generation,
+    };
+    authority
+        .report(
+            token,
+            Some(RUNNER),
+            Observation::Started {
+                attempt: token.attempt,
+                generation: token.generation,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    (job, token)
+}
+
+fn beat(token: GrantToken) -> Heartbeat {
+    Heartbeat::new(vec![token]).unwrap()
+}
+
+async fn status(authority: &Authority, token: GrantToken) -> AttemptStatus {
+    authority
+        .job(token.job)
+        .await
+        .unwrap()
+        .unwrap()
+        .attempt(token.attempt)
+        .unwrap()
+        .status
+        .clone()
+}
+
+async fn revision(authority: &Authority, job: JobId) -> u64 {
+    authority
+        .job(job)
+        .await
+        .unwrap()
+        .unwrap()
+        .job
+        .revision
+        .get()
+}
+
+#[tokio::test]
+async fn presence_marks_overdue_on_the_authority_clock_and_writes_no_heartbeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let before = revision(&authority, job).await;
+    // A heartbeat from the runner: live, and nothing written.
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(answer.verdicts, vec![(token.attempt, FenceVerdict::Live)]);
+    assert_eq!(revision(&authority, job).await, before);
+    // One from another node: wrong node, nothing written, nothing reset.
+    let answer = authority.heartbeat(OTHER, beat(token)).await.unwrap();
+    assert_eq!(
+        answer.verdicts,
+        vec![(
+            token.attempt,
+            FenceVerdict::WrongNode {
+                granted: RUNNER,
+                from: OTHER
+            }
+        )]
+    );
+    assert_eq!(revision(&authority, job).await, before);
+    // Silence short of the threshold on the authority's clock: nothing.
+    let now = now_ms();
+    assert!(authority.tick(now).await.unwrap().is_empty());
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+    // Past it: unknown, with the state visible; the job waits under Block.
+    let overdue = authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
+    assert_eq!(overdue.len(), 1);
+    assert_eq!(overdue[0].attempt, token.attempt);
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    assert!(s.attempts[0].unavailable_since_ms.is_some());
+    assert_eq!(s.job.generation, Generation::FIRST);
+    assert!(s.live_attempt().is_some(), "unknown still may run");
+    // Another tick records nothing more under Block.
+    let after = revision(&authority, job).await;
+    assert!(
+        authority
+            .tick(now + 2 * UNAVAILABLE_AFTER_MS)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(revision(&authority, job).await, after);
+    // The heartbeat returns: one observation, running again, live.
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(answer.verdicts, vec![(token.attempt, FenceVerdict::Live)]);
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+    assert_eq!(revision(&authority, job).await, after + 1);
+    // A restarted authority tracks the live remote attempt again.
+    drop(authority);
+    let authority = Authority::start(&state, NODE).unwrap();
+    assert!(authority.tick(now_ms()).await.unwrap().is_empty());
+    let overdue = authority
+        .tick(now_ms() + UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(overdue.len(), 1);
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the whole loss, restart and wake reads best as one scenario"
+)]
+async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_runner() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
+    let now = now_ms();
+    // Silent with nothing acknowledged: blocked, recorded once.
+    authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
+    let kinds = |s: &fabric_core::managed::ManagedState| s.job.revision.get();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    assert_eq!(
+        s.job.generation,
+        Generation::FIRST,
+        "nothing to restart from"
+    );
+    let after_block = kinds(&s);
+    authority
+        .tick(now + UNAVAILABLE_AFTER_MS + 2_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        revision(&authority, job).await,
+        after_block,
+        "the same reason is not recorded twice"
+    );
+    // The runner comes back, captures a checkpoint, and the authority
+    // acknowledges it after its own fetch (the fetch is M5's executor
+    // path; the acknowledgement is what recovery reads).
+    authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
+    let snapshot = SnapshotId::of(b"the runner's checkpoint");
+    let cut = CutDigest::of(b"its cut");
+    authority
+        .report(
+            token,
+            Some(RUNNER),
+            Observation::Captured {
+                attempt: token.attempt,
+                generation: token.generation,
+                snapshot,
+                cut,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    authority
+        .acknowledge(
+            job,
+            CheckpointAck {
+                attempt: token.attempt,
+                generation: token.generation,
+                snapshot,
+                cut,
+                manifests: 1,
+                chunks: 1,
+                bytes: 1,
+                fetched_from: RUNNER,
+            },
+        )
+        .await
+        .unwrap();
+    // Silent again: recovered onto this node from the acknowledged checkpoint.
+    let later = now_ms() + UNAVAILABLE_AFTER_MS;
+    authority.tick(later).await.unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation.get(), 2);
+    assert_eq!(
+        s.attempts[0].status,
+        AttemptStatus::Superseded {
+            by: Some(Generation::new(2).unwrap())
+        }
+    );
+    let next = &s.attempts[1];
+    assert_eq!(next.resource, ResourceRef::Node { node: NODE });
+    assert_eq!(next.initial_checkpoint, Some(snapshot));
+    assert_eq!(next.status, AttemptStatus::Granted);
+    let recover = s.operation(next.granted_by).unwrap();
+    assert_eq!(recover.kind, fabric_core::managed::CommandKind::Recover);
+    assert!(recover.key.as_str().starts_with("recover."));
+    // The old runner wakes: its heartbeat is answered superseded, its
+    // writes are refused and recorded, and the job does not move.
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(
+        answer.verdicts,
+        vec![(
+            token.attempt,
+            FenceVerdict::Superseded {
+                by: Some(Generation::new(2).unwrap())
+            }
+        )]
+    );
+    let refused = authority
+        .report(
+            token,
+            Some(RUNNER),
+            Observation::Exited {
+                attempt: token.attempt,
+                generation: token.generation,
+                outcome: fabric_core::managed::ExitOutcome::Succeeded,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(refused, FenceVerdict::Superseded { .. }));
+    let refused = authority
+        .fence(
+            token,
+            fabric_core::managed::CoveredPath::LedgerAppend,
+            Some(RUNNER),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(refused, FenceVerdict::Superseded { .. }));
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation.get(), 2);
+    assert_eq!(s.attempts.len(), 2);
+    assert_eq!(s.attempts[1].status, AttemptStatus::Granted);
+    // The new attempt is local: no heartbeat, never unavailable this way.
+    assert!(
+        authority
+            .tick(later + 3 * UNAVAILABLE_AFTER_MS)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        status(&authority, token).await,
+        AttemptStatus::Superseded {
+            by: Some(Generation::new(2).unwrap())
+        }
+    );
+    // A restart replays the authority's recover under its derived key
+    // rather than granting again.
+    drop(authority);
+    let authority = Authority::start(&state, NODE).unwrap();
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.attempts.len(), 2);
+    assert_eq!(s.job.generation.get(), 2);
 }

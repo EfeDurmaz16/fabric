@@ -35,15 +35,23 @@ use std::sync::{Arc, Mutex};
 
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
-    AttemptId, Command, DomainError, Envelope, ManagedState, NewIds, Observation, OperationId,
-    OperationMark, StoredResult, TaskId, Transition,
+    AttemptId, AttemptStatus, CheckpointAck, Command, CoveredPath, DomainError, Envelope,
+    FenceVerdict, GrantToken, HEARTBEAT_INTERVAL_MS, ManagedEvent, ManagedState, NewIds,
+    Observation, OperationId, OperationKey, OperationMark, OutcomePolicy, RecoveryBlock,
+    RecoveryPolicy, ResourceRef, StoredResult, TaskId, Transition, fence, recovery_decision,
 };
-use fabric_journal::{Answer, CommitError, FILE_NAME, Journal, Liveness, OpenError};
+use fabric_journal::{Answer, Blocker, CommitError, FILE_NAME, Journal, Liveness, OpenError};
+use fabric_net::wire::{Heartbeat, HeartbeatAnswer};
 use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
 
 use crate::clock::now_ms;
 use crate::paths::StateDir;
+
+mod presence;
+
+pub(crate) use presence::Overdue;
+use presence::Presence;
 
 /// How many calls may wait for the authority before a caller waits to queue one.
 const QUEUE: usize = 64;
@@ -105,6 +113,41 @@ enum Call {
         expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
     )]
     Mark(JobId, OperationId, OperationMark, Reply<Transition>),
+    /// An executor's report behind the fence (ADR 0028).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the M5 executor reports through it at the restack"
+        )
+    )]
+    Report(
+        GrantToken,
+        Option<NodeId>,
+        Observation,
+        Reply<Result<Transition, FenceVerdict>>,
+    ),
+    /// The fence alone, for a covered write other than a journal operation.
+    Fence(
+        GrantToken,
+        CoveredPath,
+        Option<NodeId>,
+        Reply<Result<(), FenceVerdict>>,
+    ),
+    /// The authority's acceptance of a checkpoint it fetched and verified.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the verifier commits through it once M5 reports Captured"
+        )
+    )]
+    Acknowledge(JobId, CheckpointAck, Reply<Transition>),
+    /// A heartbeat from an executor node: never a journal write by itself.
+    Heartbeat(NodeId, Heartbeat, Reply<HeartbeatAnswer>),
+    /// One tick of the authority's clock: overdue attempts become
+    /// unavailable, and the recovery policy runs for each.
+    Tick(u64, Reply<Vec<Overdue>>),
     Job(JobId, Reply<Option<ManagedState>>),
     List(Reply<Vec<ManagedState>>),
 }
@@ -278,6 +321,103 @@ impl Authority {
             .await
     }
 
+    /// Records an executor's report behind the fence: `token` is the grant
+    /// it acts under and `from` the peer it came from (ADR 0028).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the M5 executor reports through it at the restack"
+        )
+    )]
+    pub(crate) async fn report(
+        &self,
+        token: GrantToken,
+        from: Option<NodeId>,
+        observation: Observation,
+    ) -> Result<Result<Transition, FenceVerdict>, AuthorityError> {
+        self.call(|reply| Call::Report(token, from, observation, reply))
+            .await
+    }
+
+    /// Runs the fence for a covered write other than a journal operation;
+    /// a refusal is recorded and returned (ADR 0028).
+    pub(crate) async fn fence(
+        &self,
+        token: GrantToken,
+        path: CoveredPath,
+        from: Option<NodeId>,
+    ) -> Result<Result<(), FenceVerdict>, AuthorityError> {
+        self.call(|reply| Call::Fence(token, path, from, reply))
+            .await
+    }
+
+    /// Commits a checkpoint the authority fetched and verified (ADR 0028).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the verifier commits through it once M5 reports Captured"
+        )
+    )]
+    pub(crate) async fn acknowledge(
+        &self,
+        job: JobId,
+        ack: CheckpointAck,
+    ) -> Result<Transition, AuthorityError> {
+        self.call(|reply| Call::Acknowledge(job, ack, reply)).await
+    }
+
+    /// Answers a heartbeat from `from` with the verdict of each grant it
+    /// names (ADR 0028). A heartbeat is never a journal write; an attempt
+    /// it brings back from `unknown` is one observation.
+    pub(crate) async fn heartbeat(
+        &self,
+        from: NodeId,
+        beat: Heartbeat,
+    ) -> Result<HeartbeatAnswer, AuthorityError> {
+        if self.idle() {
+            let verdicts = beat
+                .attempts()
+                .iter()
+                .map(|t| (t.attempt, FenceVerdict::UnknownJob))
+                .collect();
+            return Ok(HeartbeatAnswer { verdicts });
+        }
+        self.call(|reply| Call::Heartbeat(from, beat, reply)).await
+    }
+
+    /// One tick of the authority's clock at `now_ms`: every tracked attempt
+    /// silent for `UNAVAILABLE_AFTER_MS` becomes `unknown`, and the job's
+    /// recovery policy runs for each unavailable attempt. Returns what
+    /// became unavailable on this tick.
+    pub(crate) async fn tick(&self, now_ms: u64) -> Result<Vec<Overdue>, AuthorityError> {
+        if self.idle() {
+            return Ok(Vec::new());
+        }
+        self.call(|reply| Call::Tick(now_ms, reply)).await
+    }
+
+    /// Ticks every `HEARTBEAT_INTERVAL_MS` until the authority is gone.
+    /// Nothing runs while no thread does: no journal, no attempts.
+    pub(crate) async fn run_ticker(self) {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match self.tick(now_ms()).await {
+                Ok(overdue) => {
+                    for o in overdue {
+                        tracing::warn!(job = %o.job, attempt = %o.attempt, "an attempt's resource is unavailable: no heartbeat");
+                    }
+                }
+                Err(AuthorityError::Unavailable(_)) => return,
+                Err(e) => tracing::warn!(error = %e, "the authority's tick failed"),
+            }
+        }
+    }
+
     /// A managed job, or `None` when the authority has no such job.
     pub(crate) async fn job(&self, job: JobId) -> Result<Option<ManagedState>, AuthorityError> {
         if self.idle() {
@@ -388,8 +528,16 @@ fn stopped(e: &dyn std::fmt::Display) -> Holder {
 }
 
 /// The authority's thread: recovery first, then one call at a time.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per call reads better than a helper per arm"
+)]
 fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids>) {
     let mut holder = open_existing(place, ids);
+    let mut presence = Presence::default();
+    if let Holder::Open(journal) = &holder {
+        track_live(place, journal, &mut presence, now_ms());
+    }
     while let Some(call) = queue.blocking_recv() {
         match call {
             Call::Submit(envelope, reply) => {
@@ -406,20 +554,54 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                             set.insert(accepted.job);
                         }
                     });
+                    note(
+                        place,
+                        &mut presence,
+                        accepted.job,
+                        &accepted.events,
+                        now_ms(),
+                    );
                 }
                 let _ = reply.send(answer);
             }
             Call::Observe(job, observation, reply) => {
-                let _ = reply.send(
-                    open(&mut holder, job)
-                        .and_then(|j| Ok(j.observe_authority(job, &observation, now_ms())?)),
-                );
+                let answer = open(&mut holder, job)
+                    .and_then(|j| Ok(j.observe_authority(job, &observation, now_ms())?));
+                if let Ok(t) = &answer {
+                    note(place, &mut presence, job, &t.events, now_ms());
+                }
+                let _ = reply.send(answer);
             }
             Call::Mark(job, operation, mark, reply) => {
                 let _ = reply.send(
                     open(&mut holder, job)
                         .and_then(|j| Ok(j.mark_authority(job, operation, mark, now_ms())?)),
                 );
+            }
+            Call::Report(token, from, observation, reply) => {
+                let answer = open(&mut holder, token.job)
+                    .and_then(|j| Ok(j.observe(&token, from, &observation, now_ms())?));
+                if let Ok(Ok(t)) = &answer {
+                    note(place, &mut presence, token.job, &t.events, now_ms());
+                }
+                let _ = reply.send(answer);
+            }
+            Call::Fence(token, path, from, reply) => {
+                let _ = reply.send(
+                    open(&mut holder, token.job)
+                        .and_then(|j| Ok(j.fence(&token, path, from, now_ms())?)),
+                );
+            }
+            Call::Acknowledge(job, ack, reply) => {
+                let _ = reply.send(
+                    open(&mut holder, job).and_then(|j| Ok(j.acknowledge(job, &ack, now_ms())?)),
+                );
+            }
+            Call::Heartbeat(from, beat, reply) => {
+                let _ = reply.send(heartbeat(&mut holder, &mut presence, from, &beat));
+            }
+            Call::Tick(now, reply) => {
+                let _ = reply.send(tick(place, &mut holder, &mut presence, now));
             }
             Call::Job(job, reply) => {
                 let _ = reply.send(match &holder {
@@ -462,6 +644,225 @@ fn list(holder: &Holder) -> Result<Vec<ManagedState>, AuthorityError> {
 
 fn ulid() -> [u8; 16] {
     Ulid::generate().to_bytes()
+}
+
+/// Tracks every live attempt of a remote node the journal holds, at the
+/// authority's start: each is overdue `UNAVAILABLE_AFTER_MS` from now
+/// unless a heartbeat arrives first (ADR 0028).
+fn track_live(place: &Place, journal: &Journal, presence: &mut Presence, now: u64) {
+    let Ok(jobs) = journal.jobs() else {
+        return;
+    };
+    for job in jobs {
+        let Ok(Some(state)) = journal.job(job) else {
+            continue;
+        };
+        for attempt in state.attempts.iter().filter(|a| a.status.may_run()) {
+            let ResourceRef::Node { node } = attempt.resource;
+            if node != place.node {
+                presence.track(job, attempt.id, attempt.generation, node, now);
+            }
+        }
+    }
+}
+
+/// Keeps the presence in step with what a committed transition did to the
+/// job's attempts: a grant to a remote node is tracked from now; an
+/// attempt that ended or lost its grant is forgotten.
+fn note(place: &Place, presence: &mut Presence, job: JobId, events: &[ManagedEvent], now: u64) {
+    for event in events {
+        match event {
+            ManagedEvent::AttemptGranted {
+                attempt,
+                resource: ResourceRef::Node { node },
+                generation,
+                ..
+            } if *node != place.node => {
+                presence.track(job, *attempt, *generation, *node, now);
+            }
+            ManagedEvent::AttemptObserved {
+                attempt, status, ..
+            } if !status.may_run() => presence.forget(*attempt),
+            ManagedEvent::GrantSuperseded { attempt, .. } => presence.forget(*attempt),
+            _ => {}
+        }
+    }
+}
+
+/// Answers a heartbeat: the attempts it brings back from `unknown` are
+/// observed `ResourceReachable`, then every token gets its fence verdict
+/// from the projection. No other write.
+fn heartbeat(
+    holder: &mut Holder,
+    presence: &mut Presence,
+    from: NodeId,
+    beat: &Heartbeat,
+) -> Result<HeartbeatAnswer, AuthorityError> {
+    let now = now_ms();
+    let journal = match holder {
+        Holder::Open(journal) => journal,
+        Holder::Absent => {
+            let verdicts = beat
+                .attempts()
+                .iter()
+                .map(|t| (t.attempt, FenceVerdict::UnknownJob))
+                .collect();
+            return Ok(HeartbeatAnswer { verdicts });
+        }
+        Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
+    };
+    for (job, attempt, generation) in presence.seen(from, beat, now) {
+        let back = Observation::ResourceReachable {
+            attempt,
+            generation,
+        };
+        if let Err(e) = journal.observe_authority(job, &back, now) {
+            tracing::warn!(%job, %attempt, error = %e, "a returned heartbeat was not recorded");
+        }
+    }
+    let mut verdicts = Vec::with_capacity(beat.attempts().len());
+    for token in beat.attempts() {
+        let state = journal.job(token.job)?;
+        let verdict = fence(state.as_ref(), token, Some(from));
+        if verdict.allows() && !presence.tracks(token.attempt) {
+            // A grant the start scan did not see, such as one made while
+            // the journal was stopped: tracked from this heartbeat on.
+            presence.track(token.job, token.attempt, token.generation, from, now);
+            let _ = presence.seen(from, beat, now);
+        }
+        verdicts.push((token.attempt, verdict));
+    }
+    Ok(HeartbeatAnswer { verdicts })
+}
+
+/// One tick: every overdue attempt is observed `ResourceUnavailable`, and
+/// the recovery policy of each unavailable attempt's job runs.
+fn tick(
+    place: &Place,
+    holder: &mut Holder,
+    presence: &mut Presence,
+    now: u64,
+) -> Result<Vec<Overdue>, AuthorityError> {
+    let journal = match holder {
+        Holder::Open(journal) => journal,
+        Holder::Absent => return Ok(Vec::new()),
+        Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
+    };
+    let mut out = Vec::new();
+    for o in presence.overdue(now) {
+        let unavailable = Observation::ResourceUnavailable {
+            attempt: o.attempt,
+            generation: o.generation,
+            last_heartbeat_ms: o.last_heartbeat_ms,
+            at_ms: now,
+        };
+        match journal.observe_authority(o.job, &unavailable, now) {
+            Ok(_) => {
+                presence.mark_unavailable(o.attempt);
+                out.push(o);
+            }
+            Err(CommitError::Domain(_)) => presence.forget(o.attempt),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    for o in presence.unavailable() {
+        recover(place, journal, presence, &o, now)?;
+    }
+    Ok(out)
+}
+
+/// The key of the authority's own `Recover` for an attempt, derived from
+/// the attempt and its generation, so a restart after a crash replays the
+/// same operation and never grants twice.
+fn recover_key(
+    job: JobId,
+    attempt: AttemptId,
+    generation: fabric_core::managed::Generation,
+) -> OperationKey {
+    OperationKey::parse(&format!("recover.{job}.{attempt}.{}", generation.get()))
+        .unwrap_or_else(|_| OperationKey::parse("recover").unwrap_or_else(|_| unreachable_key()))
+}
+
+fn unreachable_key() -> OperationKey {
+    // "recover" is within the key grammar; this arm never runs.
+    OperationKey::parse("r").unwrap_or_else(|_| std::process::abort())
+}
+
+/// Runs the recovery policy for one unavailable attempt (ADR 0028): under
+/// `Block` nothing; under `RestartFromAcknowledged` the pure decision,
+/// then the `Recover` it names under its derived key, or the reason it
+/// did not restart, recorded once per silence and reason. Placement is
+/// this node until the M5 placement lands at the restack.
+fn recover(
+    place: &Place,
+    journal: &mut Journal,
+    presence: &mut Presence,
+    o: &Overdue,
+    now: u64,
+) -> Result<(), AuthorityError> {
+    let Some(state) = journal.job(o.job)? else {
+        presence.forget(o.attempt);
+        return Ok(());
+    };
+    let Some(attempt) = state.attempt(o.attempt) else {
+        presence.forget(o.attempt);
+        return Ok(());
+    };
+    if attempt.status != AttemptStatus::Unknown {
+        presence.forget(o.attempt);
+        return Ok(());
+    }
+    if state.job.policy.recovery != RecoveryPolicy::RestartFromAcknowledged {
+        return Ok(());
+    }
+    let outcome = OutcomePolicy::of_primary(&state.job.intent);
+    let blockers: Vec<OperationId> = journal
+        .replacement_blockers(o.job)?
+        .iter()
+        .map(Blocker::operation)
+        .collect();
+    let placement = Ok(ResourceRef::Node { node: place.node });
+    let decided = recovery_decision(&state, o.attempt, outcome, &blockers, placement);
+    let reason = match decided {
+        Ok(command) => {
+            let envelope = Envelope {
+                key: recover_key(o.job, o.attempt, o.generation),
+                job: Some(o.job),
+                expected: None,
+                body: command,
+            };
+            let ids = NewIds {
+                job: o.job,
+                task: TaskId::from_bytes(ulid()),
+                attempt: AttemptId::from_bytes(ulid()),
+                operation: OperationId::from_bytes(ulid()),
+                at_ms: now,
+            };
+            match journal.submit(&envelope, ids)?.result {
+                StoredResult::Accepted(accepted) => {
+                    tracing::info!(job = %o.job, attempt = %o.attempt, operation = %accepted.operation, "recovered an unavailable attempt from its acknowledged checkpoint");
+                    presence.forget(o.attempt);
+                    note(place, presence, o.job, &accepted.events, now);
+                    return Ok(());
+                }
+                StoredResult::Rejected(DomainError::ReplacementBlocked { operation }) => {
+                    RecoveryBlock::ReplacementBlocked {
+                        blockers: vec![operation],
+                    }
+                }
+                StoredResult::Rejected(other) => {
+                    tracing::warn!(job = %o.job, attempt = %o.attempt, refusal = %other, "the authority's recover was refused");
+                    presence.forget(o.attempt);
+                    return Ok(());
+                }
+            }
+        }
+        Err(reason) => reason,
+    };
+    if presence.block_changed(o.attempt, &reason) {
+        journal.recovery_blocked(o.job, o.attempt, reason, now)?;
+    }
+    Ok(())
 }
 
 fn submit(

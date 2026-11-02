@@ -21,11 +21,13 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Author, LedgerError};
+use fabric_core::managed::{CoveredPath, GrantToken};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
 use fabric_net::rpc::{JobFuture, Service};
 use fabric_net::wire::{
-    Appended, Facts, Fault, FaultText, Fenced, KnownWriter, ManifestChunks, MoveRequested,
-    MoveState, Offered, Pulled, RecordBytes, RecordPage, Tools, VersionText,
+    Appended, Facts, Fault, FaultText, Fenced, Heartbeat, HeartbeatAnswer, JobRequest, JobResponse,
+    KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, Pulled, RecordBytes,
+    RecordPage, Tools, VersionText,
 };
 use fabric_store::objects::ObjectError;
 use fabric_store::store::StoreError;
@@ -189,6 +191,65 @@ impl Service for Node {
             }
             Ok(facts.to_wire())
         })
+    }
+
+    fn managed_job(
+        &self,
+        peer: NodeId,
+        token: GrantToken,
+        body: JobRequest,
+    ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
+        Box::pin(async move {
+            // The fence runs before the body is read (ADR 0028): a refused
+            // grant is recorded by the authority and answered as such.
+            let JobRequest::Append { .. } = body else {
+                return Err(bad(&format!(
+                    "{} is not a managed job operation",
+                    job_request_name(&body)
+                )));
+            };
+            match self
+                .authority
+                .fence(token, CoveredPath::LedgerAppend, Some(peer))
+                .await
+                .map_err(|e| internal(&e))?
+            {
+                Err(verdict) => Ok(JobResponse::GrantRefused { verdict }),
+                // The grant is live. The ledger a managed attempt appends
+                // to lands with the M5 executor at the restack; until then
+                // this node holds none, and the runner is told so rather
+                // than told its records were kept.
+                Ok(()) => Err(bad(
+                    &"this node holds no ledger for a managed job yet; the grant is live",
+                )),
+            }
+        })
+    }
+
+    fn heartbeat(
+        &self,
+        peer: NodeId,
+        beat: Heartbeat,
+    ) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>> {
+        Box::pin(async move {
+            self.authority
+                .heartbeat(peer, beat)
+                .await
+                .map_err(|e| internal(&e))
+        })
+    }
+}
+
+/// The name of a per-job message, for a refusal.
+fn job_request_name(body: &JobRequest) -> &'static str {
+    match body {
+        JobRequest::Pull { .. } => "pull",
+        JobRequest::Append { .. } => "append",
+        JobRequest::MoveRequest => "move request",
+        JobRequest::MoveOffer(_) => "move offer",
+        JobRequest::MoveStatus { .. } => "move status",
+        JobRequest::MoveAbort { .. } => "move abort",
+        JobRequest::KnownWriter => "known writer",
     }
 }
 

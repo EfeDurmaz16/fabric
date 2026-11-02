@@ -1525,6 +1525,14 @@ impl Node {
                         },
                     ));
                 }
+                // A standalone call never gets a grant verdict: the session
+                // refuses one before it is answered (`RpcError::WrongFence`).
+                fenced @ Fenced::GrantRefused { .. } => {
+                    return Err(NodeError::Peer {
+                        peer,
+                        reason: fenced_words(&fenced),
+                    });
+                }
             }
         }
         Ok(())
@@ -1833,6 +1841,10 @@ impl Node {
     }
 
     /// Offers the open move until the target decides, asking again after a lost answer.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per answer the target can give"
+    )]
     async fn offer(
         self: &Arc<Self>,
         id: JobId,
@@ -1917,6 +1929,15 @@ impl Node {
                     | Asked::Status(Fenced::AheadOfUs { current, .. }),
                 ) => {
                     last_error = format!("{to} is at epoch {current} and has not caught up");
+                }
+                Ok(
+                    Asked::Offer(Fenced::GrantRefused { verdict })
+                    | Asked::Status(Fenced::GrantRefused { verdict }),
+                ) => {
+                    return Err(NodeError::Peer {
+                        peer: to,
+                        reason: fenced_words::<()>(&Fenced::GrantRefused { verdict }),
+                    });
                 }
                 Err(e) => {
                     last_error = e.to_string();
@@ -3092,7 +3113,7 @@ impl Node {
                         peer: owner,
                         epoch: current,
                     },
-                    Fenced::Answer(_) => Reason::Peer { peer: owner },
+                    Fenced::Answer(_) | Fenced::GrantRefused { .. } => Reason::Peer { peer: owner },
                 };
                 out.emit(Event::KnownWriterUnknown {
                     owner,
@@ -3393,6 +3414,10 @@ fn started_move(
                 epoch: current,
             },
         )),
+        fenced @ Fenced::GrantRefused { .. } => Err(NodeError::Peer {
+            peer: holder,
+            reason: format!("it did not start a move: {}", fenced_words(&fenced)),
+        }),
     }
 }
 
@@ -4147,6 +4172,12 @@ fn fenced_words<T>(answer: &Fenced<T>) -> String {
         }
         Fenced::AheadOfUs { current, .. } => {
             format!("it is at epoch {current}, behind this node's, and must catch up first")
+        }
+        Fenced::GrantRefused { verdict } => {
+            format!(
+                "it answered a standalone request with a managed grant verdict ({})",
+                verdict.name()
+            )
         }
     }
 }
