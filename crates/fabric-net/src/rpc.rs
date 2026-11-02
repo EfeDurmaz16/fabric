@@ -32,6 +32,7 @@ use fabric_core::BoxFuture;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
+use fabric_core::managed::GrantToken;
 use fabric_core::moves::MoveOffer;
 use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -47,10 +48,10 @@ use crate::idle::{IdleReader, StallWriter};
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
-    Appended, ChunkBatch, Facts, Fault, FaultText, Fenced, Hello, JobAnswer, JobRequest,
-    JobResponse, KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION,
-    Pulled, RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody,
-    Tools, VersionText, WireError, decode, encode, wall_clock_ms,
+    Appended, ChunkBatch, Facts, Fault, FaultText, Fenced, Heartbeat, HeartbeatAnswer, Hello,
+    JobAnswer, JobRequest, JobResponse, KnownWriter, ManifestChunks, MoveRequested, MoveState,
+    Offered, PROTOCOL_VERSION, Pulled, RecordBytes, RecordPage, Request, RequestBody, RequestId,
+    Response, ResponseBody, Tools, VersionText, WireError, decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -181,6 +182,15 @@ pub enum RpcError {
         /// The receiver epoch the verdict names.
         current: Epoch,
     },
+    /// The peer answered a standalone request with a grant verdict, or a
+    /// managed request with an epoch verdict (ADR 0028).
+    #[error("the peer answered a {request} request with a {verdict} verdict")]
+    WrongFence {
+        /// The request's kind: `standalone` or `managed`.
+        request: &'static str,
+        /// The verdict's kind.
+        verdict: &'static str,
+    },
     /// The peer's move status names another move than the one asked about.
     #[error("asked about move {asked}, the peer answered for move {got}")]
     WrongMove {
@@ -286,6 +296,37 @@ pub trait Service: Send + Sync {
         let _ = (harness, tools);
         self.facts(peer)
     }
+    /// Answers a per-job message for a managed job under `token` (ADR
+    /// 0028): the authority runs the fence first and answers
+    /// `GrantRefused` when the grant is not the job's live one. The
+    /// default serves no managed job.
+    fn managed_job(
+        &self,
+        peer: NodeId,
+        token: GrantToken,
+        body: JobRequest,
+    ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
+        let _ = (peer, token, body);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node serves no managed job",
+            )))
+        })
+    }
+    /// Answers a `Heartbeat` from `peer` with the verdict of each grant it
+    /// named (ADR 0028). The default serves no managed job.
+    fn heartbeat(
+        &self,
+        peer: NodeId,
+        beat: Heartbeat,
+    ) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>> {
+        let _ = (peer, beat);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node serves no managed job",
+            )))
+        })
+    }
 }
 
 /// An authenticated connection after the `Hello` exchange.
@@ -324,6 +365,12 @@ fn check_verdict<T>(sent: Epoch, fenced: &Fenced<T>) -> Result<(), RpcError> {
         Fenced::Answer(_) => return Ok(()),
         Fenced::StaleEpoch { yours, current } => (yours, current, current > sent),
         Fenced::AheadOfUs { yours, current } => (yours, current, current < sent),
+        Fenced::GrantRefused { .. } => {
+            return Err(RpcError::WrongFence {
+                request: "standalone",
+                verdict: "grant",
+            });
+        }
     };
     if yours == sent && fits {
         Ok(())
@@ -380,6 +427,7 @@ fn kind_of(body: &ResponseBody) -> &'static str {
         ResponseBody::ChunksDone => "chunks done",
         ResponseBody::Fault(_) => "fault",
         ResponseBody::Facts(_) => "facts",
+        ResponseBody::Heartbeat(_) => "heartbeat",
     }
 }
 
@@ -662,6 +710,54 @@ impl Session {
     ) -> Result<Fenced<Appended>, RpcError> {
         self.job(token, JobRequest::Append { records }, deadline)
             .await
+    }
+
+    /// Appends one page of records to a managed job's ledger under the
+    /// grant `token` (ADR 0028), waiting at most `deadline`. The answer is
+    /// `GrantRefused` when the authority's fence refused the grant; an
+    /// epoch verdict is never a valid answer here.
+    pub async fn managed_append(
+        &self,
+        token: GrantToken,
+        records: RecordPage,
+        deadline: Duration,
+    ) -> Result<Fenced<Appended>, RpcError> {
+        let body = RequestBody::ManagedJob {
+            token,
+            body: JobRequest::Append { records },
+        };
+        match self.call(body, deadline).await? {
+            ResponseBody::Job(response) => {
+                let fenced: Fenced<Appended> =
+                    Fenced::from_response(response).map_err(|other| {
+                        RpcError::UnexpectedResponse {
+                            expected: Appended::KIND,
+                            got: other.kind(),
+                        }
+                    })?;
+                if let Fenced::StaleEpoch { .. } | Fenced::AheadOfUs { .. } = fenced {
+                    return Err(RpcError::WrongFence {
+                        request: "managed",
+                        verdict: "epoch",
+                    });
+                }
+                Ok(fenced)
+            }
+            other => Err(unexpected(Appended::KIND, &other)),
+        }
+    }
+
+    /// Sends the grants this node holds and reads the verdict of each,
+    /// waiting at most `deadline` (ADR 0028).
+    pub async fn heartbeat(
+        &self,
+        beat: Heartbeat,
+        deadline: Duration,
+    ) -> Result<HeartbeatAnswer, RpcError> {
+        match self.call(RequestBody::Heartbeat(beat), deadline).await? {
+            ResponseBody::Heartbeat(answer) => Ok(answer),
+            other => Err(unexpected("heartbeat", &other)),
+        }
     }
 
     /// Asks the owner to start a move toward this node under `token`, waiting at most `deadline`.
@@ -1090,33 +1186,23 @@ async fn handle(
         ))),
         RequestBody::Ping => ResponseBody::Pong,
         RequestBody::Job { token, body } => {
-            // Only the answer races the budget; the work is never dropped
-            // halfway. The work holds its permit to its end, so work left
-            // behind by a spent budget still counts against the cap.
             let service = Arc::clone(&service);
-            let job_work = Arc::clone(&limits.job_work);
-            let work = async move {
-                let Ok(permit) = job_work.acquire_owned().await else {
-                    return Err(Fault::Internal(FaultText::truncated(
-                        "the session takes no more job requests",
-                    )));
-                };
-                tokio::spawn(async move {
-                    let _held = (permit, held);
-                    answer_job(service.as_ref(), peer, token, body).await
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Fault::Internal(FaultText::truncated(
-                        "the job request failed",
-                    )))
-                })
-            };
-            match timeout(budget, work).await {
-                Ok(answer) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Job),
-                Err(_) => ResponseBody::Fault(Fault::Deadline),
-            }
+            job_answer(limits, held, budget, async move {
+                answer_job(service.as_ref(), peer, token, body).await
+            })
+            .await
         }
+        RequestBody::ManagedJob { token, body } => {
+            let service = Arc::clone(&service);
+            job_answer(limits, held, budget, async move {
+                service.managed_job(peer, token, body).await
+            })
+            .await
+        }
+        RequestBody::Heartbeat(beat) => timeout(budget, service.heartbeat(peer, beat))
+            .await
+            .unwrap_or(Err(Fault::Deadline))
+            .map_or_else(ResponseBody::Fault, ResponseBody::Heartbeat),
         RequestBody::WantSnapshot { snapshot } => timeout(budget, service.manifest(peer, snapshot))
             .await
             .unwrap_or(Err(Fault::Deadline))
@@ -1151,6 +1237,43 @@ async fn handle(
     reply(&mut send, id, body, MAX_CONTROL_FRAME).await?;
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
+}
+
+/// Runs one per-job message's work under the peer's job-work permit. Only
+/// the answer races the budget; the work is never dropped halfway. The
+/// work holds its permit to its end, so work left behind by a spent
+/// budget still counts against the cap.
+async fn job_answer<F>(
+    limits: &Limits,
+    held: OwnedSemaphorePermit,
+    budget: Duration,
+    work: F,
+) -> ResponseBody
+where
+    F: std::future::Future<Output = Result<JobResponse, Fault>> + Send + 'static,
+{
+    let job_work = Arc::clone(&limits.job_work);
+    let run = async move {
+        let Ok(permit) = job_work.acquire_owned().await else {
+            return Err(Fault::Internal(FaultText::truncated(
+                "the session takes no more job requests",
+            )));
+        };
+        tokio::spawn(async move {
+            let _held = (permit, held);
+            work.await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Fault::Internal(FaultText::truncated(
+                "the job request failed",
+            )))
+        })
+    };
+    match timeout(budget, run).await {
+        Ok(answer) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Job),
+        Err(_) => ResponseBody::Fault(Fault::Deadline),
+    }
 }
 
 /// Reads one request from a stream the peer opened, counting its payload's
