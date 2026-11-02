@@ -258,7 +258,8 @@ pub struct ProviderOperation {
     pub answer: ProviderAnswer,
     /// The last locator the worker reported.
     pub locator: Option<LocatorRecord>,
-    /// The scope the last `absent` attach searched, as canonical JSON.
+    /// The scope the last `absent` answer searched, as canonical JSON: an
+    /// attach of a create, or the observe that settled a destroy.
     pub searched: Option<String>,
     /// Why the owner abandoned it; set exactly when it is `abandoned`.
     pub abandon_reason: Option<String>,
@@ -1019,6 +1020,69 @@ impl Journal {
             }
             .into());
         }
+        Ok(())
+    }
+
+    /// Records an `absent` answer to an observe of a destroy's resource:
+    /// no resource of that identity is in the scope the worker searched,
+    /// which is what the destroy was to bring about. The destroy settles
+    /// `succeeded` with the answer and the scope it searched (`searched`,
+    /// its canonical JSON): the evidence the replacement barrier and
+    /// `residuals` read, kept for the owner. A destroy the provider
+    /// answered `not_found` is `unknown` until this: `not_found` says the
+    /// provider did not find the resource, not that it is gone from the
+    /// scope. Refused as a `Transition` for anything but a destroy that is
+    /// `dispatched`, `unknown` or `observed`: absence settles neither a
+    /// create nor an exec, and a terminal operation never changes.
+    pub fn provider_absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+        at_ms: u64,
+    ) -> Result<(), CommitError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = operation.to_bytes();
+        let row: Option<(String, String)> = tx
+            .prepare_cached(
+                "SELECT status, effect_class FROM provider_operations WHERE operation_id = ?1",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let (from, effect) = row.ok_or(ProviderError::UnknownOperation { operation })?;
+        let corrupt = |what: String| CommitError::Corrupt {
+            job: None,
+            reason: format!("provider operation {operation} has {what}"),
+        };
+        let from = ProviderStatus::parse(&from).ok_or_else(|| corrupt(format!("status {from}")))?;
+        let effect =
+            EffectClass::parse(&effect).ok_or_else(|| corrupt(format!("effect class {effect}")))?;
+        let to = ProviderStatus::Succeeded;
+        if effect != EffectClass::Destroy || from.is_terminal() || !from.may_become(to) {
+            return Err(ProviderError::Transition {
+                operation,
+                from: from.name(),
+                to: to.name(),
+            }
+            .into());
+        }
+        tx.prepare_cached(
+            "UPDATE provider_operations
+             SET status = ?2, code = ?3, reason = ?4, effect = ?5, searched = ?6, updated_ms = ?7
+             WHERE operation_id = ?1",
+        )?
+        .execute(params![
+            id,
+            to.name(),
+            answer.code,
+            answer.reason,
+            answer.effect,
+            searched,
+            sql_u64(at_ms)?,
+        ])?;
+        tx.commit()?;
         Ok(())
     }
 
