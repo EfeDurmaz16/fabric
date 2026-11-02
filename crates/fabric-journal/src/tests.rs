@@ -858,6 +858,110 @@ fn a_refused_covered_write_changes_nothing_else() {
     f.journal.verify().unwrap();
 }
 
+/// A runner that keeps writing under a grant it lost, or any peer that
+/// makes tokens up, cannot grow a job's history without bound: the same
+/// refusal is recorded once per attempt, path and verdict while the
+/// journal is open, a token that names no attempt of the job is refused
+/// without a record, and a different verdict for the same attempt is
+/// recorded again.
+#[test]
+fn a_repeated_refusal_is_recorded_once_and_a_made_up_attempt_never() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    let path = f.path();
+    let other = NodeId::from_bytes([0x77; 32]);
+    let revision = |f: &Fixture| f.journal.job(job).unwrap().unwrap().job.revision.get();
+    let before = revision(&f);
+    for i in 0..5 {
+        let verdict = f
+            .journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(other), 3_000 + i)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(verdict, FenceVerdict::WrongNode { .. }));
+    }
+    assert_eq!(
+        revision(&f),
+        before + 1,
+        "five identical refusals, one record"
+    );
+    // Another path for the same token: its own record, once.
+    for i in 0..3 {
+        f.journal
+            .fence(&token, CoveredPath::BundlePublish, Some(other), 3_100 + i)
+            .unwrap()
+            .unwrap_err();
+    }
+    assert_eq!(revision(&f), before + 2);
+    // A token for an attempt the job does not have: refused, never recorded.
+    let ghost = GrantToken {
+        attempt: fabric_core::managed::AttemptId::from_bytes([0xee; 16]),
+        ..token
+    };
+    for i in 0..5 {
+        let verdict = f
+            .journal
+            .fence(&ghost, CoveredPath::LedgerAppend, Some(NODE), 3_200 + i)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(verdict, FenceVerdict::UnknownAttempt);
+        let ghost_report = f
+            .journal
+            .observe(
+                &ghost,
+                Some(NODE),
+                &Observation::Started {
+                    attempt: ghost.attempt,
+                    generation: ghost.generation,
+                },
+                3_300 + i,
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(ghost_report, FenceVerdict::UnknownAttempt);
+    }
+    assert_eq!(revision(&f), before + 2);
+    // A new verdict for the same attempt and path is recorded again.
+    silent(&mut f, &token, 13_000);
+    let supersede = f.submit(
+        "supersede",
+        Some(job),
+        Command::Supersede {
+            attempt: token.attempt,
+            reason: "test".into(),
+        },
+    );
+    accepted(&supersede);
+    let after_supersede = revision(&f);
+    for i in 0..3 {
+        let verdict = f
+            .journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(NODE), 13_100 + i)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(verdict, FenceVerdict::Superseded { by: None });
+    }
+    assert_eq!(revision(&f), after_supersede + 1);
+    let kinds = rows(&path, "SELECT kind FROM events ORDER BY seq");
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "covered_write_refused")
+            .count(),
+        3
+    );
+    // After a reopen the memory is gone: the first repeat is recorded
+    // once more, and the next ones are not.
+    f.reopen();
+    for i in 0..3 {
+        f.journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(NODE), 13_200 + i)
+            .unwrap()
+            .unwrap_err();
+    }
+    assert_eq!(revision(&f), after_supersede + 2);
+}
+
 #[test]
 fn recover_never_marks_lost_from_a_missed_heartbeat() {
     let mut f = Fixture::new();

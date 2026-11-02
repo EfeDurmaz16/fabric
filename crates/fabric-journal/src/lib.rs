@@ -26,6 +26,7 @@ mod schema;
 #[cfg(test)]
 mod crash_tests;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -213,6 +214,12 @@ pub struct Recovery {
 pub struct Journal {
     conn: Connection,
     path: PathBuf,
+    /// The last refusal recorded per attempt and covered path while this
+    /// journal is open, so a runner that keeps writing under a grant it
+    /// lost grows the job's history by one event per verdict, not one per
+    /// write (ADR 0028). In memory: after a reopen the first repeat is
+    /// recorded once more.
+    refused: HashMap<(AttemptId, CoveredPath), FenceVerdict>,
 }
 
 impl std::fmt::Debug for Journal {
@@ -405,6 +412,7 @@ impl Journal {
         Ok(Journal {
             conn,
             path: path.to_owned(),
+            refused: HashMap::new(),
         })
     }
 
@@ -674,7 +682,11 @@ impl Journal {
     /// One covered write: the fence in the write's own transaction, then
     /// `rule` when the token is live. `report` says a stale token is
     /// recorded as `StaleObservationRefused` (a report) rather than
-    /// `CoveredWriteRefused`.
+    /// `CoveredWriteRefused`. A refusal is recorded once per attempt,
+    /// path and verdict while the journal is open, and a token that names
+    /// no attempt of the job (`UnknownAttempt`) is refused without a
+    /// record, as `UnknownJob` is: there is nothing to record it against,
+    /// and any peer can make such tokens up at wire speed.
     fn fenced_change(
         &mut self,
         token: &GrantToken,
@@ -690,10 +702,17 @@ impl Journal {
         let state = load_state(&tx, token.job)?;
         let verdict = fence(state.as_ref(), token, from);
         if !verdict.allows() {
-            // No job: nothing to record it against.
+            // No job, or no such attempt: nothing to record it against.
             let Some(state) = state else {
                 return Ok(Err(verdict));
             };
+            if verdict == FenceVerdict::UnknownAttempt {
+                return Ok(Err(verdict));
+            }
+            // The same refusal again: refused, not recorded again.
+            if self.refused.get(&(token.attempt, path)) == Some(&verdict) {
+                return Ok(Err(verdict));
+            }
             let event = match verdict {
                 FenceVerdict::Stale { current } if report => {
                     ManagedEvent::StaleObservationRefused {
@@ -715,6 +734,7 @@ impl Journal {
             };
             write_transition(&tx, Some(state), &refused, None, at_ms)?;
             tx.commit()?;
+            self.refused.insert((token.attempt, path), verdict.clone());
             return Ok(Err(verdict));
         }
         let state = state.ok_or(DomainError::UnknownJob { job: token.job })?;
