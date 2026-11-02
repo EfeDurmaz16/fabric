@@ -271,7 +271,15 @@ async fn capsule_worker_latencies() {
         "binding": {"account": "acct-a", "project": "proj-1"},
         "policy": {"images": ["fixture/ok"]},
         "approvals": [],
-        "sandboxes": [{"native_id": "fx-seed", "project": "proj-1", "owner_job": common::JOB, "status": "ready"}],
+        // A seeded sandbox names the job and the create that made it
+        // together, as the worker's attach by identity needs.
+        "sandboxes": [{
+            "native_id": "fx-seed",
+            "project": "proj-1",
+            "owner_job": common::JOB,
+            "operation": OperationId::from_bytes([0x5e; 16]).to_string(),
+            "status": "ready"
+        }],
         "script": []
     });
     std::fs::write(&fixture, seed.to_string()).unwrap();
