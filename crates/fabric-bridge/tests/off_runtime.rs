@@ -402,8 +402,9 @@ impl OperationLog for Slow {
 /// Recording an operation and queueing its frame are one call on the log
 /// thread: a caller that stops waiting while the journal commits leaves
 /// the operation recorded and its frame sent whole. The worker answers it,
-/// late, and the locator it names is recorded; the status stays
-/// `dispatched`, as for any request whose caller dropped it.
+/// late, and the locator it names is recorded; the status is `unknown`,
+/// as for any request whose caller dropped it, so the journal refuses a
+/// second create of the job until it is settled.
 #[tokio::test]
 async fn a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent() {
     let dir = tempfile::tempdir().unwrap();
@@ -440,11 +441,30 @@ async fn a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_an
         })
         .await
         .unwrap();
-    assert_eq!(row.status, ProviderStatus::Dispatched);
+    assert_eq!(row.status, ProviderStatus::Unknown);
     assert_eq!(
         row.locator,
         Some(fabric_bridge::wire::locator_record(&fx("key-1")))
     );
+    let refused = bridge.request(&mut log, create(2, "fixture/ok")).await;
+    assert!(
+        matches!(refused, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{refused:?}"
+    );
+    let observed = bridge
+        .observe(
+            &mut log,
+            OperationId::from_bytes([1; 16]),
+            "sandbox.create",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut log)
+        .await
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
     // Nothing of the dropped request holds the worker's in-flight room.
     let next = bridge
         .request(&mut log, create(2, "fixture/ok"))

@@ -250,3 +250,54 @@ async fn a_request_admitted_before_a_shutdown_is_never_written_after_it() {
     assert_eq!(bridge.close().await, None);
     assert_eq!(script.await.unwrap(), ["shutdown:r-2"]);
 }
+
+/// A caller drops a create before its answer, and the worker is then
+/// lost with it in flight. Nothing waits on it, so no answer or loss can
+/// settle it; the next call handed the log records it `unknown`, as the
+/// protocol's loss rule says of every dispatched operation of a lost
+/// worker, instead of leaving it `dispatched` until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lost() {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let (read, was_read) = oneshot::channel::<()>();
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let request = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(request["type"], "request", "{request}");
+        read.send(()).unwrap();
+        // The worker ends with the request in flight: its output closes.
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        reader
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let dropped = bridge
+        .request(&mut log, create(1, "fixture/ok"))
+        .await
+        .unwrap();
+    drop(dropped);
+    was_read.await.unwrap();
+    let started = std::time::Instant::now();
+    while bridge.lost().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the worker was never lost"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bridge.record_late(&mut log).await.unwrap();
+    let entry = log
+        .entry(OperationId::from_bytes([1; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    assert_eq!(entry.locator, None);
+    let _reader = script.await.unwrap();
+}

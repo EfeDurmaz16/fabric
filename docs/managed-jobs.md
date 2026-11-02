@@ -412,7 +412,7 @@ M4 adds only what is missing. These are in the M3 code and tests and do not chan
 | Durable intent before any frame | `Journal::provider_begin` commits the row `dispatched` (or `rejected`) in its own `BEGIN IMMEDIATE` transaction; the client records it and queues the frame in one call on the log thread, so the record always precedes the frame | `fabric-journal` `provider::tests::a_key_or_an_id_is_dispatched_once`, `fabric-bridge` `tests/off_runtime.rs`, `tests/process.rs` |
 | Nothing sent twice | key and id unique across `operations` and `provider_operations`; `Log(Used)` before any frame | `a_key_or_an_id_is_dispatched_once`, `a_command_cannot_take_a_provider_key` |
 | Fencing of effects | `provider_begin` refuses a closed job and any attempt that is not the job's current grant, `granted` or `running`, at the job's generation | `only_the_current_live_attempt_dispatches` |
-| Unknown on loss | worker lost, framing broken, deadline plus grace passed, or authority restarted: `dispatched` becomes `unknown`; `unknown` moves only to an observed terminal state | `statuses_move_only_forward`, `the_target_is_kept_from_dispatch_through_recovery`, scenario `worker_loss_is_not_cancellation` |
+| Unknown on loss | worker lost, framing broken, deadline plus grace passed, the caller stopped waiting, or authority restarted: `dispatched` becomes `unknown`; `unknown` moves only to an observed terminal state | `statuses_move_only_forward`, `the_target_is_kept_from_dispatch_through_recovery`, scenario `worker_loss_is_not_cancellation`, `tests/process.rs` `a_late_answer_records_the_locator_it_names_and_not_its_status`, `tests/stream.rs` `a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lost` |
 | Target kept from dispatch | the target locator is written once with the dispatch, so a destroy lost before any answer still names its resource | `the_target_is_kept_from_dispatch_through_recovery` |
 | Locator as early as known | `progress` and late answers store the locator (`provider_locate`, `record_late`) | `tests/process.rs`, `tests/capsule_worker.rs` |
 | Observe by original identity | `Bridge::observe` for `dispatched` or `unknown` only, with the journal's scope, action and target or locator (`ObserveMismatch` otherwise); the worker checks owner labels | scenarios `unknown_after_dispatch_with_locator`, `observe_checks_owner`, `exec_observed_until_exit`, `exec_observe_after_worker_loss` |
@@ -573,7 +573,7 @@ CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
 | `error` `provider_failed` | `dispatched` | `failed` |
 | `error` `invalid`, `unsupported`, `denied`, `unavailable` | `dispatched` | `rejected` |
 | `error` `pending`, `result` `accepted` or `running`, `progress` | `dispatched` | `dispatched`, locator and answer stored |
-| `error` `unknown`; no answer by the deadline plus grace; worker lost; `recover` | `dispatched` | `unknown` |
+| `error` `unknown`; no answer by the deadline plus grace; worker lost; the caller dropped the request; `recover` | `dispatched` | `unknown` |
 | observe or attach `result` (an observed terminal state) | `unknown`, `attached`, `observed` | `succeeded` or `cancelled` (`failed` stays reachable from these for an observed terminal failure, as in M3) |
 | attach `error` `pending`; attach `error` `unknown`/`observation_failed` with a locator | `unknown` | `attached`, locator stored |
 | attach `error` `unknown`/`absent` | `unknown` | `unknown`, answer and `searched` stored |

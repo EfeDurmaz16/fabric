@@ -1013,8 +1013,11 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
         .unwrap();
     assert_eq!(observed.status, ProviderStatus::Succeeded);
 
-    // A caller drops its request; the next request records the locator
-    // the answer named, and the operation stays dispatched.
+    // A caller drops its request: nothing will settle it, so the next
+    // call handed the journal records it unknown, as at its deadline,
+    // with the locator the late answer named. The journal then sees it
+    // as it sees any lost create: a second create of the job is refused
+    // until it is settled, and it is listed as a residual.
     let dropped = bridge
         .request(&mut journal, create(101, "double/late"))
         .await
@@ -1024,15 +1027,45 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
         assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let refused = bridge
+        .request(&mut journal, create(102, "fixture/ok"))
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{refused:?}"
+    );
+    assert_eq!(status(&journal, 101), Some(ProviderStatus::Unknown));
+    let own = fx("key-101");
+    assert_eq!(
+        locator(&journal, 101),
+        Some(fabric_bridge::wire::locator_record(&own))
+    );
+    assert!(
+        journal
+            .residuals(scope().job)
+            .unwrap()
+            .iter()
+            .any(|r| r.creating == OperationId::from_bytes([101; 16])),
+        "the dropped create is not a residual"
+    );
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([101; 16]),
+            "sandbox.create",
+            own,
+            1000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
     let next = bridge
         .request(&mut journal, create(102, "fixture/ok"))
         .await
         .unwrap();
-    assert_eq!(status(&journal, 101), Some(ProviderStatus::Dispatched));
-    assert_eq!(
-        locator(&journal, 101),
-        Some(fabric_bridge::wire::locator_record(&fx("key-101")))
-    );
     assert_eq!(
         next.finish(&mut journal).await.unwrap().status,
         ProviderStatus::Succeeded

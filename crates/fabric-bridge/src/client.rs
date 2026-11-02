@@ -243,6 +243,8 @@ struct State {
     expired: VecDeque<Expired>,
     /// The locators late answers named, by operation, not yet in the log.
     found: HashMap<OperationId, Locator>,
+    /// Requests whose caller stopped waiting, not yet recorded `unknown`.
+    dropped: Vec<OperationId>,
     lost: Option<String>,
     shutting_down: bool,
     late: u64,
@@ -270,9 +272,21 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stops waiting on `id`. A request is remembered, so that the
-    /// locator its late answer names is still recorded.
+    /// Stops waiting on `id` at its deadline; the caller settles the
+    /// operation. A request is remembered, so that the locator its late
+    /// answer names is still recorded.
     fn expire(&self, id: &str) {
+        self.stop_waiting(id, false);
+    }
+
+    /// Stops waiting on `id` because its caller did: nothing will settle
+    /// the operation, so a request is also due to be recorded `unknown`,
+    /// as one whose deadline passed, by the next call handed the log.
+    fn give_up(&self, id: &str) {
+        self.stop_waiting(id, true);
+    }
+
+    fn stop_waiting(&self, id: &str, by_caller: bool) {
         let mut state = self.lock();
         let Some(waiter) = state.waiters.remove(id) else {
             return;
@@ -288,12 +302,42 @@ impl Shared {
             operation,
             progress: waiter.progress,
         });
+        if by_caller {
+            state.dropped.push(operation);
+        }
     }
 
-    /// Records in `log` each locator a late answer named. One for an
-    /// operation `log` does not hold is dropped; when the log fails, what
-    /// is left is kept for the next call.
-    fn record_found<L: OperationLog>(&self, log: &mut L) -> Result<(), LogError> {
+    /// Whether `catch_up` has anything to record.
+    fn behind(&self) -> bool {
+        let state = self.lock();
+        !state.dropped.is_empty() || !state.found.is_empty()
+    }
+
+    /// Records in `log` what the calls that stopped waiting left: each
+    /// request whose caller gave up `unknown`, as at its deadline, then
+    /// each locator a late answer named. One for an operation `log` does
+    /// not hold, or that moved on, is dropped; when the log fails, what is
+    /// left is kept for the next call.
+    fn catch_up<L: OperationLog>(&self, log: &mut L) -> Result<(), LogError> {
+        let dropped = std::mem::take(&mut self.lock().dropped);
+        let mut rest = dropped.into_iter();
+        while let Some(operation) = rest.next() {
+            match log.record(
+                operation,
+                ProviderStatus::Unknown,
+                &ProviderAnswer::default(),
+                None,
+            ) {
+                Ok(()) | Err(LogError::Transition(_)) => {}
+                Err(e) => {
+                    let mut state = self.lock();
+                    let kept = std::mem::take(&mut state.dropped);
+                    state.dropped.extend(std::iter::once(operation).chain(rest));
+                    state.dropped.extend(kept);
+                    return Err(e);
+                }
+            }
+        }
         let found = std::mem::take(&mut self.lock().found);
         let mut rest = found.into_iter();
         while let Some((operation, locator)) = rest.next() {
@@ -659,12 +703,14 @@ impl Bridge {
         self.shared.lock().late
     }
 
-    /// Records in `log` the locators that answers to requests Fabric
-    /// stopped waiting on named since the last call; the status each
-    /// operation holds stays. `request`, `observe` and `InFlight::next` do
-    /// this first, so a caller only needs it while it makes none of those.
+    /// Records in `log` what Fabric stopped waiting on since the last
+    /// call: a request whose caller dropped it `unknown`, as at its
+    /// deadline, and the locator each late answer named, with the status
+    /// the operation holds kept. `request`, `observe`, `attach` and
+    /// `InFlight::next` do this first, so a caller only needs it while it
+    /// makes none of those.
     pub async fn record_late<L: Recorder>(&self, log: &mut L) -> Result<(), BridgeError> {
-        Ok(record_found(&self.shared, log).await?)
+        Ok(catch_up(&self.shared, log).await?)
     }
 
     /// Why the worker is gone, if it is.
@@ -843,7 +889,7 @@ impl Bridge {
         log: &mut L,
         effect: Effect,
     ) -> Result<InFlight, BridgeError> {
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         let request = Request {
             request_id: self.request_id(),
             operation: effect.operation,
@@ -982,7 +1028,7 @@ impl Bridge {
         wait_ms: u64,
     ) -> Result<InFlight, BridgeError> {
         // A late answer may have named the resource this observe reads.
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         crate::wire::observable(action, &resource, wait_ms, &self.profile)
             .map_err(BridgeError::RefusedLocally)?;
         let entry = log
@@ -1054,7 +1100,7 @@ impl Bridge {
         operation: OperationId,
         wait_ms: u64,
     ) -> Result<InFlight, BridgeError> {
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         if wait_ms == 0 || wait_ms > self.profile.limits.max_observe_wait_ms {
             return Err(BridgeError::RefusedLocally(Refusal {
                 code: "invalid",
@@ -1137,7 +1183,7 @@ impl Bridge {
         log: &mut L,
         cleanup: Cleanup,
     ) -> Result<InFlight, BridgeError> {
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         let creating = cleanup.creating;
         let target = log
             .reserve()
@@ -1426,7 +1472,7 @@ pub struct InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.done {
-            self.shared.expire(&self.request_id);
+            self.shared.give_up(&self.request_id);
         }
     }
 }
@@ -1447,7 +1493,10 @@ impl InFlight {
     /// The next step: a locator reported early, or the answer. Past
     /// Fabric's deadline the answer is `TimedOut` and the operation
     /// `unknown`; a later answer leaves the status as it is and only the
-    /// locator it names is recorded (`Bridge::record_late`).
+    /// locator it names is recorded (`Bridge::record_late`). A caller that
+    /// drops a request instead leaves it the same way: `unknown`, recorded
+    /// by the next call handed the log, with the locator its late answer
+    /// names. A read dropped, lost or timed out changes nothing.
     ///
     /// Room on the log is taken before a frame is: a step taken from the
     /// worker is then recorded, on the log's side, even when the caller
@@ -1456,7 +1505,7 @@ impl InFlight {
         if self.done {
             return Err(BridgeError::Lost("the request was already answered".into()));
         }
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         let slot = log.reserve().await?;
         let incoming = tokio::time::timeout_at(self.deadline, self.rx.recv()).await;
         let operation = self.operation;
@@ -1655,16 +1704,16 @@ fn rejected(refusal: &Refusal) -> ProviderAnswer {
     }
 }
 
-/// Records in `log` each locator a late answer named
-/// (`Shared::record_found`), on the log's side; with none, it makes no call.
-async fn record_found<L: Recorder>(shared: &Arc<Shared>, log: &mut L) -> Result<(), LogError> {
-    if shared.lock().found.is_empty() {
+/// Records in `log` what the calls that stopped waiting left
+/// (`Shared::catch_up`), on the log's side; with nothing, it makes no call.
+async fn catch_up<L: Recorder>(shared: &Arc<Shared>, log: &mut L) -> Result<(), LogError> {
+    if !shared.behind() {
         return Ok(());
     }
     let shared = Arc::clone(shared);
     log.reserve()
         .await?
-        .run(move |log| shared.record_found(log))
+        .run(move |log| shared.catch_up(log))
         .await?
 }
 
