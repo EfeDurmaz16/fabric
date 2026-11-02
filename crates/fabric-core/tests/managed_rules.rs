@@ -95,13 +95,21 @@ fn create() -> Command {
         intent: Intent {
             goal: "make the greeting louder".into(),
             harness: HarnessKind::ClaudeCode,
+            acceptance: Vec::new(),
         },
         source: SourceBinding::Repository {
             path: AbsPath::parse("/src/repo").unwrap(),
         },
-        policy: JobPolicy {
-            restart: RestartPolicy::ExplicitOnly,
-        },
+        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
+    }
+}
+
+fn cut(snapshot: SnapshotId) -> CheckpointCut {
+    CheckpointCut {
+        snapshot,
+        receipts: Vec::new(),
+        facts: Vec::new(),
+        evidence: Vec::new(),
     }
 }
 
@@ -128,7 +136,11 @@ fn a_new_job_has_its_primary_task_at_revision_one() {
     assert_eq!(s.tasks.len(), 1);
     assert_eq!(s.tasks[0].id, s.job.primary);
     assert_eq!(s.tasks[0].kind, TaskKind::Primary);
-    assert_eq!(s.operations[0].status, OperationStatus::Succeeded);
+    assert_eq!(s.tasks[0].class, TaskClass::Harness);
+    // M5: the create's effect is the initial placement, so it stays
+    // accepted until a `Placed` observation grants or parks.
+    assert_eq!(s.operations[0].status, OperationStatus::Accepted);
+    assert!(s.parked());
     kept.replays();
 }
 
@@ -201,10 +213,19 @@ fn no_second_grant_while_an_attempt_may_run_even_after_a_timeout() {
         ),
         Err(DomainError::AttemptStillLive { .. })
     ));
+    // M5: a cancel with a live attempt is accepted and asks the executor
+    // to stop it; the job is not cancelled until the attempt is seen ended.
+    let cancel = kept
+        .submit("cancel", Command::CancelJob { reason: "x".into() })
+        .unwrap();
     assert!(matches!(
-        kept.submit("cancel", Command::CancelJob { reason: "x".into() }),
-        Err(DomainError::AttemptStillLive { .. })
+        cancel.events[1],
+        ManagedEvent::EffectRequested {
+            request: EffectRequest::CancelJob { .. },
+            ..
+        }
     ));
+    assert_eq!(kept.state().job.state, JobState::Active);
     // Dispatching again is refused: the operation is past accepted.
     assert!(matches!(
         kept.mark(op, OperationMark::Dispatched),
@@ -278,6 +299,7 @@ fn a_repeated_report_changes_nothing_and_an_ended_attempt_stays_ended() {
         attempt: a.id,
         generation: a.generation,
         snapshot,
+        cut: cut(snapshot),
     })
     .unwrap();
     assert!(matches!(
@@ -368,6 +390,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
                 label: "tests".into(),
             },
             restart: RestartPolicy::Block,
+            class: TaskClass::Test,
         },
     )
     .unwrap();
@@ -378,6 +401,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
                 parent: primary,
                 kind: TaskKind::Primary,
                 restart: RestartPolicy::Block,
+                class: TaskClass::Harness,
             }
         ),
         Err(DomainError::BadParent { .. })
@@ -449,10 +473,10 @@ fn frames_and_answers_have_one_byte_form() {
     assert_eq!(bytes[0], MANAGED_FORMAT);
     assert_eq!(EventFrame::decode(&bytes).unwrap(), frame);
     let mut other = bytes.clone();
-    other[0] = 2;
+    other[0] = 3;
     assert!(matches!(
         EventFrame::decode(&other),
-        Err(FrameError::UnknownFormat(2))
+        Err(FrameError::UnknownFormat(3))
     ));
     let mut trailing = bytes.clone();
     trailing.push(0);
@@ -548,7 +572,7 @@ proptest! {
                         1 => Observation::Lost { attempt, generation },
                         2 => Observation::Exited { attempt, generation, outcome: ExitOutcome::Succeeded },
                         3 => Observation::Exited { attempt, generation, outcome: ExitOutcome::Failed { code: Some(1) } },
-                        4 => Observation::Checkpointed { attempt, generation, snapshot: SnapshotId::of(&[which]) },
+                        4 => Observation::Checkpointed { attempt, generation, snapshot: SnapshotId::of(&[which]), cut: cut(SnapshotId::of(&[which])) },
                         _ => Observation::Exited { attempt, generation, outcome: ExitOutcome::Cancelled },
                     };
                     let lost = matches!(observation, Observation::Lost { .. });
@@ -563,6 +587,7 @@ proptest! {
                     parent: s.job.primary,
                     kind: TaskKind::Child { label: key.clone() },
                     restart: RestartPolicy::Block,
+                    class: TaskClass::Build,
                 }),
                 Step::Finish(which) => {
                     let task = s.tasks[usize::from(which) % s.tasks.len()].id;

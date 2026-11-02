@@ -57,6 +57,13 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::Exhausted => "exhausted",
         DomainError::Broken { .. } => "broken",
         DomainError::ReplacementBlocked { .. } => "replacement_blocked",
+        DomainError::BadPolicy { .. } => "bad_policy",
+        DomainError::UnsupportedSource { .. } => "unsupported_source",
+        DomainError::FidelityRefused { .. } => "fidelity_refused",
+        DomainError::NotLive { .. } => "not_live",
+        DomainError::NoteTooLong { .. } => "note_too_long",
+        DomainError::CredentialLike { .. } => "credential_like",
+        DomainError::EffectInFlight { .. } => "effect_in_flight",
     }
 }
 
@@ -123,11 +130,13 @@ impl Node {
                     job: None,
                     expected: None,
                     body: Command::CreateJob {
-                        intent: Intent { goal, harness },
-                        source: source(&repo)?,
-                        policy: JobPolicy {
-                            restart: RestartPolicy::ExplicitOnly,
+                        intent: Intent {
+                            goal,
+                            harness,
+                            acceptance: Vec::new(),
                         },
+                        source: source(&repo)?,
+                        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
                     },
                 };
                 let operation = self.managed_submit(envelope).await?;
