@@ -335,9 +335,21 @@ async fn capsule_worker_latencies() {
             };
             let _cleanup = Cleanup(format!("label=fabric.job={}", scope.job));
             let config = dir.path().join("docker.json");
+            // One grant per destroy: the worker binds a ref to the first
+            // operation it resolves for (protocol rule 7), so a ref shared
+            // by every destroy would be refused from the second on.
+            let grants: Vec<serde_json::Value> = (0..n)
+                .map(|i| {
+                    serde_json::json!({
+                        "ref": format!("apr-destroy-{i}"),
+                        "action": "sandbox.destroy",
+                        "native_id": null
+                    })
+                })
+                .collect();
             let worker = serde_json::json!({
                 "policy": {"images": [image]},
-                "approvals": [{"ref": "apr-destroy", "action": "sandbox.destroy", "native_id": null}]
+                "approvals": grants
             });
             std::fs::write(&config, worker.to_string()).unwrap();
             let server =
@@ -411,7 +423,7 @@ async fn capsule_worker_latencies() {
                     Action::Destroy {
                         target: created[i].clone(),
                     },
-                    Some("apr-destroy"),
+                    Some(&format!("apr-destroy-{i}")),
                 )
             })
             .await;
