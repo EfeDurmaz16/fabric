@@ -234,12 +234,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: EfeDurmaz16/capsule
-          # Capsule's m4/reconciliation worker head: the M3 worker plus
-          # attach by the operation's identity, the starting fixture seed,
-          # and the package without declaration maps, which
-          # docs/evidence/m4 ran against. Capsule's later commits on that
-          # branch are evidence only.
-          ref: ee189d4609783217178e45124a5b014126aba4b7
+          # Capsule's m4/reconciliation worker head: the M4 worker with its
+          # review fixes (an approval ref bound to the first operation it
+          # resolves for, a container kept when its start timed out), which
+          # docs/evidence/perf-ab/m4-interop ran against. Capsule's later
+          # commits on that branch are evidence only.
+          ref: ab7f0d3dfbf642afd0a140f495184ce92c11d4d9
           path: capsule
           persist-credentials: false
 
@@ -291,7 +291,7 @@ jobs:
         with:
           repository: EfeDurmaz16/capsule
           # The same worker as bridge-interop; move both pins together.
-          ref: ee189d4609783217178e45124a5b014126aba4b7
+          ref: ab7f0d3dfbf642afd0a140f495184ce92c11d4d9
           path: capsule
           persist-credentials: false
 
