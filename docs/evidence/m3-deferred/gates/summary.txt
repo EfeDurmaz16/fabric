@@ -1,0 +1,16 @@
+load at start: { 8.41 9.26 9.31 }
+fmt: exit 0 (1 s) load { 8.41 9.26 9.31 }
+clippy: exit 0 (3 s) load { 8.70 9.30 9.33 }
+clippy-features: exit 0 (1 s) load { 8.70 9.30 9.33 }
+test: exit 0 (226 s) load { 20.15 16.14 12.28 }
+e2e: exit 0 (98 s) load { 11.95 14.59 12.10 }
+doc: exit 0 (3 s) load { 11.79 14.51 12.09 }
+deny: exit 0 (1 s) load { 11.79 14.51 12.09 }
+hygiene: exit 0 (4 s) load { 11.49 14.40 12.06 }
+budget-check: exit 0 (13 s) load { 10.72 14.14 12.00 }
+fixtures: exit 0 (14 s) load { 10.26 13.87 11.94 }
+actionlint: exit 0 (1 s) load { 10.26 13.87 11.94 }
+build-fabric: exit 0 (0 s) load { 10.26 13.87 11.94 }
+sdk: exit 0 (8 s) load { 10.37 13.78 11.93 }
+budget-count: exit 0 (28 s) load { 9.70 13.37 11.83 }
+DONE

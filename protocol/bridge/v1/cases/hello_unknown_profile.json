@@ -1,0 +1,25 @@
+{
+  "case": "hello_unknown_profile",
+  "direction": "fabric_to_worker",
+  "phase": "handshake",
+  "expect": {
+    "outcome": "reject",
+    "code": "hello_refused",
+    "reason": "unsupported_profile"
+  },
+  "message": {
+    "type": "hello",
+    "versions": {
+      "min": 1,
+      "max": 1
+    },
+    "fabric": "fabric/0.1.0",
+    "profile": "ec2",
+    "limits": {
+      "max_request_bytes": 1048576,
+      "max_frame_bytes": 16777216,
+      "max_in_flight": 8,
+      "max_stderr_bytes": 65536
+    }
+  }
+}

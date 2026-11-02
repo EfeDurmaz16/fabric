@@ -1,0 +1,13 @@
+ok   clean tree, rule-naming prose in a file and a commit
+ok   em dash in a tracked file
+ok   em dash in a tracked file, run from a subdirectory
+ok   co-authored-by trailer in a tracked file, canonical casing
+ok   generated-with line in a tracked file, no link
+ok   em dash in a commit message
+ok   co-authored-by trailer in a commit message
+ok   generated-with trailer in a commit message
+ok   generated-by line in a tracked file
+ok   generated-by trailer in a commit message
+ok   generated-by line in a commit message
+ok   outside a git repository
+exit 0 (2 s)

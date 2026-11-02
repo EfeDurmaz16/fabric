@@ -1,0 +1,43 @@
+[package]
+name = "fabric-bridge"
+version = "0.1.0"
+description = "The bridge to a provider worker (ADR 0021): protocol v1 messages, and a client that runs a worker over stdio and records each effect in the managed journal"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# The scripted test double worker the bridge tests and the bench launch.
+double = []
+
+[dependencies]
+# The request digest, under its own domain; fabric-core already hashes
+# commands with it, so no new crate enters the workspace.
+blake3 = "1.8"
+fabric-client = { path = "../fabric-client" }
+fabric-core = { path = "../fabric-core" }
+fabric-journal = { path = "../fabric-journal" }
+rustix = { version = "1.1", features = ["process"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["io-std", "io-util", "macros", "process", "rt", "sync", "time"] }
+
+[dev-dependencies]
+# The tests launch the test double worker; this builds it for test builds only.
+fabric-bridge = { path = ".", features = ["double"] }
+tempfile = "3.27"
+tokio = { version = "1.54", features = ["rt-multi-thread"] }
+
+# A worker that speaks bridge protocol v1 from a script, for the tests and
+# the bench: it never calls a provider.
+[[bin]]
+name = "fabric-bridge-double"
+path = "src/bin/double.rs"
+test = false
+doc = false
+bench = false
+required-features = ["double"]
+
+[lints]
+workspace = true

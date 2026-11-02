@@ -1,0 +1,19 @@
+== features []
+   Compiling nix v0.31.3
+    Checking rustix v1.1.5
+    Checking rand v0.10.3
+    Checking tokio v1.54.1
+    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-core)
+    Checking proptest v1.12.0
+    Checking tempfile v3.27.0
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.97s
+== features [acp]
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.93s
+== features [claude]
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.07s
+== features [codex]
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.99s

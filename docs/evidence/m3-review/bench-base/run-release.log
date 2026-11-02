@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running tests/bench.rs (<scratch>/target-base/release/deps/bench-7958c459f9b27d44)
+
+running 2 tests
+test bridge_latencies ... ok
+test capsule_worker_latencies ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.93s
+

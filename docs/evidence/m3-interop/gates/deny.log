@@ -1,0 +1,465 @@
+warning[duplicate]: found 2 duplicate entries for crate 'getrandom'
+   ┌─ /private/tmp/fabric-wt/m3/Cargo.lock:49:1
+   │  
+49 │ ╭ getrandom 0.2.17 registry+https://github.com/rust-lang/crates.io-index
+50 │ │ getrandom 0.4.3 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ getrandom v0.2.17
+     └── ring v0.17.14
+         ├── quinn-proto v0.11.19
+         │   └── quinn v0.11.12
+         │       └── fabric-net v0.1.0
+         │           ├── fabric v0.1.0
+         │           │   └── (dev) fabric v0.1.0 (*)
+         │           └── fabricd v0.1.0
+         │               └── fabric v0.1.0 (*)
+         ├── rcgen v0.14.10
+         │   └── fabric-net v0.1.0 (*)
+         ├── rustls v0.23.46
+         │   ├── fabric-net v0.1.0 (*)
+         │   ├── quinn v0.11.12 (*)
+         │   ├── quinn-proto v0.11.19 (*)
+         │   └── tokio-rustls v0.26.6
+         │       └── fabric-net v0.1.0 (*)
+         └── rustls-webpki v0.103.16
+             ├── fabric-net v0.1.0 (*)
+             └── rustls v0.23.46 (*)
+   ├ getrandom v0.4.3
+     ├── jobserver v0.1.35
+     │   └── cc v1.9.0
+     │       ├── (build) blake3 v1.8.7
+     │       │   ├── fabric-bridge v0.1.0
+     │       │   │   └── (dev) fabric-bridge v0.1.0 (*)
+     │       │   ├── fabric-core v0.1.0
+     │       │   │   ├── fabric v0.1.0
+     │       │   │   │   └── (dev) fabric v0.1.0 (*)
+     │       │   │   ├── fabric-bridge v0.1.0 (*)
+     │       │   │   ├── fabric-client v0.1.0
+     │       │   │   │   ├── fabric v0.1.0 (*)
+     │       │   │   │   ├── fabric-bridge v0.1.0 (*)
+     │       │   │   │   └── fabricd v0.1.0
+     │       │   │   │       └── fabric v0.1.0 (*)
+     │       │   │   ├── fabric-env v0.1.0
+     │       │   │   │   ├── fabric v0.1.0 (*)
+     │       │   │   │   └── fabricd v0.1.0 (*)
+     │       │   │   ├── fabric-harness v0.1.0
+     │       │   │   │   ├── fabric v0.1.0 (*)
+     │       │   │   │   ├── (dev) fabric-harness v0.1.0 (*)
+     │       │   │   │   └── fabricd v0.1.0 (*)
+     │       │   │   ├── fabric-journal v0.1.0
+     │       │   │   │   ├── fabric-bridge v0.1.0 (*)
+     │       │   │   │   └── fabricd v0.1.0 (*)
+     │       │   │   ├── fabric-net v0.1.0
+     │       │   │   │   ├── fabric v0.1.0 (*)
+     │       │   │   │   └── fabricd v0.1.0 (*)
+     │       │   │   ├── fabric-store v0.1.0
+     │       │   │   │   └── fabricd v0.1.0 (*)
+     │       │   │   └── fabricd v0.1.0 (*)
+     │       │   ├── fabric-env v0.1.0 (*)
+     │       │   ├── fabric-harness v0.1.0 (*)
+     │       │   └── fabricd v0.1.0 (*)
+     │       ├── (build) libsqlite3-sys v0.38.2
+     │       │   └── rusqlite v0.40.2
+     │       │       ├── fabric-journal v0.1.0 (*)
+     │       │       └── fabric-store v0.1.0 (*)
+     │       ├── (build) ring v0.17.14
+     │       │   ├── quinn-proto v0.11.19
+     │       │   │   └── quinn v0.11.12
+     │       │   │       └── fabric-net v0.1.0 (*)
+     │       │   ├── rcgen v0.14.10
+     │       │   │   └── fabric-net v0.1.0 (*)
+     │       │   ├── rustls v0.23.46
+     │       │   │   ├── fabric-net v0.1.0 (*)
+     │       │   │   ├── quinn v0.11.12 (*)
+     │       │   │   ├── quinn-proto v0.11.19 (*)
+     │       │   │   └── tokio-rustls v0.26.6
+     │       │   │       └── fabric-net v0.1.0 (*)
+     │       │   └── rustls-webpki v0.103.16
+     │       │       ├── fabric-net v0.1.0 (*)
+     │       │       └── rustls v0.23.46 (*)
+     │       ├── (build) sqlite-wasm-rs v0.5.5
+     │       │   └── rusqlite v0.40.2 (*)
+     │       └── (build) zstd-sys v2.1.2+zstd.1.5.7
+     │           └── zstd-safe v8.2.0
+     │               └── zstd v0.14.3
+     │                   ├── (dev) fabric-harness v0.1.0 (*)
+     │                   ├── fabric-net v0.1.0 (*)
+     │                   └── fabric-store v0.1.0 (*)
+     ├── quinn-proto v0.11.19 (*)
+     ├── rand v0.10.3
+     │   ├── proptest v1.12.0
+     │   │   ├── (dev) fabric-core v0.1.0 (*)
+     │   │   ├── (dev) fabric-harness v0.1.0 (*)
+     │   │   ├── (dev) fabric-net v0.1.0 (*)
+     │   │   └── (dev) fabric-store v0.1.0 (*)
+     │   ├── quinn-proto v0.11.19 (*)
+     │   └── ulid v3.0.0
+     │       ├── fabric-core v0.1.0 (*)
+     │       └── fabricd v0.1.0 (*)
+     ├── tempfile v3.27.0
+     │   ├── (dev) fabric v0.1.0 (*)
+     │   ├── (dev) fabric-bridge v0.1.0 (*)
+     │   ├── (dev) fabric-client v0.1.0 (*)
+     │   ├── (dev) fabric-core v0.1.0 (*)
+     │   ├── (dev) fabric-env v0.1.0 (*)
+     │   ├── (dev) fabric-harness v0.1.0 (*)
+     │   ├── (dev) fabric-journal v0.1.0 (*)
+     │   ├── (dev) fabric-net v0.1.0 (*)
+     │   ├── (dev) fabric-store v0.1.0 (*)
+     │   └── (dev) fabricd v0.1.0 (*)
+     └── uuid v1.28.0
+         └── fabric-harness v0.1.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'hashbrown'
+   ┌─ /private/tmp/fabric-wt/m3/Cargo.lock:51:1
+   │  
+51 │ ╭ hashbrown 0.16.1 registry+https://github.com/rust-lang/crates.io-index
+52 │ │ hashbrown 0.17.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ hashbrown v0.16.1
+     └── rsqlite-vfs v0.1.1
+         └── sqlite-wasm-rs v0.5.5
+             └── rusqlite v0.40.2
+                 ├── fabric-journal v0.1.0
+                 │   ├── fabric-bridge v0.1.0
+                 │   │   └── (dev) fabric-bridge v0.1.0 (*)
+                 │   └── fabricd v0.1.0
+                 │       └── fabric v0.1.0
+                 │           └── (dev) fabric v0.1.0 (*)
+                 └── fabric-store v0.1.0
+                     └── fabricd v0.1.0 (*)
+   ├ hashbrown v0.17.1
+     ├── hashlink v0.12.2
+     │   └── rusqlite v0.40.2
+     │       ├── fabric-journal v0.1.0
+     │       │   ├── fabric-bridge v0.1.0
+     │       │   │   └── (dev) fabric-bridge v0.1.0 (*)
+     │       │   └── fabricd v0.1.0
+     │       │       └── fabric v0.1.0
+     │       │           └── (dev) fabric v0.1.0 (*)
+     │       └── fabric-store v0.1.0
+     │           └── fabricd v0.1.0 (*)
+     └── indexmap v2.14.2
+         ├── serde_json v1.0.154
+         │   ├── fabric v0.1.0 (*)
+         │   ├── fabric-bridge v0.1.0 (*)
+         │   ├── fabric-client v0.1.0
+         │   │   ├── fabric v0.1.0 (*)
+         │   │   ├── fabric-bridge v0.1.0 (*)
+         │   │   └── fabricd v0.1.0 (*)
+         │   ├── fabric-env v0.1.0
+         │   │   ├── fabric v0.1.0 (*)
+         │   │   └── fabricd v0.1.0 (*)
+         │   ├── fabric-harness v0.1.0
+         │   │   ├── fabric v0.1.0 (*)
+         │   │   ├── (dev) fabric-harness v0.1.0 (*)
+         │   │   └── fabricd v0.1.0 (*)
+         │   └── fabricd v0.1.0 (*)
+         └── toml v1.1.8+spec-1.1.0
+             ├── (dev) fabric v0.1.0 (*)
+             ├── fabric-env v0.1.0 (*)
+             └── fabricd v0.1.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'syn'
+    ┌─ /private/tmp/fabric-wt/m3/Cargo.lock:114:1
+    │  
+114 │ ╭ syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index
+115 │ │ syn 3.0.9 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰───────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ syn v2.0.119
+      └── tracing-attributes v0.1.31
+          └── tracing v0.1.44
+              ├── fabric v0.1.0
+              │   └── (dev) fabric v0.1.0 (*)
+              ├── fabric-env v0.1.0
+              │   ├── fabric v0.1.0 (*)
+              │   └── fabricd v0.1.0
+              │       └── fabric v0.1.0 (*)
+              ├── fabric-harness v0.1.0
+              │   ├── fabric v0.1.0 (*)
+              │   ├── (dev) fabric-harness v0.1.0 (*)
+              │   └── fabricd v0.1.0 (*)
+              ├── fabric-net v0.1.0
+              │   ├── fabric v0.1.0 (*)
+              │   └── fabricd v0.1.0 (*)
+              ├── fabric-store v0.1.0
+              │   └── fabricd v0.1.0 (*)
+              ├── fabricd v0.1.0 (*)
+              ├── quinn v0.11.12
+              │   └── fabric-net v0.1.0 (*)
+              ├── quinn-proto v0.11.19
+              │   └── quinn v0.11.12 (*)
+              └── quinn-udp v0.5.16
+                  └── quinn v0.11.12 (*)
+    ├ syn v3.0.9
+      ├── clap_derive v4.6.7
+      │   └── clap v4.6.7
+      │       └── fabric v0.1.0
+      │           └── (dev) fabric v0.1.0 (*)
+      ├── serde_derive v1.0.229
+      │   └── serde v1.0.229
+      │       ├── fabric-client v0.1.0
+      │       │   ├── fabric v0.1.0 (*)
+      │       │   ├── fabric-bridge v0.1.0
+      │       │   │   └── (dev) fabric-bridge v0.1.0 (*)
+      │       │   └── fabricd v0.1.0
+      │       │       └── fabric v0.1.0 (*)
+      │       ├── fabric-core v0.1.0
+      │       │   ├── fabric v0.1.0 (*)
+      │       │   ├── fabric-bridge v0.1.0 (*)
+      │       │   ├── fabric-client v0.1.0 (*)
+      │       │   ├── fabric-env v0.1.0
+      │       │   │   ├── fabric v0.1.0 (*)
+      │       │   │   └── fabricd v0.1.0 (*)
+      │       │   ├── fabric-harness v0.1.0
+      │       │   │   ├── fabric v0.1.0 (*)
+      │       │   │   ├── (dev) fabric-harness v0.1.0 (*)
+      │       │   │   └── fabricd v0.1.0 (*)
+      │       │   ├── fabric-journal v0.1.0
+      │       │   │   ├── fabric-bridge v0.1.0 (*)
+      │       │   │   └── fabricd v0.1.0 (*)
+      │       │   ├── fabric-net v0.1.0
+      │       │   │   ├── fabric v0.1.0 (*)
+      │       │   │   └── fabricd v0.1.0 (*)
+      │       │   ├── fabric-store v0.1.0
+      │       │   │   └── fabricd v0.1.0 (*)
+      │       │   └── fabricd v0.1.0 (*)
+      │       ├── fabric-harness v0.1.0 (*)
+      │       ├── fabric-net v0.1.0 (*)
+      │       ├── fabricd v0.1.0 (*)
+      │       └── postcard v1.1.3
+      │           ├── fabric-core v0.1.0 (*)
+      │           └── fabric-net v0.1.0 (*)
+      ├── thiserror-impl v2.0.21
+      │   └── thiserror v2.0.21
+      │       ├── cobs v0.3.0
+      │       │   └── postcard v1.1.3 (*)
+      │       ├── fabric-bridge v0.1.0 (*)
+      │       ├── fabric-client v0.1.0 (*)
+      │       ├── fabric-core v0.1.0 (*)
+      │       ├── fabric-env v0.1.0 (*)
+      │       ├── fabric-harness v0.1.0 (*)
+      │       ├── fabric-journal v0.1.0 (*)
+      │       ├── fabric-net v0.1.0 (*)
+      │       ├── fabric-store v0.1.0 (*)
+      │       ├── fabricd v0.1.0 (*)
+      │       ├── quinn v0.11.12
+      │       │   └── fabric-net v0.1.0 (*)
+      │       ├── quinn-proto v0.11.19
+      │       │   └── quinn v0.11.12 (*)
+      │       └── rsqlite-vfs v0.1.1
+      │           └── sqlite-wasm-rs v0.5.5
+      │               └── rusqlite v0.40.2
+      │                   ├── fabric-journal v0.1.0 (*)
+      │                   └── fabric-store v0.1.0 (*)
+      ├── tokio-macros v2.7.2
+      │   └── tokio v1.54.1
+      │       ├── (dev) fabric v0.1.0 (*)
+      │       ├── fabric-bridge v0.1.0 (*)
+      │       ├── (dev) fabric-client v0.1.0 (*)
+      │       ├── fabric-harness v0.1.0 (*)
+      │       ├── fabric-net v0.1.0 (*)
+      │       ├── fabricd v0.1.0 (*)
+      │       ├── quinn v0.11.12 (*)
+      │       └── tokio-rustls v0.26.6
+      │           └── fabric-net v0.1.0 (*)
+      └── wasm-bindgen-macro-support v0.2.129
+          └── wasm-bindgen-macro v0.2.129
+              └── wasm-bindgen v0.2.129
+                  ├── getrandom v0.2.17
+                  │   └── ring v0.17.14
+                  │       ├── quinn-proto v0.11.19 (*)
+                  │       ├── rcgen v0.14.10
+                  │       │   └── fabric-net v0.1.0 (*)
+                  │       ├── rustls v0.23.46
+                  │       │   ├── fabric-net v0.1.0 (*)
+                  │       │   ├── quinn v0.11.12 (*)
+                  │       │   ├── quinn-proto v0.11.19 (*)
+                  │       │   └── tokio-rustls v0.26.6 (*)
+                  │       └── rustls-webpki v0.103.16
+                  │           ├── fabric-net v0.1.0 (*)
+                  │           └── rustls v0.23.46 (*)
+                  ├── getrandom v0.4.3
+                  │   ├── jobserver v0.1.35
+                  │   │   └── cc v1.9.0
+                  │   │       ├── (build) blake3 v1.8.7
+                  │   │       │   ├── fabric-bridge v0.1.0 (*)
+                  │   │       │   ├── fabric-core v0.1.0 (*)
+                  │   │       │   ├── fabric-env v0.1.0 (*)
+                  │   │       │   ├── fabric-harness v0.1.0 (*)
+                  │   │       │   └── fabricd v0.1.0 (*)
+                  │   │       ├── (build) libsqlite3-sys v0.38.2
+                  │   │       │   └── rusqlite v0.40.2 (*)
+                  │   │       ├── (build) ring v0.17.14 (*)
+                  │   │       ├── (build) sqlite-wasm-rs v0.5.5 (*)
+                  │   │       └── (build) zstd-sys v2.1.2+zstd.1.5.7
+                  │   │           └── zstd-safe v8.2.0
+                  │   │               └── zstd v0.14.3
+                  │   │                   ├── (dev) fabric-harness v0.1.0 (*)
+                  │   │                   ├── fabric-net v0.1.0 (*)
+                  │   │                   └── fabric-store v0.1.0 (*)
+                  │   ├── quinn-proto v0.11.19 (*)
+                  │   ├── rand v0.10.3
+                  │   │   ├── proptest v1.12.0
+                  │   │   │   ├── (dev) fabric-core v0.1.0 (*)
+                  │   │   │   ├── (dev) fabric-harness v0.1.0 (*)
+                  │   │   │   ├── (dev) fabric-net v0.1.0 (*)
+                  │   │   │   └── (dev) fabric-store v0.1.0 (*)
+                  │   │   ├── quinn-proto v0.11.19 (*)
+                  │   │   └── ulid v3.0.0
+                  │   │       ├── fabric-core v0.1.0 (*)
+                  │   │       └── fabricd v0.1.0 (*)
+                  │   ├── tempfile v3.27.0
+                  │   │   ├── (dev) fabric v0.1.0 (*)
+                  │   │   ├── (dev) fabric-bridge v0.1.0 (*)
+                  │   │   ├── (dev) fabric-client v0.1.0 (*)
+                  │   │   ├── (dev) fabric-core v0.1.0 (*)
+                  │   │   ├── (dev) fabric-env v0.1.0 (*)
+                  │   │   ├── (dev) fabric-harness v0.1.0 (*)
+                  │   │   ├── (dev) fabric-journal v0.1.0 (*)
+                  │   │   ├── (dev) fabric-net v0.1.0 (*)
+                  │   │   ├── (dev) fabric-store v0.1.0 (*)
+                  │   │   └── (dev) fabricd v0.1.0 (*)
+                  │   └── uuid v1.28.0
+                  │       └── fabric-harness v0.1.0 (*)
+                  ├── js-sys v0.3.106
+                  │   ├── getrandom v0.2.17 (*)
+                  │   ├── getrandom v0.4.3 (*)
+                  │   ├── sqlite-wasm-rs v0.5.5 (*)
+                  │   └── web-time v1.1.0
+                  │       ├── quinn v0.11.12 (*)
+                  │       ├── quinn-proto v0.11.19 (*)
+                  │       ├── rustls-pki-types v1.15.1
+                  │       │   ├── quinn-proto v0.11.19 (*)
+                  │       │   ├── rcgen v0.14.10 (*)
+                  │       │   ├── rustls v0.23.46 (*)
+                  │       │   └── rustls-webpki v0.103.16 (*)
+                  │       └── ulid v3.0.0 (*)
+                  ├── sqlite-wasm-rs v0.5.5 (*)
+                  └── web-time v1.1.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'windows-sys'
+    ┌─ /private/tmp/fabric-wt/m3/Cargo.lock:148:1
+    │  
+148 │ ╭ windows-sys 0.52.0 registry+https://github.com/rust-lang/crates.io-index
+149 │ │ windows-sys 0.61.2 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰────────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ windows-sys v0.52.0
+      ├── errno v0.3.14
+      │   ├── rustix v1.1.5
+      │   │   ├── (dev) fabric v0.1.0
+      │   │   │   └── (dev) fabric v0.1.0 (*)
+      │   │   ├── fabric-bridge v0.1.0
+      │   │   │   └── (dev) fabric-bridge v0.1.0 (*)
+      │   │   ├── fabric-client v0.1.0
+      │   │   │   ├── fabric v0.1.0 (*)
+      │   │   │   ├── fabric-bridge v0.1.0 (*)
+      │   │   │   └── fabricd v0.1.0
+      │   │   │       └── fabric v0.1.0 (*)
+      │   │   ├── fabric-env v0.1.0
+      │   │   │   ├── fabric v0.1.0 (*)
+      │   │   │   └── fabricd v0.1.0 (*)
+      │   │   ├── fabric-harness v0.1.0
+      │   │   │   ├── fabric v0.1.0 (*)
+      │   │   │   ├── (dev) fabric-harness v0.1.0 (*)
+      │   │   │   └── fabricd v0.1.0 (*)
+      │   │   ├── fabric-store v0.1.0
+      │   │   │   └── fabricd v0.1.0 (*)
+      │   │   ├── fabricd v0.1.0 (*)
+      │   │   └── tempfile v3.27.0
+      │   │       ├── (dev) fabric v0.1.0 (*)
+      │   │       ├── (dev) fabric-bridge v0.1.0 (*)
+      │   │       ├── (dev) fabric-client v0.1.0 (*)
+      │   │       ├── (dev) fabric-core v0.1.0
+      │   │       │   ├── fabric v0.1.0 (*)
+      │   │       │   ├── fabric-bridge v0.1.0 (*)
+      │   │       │   ├── fabric-client v0.1.0 (*)
+      │   │       │   ├── fabric-env v0.1.0 (*)
+      │   │       │   ├── fabric-harness v0.1.0 (*)
+      │   │       │   ├── fabric-journal v0.1.0
+      │   │       │   │   ├── fabric-bridge v0.1.0 (*)
+      │   │       │   │   └── fabricd v0.1.0 (*)
+      │   │       │   ├── fabric-net v0.1.0
+      │   │       │   │   ├── fabric v0.1.0 (*)
+      │   │       │   │   └── fabricd v0.1.0 (*)
+      │   │       │   ├── fabric-store v0.1.0 (*)
+      │   │       │   └── fabricd v0.1.0 (*)
+      │   │       ├── (dev) fabric-env v0.1.0 (*)
+      │   │       ├── (dev) fabric-harness v0.1.0 (*)
+      │   │       ├── (dev) fabric-journal v0.1.0 (*)
+      │   │       ├── (dev) fabric-net v0.1.0 (*)
+      │   │       ├── (dev) fabric-store v0.1.0 (*)
+      │   │       └── (dev) fabricd v0.1.0 (*)
+      │   └── signal-hook-registry v1.4.8
+      │       └── tokio v1.54.1
+      │           ├── (dev) fabric v0.1.0 (*)
+      │           ├── fabric-bridge v0.1.0 (*)
+      │           ├── (dev) fabric-client v0.1.0 (*)
+      │           ├── fabric-harness v0.1.0 (*)
+      │           ├── fabric-net v0.1.0 (*)
+      │           ├── fabricd v0.1.0 (*)
+      │           ├── quinn v0.11.12
+      │           │   └── fabric-net v0.1.0 (*)
+      │           └── tokio-rustls v0.26.6
+      │               └── fabric-net v0.1.0 (*)
+      ├── quinn-udp v0.5.16
+      │   └── quinn v0.11.12 (*)
+      ├── ring v0.17.14
+      │   ├── quinn-proto v0.11.19
+      │   │   └── quinn v0.11.12 (*)
+      │   ├── rcgen v0.14.10
+      │   │   └── fabric-net v0.1.0 (*)
+      │   ├── rustls v0.23.46
+      │   │   ├── fabric-net v0.1.0 (*)
+      │   │   ├── quinn v0.11.12 (*)
+      │   │   ├── quinn-proto v0.11.19 (*)
+      │   │   └── tokio-rustls v0.26.6 (*)
+      │   └── rustls-webpki v0.103.16
+      │       ├── fabric-net v0.1.0 (*)
+      │       └── rustls v0.23.46 (*)
+      ├── rustix v1.1.5 (*)
+      └── tempfile v3.27.0 (*)
+    ├ windows-sys v0.61.2
+      ├── anstyle-query v1.1.5
+      │   └── anstream v1.0.0
+      │       └── clap_builder v4.6.7
+      │           └── clap v4.6.7
+      │               └── fabric v0.1.0
+      │                   └── (dev) fabric v0.1.0 (*)
+      ├── anstyle-wincon v3.0.11
+      │   └── anstream v1.0.0 (*)
+      ├── mio v1.2.4
+      │   └── tokio v1.54.1
+      │       ├── (dev) fabric v0.1.0 (*)
+      │       ├── fabric-bridge v0.1.0
+      │       │   └── (dev) fabric-bridge v0.1.0 (*)
+      │       ├── (dev) fabric-client v0.1.0
+      │       │   ├── fabric v0.1.0 (*)
+      │       │   ├── fabric-bridge v0.1.0 (*)
+      │       │   └── fabricd v0.1.0
+      │       │       └── fabric v0.1.0 (*)
+      │       ├── fabric-harness v0.1.0
+      │       │   ├── fabric v0.1.0 (*)
+      │       │   ├── (dev) fabric-harness v0.1.0 (*)
+      │       │   └── fabricd v0.1.0 (*)
+      │       ├── fabric-net v0.1.0
+      │       │   ├── fabric v0.1.0 (*)
+      │       │   └── fabricd v0.1.0 (*)
+      │       ├── fabricd v0.1.0 (*)
+      │       ├── quinn v0.11.12
+      │       │   └── fabric-net v0.1.0 (*)
+      │       └── tokio-rustls v0.26.6
+      │           └── fabric-net v0.1.0 (*)
+      ├── socket2 v0.6.5
+      │   ├── quinn v0.11.12 (*)
+      │   ├── quinn-udp v0.5.16
+      │   │   └── quinn v0.11.12 (*)
+      │   └── tokio v1.54.1 (*)
+      └── tokio v1.54.1 (*)
+
+advisories ok, bans ok, licenses ok, sources ok
+exit 0 (1 s)

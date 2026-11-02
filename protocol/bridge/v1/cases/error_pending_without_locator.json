@@ -1,0 +1,24 @@
+{
+  "case": "error_pending_without_locator",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "missing_field"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-3",
+    "operation_id": "01K8W3A00000000000000000P6",
+    "error": {
+      "code": "pending",
+      "reason": "observation_deadline",
+      "message": "pending: observation_deadline",
+      "effect": "pending",
+      "state": "stopping",
+      "observations": 3,
+      "deadline_ms": 3000
+    }
+  }
+}

@@ -1,0 +1,38 @@
+capsule commit: 9e8013536c471bf1f56677da0cf8d7de33d80572, the worker built as in interop-pin.log
+fabric commit: 25a613094b98e3369e19760d696199634adaf9ae (crates unchanged since 0b6b3a3)
+docker: 29.4.0 on context orbstack, image debian:bookworm-slim already present, never pulled
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running tests/capsule_worker.rs (target/debug/deps/capsule_worker-99bd03c600e937a1)
+
+running 8 tests
+bad_version_handshake: 3 wire steps, 1 checked elsewhere, 0 after advance
+test the_handshake_negotiates_the_fixture_profile_and_refuses_another_version ... ok
+docker server 29.4.0, context orbstack, image debian:bookworm-slim
+cancel_is_not_termination: 5 wire steps, 4 checked elsewhere, 0 after advance
+create_exec_destroy: 6 wire steps, 6 checked elsewhere, 0 after advance
+denied_before_effect: 2 wire steps, 2 checked elsewhere, 0 after advance
+duplicate_idempotency_key: 6 wire steps, 3 checked elsewhere, 0 after advance
+fresh_approval_required: 6 wire steps, 3 checked elsewhere, 0 after advance
+pending_destroy_with_locator: 4 wire steps, 3 checked elsewhere, 5 after advance
+provider_failed: 2 wire steps, 2 checked elsewhere, 0 after advance
+test a_repeated_idempotency_key_is_never_sent_again ... ok
+receipt_failure_keeps_outcome: 2 wire steps, 2 checked elsewhere, 0 after advance
+spawn and handshake: 46.787708ms
+scope_retained: 4 wire steps, 2 checked elsewhere, 0 after advance
+secrets_deny_all_and_intersection: 6 wire steps, 3 checked elsewhere, 0 after advance
+test create_exec_observe_destroy_keep_the_scoped_locator ... ok
+test a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice ... ok
+test observe_reads_only_the_operations_own_resource ... ok
+shutdown_reports_unresolved: 7 wire steps, 3 checked elsewhere, 0 after advance
+unknown_after_dispatch_with_locator: 4 wire steps, 4 checked elsewhere, 0 after advance
+unsupported_capability: 6 wire steps, 4 checked elsewhere, test denied_and_unsupported_requests_fail_before_any_effect ... 0 after advance
+ok
+worker_loss_is_not_cancellation: 6 wire steps, 4 checked elsewhere, 0 after advance
+test every_shared_scenario_over_the_workers_stdio ... ok
+test the_docker_profile_on_the_local_engine ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.12s
+
+
+containers left with a fabric.job label: 0

@@ -1,0 +1,249 @@
+{
+  "scenario": "create_exec_destroy",
+  "summary": "Happy path: create, run a command, destroy with a fresh destroy approval.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [],
+    "script": []
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-1",
+        "operation": {
+          "id": "01K8W3A00000000000000000P1",
+          "key": "key-create-1",
+          "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "params": {
+          "image": "fixture/ok",
+          "env": {},
+          "secret_names": [],
+          "labels": {}
+        },
+        "approval": null,
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A00000000000000000P1",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "output": {
+          "status": "ready"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P1",
+        "status": "succeeded"
+      }
+    },
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-2",
+        "operation": {
+          "id": "01K8W3A00000000000000000P2",
+          "key": "key-exec-1",
+          "digest": "1212121212121212121212121212121212121212121212121212121212121212"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.exec",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "params": {
+          "argv": [
+            "echo",
+            "hi"
+          ],
+          "stdin": null,
+          "cwd": null,
+          "timeout_ms": 10000,
+          "max_output_bytes": 65536,
+          "secret_names": []
+        },
+        "approval": null,
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A00000000000000000P2",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "output": {
+          "exit_code": 0,
+          "stdout": {
+            "text": "hi\n",
+            "captured_bytes": 3,
+            "truncated": false,
+            "lossy": false
+          },
+          "stderr": {
+            "text": "",
+            "captured_bytes": 0,
+            "truncated": false,
+            "lossy": false
+          }
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 2
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P2",
+        "status": "succeeded"
+      }
+    },
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-3",
+        "operation": {
+          "id": "01K8W3A00000000000000000P3",
+          "key": "key-destroy-1",
+          "digest": "1313131313131313131313131313131313131313131313131313131313131313"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "params": {},
+        "approval": {
+          "ref": "apr-destroy-1"
+        },
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-3",
+        "operation_id": "01K8W3A00000000000000000P3",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "output": {
+          "status": "destroyed"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 3
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P3",
+        "status": "succeeded"
+      }
+    }
+  ]
+}

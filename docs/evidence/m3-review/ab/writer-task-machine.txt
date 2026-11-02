@@ -1,0 +1,31 @@
+base binary: <scratch>/target-base/release/deps/bench-7958c459f9b27d44 (commit b3d0311)
+head binary: /tmp/fabric-wt/m3/target/release/deps/bench-7958c459f9b27d44 (commit d4855fd)
+capsule worker: /tmp/capsule-wt/m3/packages/bridge-worker/dist/bin.js (d716629)
+node: v22.23.2
+uname: Darwin 25.6.0 arm64
+load before:  0:32  up 44 days, 57 mins, 1 user, load averages: 22.42 20.29 19.95
+base-1 start:  0:32  up 44 days, 57 mins, 1 user, load averages: 22.42 20.29 19.95
+head-1 start:  0:32  up 44 days, 57 mins, 1 user, load averages: 25.21 20.93 20.18
+base-2 start:  0:32  up 44 days, 57 mins, 1 user, load averages: 22.93 20.59 20.06
+head-2 start:  0:32  up 44 days, 57 mins, 1 user, load averages: 21.66 20.36 19.98
+base-3 start:  0:33  up 44 days, 57 mins, 1 user, load averages: 20.01 20.05 19.88
+head-3 start:  0:33  up 44 days, 58 mins, 1 user, load averages: 19.52 19.95 19.84
+base-4 start:  0:33  up 44 days, 58 mins, 1 user, load averages: 18.19 19.66 19.74
+head-4 start:  0:33  up 44 days, 58 mins, 1 user, load averages: 17.38 19.46 19.67
+base-5 start:  0:33  up 44 days, 58 mins, 1 user, load averages: 17.29 19.38 19.64
+head-5 start:  0:33  up 44 days, 58 mins, 1 user, load averages: 16.47 19.17 19.57
+base-6 start:  0:33  up 44 days, 58 mins, 1 user, load averages: 17.47 19.34 19.62
+head-6 start:  0:33  up 44 days, 58 mins, 1 user, load averages: 16.63 19.13 19.55
+base-7 start:  0:34  up 44 days, 58 mins, 1 user, load averages: 17.23 19.16 19.55
+head-7 start:  0:34  up 44 days, 58 mins, 1 user, load averages: 16.89 19.06 19.51
+base-8 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 16.50 18.94 19.47
+head-8 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 18.28 19.24 19.57
+base-9 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 17.46 19.05 19.50
+head-9 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 16.62 18.85 19.43
+base-10 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 15.93 18.67 19.36
+head-10 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 17.86 19.03 19.48
+base-11 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 17.14 18.83 19.40
+head-11 start:  0:34  up 44 days, 59 mins, 1 user, load averages: 16.89 18.75 19.37
+base-12 start:  0:35  up 44 days, 59 mins, 1 user, load averages: 16.18 18.57 19.31
+head-12 start:  0:35  up 44 days, 59 mins, 1 user, load averages: 15.92 18.48 19.27
+load after:  0:35  up 44 days, 1 hr, 1 user, load averages: 16.25 18.50 19.27

@@ -214,3 +214,120 @@ jobs:
         env:
           FABRIC_BIN: ${{ github.workspace }}/target/debug/fabric
         run: bun test
+
+  # Fabric's bridge client against the real Capsule worker
+  # (crates/fabric-bridge/tests/capsule_worker.rs): every shared scenario
+  # over the worker's stdio, then the client and a real journal through
+  # create, exec, observe, destroy, refusals and a killed worker. The worker
+  # is built from a pinned Capsule commit; bump the pin when Capsule's
+  # worker changes, here and in bridge-docker. The Docker test skips here:
+  # no image is on the runner, and nothing pulls one; bridge-docker runs it.
+  bridge-interop:
+    name: bridge interop (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: EfeDurmaz16/capsule
+          # Capsule's m3/bridge-worker head: the worker with the v1
+          # corrections of 2026-10-29 (an exec bound of 0 refused, observe
+          # with the operation's scope, exec observe and labelled seeds) and
+          # its docker create, start and rm clients out of its process
+          # group, which docs/evidence/m3-reconcile ran against.
+          ref: a4d597aa8df665f403389bd34f592ad2ce2056c4
+          path: capsule
+          persist-credentials: false
+
+      # Node 22 is the floor the worker's package.json names.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # The pnpm version is the one Capsule's packageManager field pins.
+      - name: Build the Capsule worker
+        working-directory: capsule
+        run: |
+          npm install --global "$(node -p 'require("./package.json").packageManager')"
+          pnpm install --frozen-lockfile
+          pnpm --filter "@capsule-sdk/bridge-worker..." run build
+
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Bridge against the Capsule worker
+        env:
+          CAPSULE_BRIDGE_WORKER: ${{ github.workspace }}/capsule/packages/bridge-worker/dist/bin.js
+        run: cargo test -p fabric-bridge --test capsule_worker --locked -- --ignored --nocapture
+
+  # The bridge's Docker profile against the runner's own engine, through
+  # the same Capsule worker as bridge-interop: refusals that leave no
+  # container, a create with its labels and engine scope, exec and an
+  # artifact within bounds, a worker killed mid-exec whose exec client
+  # goes with it while the exec runs on, and a destroy that needs its own
+  # grant. The worker never pulls (the profile says image_pull: never), so
+  # this job pulls one tiny public image first, by digest.
+  bridge-docker:
+    name: bridge docker (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # busybox 1.37.0: its multi-platform index, about 2 MiB for amd64.
+      BRIDGE_DOCKER_IMAGE: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: EfeDurmaz16/capsule
+          # The same worker as bridge-interop; move both pins together.
+          ref: a4d597aa8df665f403389bd34f592ad2ce2056c4
+          path: capsule
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build the Capsule worker
+        working-directory: capsule
+        run: |
+          npm install --global "$(node -p 'require("./package.json").packageManager')"
+          pnpm install --frozen-lockfile
+          pnpm --filter "@capsule-sdk/bridge-worker..." run build
+
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Pull the pinned image
+        run: |
+          docker version
+          docker pull "$BRIDGE_DOCKER_IMAGE"
+
+      # With CAPSULE_BRIDGE_DOCKER_IMAGE set, a missing image or an
+      # unreachable engine fails the test instead of skipping it.
+      - name: Docker profile against the Capsule worker
+        env:
+          CAPSULE_BRIDGE_WORKER: ${{ github.workspace }}/capsule/packages/bridge-worker/dist/bin.js
+          CAPSULE_BRIDGE_DOCKER_IMAGE: ${{ env.BRIDGE_DOCKER_IMAGE }}
+        run: cargo test -p fabric-bridge --test capsule_worker --locked -- --ignored --exact the_docker_profile_on_the_local_engine --nocapture
+
+      - name: No container left behind
+        if: always()
+        run: |
+          docker ps -a --filter label=fabric.job
+          test -z "$(docker ps -a -q --filter label=fabric.job)"

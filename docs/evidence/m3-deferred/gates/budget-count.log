@@ -1,0 +1,31 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running tests/e2e/main.rs (target/debug/deps/e2e-5aad294b239a4019)
+
+running 1 test
+### Time budget, macos-aarch64, count
+
+On Apple M5 Pro, 18 cores. Times in ms: the 25th percentile of 7 timed runs, the median, and the 25th percentile of a second batch when the first was over the limit in enforce mode. The limit is the larger of 1.3 x baseline and baseline + 50 ms. Processes are the starts of each counted program in each of the 2 warm-up runs; a program not named started in none.
+
+Count mode: only the warm-up runs ran, and no op was timed.
+
+| op | p25 | median | baseline | limit | second p25 | processes | verdict |
+|---|---:|---:|---:|---:|---:|---|---|
+| acp suspend | - | - | 342 | 444 | - | git 27/29, node 2/2, python3 2/2, fabric-fake-agent 1/1 | counted only |
+| acp move | - | - | 144 | 194 | - | git 2/2, id 2/2, node 4/4 | counted only |
+| acp resume | - | - | 545 | 708 | - | git 9/10, ps 1/1, node 2/2, fabric-fake-agent 1/1 | counted only |
+| acp pull | - | - | 995 | 1293 | - | git 41/41, ps 1/1, id 2/2, node 8/8, python3 2/2, fabric-fake-agent 2/2 | counted only |
+| claude suspend | - | - | 407 | 529 | - | git 27/29, node 2/2, python3 2/2, claude 1/1 | counted only |
+| claude move | - | - | 145 | 195 | - | git 2/2, id 2/2, node 4/4, claude 3/3 | counted only |
+| claude resume | - | - | 684 | 889 | - | git 9/10, ps 1/1, node 2/2, claude 3/3 | counted only |
+| claude pull | - | - | 1221 | 1587 | - | git 41/41, ps 1/1, id 2/2, node 8/8, python3 2/2, claude 7/7 | counted only |
+| codex suspend | - | - | 550 | 715 | - | git 27/29, lsof 1/1, node 2/2, python3 2/2, codex 2/2 | counted only |
+| codex move | - | - | 144 | 194 | - | git 2/2, id 2/2, node 4/4, codex 3/3 | counted only |
+| codex resume | - | - | 836 | 1086 | - | git 9/10, lsof 1/1, ps 1/1, node 2/2, codex 3/3 | counted only |
+| codex pull | - | - | 1486 | 1931 | - | git 41/41, lsof 2/2, ps 1/1, id 2/2, node 8/8, python3 2/2, codex 8/8 | counted only |
+| cold start | - | - | 57 | 107 | - | none | counted only |
+| restart | - | - | 78 | 128 | - | none | counted only |
+
+test budget::hot_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 27.03s
+

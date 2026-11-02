@@ -1,0 +1,15 @@
+date: 2026-10-27T22:20:13Z
+fabric: 44d677aa9f742de5bf3d6288a5cf41d71ec08e68 plus the uncommitted interop test
+node: v22.23.2
+docker: 29.4.0 context orbstack
+worker before:
+capsule HEAD 884e568c8f2ed6d9dd28a43d18c37f7f100c717e, dirty paths 0
+723ac404ede7a24320912ca7c8c432271cf02ac3c3646d63420a23d300679f61  packages/bridge-worker/dist/bin.js
+0799c9d03387d2d6cd6e0d5f97f009236df44b781fa8339fe3f57e779ee96b67  packages/bridge-worker/dist/chunk-SGIOW5WE.js
+1fddcdd47052243c143a2f07cd1e9eea19faf5445cd8dcbf79f6f8f426a3261d  packages/bridge-worker/dist/index.js
+exit 0
+worker after:
+capsule HEAD 884e568c8f2ed6d9dd28a43d18c37f7f100c717e, dirty paths 0
+723ac404ede7a24320912ca7c8c432271cf02ac3c3646d63420a23d300679f61  packages/bridge-worker/dist/bin.js
+0799c9d03387d2d6cd6e0d5f97f009236df44b781fa8339fe3f57e779ee96b67  packages/bridge-worker/dist/chunk-SGIOW5WE.js
+1fddcdd47052243c143a2f07cd1e9eea19faf5445cd8dcbf79f6f8f426a3261d  packages/bridge-worker/dist/index.js

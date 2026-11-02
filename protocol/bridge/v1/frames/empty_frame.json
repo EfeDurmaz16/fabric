@@ -1,0 +1,11 @@
+{
+  "case": "empty_frame",
+  "direction": "fabric_to_worker",
+  "phase": "handshake",
+  "hex": "00000000",
+  "expect": {
+    "outcome": "reject",
+    "code": "empty",
+    "read_body": false
+  }
+}

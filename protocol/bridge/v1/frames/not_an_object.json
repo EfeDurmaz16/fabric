@@ -1,0 +1,11 @@
+{
+  "case": "not_an_object",
+  "direction": "fabric_to_worker",
+  "phase": "handshake",
+  "hex": "030000005b315d",
+  "expect": {
+    "outcome": "reject",
+    "code": "malformed",
+    "read_body": true
+  }
+}

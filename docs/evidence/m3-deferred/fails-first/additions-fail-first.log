@@ -1,0 +1,55 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.95s
+     Running tests/golden.rs (target/debug/deps/golden-141c34731347adb1)
+
+running 5 tests
+test a_negative_zero_or_a_float_is_not_an_integer ... ok
+test every_profile_parses_and_writes_back_the_same_document ... ok
+test every_frame_is_read_or_refused_as_it_says ... ok
+test every_scenario_message_decodes_and_writes_back_unchanged ... FAILED
+test every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged ... FAILED
+
+failures:
+
+---- every_scenario_message_decodes_and_writes_back_unchanged stdout ----
+
+thread 'every_scenario_message_decodes_and_writes_back_unchanged' (278957625) panicked at crates/fabric-bridge/tests/golden.rs:244:27:
+exec_observe_after_worker_loss.json: ("invalid", "unknown_field") for {"action":"sandbox.exec","operation_id":"01K8W3A0000000000000000P23","request_id":"r-2","resource":{"kind":"sandbox","native_id":"fx-key-create-1","provider":"fixture","scope":{"account":"acct-a","project":"proj-1"}},"scope":{"attempt":"01K8W3A00000000000000000A1","generation":"1","job":"01K8W3A00000000000000000J1","task":"01K8W3A00000000000000000T1"},"type":"observe","wait_ms":3000}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged stdout ----
+
+thread 'every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged' (278957622) panicked at crates/fabric-bridge/tests/golden.rs:114:57:
+observe_exec_valid.json: refused ("invalid", "unknown_field")
+
+
+failures:
+    every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged
+    every_scenario_message_decodes_and_writes_back_unchanged
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p fabric-bridge --test golden`
+     Running tests/scenarios.rs (target/debug/deps/scenarios-50f8df72bf472dca)
+
+running 2 tests
+test the_scenarios_negotiate_the_fixture_profile ... ok
+test fabric_runs_every_scenario_against_a_scripted_worker ... FAILED
+
+failures:
+
+---- fabric_runs_every_scenario_against_a_scripted_worker stdout ----
+
+thread 'fabric_runs_every_scenario_against_a_scripted_worker' (278957985) panicked at crates/fabric-bridge/tests/scenarios.rs:148:45:
+called `Result::unwrap()` on an `Err` value: Refusal { code: "invalid", reason: "unknown_field", detail: "message.scope" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    fabric_runs_every_scenario_against_a_scripted_worker
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p fabric-bridge --test scenarios`
+error: 2 targets failed:
+    `-p fabric-bridge --test golden`
+    `-p fabric-bridge --test scenarios`

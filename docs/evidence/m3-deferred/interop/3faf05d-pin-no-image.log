@@ -1,0 +1,34 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running tests/capsule_worker.rs (target/debug/deps/capsule_worker-99bd03c600e937a1)
+
+running 8 tests
+skipped: CAPSULE_BRIDGE_DOCKER_IMAGE is not set; name an image the engine already holds
+test the_docker_profile_on_the_local_engine ... ok
+bad_version_handshake: 3 wire steps, 1 checked elsewhere, 0 after advance
+test the_handshake_negotiates_the_fixture_profile_and_refuses_another_version ... ok
+cancel_is_not_termination: 5 wire steps, 4 checked elsewhere, 0 after advance
+create_exec_destroy: 6 wire steps, 6 checked elsewhere, 0 after advance
+test a_repeated_idempotency_key_is_never_sent_again ... ok
+denied_before_effect: 2 wire steps, 2 checked elsewhere, 0 after advance
+test create_exec_observe_destroy_keep_the_scoped_locator ... ok
+duplicate_idempotency_key: 6 wire steps, 3 checked elsewhere, 0 after advance
+test denied_and_unsupported_requests_fail_before_any_effect ... ok
+test observe_reads_only_the_operations_own_resource ... ok
+test a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice ... ok
+exec_observe_after_worker_loss: 8 wire steps, 3 checked elsewhere, 0 after advance
+exec_observed_until_exit: 4 wire steps, 4 checked elsewhere, 5 after advance
+fresh_approval_required: 6 wire steps, 3 checked elsewhere, 0 after advance
+observe_checks_owner: 6 wire steps, 3 checked elsewhere, 0 after advance
+pending_destroy_with_locator: 4 wire steps, 3 checked elsewhere, 5 after advance
+provider_failed: 2 wire steps, 2 checked elsewhere, 0 after advance
+receipt_failure_keeps_outcome: 2 wire steps, 2 checked elsewhere, 0 after advance
+scope_retained: 4 wire steps, 2 checked elsewhere, 0 after advance
+secrets_deny_all_and_intersection: 6 wire steps, 3 checked elsewhere, 0 after advance
+shutdown_reports_unresolved: 7 wire steps, 3 checked elsewhere, 0 after advance
+unknown_after_dispatch_with_locator: 4 wire steps, 4 checked elsewhere, 0 after advance
+unsupported_capability: 6 wire steps, 4 checked elsewhere, 0 after advance
+worker_loss_is_not_cancellation: 6 wire steps, 4 checked elsewhere, 0 after advance
+test every_shared_scenario_over_the_workers_stdio ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.42s
+

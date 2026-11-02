@@ -1,0 +1,800 @@
+   Compiling fabric-bridge v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-bridge)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.63s
+     Running unittests src/lib.rs (target/debug/deps/fabric-8f749fe0e2608da4)
+
+running 13 tests
+test render::tests::doctor_fails_on_a_refused_path_as_the_move_would ... ok
+test tests::the_report_names_what_was_carried_and_what_was_not ... ok
+test terminal::tests::a_hand_over_that_fails_is_an_error ... ok
+test render::tests::ledger_text_prints_with_its_control_characters_escaped ... ok
+test tests::a_launch_under_another_home_than_the_nodes_is_refused ... ok
+setup: mkdir -p ran
+setup: mkdir -p ran
+cache out: missing
+setup: sh -c echo ran >> ran.log; mkdir -p out; echo x > out/f
+test tests::a_missing_declared_variable_stops_a_launch_with_no_setup_step ... ok
+test tests::a_spec_this_node_has_not_run_does_not_run_unapproved ... ok
+test tests::an_approval_is_not_written_through_a_link_at_a_temporary_name ... oksetup: mkdir -p ran
+
+test tests::a_launch_asks_the_node_again_before_any_setup_step ... ok
+setup: mkdir -p other
+test tests::an_approval_holds_for_its_spec_only ... ok
+cache out: installed from other lockfiles than the workspace has now
+setup: sh -c echo ran >> ran.log; mkdir -p out; echo x > out/f
+test tests::a_changed_install_input_asks_again ... ok
+interrupted by signal 1 while telling the node the harness exited; `fabric job status 01M5EBB2BWY97N3YEKD6CDN2EM` shows what it holds
+test tests::a_signal_ends_the_wait_for_the_node_after_the_harness_exited ... ok
+interrupted by signal 1 while the node recorded the session; `fabric job status 01M5EBB2BWY97N3YEKD6CDN2EM` shows what it holds
+test tests::a_signal_while_the_node_records_the_session_ends_the_turn_with_it ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+     Running unittests src/main.rs (target/debug/deps/fabric-8c8382a9cbf8ba9d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e2e/main.rs (target/debug/deps/e2e-7c0e2420d7bfe833)
+
+running 5 tests
+test bench::m2_paths ... ignored, benchmark; scripts/bench-m2.sh runs it
+test budget::hot_paths ... ignored, takes minutes; CI runs it in a step of its own
+test budget::the_budget_file_holds_every_op ... ok
+test budget::the_verdicts_follow_the_rules ... ok
+test world::a_killed_command_whose_child_keeps_its_pipes_fails_in_time ... ok
+
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 54 filtered out; finished in 10.22s
+
+     Running unittests src/lib.rs (target/debug/deps/fabric_bridge-1360a773e6696517)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bench.rs (target/debug/deps/bench-b3a973ed77e9a970)
+
+running 2 tests
+test bridge_latencies ... ignored, a bench; run by scripts/bench-bridge.sh with FABRIC_BRIDGE_BENCH_OUT set
+test capsule_worker_latencies ... ignored, a bench; run by scripts/bench-bridge.sh with FABRIC_BRIDGE_BENCH_OUT and CAPSULE_BRIDGE_WORKER set
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/capsule_worker.rs (target/debug/deps/capsule_worker-622f0fab75be1039)
+
+running 8 tests
+test a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test a_repeated_idempotency_key_is_never_sent_again ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test create_exec_observe_destroy_keep_the_scoped_locator ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test denied_and_unsupported_requests_fail_before_any_effect ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test every_shared_scenario_over_the_workers_stdio ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test observe_reads_only_the_operations_own_resource ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test the_docker_profile_on_the_local_engine ... ignored, needs the Capsule worker and a local Docker engine: set CAPSULE_BRIDGE_WORKER and CAPSULE_BRIDGE_DOCKER_IMAGE, run with --ignored
+test the_handshake_negotiates_the_fixture_profile_and_refuses_another_version ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+
+test result: ok. 0 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/golden.rs (target/debug/deps/golden-77bf01b89f2cb743)
+
+running 5 tests
+test a_negative_zero_or_a_float_is_not_an_integer ... ok
+test every_profile_parses_and_writes_back_the_same_document ... ok
+test every_frame_is_read_or_refused_as_it_says ... ok
+test every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged ... ok
+test every_scenario_message_decodes_and_writes_back_unchanged ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/process.rs (target/debug/deps/process-4609d4bbb65871d3)
+
+running 22 tests
+test a_handshake_answer_over_1_mib_is_refused_from_its_length ... ok
+test a_worker_that_does_not_answer_hello_or_exits_is_not_a_bridge ... ok
+test a_worker_without_a_common_version_refuses_and_says_which_it_speaks ... ok
+test a_handshake_that_raises_a_limit_or_names_another_profile_is_refused ... ok
+test a_stale_generation_is_fenced_before_anything_is_sent ... ok
+test an_answer_under_another_operation_breaks_the_protocol ... ok
+test a_locator_reported_before_a_crash_is_kept_with_unknown ... ok
+test a_terminal_only_action_answered_before_terminal_is_unknown_and_ends_the_worker ... ok
+test a_denied_request_records_rejected_and_no_effect ... ok
+test a_create_is_recorded_dispatched_then_succeeded_with_its_locator ... ok
+test a_worker_crash_mid_request_leaves_the_operation_unknown ... ok
+test a_worker_frame_over_the_cap_is_refused_unread_and_the_worker_terminated ... ok
+test an_observe_of_an_unknown_operation_settles_it_and_a_refused_one_changes_nothing ... ok
+test a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_restart ... ok
+test exec_and_destroy_round_trip_with_their_targets ... ok
+test a_worker_that_stops_reading_is_lost_and_terminated_at_the_deadline ... ok
+test a_timeout_leaves_unknown_and_the_operation_is_never_sent_again ... ok
+test the_in_flight_limit_refuses_before_the_journal_and_shutdown_lists_the_rest ... ok
+test fabric_refuses_before_sending_what_the_profile_or_the_cap_refuses ... ok
+test progress_is_bounded_to_sixteen_frames_in_order ... ok
+test a_late_answer_records_the_locator_it_names_and_not_its_status ... ok
+test observe_reads_only_the_operations_own_action_and_resource ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.95s
+
+     Running tests/scenarios.rs (target/debug/deps/scenarios-2d0a833e79f23746)
+
+running 2 tests
+test the_scenarios_negotiate_the_fixture_profile ... ok
+test fabric_runs_every_scenario_against_a_scripted_worker ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
+
+     Running tests/stream.rs (target/debug/deps/stream-e9a7ed6f22600a38)
+
+running 1 test
+test a_caller_that_gives_up_leaves_no_partial_frame ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/fabric_client-fff4ce18e6caba51)
+
+running 14 tests
+test client::tests::a_directory_above_the_socket_only_this_user_or_root_may_own ... ok
+test sentences::tests::a_preflight_row_prints_in_columns ... ok
+test api::tests::an_absolute_entry_that_is_not_utf8_fails_instead_of_vanishing ... ok
+test sentences::tests::event_lines_print_with_their_control_characters_escaped ... ok
+test client::tests::a_socket_under_a_missing_directory_is_no_daemon ... ok
+test client::tests::a_state_directory_others_can_enter_is_not_trusted ... ok
+test client::tests::a_socket_that_is_a_symlink_is_not_trusted ... ok
+test client::tests::a_directory_above_the_socket_group_or_others_may_write_is_not_trusted_unless_sticky ... ok
+test client::tests::the_path_dialed_goes_through_no_symlink ... ok
+test api::tests::the_client_env_keeps_every_absolute_entry_and_root_as_written ... ok
+test frame::tests::a_connection_closed_between_frames_is_not_an_error_and_one_closed_inside_a_header_is ... ok
+test frame::tests::a_frame_over_the_cap_is_refused_from_its_header ... ok
+test frame::tests::a_lower_cap_is_inclusive_and_refuses_from_the_header ... ok
+test frame::tests::a_writer_bounds_an_integer_no_reader_takes ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/bridge_fixtures.rs (target/debug/deps/bridge_fixtures-86ff0b5a8955bc64)
+
+running 4 tests
+test sha256_matches_the_fips_known_answers ... ok
+test the_manifest_is_the_pinned_one ... ok
+test framed_fixtures_agree_with_the_framing_caps_and_the_message_cases ... ok
+test every_fixture_matches_the_manifest_and_none_is_missing_or_extra ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/client.rs (target/debug/deps/client-d2bd4e556ee7794e)
+
+running 9 tests
+test a_directory_above_the_socket_others_may_write_gets_no_connection ... ok
+test a_node_that_closes_after_the_hello_reads_as_an_older_node ... ok
+test events_reach_the_caller_in_order_and_unknown_kinds_are_skipped ... ok
+test a_reply_for_another_op_is_refused ... ok
+test a_welcome_of_another_api_version_gets_no_request ... ok
+test an_incompatible_node_gets_no_request ... ok
+test a_refusal_arrives_typed_with_the_nodes_sentence ... ok
+test an_op_the_node_does_not_list_is_not_sent ... ok
+test a_root_the_node_does_not_list_is_not_sent ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/contract.rs (target/debug/deps/contract-9df005e42abaab2d)
+
+running 13 tests
+test a_hello_frames_to_the_fixture_bytes_and_back ... ok
+test the_hello_fixture_pins_the_api_version ... ok
+test the_welcome_fixtures_list_every_op_and_every_root ... ok
+test a_message_from_a_newer_node_reads_as_the_compatibility_rule_says ... ok
+test every_refusal_reason_has_a_fixture_with_its_kind ... ok
+test every_invalid_message_is_refused_at_the_boundary ... ok
+test every_event_kind_has_a_fixture ... ok
+test every_op_has_a_request_and_a_reply_fixture_tagged_with_its_name ... ok
+test every_fixture_parses_and_writes_back_to_the_same_json ... ok
+test every_variant_of_every_nested_enum_has_a_fixture ... ok
+test every_closed_enum_has_exactly_the_variants_its_api_version_pins ... ok
+test every_object_skips_a_field_it_does_not_know_outside_what_a_client_launches ... ok
+test every_message_needs_exactly_the_fields_its_api_version_pins ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/null_fields.rs (target/debug/deps/null_fields-8489f4b7373f534d)
+
+running 1 test
+test a_null_git_bundle_reads_as_absent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/relative_socket.rs (target/debug/deps/relative_socket-2db9e79e779707a4)
+
+running 1 test
+test a_bare_socket_name_is_checked_in_the_working_directory ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/fabric_core-76553c5ae53c3a49)
+
+running 105 tests
+test codec::tests::versioned_bytes_carry_the_version_first ... ok
+test env::tests::a_setup_arg_is_printable_and_not_a_credential ... ok
+test env::tests::an_env_var_name_is_a_name_and_never_a_value ... ok
+test credential::tests::credential_shapes_are_recognized ... ok
+test codec::tests::an_overlong_varint_is_refused ... ok
+test env::tests::a_pin_is_short_printable_and_not_a_credential ... ok
+test env::tests::a_bad_tool_name_or_pin_does_not_decode ... ok
+test credential::tests::fixed_prefix_token_shapes_are_recognized_and_their_near_misses_are_not ... ok
+test codec::tests::trailing_bytes_are_refused ... ok
+test credential::tests::ordinary_arguments_are_not_credentials ... ok
+test git::tests::branch_and_remote_names_refuse_options_and_head ... ok
+test git::tests::config_keys_are_exactly_the_allowlist ... ok
+test env::tests::unknown_version_is_refused ... ok
+test git::tests::a_url_value_knows_when_it_carries_a_credential ... ok
+test env::tests::trailing_bytes_are_refused ... ok
+test env::tests::an_overlong_version_prefix_is_refused ... ok
+test env::tests::unordered_lists_must_be_strictly_sorted ... ok
+test env::tests::id_changes_when_the_spec_changes ... ok
+test git::tests::config_values_cannot_look_like_options_or_span_lines ... ok
+test git::tests::config_values_refuse_the_remote_helper_form ... ok
+test git::tests::names_travel_as_text ... ok
+test git::tests::oid_is_40_or_64_lowercase_hex ... ok
+test git::tests::ref_name_follows_check_ref_format ... ok
+test harness::tests::display_names_the_adapter ... ok
+test harness::tests::program_name_is_a_bare_name_for_a_path_lookup ... ok
+test id::tests::epoch_zero_does_not_exist_and_next_stops_at_the_counter_limit ... ok
+test id::tests::hash_id_text_form_is_lowercase_hex_and_nothing_else_parses ... ok
+test id::tests::ids_serialize_as_raw_bytes ... ok
+test id::tests::node_id_rejects_wrong_prefix_and_wrong_length ... ok
+test id::tests::base32_round_trips_any_length ... ok
+test id::tests::node_id_text_form_has_prefix_and_52_characters ... ok
+test lease::tests::departing_is_runnable_by_nobody ... ok
+test id::tests::ulid_id_text_form_is_uppercase_and_nothing_else_parses ... ok
+test id::tests::ulid_id_round_trips ... ok
+test id::tests::node_id_round_trips ... ok
+test lease::tests::token_must_match_job_and_epoch_exactly ... ok
+test ledger::tests::a_record_that_does_not_link_to_head_is_refused ... ok
+test ledger::tests::a_decision_without_an_open_move_is_refused ... ok
+test ledger::tests::a_published_snapshot_must_follow_the_latest_one ... ok
+test ledger::tests::a_relayed_record_skips_only_the_sender_rule ... ok
+test ledger::tests::a_second_created_is_refused ... ok
+test ledger::tests::a_record_with_the_wrong_epoch_is_stale_or_ahead ... ok
+test ledger::tests::abort_returns_the_job_to_the_source_at_the_same_epoch ... ok
+test ledger::tests::commit_persists_nothing_invalid ... ok
+test ledger::tests::a_move_id_is_used_once_per_chain ... ok
+test ledger::tests::created_makes_the_creator_owner_at_epoch_one ... ok
+test ledger::tests::created_with_prev_or_other_epoch_is_refused ... ok
+test ledger::tests::env_spec_changed_updates_the_manifest ... ok
+test ledger::tests::first_record_must_be_created ... ok
+test ledger::tests::commit_shows_nothing_the_store_refused ... ok
+test ledger::tests::job_manifest_with_trailing_bytes_is_refused ... ok
+test ledger::tests::departing_accepts_only_the_targets_decision_for_the_open_move ... ok
+test ledger::tests::import_hands_the_job_to_the_target_at_the_next_epoch ... ok
+test ledger::tests::move_needs_another_node ... ok
+test ledger::tests::only_the_owner_writes_while_owned ... ok
+test ledger::tests::replay_under_another_job_id_is_refused ... ok
+test ledger::tests::scan_refuses_an_unknown_format_version ... ok
+test ledger::tests::replay_rebuilds_the_same_manifest ... ok
+test ledger::tests::stolen_bumps_the_epoch_and_names_the_owner_of_record ... ok
+test ledger::tests::resumed_needs_the_owner_and_a_snapshot_once_one_exists ... ok
+test ledger::tests::suffix_after_returns_what_a_replica_lacks ... ok
+test ledger::tests::move_needs_the_workspace_suspended_in_the_latest_snapshot ... ok
+test ledger::tests::stolen_while_departing_is_written_by_the_thief ... ok
+test managed::ids::tests::managed_ulids_have_one_text_form ... ok
+test managed::ids::tests::counters_refuse_zero_and_noncanonical_text ... ok
+test ledger::tests::suspended_must_name_the_latest_published_snapshot ... ok
+test managed::ids::tests::operation_keys_take_the_alphabet_and_the_length_and_nothing_else ... ok
+test moves::tests::a_departing_source_cannot_steal_its_own_frozen_move ... ok
+test moves::tests::steal_needs_the_witness_for_the_latest_snapshot ... ok
+test moves::tests::steal_warning_names_the_owner_and_the_snapshot_in_words ... ok
+test moves::tests::the_age_of_the_owners_last_record_reads_in_the_largest_whole_unit ... ok
+test moves::tests::answer_offer_names_each_refusal ... ok
+test moves::tests::steal_warning_says_whether_work_can_be_lost_and_when_the_owner_last_wrote ... ok
+test moves::tests::the_target_of_an_open_move_decides_it_and_cannot_steal ... ok
+test path::tests::abs_path_rules ... ok
+test path::tests::deserialize_refuses_a_bad_path ... ok
+test moves::tests::view_after_a_steal_makes_the_old_owner_a_replica ... ok
+test path::tests::folded_comparisons_ignore_ascii_case_and_respect_components ... ok
+test moves::tests::view_names_each_side_of_a_move_and_of_the_move_after_it ... ok
+test secret::tests::a_bad_secret_pattern_does_not_decode ... ok
+test path::tests::join_and_prefix ... ok
+test secret::tests::a_credential_shaped_pattern_is_refused ... ok
+test secret::tests::a_job_widens_the_list_in_every_scope ... ok
+test secret::tests::a_secret_pattern_that_gitignore_would_read_differently_is_refused ... ok
+test secret::tests::a_pattern_that_denies_the_override_file_is_refused ... ok
+test path::tests::rel_path_rules ... ok
+test secret::tests::a_secret_pattern_with_a_control_character_is_refused ... ok
+test secret::tests::a_pattern_has_one_value_whatever_its_ascii_case ... ok
+test secret::tests::env_templates_travel_unless_a_job_names_them ... ok
+test secret::tests::matching_ignores_ascii_case ... ok
+test secret::tests::every_builtin_is_a_valid_pattern ... ok
+test session::tests::a_uuid_is_written_lowercase_and_hyphenated ... ok
+test secret::tests::staging_applies_the_scope_the_caller_gives_each_path ... ok
+test session::tests::session_id_rules ... ok
+test snapshot::tests::an_unmeasured_key_matches_nothing_and_equal_keys_match ... ok
+test snapshot::tests::from_masked_keeps_only_the_permission_bits ... ok
+test secret::tests::near_misses_travel ... ok
+test version::tests::a_number_ranks_below_a_word_as_semver_orders_its_example ... ok
+test version::tests::long_numeric_prerelease_identifiers_order_as_numbers ... ok
+test version::tests::only_three_numbers_and_a_pre_release_parse ... ok
+test version::tests::version_token_finds_the_number ... ok
+test version::tests::versions_order_by_semver_precedence ... ok
+test version::tests::build_metadata_is_checked_and_a_bad_version_is_shown_safely ... ok
+test secret::tests::every_builtin_pattern_denies_its_sample_at_the_top_and_nested ... ok
+test secret::tests::the_matcher_agrees_with_the_definition ... ok
+
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/env_codec.rs (target/debug/deps/env_codec-2f71227609f9c9d2)
+
+running 1 test
+test a_valid_spec_decodes_to_itself ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/managed_rules.rs (target/debug/deps/managed_rules-433403eb8b3dd5be)
+
+running 12 tests
+test a_create_names_no_job_and_other_commands_name_theirs ... ok
+test child_tasks_need_an_open_parent_and_cancel_closes_open_tasks ... ok
+test a_new_job_has_its_primary_task_at_revision_one ... ok
+test dedupe_tells_a_retry_from_a_conflict ... ok
+test a_worker_loss_is_not_a_cancel_and_does_not_grant_again ... ok
+test the_expected_revision_is_checked_and_closed_jobs_take_no_command ... ok
+test an_observation_at_an_older_generation_changes_nothing_but_is_recorded ... ok
+test no_second_grant_while_an_attempt_may_run_even_after_a_timeout ... ok
+test a_broken_history_does_not_replay ... ok
+test a_repeated_report_changes_nothing_and_an_ended_attempt_stays_ended ... ok
+test frames_and_answers_have_one_byte_form ... ok
+test replay_equals_projection ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/manifest_codec.rs (target/debug/deps/manifest_codec-705e4b675aa3285a)
+
+running 22 tests
+test a_mode_for_a_path_outside_the_working_tree_is_refused ... ok
+test a_remake_with_no_setup_step_is_refused ... ok
+test a_symbolic_ref_must_point_at_a_ref_and_not_be_one ... ok
+test an_entry_below_a_file_or_symlink_is_refused ... ok
+test a_repeated_or_unsorted_path_is_refused ... ok
+test format_version_two_hash_is_pinned ... ok
+test a_bad_path_on_the_wire_does_not_decode ... ok
+test a_manifest_without_root_meta_holds_no_version_three_field ... ok
+test a_repeated_config_key_keeps_its_values_and_an_unsorted_one_is_refused ... ok
+test a_files_entry_nested_with_a_working_tree_path_is_refused ... ok
+test a_mode_above_0o777_on_the_wire_does_not_decode ... ok
+test a_version_two_manifest_decodes_and_keeps_its_bytes ... ok
+test a_remote_url_with_userinfo_on_the_wire_does_not_decode ... ok
+test a_path_in_files_and_the_working_tree_is_refused ... ok
+test a_denied_config_key_on_the_wire_does_not_decode ... ok
+test format_version_three_hash_is_pinned ... ok
+test unknown_version_and_oversize_are_refused ... ok
+test trailing_bytes_do_not_decode ... ok
+test mixed_object_id_widths_are_refused ... ok
+test version_three_bytes_without_root_meta_do_not_decode ... ok
+test an_overlong_varint_in_a_manifest_does_not_decode ... ok
+test encode_decode_round_trips_and_the_hash_is_stable ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/move_protocol.rs (target/debug/deps/move_protocol-18f7a82628be9772)
+
+running 5 tests
+test an_owner_that_receives_stolen_through_verify_is_fenced ... ok
+test lost_decision_converges_on_the_one_import ... ok
+test abort_after_import_returns_the_import ... ok
+test steal_bumps_the_epoch_exactly_once_and_stale_is_refused ... ok
+test never_two_runnable_copies_without_a_steal ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/record_codec.rs (target/debug/deps/record_codec-bbac03664433ebbf)
+
+running 12 tests
+test bytes_after_the_event_inside_a_frame_are_corruption ... ok
+test job_manifest_version_one_bytes_are_pinned ... ok
+test an_all_zero_tail_is_a_torn_tail ... ok
+test a_last_record_whose_checksum_never_landed_is_a_torn_tail ... ok
+test a_last_record_with_a_zeroed_body_is_a_torn_tail ... ok
+test a_last_record_with_a_flipped_body_bit_is_corrupt ... ok
+test a_declared_length_over_the_bound_is_refused ... ok
+test record_format_version_one_bytes_are_pinned ... ok
+test an_overlong_varint_inside_a_frame_is_corruption ... ok
+test frame_round_trips ... ok
+test any_flipped_byte_before_the_tail_is_corruption ... ok
+test any_cut_of_the_last_record_is_a_torn_tail ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/secret_staging.rs (target/debug/deps/secret_staging-04589710c84a1ae7)
+
+running 2 tests
+test a_changed_tracked_secret_refuses_the_capture_and_names_it ... ok
+test w_holds_every_tracked_change_and_no_untracked_secret ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running unittests src/lib.rs (target/debug/deps/fabric_env-359739e3cae48e2c)
+
+running 18 tests
+test detect::tests::no_file_detection_reads_is_a_builtin_secret ... ok
+test overrides::tests::a_repeated_env_name_is_refused ... ok
+test overrides::tests::a_credential_in_setup_arguments_is_refused ... ok
+test overrides::tests::a_syntax_error_reports_its_line ... ok
+test overrides::tests::a_tools_entry_is_named_by_its_place_in_the_file ... ok
+test overrides::tests::a_pattern_that_denies_the_override_file_is_refused ... ok
+test overrides::tests::a_tool_pinned_twice_under_an_alias_is_refused ... ok
+test overrides::tests::a_cache_path_declared_twice_is_refused ... ok
+test overrides::tests::an_empty_setup_list_is_a_declaration ... ok
+test overrides::tests::a_repeated_secret_pattern_is_refused ... ok
+test overrides::tests::a_setup_program_must_be_a_bare_name ... ok
+test overrides::tests::a_full_file_parses ... ok
+test overrides::tests::unknown_keys_are_refused_at_every_level ... ok
+test overrides::tests::a_cache_under_fabric_or_nested_in_another_cache_is_refused ... ok
+test overrides::tests::a_value_written_where_a_name_belongs_is_refused_without_echoing_it ... ok
+test detect::tests::a_dropped_pin_is_named_by_its_place_in_the_file ... ok
+test materialize::tests::a_program_inside_the_workspace_is_never_found ... ok
+test materialize::tests::a_lock_released_while_a_child_shares_its_file_is_taken_once_the_child_lets_go ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/crash.rs (target/debug/deps/crash-e70b1566c8025ae0)
+
+running 4 tests
+test a_resume_killed_before_the_sentinel_write_leaves_the_cache_to_fill ... ok
+test a_resume_killed_during_a_step_removes_the_old_proof ... ok
+test a_step_that_replaces_its_input_still_holds_the_tree_after_resume_dies ... ok
+test a_step_orphaned_by_a_killed_resume_blocks_the_next_one_until_it_exits ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.19s
+
+     Running tests/detect.rs (target/debug/deps/detect-d3452e288497e33b)
+
+running 33 tests
+test a_broken_override_file_stops_detection ... ok
+test a_devcontainer_is_recorded_and_not_interpreted ... ok
+test a_declared_cache_keeps_the_full_secret_list ... ok
+test a_file_the_job_denies_is_not_read ... ok
+test a_pnpm_workspace_gives_a_frozen_install_and_node_modules ... ok
+test a_named_manager_without_its_lockfile_is_refused ... ok
+test a_declared_ecosystem_cannot_override_a_detected_one ... ok
+test a_linked_pin_file_is_refused_without_reading_it ... ok
+test a_declared_cache_inside_a_detected_one_is_refused ... ok
+test detecting_with_the_previous_spec_gives_the_same_spec ... ok
+test a_denied_requirements_include_is_not_read ... ok
+test a_lockfile_the_job_denies_counts_as_absent ... ok
+test a_package_manager_without_a_package_json_is_refused ... ok
+test the_override_file_wins_over_detection ... ok
+test a_linked_override_directory_is_refused ... ok
+test cargo_fetch_is_locked_exactly_when_a_lockfile_exists ... ok
+test a_declared_pin_under_an_alias_replaces_the_detected_one ... ok
+test package_json_without_a_lockfile_has_no_install_and_no_cache ... ok
+test a_declared_class_keeps_the_detected_ecosystem ... ok
+test removing_a_pattern_from_the_override_file_does_not_shrink_the_policy ... ok
+test two_lockfiles_with_nothing_to_decide_are_refused ... ok
+test a_file_detection_checks_for_may_link_to_a_file_inside_the_workspace ... ok
+test a_linked_or_non_regular_file_detection_checks_for_is_refused ... ok
+test a_malformed_package_manager_field_is_refused ... ok
+test pins_follow_precedence_and_aliases ... ok
+test python_installs_into_the_workspace_venv ... ok
+test the_package_manager_field_decides_the_yarn_line ... ok
+test a_detected_pin_that_breaks_the_rules_is_dropped ... ok
+test requirements_includes_that_cycle_or_leave_the_workspace_still_detect ... ok
+test every_included_requirements_file_is_an_input_of_the_venv ... ok
+test a_declared_cache_takes_the_carry_key_of_the_ecosystem_that_makes_it ... ok
+test each_lockfile_names_its_manager_and_install ... ok
+test yarn_berry_needs_the_node_modules_linker ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/freshness.rs (target/debug/deps/freshness-d14c0afc94b2e996)
+
+running 2 tests
+test an_edited_included_requirements_file_makes_the_venv_stale ... ok
+test a_changed_setup_recipe_fills_its_cache_again ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/inherited_env.rs (target/debug/deps/inherited_env-01d72ce70beff74e)
+
+running 1 test
+test a_detected_uv_step_never_follows_an_inherited_uv_location ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/materialize.rs (target/debug/deps/materialize-bd9af83ff5fa87ce)
+
+running 27 tests
+test a_lock_directory_inside_the_workspace_is_refused ... ok
+test a_lock_file_that_is_a_link_is_refused ... ok
+test a_plan_with_no_steps_still_needs_the_declared_variables ... ok
+test a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing ... ok
+test a_missing_target_does_not_reinstall_a_whole_node_modules ... ok
+test a_finished_install_runs_nothing ... ok
+test a_lock_for_another_tree_does_not_plan_or_run_this_one ... ok
+test a_step_that_fills_a_cache_outside_the_workspace_runs_beside_a_warm_one ... ok
+test a_missing_target_does_not_run_a_declared_install ... ok
+test an_always_step_runs_on_a_warm_workspace ... ok
+test a_directory_at_the_sentinel_name_is_replaced ... ok
+test a_sentinel_without_the_steps_digest_is_stale ... ok
+test a_step_directory_may_not_leave_the_workspace ... ok
+test a_report_without_caches_runs_its_steps_on_every_resume ... ok
+test a_step_never_fills_a_cache_through_a_link ... ok
+test missing_programs_and_variables_refuse_before_anything_runs_and_are_all_named ... ok
+test a_sentinel_the_steps_left_is_written_again_and_a_link_there_is_replaced ... ok
+test steps_run_in_order_and_stop_at_the_first_failure ... ok
+test only_a_change_to_the_steps_that_fill_a_cache_makes_it_stale ... ok
+test the_sentinel_marks_a_cache_whole_once_its_steps_succeed ... ok
+test every_resume_names_the_steps_a_warm_workspace_still_plans ... ok
+test declared_steps_over_a_declared_node_cache_run_once ... ok
+test a_declared_node_cache_is_proven_by_content_or_its_sentinel ... ok
+test a_lockfile_changed_since_the_install_installs_again ... ok
+test health_follows_the_cache_kind ... ok
+test an_installer_marker_left_by_a_failed_install_is_not_proof ... ok
+test a_step_that_leaves_a_process_behind_does_not_hold_the_resume ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+     Running tests/step_output.rs (target/debug/deps/step_output-dc7757e7a8b5be27)
+
+running 1 test
+test step_output_reaches_the_callers_log_line_by_line ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (target/debug/deps/fabric_harness-bb7d715d4de0ec11)
+
+running 154 tests
+test acp::client::tests::stop_reason_keeps_unknown_values ... ok
+test claude::slug::tests::a_character_outside_the_bmp_becomes_two_dashes ... ok
+test claude::slug::tests::matches_the_observed_store ... ok
+test acp::client::tests::policies_never_grant_more_than_they_say ... ok
+test acp::client::tests::an_update_with_a_bad_session_id_is_dropped ... ok
+test claude::slug::tests::refuses_a_key_claude_would_hash ... ok
+test claude::flags::tests::every_flag_renders_as_flag_and_value ... ok
+test acp::client::tests::a_full_update_queue_drops_the_newest_and_counts_it ... ok
+test acp::tests::departure_records_are_keyed_by_program_and_arguments ... ok
+test acp::client::tests::a_cancelled_session_gets_no_permission_until_its_next_prompt ... ok
+test claude::tests::a_headless_result_gives_the_answer_and_the_session ... ok
+test claude::history::tests::host_state_is_denied_however_the_record_spells_its_path ... ok
+test acp::client::tests::an_agent_that_stops_reading_is_disconnected_not_buffered ... ok
+test claude::history::tests::only_backups_of_allowed_named_files_are_admitted ... ok
+test claude::history::tests::a_backup_named_for_a_denied_path_once_is_never_admitted ... ok
+test claude::recorded::tests::a_reply_from_another_model_ends_the_fallback ... ok
+test claude::plans::tests::the_first_slug_of_each_transcript_names_its_plans ... ok
+test claude::recorded::tests::a_writer_is_never_skipped_with_its_line ... ok
+test claude::recorded::tests::the_last_real_model_and_the_newest_writer_are_read ... ok
+test claude::tests::a_missing_config_is_left_to_claude_and_not_created ... ok
+test claude::recorded::tests::a_fallback_line_after_the_reply_it_served_still_stands_for_the_original ... ok
+test claude::tests::a_launch_env_that_moves_the_config_is_refused_before_trust_is_read ... ok
+test claude::tests::a_symlinked_config_is_never_written_through ... ok
+test claude::tests::a_malformed_config_is_an_error_and_stays_as_it_was ... ok
+test claude::tests::a_trusted_ancestor_alone_is_inherited_and_left_to_a_running_claude ... ok
+test claude::tests::a_transcript_whose_writer_cannot_be_read_is_refused ... ok
+test claude::tests::a_trusted_workspace_root_writes_nothing ... ok
+test claude::tests::a_linked_worktree_is_keyed_by_its_main_checkout ... ok
+test claude::tests::args_follow_the_cli_surface ... ok
+test claude::tests::a_workspace_stored_in_nfd_is_refused_before_trust_is_read ... ok
+test claude::tests::restore_accepts_only_the_places_capture_reads ... ok
+test claude::tests::a_trusted_ancestor_alone_gets_the_exact_key_while_no_claude_runs ... ok
+test claude::tests::a_trusted_directory_above_a_symlink_to_the_workspace_does_not_count ... ok
+test claude::tests::a_legacy_config_file_is_the_one_read_and_written ... ok
+test claude::tests::an_untrusted_workspace_is_left_to_a_running_claude ... ok
+test claude::tests::a_trusted_directory_above_the_git_root_does_not_count ... ok
+test claude::tests::a_workspace_reached_through_a_symlink_is_keyed_by_its_physical_path ... ok
+test codex::overrides::tests::a_pin_wins_field_by_field_and_the_rest_comes_from_the_session ... ok
+test codex::overrides::tests::a_headless_launch_leaves_the_approval_policy_to_codex_exec ... ok
+test codex::overrides::tests::a_terminal_launch_carries_the_reviewer_only_with_the_policy ... ok
+test codex::overrides::tests::a_terminal_launch_does_not_carry_a_recorded_never ... ok
+test claude::tests::a_workspace_given_in_other_letter_case_is_keyed_by_its_spelling_on_disk ... ok
+test codex::overrides::tests::the_model_provider_travels_only_with_the_session_s_model ... ok
+test claude::tests::a_symlinked_key_or_transcript_refuses_the_resume_as_capture_does ... ok
+test codex::rollout::tests::parses_the_observed_names ... ok
+test claude::tests::a_workspace_below_its_git_root_is_keyed_by_the_root ... ok
+test claude::trust::tests::sets_only_the_trust_key_keeps_the_mode_and_is_idempotent ... ok
+test acp::client::tests::a_failed_write_fails_a_waiting_prompt ... ok
+test codex::rollout::tests::the_last_turn_and_the_newest_writer_across_the_lineage_are_read ... ok
+test codex::rollout::tests::plain_wins_over_its_compressed_sibling_and_newest_sorts_first ... ok
+test codex::tests::a_capture_that_cannot_read_the_installed_codex_records_the_known_writer ... ok
+test claude::tests::an_untrusted_workspace_is_written_while_no_claude_runs ... ok
+test codex::rollout::tests::the_newer_of_the_last_turn_and_a_settings_change_is_read ... ok
+test codex::rollout::tests::only_a_link_that_reaches_the_thread_counts ... ok
+test codex::rollout::tests::the_provider_is_the_newest_meta_s_or_a_later_change_s ... ok
+test codex::rollout::tests::values_outside_the_closed_sets_are_not_carried_and_a_bad_writer_is_refused ... ok
+test codex::rollout::tests::a_permission_profile_set_between_turns_gives_the_sandbox_it_names ... ok
+test codex::rollout::tests::a_writer_recorded_as_anything_but_text_is_refused ... ok
+test claude::tests::a_resume_passes_the_model_the_session_ran_with ... ok
+test claude::tests::a_cut_key_carries_the_model_every_key_ends_on ... ok
+test codex::rollout::tests::a_profile_that_does_not_write_the_workspace_is_not_widened_to_it ... ok
+test claude::trust::tests::concurrent_preseeds_keep_every_key ... ok
+test codex::tests::a_thread_whose_writer_cannot_be_read_is_refused ... ok
+test codex::tests::args_follow_the_cli_surface_and_quote_the_root ... ok
+test codex::tests::headless_events_give_the_thread_and_the_last_answer ... ok
+test claude::tests::a_cut_key_with_transcripts_under_several_keys_carries_no_model ... ok
+test claude::tests::an_older_claude_is_refused_before_it_starts ... ok
+test denylist::tests::credentials_and_host_state_are_denied ... ok
+test denylist::tests::session_state_is_allowed ... ok
+test claude::tests::a_workspace_whose_key_claude_cuts_still_resumes_guarded ... ok
+test claude::tests::the_version_is_asked_in_the_workspace_claude_starts_in ... ok
+test departure::tests::a_capture_replaced_by_a_later_one_cannot_be_confirmed ... ok
+test departure::tests::a_pending_record_counts_only_once_confirmed ... ok
+test durable::tests::a_temporary_name_taken_by_a_symlink_is_never_written_through ... ok
+test harness::tests::a_value_left_out_is_shown_without_control_characters_and_cut ... ok
+test harness::tests::model_names_are_plain_tokens ... ok
+test departure::tests::the_record_holds_the_bytes_staging_read_not_a_later_edit ... ok
+test claude::tests::the_workspace_transcript_gives_the_model_over_another_key ... ok
+test jsontext::props::json_without_a_secret_is_never_changed ... ok
+test jsontext::props::escaped_key_spellings_are_redacted_as_the_canonical_ones ... ok
+test jsontext::tests::a_signed_block_nested_in_a_dropped_one_goes_with_it ... ok
+test jsontext::tests::a_signed_block_whose_secret_hides_behind_an_escape_is_dropped ... ok
+test jsontext::tests::a_signed_block_with_escaped_key_names_is_dropped_whole ... ok
+test jsontext::tests::an_object_with_a_signature_key_that_is_not_a_thinking_block_is_redacted ... ok
+test jsontext::tests::escaped_strings_are_decoded_before_matching ... ok
+test jsontext::tests::keys_are_redacted_like_values ... ok
+test jsontext::tests::neighbouring_signed_elements_with_secrets_are_all_dropped ... ok
+test jsontext::tests::redacts_strings_outside_signed_blocks_and_keeps_signed_bytes ... ok
+test jsontext::tests::secret_in_a_signed_object_value_is_refused ... ok
+test jsontext::tests::truncated_and_trailing_text_are_not_json ... ok
+test jsontext::tests::signed_element_with_a_secret_is_dropped_whole ... ok
+test jsontext::tests::unchanged_text_is_reported_as_unchanged ... ok
+test manifest::tests::files_must_be_sorted_and_under_home ... ok
+test jsontext::props::redaction_drops_only_the_signed_blocks_that_hold_a_secret ... ok
+test markers::tests::a_terminal_host_keeps_the_users_provider_settings ... ok
+test manifest::tests::round_trips_through_the_file_and_digests_are_hex ... ok
+test markers::tests::claudecode_alone_marks_a_host_session ... ok
+test markers::tests::outside_a_host_session_only_identity_markers_are_left_out ... ok
+test markers::tests::the_desktop_host_loses_every_marker_and_keeps_user_configuration ... ok
+test manifest::tests::a_manifest_file_that_breaks_the_rules_is_refused_on_read ... ok
+test pipeline::tests::a_dropped_file_edited_before_its_removal_is_kept ... ok
+test pipeline::tests::walk_skips_temp_files_and_refuses_symlinks ... ok
+test place::tests::a_divergence_in_the_last_file_writes_nothing_before_it ... ok
+test place::tests::a_departed_copy_keeps_its_own_bytes_and_gains_only_the_new_suffix ... ok
+test place::tests::a_destination_written_after_it_was_planned_is_not_replaced ... ok
+test claude::tests::transcripts_under_other_project_keys_are_read ... ok
+test place::tests::destinations_that_differ_only_in_case_are_refused_before_any_write ... ok
+test codex::tests::a_codex_whose_version_cannot_be_read_is_refused ... ok
+test place::tests::place_accepts_equal_and_prefix_and_refuses_divergence ... ok
+test process::tests::ere_literal_escapes_every_metacharacter ... ok
+test place::tests::written_files_keep_the_mode_they_replace_and_default_to_0600 ... ok
+test process::tests::find_on_path_needs_an_executable_file ... ok
+test process::tests::pid_alive_sees_this_process_and_not_a_dead_one ... ok
+test process::tests::find_on_path_skips_relative_and_empty_entries ... ok
+test codex::tests::a_codex_whose_version_run_fails_is_refused ... ok
+test process::tests::running_pids_finds_a_script_whose_path_holds_regex_characters ... ok
+test redact::tests::a_literal_assignment_starting_with_a_dollar_or_a_bracket_is_redacted ... ok
+test redact::tests::a_short_number_under_a_name_that_ends_in_a_secret_word_is_a_secret ... ok
+test redact::tests::a_short_number_under_a_secret_word_is_not_a_secret ... ok
+test redact::tests::a_short_value_of_a_secret_named_variable_is_redacted ... ok
+test redact::tests::bytes_that_are_not_utf8_are_redacted_and_kept_around_the_match ... ok
+test redact::tests::every_standard_pattern_compiles ... ok
+test redact::tests::credentials_in_urls_and_secret_named_assignments_keep_their_names ... ok
+test redact::tests::ordinary_words_and_paths_are_not_secrets ... ok
+test redact::tests::real_key_shapes_still_match ... ok
+test redact::tests::redacts_and_counts ... ok
+test departure::tests::writing_and_confirming_a_pending_record_take_turns ... ok
+test stage::tests::a_line_cut_inside_a_two_byte_character_does_not_stop_capture ... ok
+test stage::tests::a_private_key_over_several_lines_is_redacted_as_text ... ok
+test stage::tests::a_json_document_is_redacted_whole_and_falls_back_to_text ... ok
+test codex::tests::a_known_writer_older_than_the_rollout_does_not_lower_the_floor ... ok
+test stage::tests::a_private_key_over_several_lines_refuses_an_opaque_capture ... ok
+test stage::tests::stage_redacts_json_lines_and_keeps_a_cut_last_line ... ok
+test stage::tests::opaque_with_a_secret_is_refused_and_text_is_redacted ... ok
+test stage::tests::stage_counts_a_dropped_signed_block ... ok
+test stage::tests::stage_refuses_two_sources_on_one_tree_path ... ok
+test version::tests::a_floor_is_compared_by_the_same_order_as_the_guard ... ok
+test stage::tests::stage_refuses_a_denied_path_before_copying ... ok
+test stage::tests::a_reused_directory_keeps_only_the_files_of_the_new_capture ... ok
+test stage::tests::verify_catches_a_truncated_or_edited_staged_file ... ok
+test codex::tests::a_resume_passes_the_settings_the_session_ran_with ... ok
+test codex::tests::a_resume_passes_the_provider_the_session_s_model_ran_on ... ok
+test codex::tests::a_resume_reports_the_version_it_started ... ok
+test codex::tests::a_terminal_resume_carries_the_reviewer_only_with_the_policy ... ok
+test codex::tests::a_terminal_resume_passes_every_effort_codex_names_with_the_model ... ok
+test codex::tests::a_rollout_behind_a_symlink_refuses_the_resume_and_the_capture ... ok
+test codex::tests::an_older_codex_is_refused_a_thread_a_newer_one_continued ... ok
+test codex::tests::an_older_codex_is_refused_before_it_starts_and_the_rollout_is_untouched ... ok
+test codex::tests::the_version_is_asked_in_the_workspace_codex_starts_in ... ok
+test codex::tests::the_version_is_asked_with_the_environment_codex_starts_with ... ok
+test process::tests::a_version_probe_does_not_pass_parent_session_markers ... ok
+test process::tests::a_version_probe_that_exits_with_a_failure_is_an_error ... ok
+test process::tests::running_pids_sees_a_claude_this_process_runs_under ... ok
+test process::tests::a_version_probe_finds_an_interpreter_on_the_configured_path ... ok
+
+test result: ok. 154 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.71s
+
+     Running tests/acp_roundtrip.rs (target/debug/deps/acp_roundtrip-08188c5afc1b5523)
+
+running 17 tests
+test fake_acp_agent ... ok
+test a_state_dir_that_overlaps_fabric_state_is_refused ... ok
+test capture_without_a_declared_state_dir_is_refused ... ok
+test a_launch_whose_handshake_fails_leaves_no_agent_running ... ok
+test allow_once_policy_picks_the_allow_option ... ok
+test a_symlinked_state_directory_is_refused ... ok
+test a_secret_in_the_launch_arguments_refuses_the_capture ... ok
+test the_trait_launch_is_headless_and_owns_the_turn ... ok
+test the_trait_launch_holds_the_agent_until_it_is_released ... ok
+test a_secret_in_the_state_directory_refuses_the_capture ... ok
+test a_value_in_escaped_quotes_in_state_is_refused ... ok
+test an_env_line_after_an_escaped_newline_in_state_is_refused ... ok
+test a_launched_agent_does_not_inherit_parent_session_markers ... ok
+test client_runs_a_turn_and_denies_permission_by_default ... ok
+test only_files_named_for_the_session_are_captured ... ok
+test captured_session_continues_on_another_node_through_session_load ... ok
+test resume_capability_is_preferred_and_its_absence_is_an_error ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s
+
+     Running tests/claude_roundtrip.rs (target/debug/deps/claude_roundtrip-53c29cc7fd546c12)
+
+running 22 tests
+test a_launch_env_that_moves_the_config_or_login_is_refused_whatever_the_value ... ok
+test launch_resumes_in_the_workspace_with_only_the_given_env ... ok
+test a_launch_from_inside_a_claude_session_leaves_the_parent_markers_out ... ok
+test a_settings_overlay_with_a_literal_token_refuses_the_launch ... ok
+test a_symlinked_claude_directory_refuses_the_capture ... ok
+test a_symlink_in_session_state_refuses_the_capture ... ok
+test a_symlink_on_the_way_to_a_destination_refuses_the_restore ... ok
+test a_truncated_staged_file_is_refused_before_anything_is_placed ... ok
+test a_registry_record_that_does_not_parse_lets_any_running_claude_block ... ok
+test a_missing_registry_lets_any_running_claude_block ... ok
+test missing_session_and_latest_session_are_reported ... ok
+test a_live_session_blocks_capture_and_restore ... ok
+test a_rewritten_file_edited_here_after_the_job_left_is_not_replaced ... ok
+test a_manifest_that_relabels_a_transcript_as_rewritable_is_refused ... ok
+test capture_carries_session_state_only_and_redacts ... ok
+test restore_under_another_root_or_home_is_refused_before_any_write ... ok
+test a_file_the_job_dropped_and_this_node_left_untouched_is_removed ... ok
+test a_manifest_naming_a_file_outside_session_state_is_refused ... ok
+test restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_there ... ok
+test a_file_made_here_after_the_job_left_is_divergence ... ok
+test the_plans_a_transcript_names_travel_with_the_session ... ok
+test a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_turns ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.85s
+
+     Running tests/codex_roundtrip.rs (target/debug/deps/codex_roundtrip-bca1eada8ba67bea)
+
+running 22 tests
+test a_launch_env_whose_codex_home_is_not_the_store_is_refused ... ok
+test a_launch_from_inside_a_codex_tool_call_leaves_the_parent_markers_out ... ok
+test a_workspace_whose_name_holds_sk_inside_a_word_is_captured ... ok
+test the_codex_home_must_be_under_the_home ... ok
+test a_rollout_with_a_secret_is_refused_not_carried ... ok
+test a_missing_prefix_breaks_the_lineage ... ok
+test a_value_in_escaped_quotes_is_refused ... ok
+test a_running_codex_too_old_for_the_writer_lock_blocks_capture_and_restore ... ok
+test a_live_writer_that_takes_no_lock_blocks_capture_and_restore ... ok
+test a_capture_asks_the_installed_codex_in_the_workspace ... ok
+test an_env_line_after_an_escaped_newline_is_refused ... ok
+test a_capture_records_the_newest_known_writer ... ok
+test a_workspace_pin_this_node_lacks_does_not_block_capture_on_a_running_codex ... ok
+test a_forked_rollout_of_another_thread_blocks_nothing ... ok
+test an_active_writer_blocks_capture_and_restore ... ok
+test a_headless_launch_runs_nothing_until_it_is_released ... ok
+test a_symlinked_codex_store_refuses_capture_and_restore ... ok
+test a_thread_that_comes_back_lands_over_its_original_file ... ok
+test capture_follows_the_lineage_and_carries_nothing_else ... ok
+test a_rollout_made_here_after_the_job_left_is_divergence ... ok
+test two_files_for_one_rollout_resolve_by_prefix_or_are_refused ... ok
+test restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_there ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.49s
+
+     Running tests/crash.rs (target/debug/deps/crash-43d3ed31e053392e)
+
+running 5 tests
+test crash_child ... ok
+test a_codex_restore_killed_mid_way_frees_the_writer_lock_and_converges ... ok
+test a_capture_killed_before_its_publish_leaves_memory_edited_since_alone ... ok
+test a_restore_killed_after_any_placed_file_leaves_whole_files_and_converges ... FAILED
+test a_capture_killed_after_any_staged_file_leaves_no_manifest ... ok
+
+failures:
+
+---- a_restore_killed_after_any_placed_file_leaves_whole_files_and_converges stdout ----
+
+thread 'a_restore_killed_after_any_placed_file_leaves_whole_files_and_converges' (264960972) panicked at crates/fabric-harness/tests/crash.rs:290:9:
+assertion failed: run_child("restore", &home, &work, out.path(), &point)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_restore_killed_after_any_placed_file_leaves_whole_files_and_converges
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.05s
+
+error: test failed, to rerun pass `-p fabric-harness --test crash`

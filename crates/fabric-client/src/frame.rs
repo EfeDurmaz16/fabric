@@ -39,6 +39,15 @@ pub enum FrameError {
     /// A frame declares, or would need, more bytes than [`MAX_FRAME`].
     #[error("control message of {0} bytes exceeds the cap of {MAX_FRAME}")]
     TooLarge(usize),
+    /// A frame declares more bytes than the cap its reader applies, a cap
+    /// lower than [`MAX_FRAME`] (see [`read_bytes_within`]).
+    #[error("message of {len} bytes exceeds the cap of {cap}")]
+    OverCap {
+        /// The declared length.
+        len: usize,
+        /// The cap the reader applied.
+        cap: usize,
+    },
     /// A frame declares no bytes, which holds no JSON object.
     #[error("control message is empty")]
     Empty,
@@ -134,6 +143,26 @@ where
 pub async fn read_bytes<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Vec<u8>>, FrameError> {
+    match read_bytes_within(reader, MAX_FRAME).await {
+        Err(FrameError::OverCap { len, .. }) => Err(FrameError::TooLarge(len)),
+        other => other,
+    }
+}
+
+/// Reads the bytes of one frame of at most `cap` bytes, `cap` itself
+/// included, and never more than [`MAX_FRAME`]; `None` when the peer
+/// closed the connection before a frame began.
+///
+/// The declared length is checked against the cap before anything is
+/// allocated, so a refused frame is refused unread. A stream that ends
+/// inside the header or the body is an `UnexpectedEof` I/O error. The
+/// bridge to a provider worker (ADR 0021) reads its handshake answers
+/// under a 1 MiB cap and every other frame under 16 MiB with this.
+pub async fn read_bytes_within<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, FrameError> {
+    let cap = cap.min(MAX_FRAME);
     let mut header = [0; 4];
     let mut filled = 0;
     while filled < header.len() {
@@ -147,8 +176,8 @@ pub async fn read_bytes<R: AsyncRead + Unpin>(
     if len == 0 {
         return Err(FrameError::Empty);
     }
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLarge(len));
+    if len > cap {
+        return Err(FrameError::OverCap { len, cap });
     }
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload).await?;
@@ -306,6 +335,33 @@ mod tests {
             };
             assert_eq!(pong.clock_skew_ms, written);
         }
+    }
+
+    /// A lower cap is inclusive and is checked before the body is read:
+    /// a frame of exactly the cap reads, one byte more is refused from the
+    /// header with the cap named, and a cap above [`MAX_FRAME`] is
+    /// [`MAX_FRAME`].
+    #[tokio::test]
+    async fn a_lower_cap_is_inclusive_and_refuses_from_the_header() {
+        let body = br#"{"a":1}"#;
+        let mut frame = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        frame.extend_from_slice(body);
+        let mut reader: &[u8] = &frame;
+        assert_eq!(
+            read_bytes_within(&mut reader, body.len()).await.unwrap(),
+            Some(body.to_vec())
+        );
+        let mut reader: &[u8] = &frame[..4];
+        assert!(matches!(
+            read_bytes_within(&mut reader, body.len() - 1).await,
+            Err(FrameError::OverCap { len, cap }) if len == body.len() && cap == body.len() - 1
+        ));
+        let header = u32::try_from(MAX_FRAME + 1).unwrap().to_le_bytes();
+        let mut reader: &[u8] = &header;
+        assert!(matches!(
+            read_bytes_within(&mut reader, usize::MAX).await,
+            Err(FrameError::OverCap { cap, .. }) if cap == MAX_FRAME
+        ));
     }
 
     #[tokio::test]

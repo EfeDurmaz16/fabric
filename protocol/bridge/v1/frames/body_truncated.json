@@ -1,0 +1,11 @@
+{
+  "case": "body_truncated",
+  "direction": "fabric_to_worker",
+  "phase": "handshake",
+  "hex": "c60000007b2274797065223a2268",
+  "expect": {
+    "outcome": "reject",
+    "code": "truncated",
+    "read_body": true
+  }
+}

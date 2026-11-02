@@ -1,0 +1,11 @@
+{
+  "case": "hello_oversize",
+  "direction": "fabric_to_worker",
+  "phase": "handshake",
+  "hex": "01001000",
+  "expect": {
+    "outcome": "reject",
+    "code": "oversize",
+    "read_body": false
+  }
+}

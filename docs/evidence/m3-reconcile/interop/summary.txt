@@ -1,0 +1,6 @@
+16d97ed-node-docker: exit 0 (8 s) containers with fabric.job left: 0; test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.33s
+16d97ed-node-no-image: exit 0 (1 s) containers with fabric.job left: 0; test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+16d97ed-sea-no-node-docker: exit 0 (8 s) containers with fabric.job left: 0; test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.12s
+16d97ed-sea-no-node-no-image: exit 0 (1 s) containers with fabric.job left: 0; test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+a4d597a-pin-docker: exit 0 containers left 0; test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.43s
+a4d597a-pin-no-image: exit 0 containers left 0; test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s

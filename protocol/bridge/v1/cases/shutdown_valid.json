@@ -1,0 +1,13 @@
+{
+  "case": "shutdown_valid",
+  "direction": "fabric_to_worker",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "shutdown",
+    "request_id": "r-99",
+    "drain_ms": 5000
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "case": "result_exec_nonzero_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "result",
+    "request_id": "r-2",
+    "operation_id": "01K8W3A00000000000000000P2",
+    "state": "completed",
+    "resource": {
+      "provider": "fixture",
+      "scope": {
+        "account": "acct-a",
+        "project": "proj-1"
+      },
+      "kind": "sandbox",
+      "native_id": "fx-key-create-1"
+    },
+    "output": {
+      "exit_code": 3,
+      "stdout": {
+        "text": "",
+        "captured_bytes": 0,
+        "truncated": false,
+        "lossy": false
+      },
+      "stderr": {
+        "text": "boom\n",
+        "captured_bytes": 5,
+        "truncated": false,
+        "lossy": false
+      }
+    },
+    "replayed": false,
+    "receipts": []
+  }
+}

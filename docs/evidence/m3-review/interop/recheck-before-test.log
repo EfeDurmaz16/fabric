@@ -1,0 +1,22 @@
+   Compiling fabric-bridge v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-bridge)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.68s
+     Running tests/zz_recheck.rs (target/debug/deps/zz_recheck-5b27dab4f0e031a8)
+
+running 2 tests
+test recheck_findings_against_the_capsule_worker ... observe op20 via fx-ghost -> Err(ObserveMismatch { operation: OperationId(0M2GA1850M2GA1850M2GA1850M), why: "{\"kind\":\"sandbox\",\"native_id\":\"fx-a\",\"provider\":\"fixture\",\"scope\":{\"account\":\"acct-a\",\"project\":\"proj-1\"}} is its resource, not the one named" })
+observe destroy op22 as sandbox.create on fx-seed -> Err(ObserveMismatch { operation: OperationId(0P2RB1C5GP2RB1C5GP2RB1C5GP), why: "it was dispatched as sandbox.destroy, not sandbox.create" })
+observe op20 by its own target fx-a -> Dispatched "pending"
+exec on fx-a -> Completed "still-alive\n"
+journal op20: status=Dispatched target=Some("{\"kind\":\"sandbox\",\"native_id\":\"fx-a\",\"provider\":\"fixture\",\"scope\":{\"account\":\"acct-a\",\"project\":\"proj-1\"}}")
+journal op22: status=Dispatched target=Some("{\"kind\":\"sandbox\",\"native_id\":\"fx-b\",\"provider\":\"fixture\",\"scope\":{\"account\":\"acct-a\",\"project\":\"proj-1\"}}")
+J1 create op40 observed on J2's sandbox -> Err(ObserveMismatch { operation: OperationId(1850M2GA1850M2GA1850M2GA18), why: "{\"kind\":\"sandbox\",\"native_id\":\"fx-key-40\",\"provider\":\"fixture\",\"scope\":{\"account\":\"acct-a\",\"project\":\"proj-1\"}} is its resource, not the one named" })
+create op40 observed as destroy of fx-never-existed -> Err(ObserveMismatch { operation: OperationId(1850M2GA1850M2GA1850M2GA18), why: "it was dispatched as sandbox.create, not sandbox.destroy" })
+journal op40: status=Unknown locator=Some("{\"kind\":\"sandbox\",\"native_id\":\"fx-key-40\",\"provider\":\"fixture\",\"scope\":{\"account\":\"acct-a\",\"project\":\"proj-1\"}}")
+op40 observed by its own locator -> Succeeded
+ok
+test recheck_target_and_late_answer ... after restart: provider_unknown=[(JobId(01K8W3A00000000000000000J1), OperationId(0Y3RF1W7GY3RF1W7GY3RF1W7GY))] status=Unknown action=sandbox.destroy target=Some("{\"kind\":\"sandbox\",\"native_id\":\"fx-a\",\"provider\":\"fixture\",\"scope\":{\"account\":\"acct-a\",\"project\":\"proj-1\"}}") locator=None
+create op60 -> TimedOut; late answers=1; journal status=Unknown locator=Some("{\"kind\":\"sandbox\",\"native_id\":\"fx-key-60\",\"provider\":\"fixture\",\"scope\":{\"account\":\"acct-a\",\"project\":\"proj-1\"}}")
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+

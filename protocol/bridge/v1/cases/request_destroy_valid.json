@@ -1,0 +1,38 @@
+{
+  "case": "request_destroy_valid",
+  "direction": "fabric_to_worker",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "request",
+    "request_id": "r-3",
+    "operation": {
+      "id": "01K8W3A00000000000000000P3",
+      "key": "key-destroy-1",
+      "digest": "1313131313131313131313131313131313131313131313131313131313131313"
+    },
+    "scope": {
+      "job": "01K8W3A00000000000000000J1",
+      "task": "01K8W3A00000000000000000T1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "action": "sandbox.destroy",
+    "target": {
+      "provider": "fixture",
+      "scope": {
+        "account": "acct-a",
+        "project": "proj-1"
+      },
+      "kind": "sandbox",
+      "native_id": "fx-key-create-1"
+    },
+    "params": {},
+    "approval": {
+      "ref": "apr-destroy-1"
+    },
+    "deadline_ms": 30000
+  }
+}

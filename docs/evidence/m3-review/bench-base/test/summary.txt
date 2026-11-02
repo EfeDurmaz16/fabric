@@ -1,0 +1,3 @@
+spawn_handshake: n=50 p50=2820us p90=3216us p99=3624us max=3624us
+round_trip_memory_log: n=500 p50=289us p90=447us p99=693us max=1822us
+round_trip_journal: n=200 p50=15975us p90=27401us p99=54121us max=75957us

@@ -1,0 +1,13 @@
+{
+  "case": "protocol_error_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "protocol_error",
+    "code": "oversize",
+    "message": "frame of 1048577 bytes exceeds the request cap of 1048576"
+  }
+}

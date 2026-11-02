@@ -1,0 +1,48 @@
+{
+  "case": "request_exec_timeout_zero",
+  "direction": "fabric_to_worker",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "invalid",
+    "reason": "limit"
+  },
+  "message": {
+    "type": "request",
+    "request_id": "r-2",
+    "operation": {
+      "id": "01K8W3A00000000000000000P2",
+      "key": "key-exec-1",
+      "digest": "1212121212121212121212121212121212121212121212121212121212121212"
+    },
+    "scope": {
+      "job": "01K8W3A00000000000000000J1",
+      "task": "01K8W3A00000000000000000T1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "action": "sandbox.exec",
+    "target": {
+      "provider": "fixture",
+      "scope": {
+        "account": "acct-a",
+        "project": "proj-1"
+      },
+      "kind": "sandbox",
+      "native_id": "fx-key-create-1"
+    },
+    "params": {
+      "argv": [
+        "echo",
+        "hi"
+      ],
+      "stdin": null,
+      "cwd": null,
+      "timeout_ms": 0,
+      "max_output_bytes": 65536,
+      "secret_names": []
+    },
+    "approval": null,
+    "deadline_ms": 30000
+  }
+}

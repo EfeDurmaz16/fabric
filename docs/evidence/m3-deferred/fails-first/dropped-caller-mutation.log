@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.08s
+     Running tests/off_runtime.rs (target/debug/deps/off_runtime-4a79ee535f52a4b2)
+
+running 2 tests
+test every_log_call_runs_on_the_log_thread_and_each_step_makes_its_pinned_calls ... ok
+test a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent ... FAILED
+
+failures:
+
+---- a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent stdout ----
+
+thread 'a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent' (278705309) panicked at crates/fabric-bridge/tests/off_runtime.rs:349:9:
+the frame was never sent
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.50s
+
+error: test failed, to rerun pass `-p fabric-bridge --test off_runtime`

@@ -1,0 +1,236 @@
+{
+  "scenario": "pending_destroy_with_locator",
+  "summary": "A terminal-only destroy that does not reach terminal within its deadline answers pending with the scoped locator, then a bounded observe reports the terminal state.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-create-1",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A00000000000000000P1",
+        "status": "ready"
+      }
+    ],
+    "script": [
+      {
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "behavior": "stay_stopping_until_settle"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-3",
+        "operation": {
+          "id": "01K8W3A00000000000000000P6",
+          "key": "key-destroy-2",
+          "digest": "2323232323232323232323232323232323232323232323232323232323232323"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "params": {},
+        "approval": {
+          "ref": "apr-destroy-1"
+        },
+        "deadline_ms": 3000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-3",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "error": {
+          "code": "pending",
+          "reason": "observation_deadline",
+          "message": "pending: observation_deadline",
+          "effect": "pending",
+          "resource": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox",
+            "native_id": "fx-key-create-1"
+          },
+          "state": "stopping",
+          "observations": 3,
+          "deadline_ms": 3000
+        }
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P6",
+        "status": "dispatched"
+      }
+    },
+    {
+      "send": {
+        "type": "observe",
+        "request_id": "r-4",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "wait_ms": 5000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-4",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "error": {
+          "code": "pending",
+          "reason": "observation_deadline",
+          "message": "pending: observation_deadline",
+          "effect": "pending",
+          "resource": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox",
+            "native_id": "fx-key-create-1"
+          },
+          "state": "stopping",
+          "observations": 5,
+          "deadline_ms": 5000
+        }
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "advance": "settle"
+    },
+    {
+      "send": {
+        "type": "observe",
+        "request_id": "r-5",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "wait_ms": 5000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-5",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "output": {
+          "status": "destroyed"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P6",
+        "status": "succeeded"
+      }
+    }
+  ]
+}

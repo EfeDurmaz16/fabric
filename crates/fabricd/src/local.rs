@@ -594,6 +594,25 @@ mod tests {
         }
     }
 
+    /// True while a process with `pid` runs. A process that exited keeps
+    /// its pid until its parent reaps it, or launchd or init does after
+    /// the parent exited, and `kill(pid, 0)` still finds it then, on macOS
+    /// and Linux alike; a stop does not wait for that reap, because a
+    /// zombie runs nothing. So the pid must be found and not be a zombie.
+    fn runs(pid: Pid) -> bool {
+        if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+            return false;
+        }
+        let stat = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.as_raw_nonzero().to_string()])
+            .output()
+            .unwrap()
+            .stdout;
+        let stat = String::from_utf8_lossy(&stat);
+        let stat = stat.trim();
+        !(stat.is_empty() || stat.starts_with('Z'))
+    }
+
     /// A command name may hold spaces and parentheses; the start is still
     /// the 22nd field of the line.
     #[test]
@@ -740,9 +759,8 @@ mod tests {
         assert_eq!(record.liveness().await, Liveness::Group);
         record.stop(Duration::from_secs(5)).await.unwrap();
         assert_eq!(record.liveness().await, Liveness::Gone);
-        let child = Pid::from_raw(child).unwrap();
         assert!(
-            rustix::process::test_kill_process(child).is_err(),
+            !runs(Pid::from_raw(child).unwrap()),
             "the background process outlived the stop"
         );
     }
@@ -778,7 +796,7 @@ mod tests {
             .parse()
             .unwrap();
         assert!(
-            rustix::process::test_kill_process(Pid::from_raw(child).unwrap()).is_err(),
+            !runs(Pid::from_raw(child).unwrap()),
             "the background process outlived the stop"
         );
     }

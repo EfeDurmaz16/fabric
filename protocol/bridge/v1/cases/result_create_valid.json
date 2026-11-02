@@ -1,0 +1,28 @@
+{
+  "case": "result_create_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "result",
+    "request_id": "r-1",
+    "operation_id": "01K8W3A00000000000000000P1",
+    "state": "completed",
+    "resource": {
+      "provider": "fixture",
+      "scope": {
+        "account": "acct-a",
+        "project": "proj-1"
+      },
+      "kind": "sandbox",
+      "native_id": "fx-key-create-1"
+    },
+    "output": {
+      "status": "ready"
+    },
+    "replayed": false,
+    "receipts": []
+  }
+}

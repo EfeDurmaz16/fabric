@@ -1,0 +1,8 @@
+== features []
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+== features [acp]
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+== features [claude]
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+== features [codex]
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s

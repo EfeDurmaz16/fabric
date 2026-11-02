@@ -1,0 +1,7 @@
+fabric commit: 61285cc2b6deb8a561c4fa2092e9e4d846c0bd30
+capsule commit: 9f5d65eb23fccdac668e7358ad0513ca994c011c
+capsule build: clean clone, npx pnpm@10.32.1 install --frozen-lockfile, pnpm --filter @capsule-sdk/bridge-worker... run build
+node: v22.23.2
+docker server: 29.4.0 context orbstack
+date: 2026-10-27T20:11:56Z
+load: 23:11  up 43 days, 23:36, 1 user, load averages: 6.61 7.06 7.38

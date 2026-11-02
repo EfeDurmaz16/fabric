@@ -1,0 +1,73 @@
+{
+  "case": "hello_ack_valid",
+  "direction": "worker_to_fabric",
+  "phase": "handshake",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "hello_ack",
+    "protocol": 1,
+    "worker": "capsule-worker/0.1.0",
+    "profile": {
+      "profile": "fixture",
+      "version": 1,
+      "provider": "fixture",
+      "scope_keys": [
+        "account",
+        "project"
+      ],
+      "resource_kinds": [
+        "sandbox"
+      ],
+      "clock": "virtual",
+      "observe_interval_ms": 1000,
+      "actions": [
+        {
+          "action": "sandbox.create",
+          "effect": "create",
+          "terminal_only": true,
+          "observe": true,
+          "cancel": false,
+          "approval": "optional",
+          "dedupe": "provider_key",
+          "secrets": true
+        },
+        {
+          "action": "sandbox.exec",
+          "effect": "mutate",
+          "terminal_only": false,
+          "observe": true,
+          "cancel": true,
+          "approval": "optional",
+          "dedupe": "none",
+          "secrets": true
+        },
+        {
+          "action": "sandbox.destroy",
+          "effect": "destroy",
+          "terminal_only": true,
+          "observe": true,
+          "cancel": false,
+          "approval": "required",
+          "dedupe": "provider_key",
+          "secrets": false
+        }
+      ],
+      "limits": {
+        "max_deadline_ms": 600000,
+        "max_observe_wait_ms": 30000,
+        "max_output_bytes": 1048576,
+        "max_stdin_bytes": 65536,
+        "max_argv": 64,
+        "max_receipts": 16
+      }
+    },
+    "limits": {
+      "max_request_bytes": 1048576,
+      "max_frame_bytes": 16777216,
+      "max_in_flight": 4,
+      "max_stderr_bytes": 65536
+    }
+  }
+}

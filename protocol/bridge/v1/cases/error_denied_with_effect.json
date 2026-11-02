@@ -1,0 +1,21 @@
+{
+  "case": "error_denied_with_effect",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "effect_mismatch"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-1",
+    "operation_id": "01K8W3A00000000000000000P4",
+    "error": {
+      "code": "denied",
+      "reason": "policy_denied",
+      "message": "denied: policy_denied",
+      "effect": "applied"
+    }
+  }
+}

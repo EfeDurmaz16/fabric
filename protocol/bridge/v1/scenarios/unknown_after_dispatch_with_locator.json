@@ -1,0 +1,164 @@
+{
+  "scenario": "unknown_after_dispatch_with_locator",
+  "summary": "The provider applies a create and the reply is lost: unknown with the best known locator, journal unknown, no replay. A later observe finds the resource.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [],
+    "script": [
+      {
+        "action": "sandbox.create",
+        "native_id": "fx-key-unknown-1",
+        "behavior": "apply_then_lose_reply"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-1",
+        "operation": {
+          "id": "01K8W3A00000000000000000P7",
+          "key": "key-unknown-1",
+          "digest": "2424242424242424242424242424242424242424242424242424242424242424"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "params": {
+          "image": "fixture/ok",
+          "env": {},
+          "secret_names": [],
+          "labels": {}
+        },
+        "approval": null,
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A00000000000000000P7",
+        "error": {
+          "code": "unknown",
+          "reason": "reply_lost",
+          "message": "unknown: reply_lost",
+          "effect": "unknown",
+          "resource": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox",
+            "native_id": "fx-key-unknown-1"
+          }
+        }
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P7",
+        "status": "unknown"
+      }
+    },
+    {
+      "send": {
+        "type": "observe",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A00000000000000000P7",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.create",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-unknown-1"
+        },
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "result",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A00000000000000000P7",
+        "state": "completed",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-unknown-1"
+        },
+        "output": {
+          "status": "ready"
+        },
+        "replayed": false,
+        "receipts": []
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P7",
+        "status": "succeeded"
+      }
+    }
+  ]
+}
