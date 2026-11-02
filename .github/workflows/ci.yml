@@ -234,12 +234,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: EfeDurmaz16/capsule
-          # Capsule's m3/bridge-worker head: the worker with the v1
-          # corrections of 2026-10-29 (an exec bound of 0 refused, observe
-          # with the operation's scope, exec observe and labelled seeds) and
-          # its docker create, start and rm clients out of its process
-          # group, which docs/evidence/m3-reconcile ran against.
-          ref: a4d597aa8df665f403389bd34f592ad2ce2056c4
+          # Capsule's m4/reconciliation worker head: the M3 worker plus
+          # attach by the operation's identity, the starting fixture seed,
+          # and the package without declaration maps, which
+          # docs/evidence/m4 ran against. Capsule's later commits on that
+          # branch are evidence only.
+          ref: ee189d4609783217178e45124a5b014126aba4b7
           path: capsule
           persist-credentials: false
 
@@ -291,7 +291,7 @@ jobs:
         with:
           repository: EfeDurmaz16/capsule
           # The same worker as bridge-interop; move both pins together.
-          ref: a4d597aa8df665f403389bd34f592ad2ce2056c4
+          ref: ee189d4609783217178e45124a5b014126aba4b7
           path: capsule
           persist-credentials: false
 
