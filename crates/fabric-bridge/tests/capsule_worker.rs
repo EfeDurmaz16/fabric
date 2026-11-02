@@ -410,7 +410,7 @@ async fn every_shared_scenario_over_the_workers_stdio() {
         })
         .collect();
     names.sort();
-    assert_eq!(names.len(), 24, "the v1 scenario set");
+    assert_eq!(names.len(), 25, "the v1 scenario set");
     let mut stopped = Vec::new();
     for name in &names {
         let tally = replay(name, dir.path()).await;

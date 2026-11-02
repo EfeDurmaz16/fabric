@@ -208,6 +208,7 @@
           ],
           "limits": {
             "max_deadline_ms": 600000,
+            "max_timeout_ms": 60000,
             "max_observe_wait_ms": 30000,
             "max_output_bytes": 1048576,
             "max_stdin_bytes": 65536,

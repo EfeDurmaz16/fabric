@@ -1,6 +1,6 @@
 {
   "scenario": "pending_destroy_with_locator",
-  "summary": "A terminal-only destroy that does not reach terminal within its deadline answers pending with the scoped locator, then a bounded observe reports the terminal state.",
+  "summary": "A terminal-only destroy that does not reach terminal within its deadline answers pending with the scoped locator. A bounded observe that still finds the resource stopping answers pending again; once the resource is gone, the observe's one read finds nothing and answers unknown/absent with the scope searched, and Fabric settles the destroy succeeded on that evidence.",
   "profile": "fixture",
   "provider_state": {
     "binding": {
@@ -203,24 +203,25 @@
     },
     {
       "receive": {
-        "type": "result",
+        "type": "error",
         "request_id": "r-5",
         "operation_id": "01K8W3A00000000000000000P6",
-        "state": "completed",
-        "resource": {
-          "provider": "fixture",
-          "scope": {
-            "account": "acct-a",
-            "project": "proj-1"
-          },
-          "kind": "sandbox",
-          "native_id": "fx-key-create-1"
-        },
-        "output": {
-          "status": "destroyed"
-        },
-        "replayed": false,
-        "receipts": []
+        "error": {
+          "code": "unknown",
+          "reason": "absent",
+          "message": "unknown: absent",
+          "effect": "unknown",
+          "observations": 1,
+          "deadline_ms": 5000,
+          "searched": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox"
+          }
+        }
       }
     },
     {

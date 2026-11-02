@@ -68,25 +68,8 @@ fn case(name: &str) -> Value {
     load(&root().join(format!("cases/{name}.json")))["message"].clone()
 }
 
-// The v1 correction of 2026-11-02 gives every profile a `max_timeout_ms`,
-// the bound on an exec's `timeout_ms` advertised in `hello_ack`. The
-// on-disk profile carries it once the Ship step copies the Capsule-written
-// fixtures; until then this adds the bound v1 names for the fixture
-// profile, 60000 ms, when it is absent. Remove with that copy.
-fn with_timeout_bound(mut value: Value) -> Value {
-    if let Some(limits) = value["limits"].as_object_mut() {
-        limits
-            .entry("max_timeout_ms")
-            .or_insert_with(|| 60_000.into());
-    }
-    value
-}
-
 fn fixture_profile() -> Profile {
-    Profile::from_value(&with_timeout_bound(load(
-        &root().join("profiles/fixture.json"),
-    )))
-    .unwrap()
+    Profile::from_value(&load(&root().join("profiles/fixture.json"))).unwrap()
 }
 
 /// What Fabric did with a `send` it did not write.
@@ -353,12 +336,7 @@ impl Run {
             self.local_answer(local, message);
             return;
         }
-        let mut wire = mapped(message, &self.ids, &["request_id", "cancels"]);
-        if wire["type"] == "hello_ack" {
-            // See `with_timeout_bound`: the fixture's handshake until the
-            // Ship step copies the corrected profile.
-            wire["profile"] = with_timeout_bound(wire["profile"].take());
-        }
+        let wire = mapped(message, &self.ids, &["request_id", "cancels"]);
         {
             let (_, writer) = self.worker.as_mut().unwrap();
             let frame = frames::encode(&wire, 16 << 20).unwrap();
@@ -601,7 +579,7 @@ async fn fabric_runs_every_scenario_against_a_scripted_worker() {
         names.push(name);
     }
     names.sort();
-    assert_eq!(names.len(), 24, "{names:?}");
+    assert_eq!(names.len(), 25, "{names:?}");
 }
 
 /// The scenarios name their action through the profile; a sanity check
@@ -609,7 +587,7 @@ async fn fabric_runs_every_scenario_against_a_scripted_worker() {
 #[test]
 fn the_scenarios_negotiate_the_fixture_profile() {
     let ack = case("hello_ack_valid");
-    let profile = Profile::from_value(&with_timeout_bound(ack["profile"].clone())).unwrap();
+    let profile = Profile::from_value(&ack["profile"]).unwrap();
     assert_eq!(profile, fixture_profile());
     assert_eq!(
         Limits::DEFAULT.max_request_bytes,

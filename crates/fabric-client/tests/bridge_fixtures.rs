@@ -22,7 +22,7 @@ use serde_json::Value;
 
 /// The sha256 of `protocol/bridge/v1/manifest.sha256`. Change it only with
 /// the same change in Capsule's copy (docs/bridge-protocol.md, Fixtures).
-const MANIFEST_SHA256: &str = "f96887e7224320b1e250109202e8920b283b1657b362c4822054fe9c018a7010";
+const MANIFEST_SHA256: &str = "40f6490fd8c54fec1f138946386f8b7793f4b8b4b88bb4eb330f828cb5900601";
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
 
