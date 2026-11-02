@@ -4,6 +4,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Abandoned.** The status of a provider operation the owner approved giving up on after its outcome stayed uncertain (ADR 0022). The approval names the status the owner saw and what may remain; abandoning never says that the effect did not happen or that anything stopped.
 
+**Acknowledged checkpoint.** A checkpoint whose bundle chain the authority node fetched through the store transfer, verified by digest and committed to the journal as `CheckpointAcknowledged` with what it verified (ADR 0028). The only restart point for recovery. A checkpoint the runner captured in its own store alone is captured, not acknowledged.
+
 **ACP** (Agent Client Protocol). A JSON-RPC protocol for driving coding agents. Fabric uses it as the generic harness path. Methods Fabric cares about: `session/new`, `session/load`, `session/prompt`, `session/cancel`.
 
 **Attach.** The bridge message that finds the resource an earlier create made, by the operation that made it, when its answer never reached Fabric (ADR 0022, docs/bridge-protocol.md). It reads and never creates; only a create whose profile dedupes by key or label can be attached.
@@ -24,6 +26,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Chunk.** One stored object: a whole file of 8 MiB or less, or one FastCDC piece of a larger file. Compressed with zstd and named by its blake3 hash.
 
+**Covered write.** One of exactly four write paths that carry a grant token and run the fence before writing: a ledger append of a managed job, a bundle publish accepted as the job's checkpoint, a journal operation an executor reports, and the outcome of a facade command (ADR 0028). The harness's own files inside the workspace are not covered.
+
 **Epoch.** A counter on a job's lease. It starts at 1 and increases by one on every `MoveImported` or `Stolen` record. Any message or write carrying an older epoch than the current one is stale and is refused.
 
 **Doctor.** `fabric doctor`: the preflight that compares exact strings (user, home, tool versions, logins as yes or no, clock offset, synced folders) between two nodes and refuses a move on a mismatch the table marks as refuse.
@@ -32,9 +36,13 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Event.** One append-only record in a job's ledger. Events are never edited or deleted.
 
+**Fence.** The one rule every covered write runs first (ADR 0028): the grant token's attempt must be the job's live attempt at the job's generation, `granted` or `running`, from the node it was granted to. Any other verdict refuses the write, records it and changes nothing else.
+
 **Fencing.** Refusing work from a stale epoch. The fencing token is `(job_id, epoch)`. The mechanism that keeps exactly one live copy among Fabric processes; native tombstones cover the harness's own writers.
 
 **Generation.** The fencing counter of a managed job's canonical execution domain. It increases by one with every new attempt the authority grants; work reported under an older generation is refused (ADR 0020). Not an epoch, which belongs to standalone jobs.
+
+**Grant token.** The triple `(job, attempt, generation)` a runner presents with every covered write of a managed job (ADR 0028); the managed counterpart of the standalone fencing token, which carries an epoch and is never written for a managed job.
 
 **Harness.** The agent program that does the work: Claude Code, Codex, or any ACP agent.
 
@@ -109,6 +117,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Steal.** `fabric job steal --force`: bumping a job's epoch without the owner's consent, from a complete local snapshot, with a printed warning. The only way past an owner or a target that does not answer.
 
 **Store.** A node's local blob directory plus catalog. Written by one process at a time, under the data directory lock.
+
+**Superseded.** The status of an attempt whose grant was taken away by `Supersede` or `Recover` while it may have been alive (ADR 0028). It does not `may_run`; its covered writes are refused; its task stays open. Never produced from a missed heartbeat alone: a heartbeat absence marks the attempt `unknown`, and only a command supersedes it.
 
 **Supervisor.** The process that kills a job's harness when a higher epoch is learned and keeps the harness record current. Always the holder of the data directory lock: the node process, or else the `fabric resume` command that launched the harness, which stays resident until the harness exits.
 
