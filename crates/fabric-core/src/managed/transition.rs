@@ -594,6 +594,25 @@ pub fn recovery_decision(
     })
 }
 
+/// Records why the authority did not restart an unavailable attempt by
+/// itself (ADR 0028): the job stays under `Block` with the reason in its
+/// history. The attempt must be the job's live attempt in status `unknown`.
+pub fn record_recovery_block(
+    job: &ManagedState,
+    attempt: AttemptId,
+    reason: RecoveryBlock,
+) -> Result<Transition, DomainError> {
+    let found = unknown_attempt(job, attempt)?;
+    one(
+        job,
+        ManagedEvent::RecoveryBlocked {
+            attempt: found.id,
+            generation: found.generation,
+            reason,
+        },
+    )
+}
+
 /// Whether an operation may move from `from` to `to`; `Ok(false)` when it is already there.
 fn mark_allowed(from: &OperationStatus, to: OperationMark) -> Result<bool, ()> {
     if *from == to.status() {

@@ -48,7 +48,7 @@ fn crash_child() {
         "dispatch" => {
             let job = ids(1).job;
             journal
-                .mark(job, ids(2).operation, OperationMark::Dispatched, 3_000)
+                .mark_authority(job, ids(2).operation, OperationMark::Dispatched, 3_000)
                 .unwrap();
             // The effect: reached only when the dispatch is durable.
             std::fs::write(dir.join(EFFECT), "launched").unwrap();
@@ -173,7 +173,7 @@ fn a_grant_killed_between_its_commit_and_its_dispatch_is_dispatched_once() {
     assert!(recovery.unknown.is_empty());
     // The one dispatch: recorded, then the effect.
     journal
-        .mark(job, ids(2).operation, OperationMark::Dispatched, 4_001)
+        .mark_authority(job, ids(2).operation, OperationMark::Dispatched, 4_001)
         .unwrap();
     // Another restart: the dispatched grant becomes unknown and is not offered again.
     drop(journal);
@@ -214,7 +214,7 @@ fn a_dispatch_killed_between_its_commit_and_its_effect_is_never_replayed() {
         StoredResult::Rejected(DomainError::AttemptStillLive { .. })
     ));
     assert!(matches!(
-        journal.mark(job, ids(2).operation, OperationMark::Dispatched, 4_001),
+        journal.mark_authority(job, ids(2).operation, OperationMark::Dispatched, 4_001),
         Err(CommitError::Domain(DomainError::OperationState { .. }))
     ));
 }

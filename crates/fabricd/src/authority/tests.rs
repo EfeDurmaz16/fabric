@@ -149,7 +149,7 @@ async fn a_restart_keeps_identity_progress_and_the_answer_to_a_key() {
         panic!("the grant was refused");
     };
     authority
-        .mark(job, grant.operation, OperationMark::Dispatched)
+        .mark_authority(job, grant.operation, OperationMark::Dispatched)
         .await
         .unwrap();
     let before = authority.job(job).await.unwrap().unwrap();
@@ -177,7 +177,7 @@ async fn a_restart_keeps_identity_progress_and_the_answer_to_a_key() {
     // The executor's late report settles the unknown grant.
     let attempt = after.attempts[0].clone();
     authority
-        .observe(
+        .observe_authority(
             job,
             fabric_core::managed::Observation::Started {
                 attempt: attempt.id,

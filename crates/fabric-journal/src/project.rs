@@ -9,10 +9,10 @@
 
 use fabric_core::id::{JobId, SnapshotId};
 use fabric_core::managed::{
-    Attempt, AttemptId, AttemptStatus, CommandKind, EventDigest, EventFrame, Generation, JobState,
-    ManagedEvent, ManagedJob, ManagedState, OperationId, OperationKey, OperationProgress,
-    OperationStatus, RequestDigest, RestartPolicy, StoredPart, Task, TaskId, TaskKind, TaskState,
-    Transition, WorkRevision, apply_batch,
+    Attempt, AttemptId, AttemptStatus, Checkpoint, CommandKind, EventDigest, EventFrame,
+    Generation, JobState, ManagedEvent, ManagedJob, ManagedState, OperationId, OperationKey,
+    OperationProgress, OperationStatus, RequestDigest, RestartPolicy, StoredPart, Task, TaskId,
+    TaskKind, TaskState, Transition, WorkRevision, apply_batch,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -121,6 +121,8 @@ pub(crate) fn command_kind(name: &str) -> Option<CommandKind> {
         "register_task" => CommandKind::RegisterTask,
         "finish_task" => CommandKind::FinishTask,
         "cancel_job" => CommandKind::CancelJob,
+        "supersede" => CommandKind::Supersede,
+        "recover" => CommandKind::Recover,
         _ => return None,
     })
 }
@@ -181,7 +183,56 @@ pub(crate) fn load_state(
         tasks: load_tasks(conn, job)?,
         attempts: load_attempts(conn, job)?,
         operations: load_operations(conn, job)?,
+        checkpoints: load_checkpoints(conn, job)?,
     }))
+}
+
+/// The job's checkpoints, captured and acknowledged, folded from the two
+/// event kinds that make them (ADR 0028); the attempts table keeps only
+/// each attempt's newest acknowledged snapshot.
+fn load_checkpoints(conn: &Connection, job: JobId) -> Result<Vec<Checkpoint>, CommitError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, body FROM events
+         WHERE job_id = ?1 AND kind IN ('checkpoint_captured', 'checkpoint_acknowledged')
+         ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([job.to_bytes()], |r| {
+        Ok((get_u64(r, 0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut checkpoints: Vec<Checkpoint> = Vec::new();
+    for row in rows {
+        let (seq, body) = row?;
+        let frame =
+            EventFrame::decode(&body).map_err(|e| corrupt(job, format!("event {seq}: {e}")))?;
+        match frame.event {
+            ManagedEvent::CheckpointCaptured {
+                attempt,
+                generation,
+                snapshot,
+                cut,
+            } => checkpoints.push(Checkpoint {
+                attempt,
+                generation,
+                snapshot,
+                cut,
+                ack: None,
+            }),
+            ManagedEvent::CheckpointAcknowledged { ack } => {
+                let found = checkpoints
+                    .iter_mut()
+                    .find(|c| c.snapshot == ack.snapshot && c.attempt == ack.attempt)
+                    .ok_or_else(|| corrupt(job, format!("event {seq} acknowledges nothing")))?;
+                found.ack = Some(ack);
+            }
+            other => {
+                return Err(corrupt(
+                    job,
+                    format!("event {seq} is a {} under a checkpoint kind", other.name()),
+                ));
+            }
+        }
+    }
+    Ok(checkpoints)
 }
 
 fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
@@ -219,7 +270,8 @@ fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
 fn load_attempts(conn: &Connection, job: JobId) -> Result<Vec<Attempt>, CommitError> {
     let id = job.to_bytes();
     let mut stmt = conn.prepare_cached(
-        "SELECT attempt_id, task_id, generation, resource, initial_checkpoint, granted_by, status_body
+        "SELECT attempt_id, task_id, generation, resource, initial_checkpoint, granted_by, status_body,
+                unavailable_since_ms
          FROM attempts WHERE job_id = ?1 ORDER BY generation",
     )?;
     let rows = stmt.query_map([id], |r| {
@@ -231,11 +283,17 @@ fn load_attempts(conn: &Connection, job: JobId) -> Result<Vec<Attempt>, CommitEr
             r.get::<_, Option<[u8; 32]>>(4)?,
             r.get::<_, [u8; 16]>(5)?,
             r.get::<_, Vec<u8>>(6)?,
+            r.get::<_, Option<i64>>(7)?
+                .map(|n| {
+                    u64::try_from(n).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, n))
+                })
+                .transpose()?,
         ))
     })?;
     let mut attempts = Vec::new();
     for row in rows {
-        let (attempt, task, generation, resource, checkpoint, granted_by, status) = row?;
+        let (attempt, task, generation, resource, checkpoint, granted_by, status, unavailable) =
+            row?;
         attempts.push(Attempt {
             id: AttemptId::from_bytes(attempt),
             task: TaskId::from_bytes(task),
@@ -245,6 +303,7 @@ fn load_attempts(conn: &Connection, job: JobId) -> Result<Vec<Attempt>, CommitEr
             initial_checkpoint: checkpoint.map(SnapshotId::from_bytes),
             granted_by: OperationId::from_bytes(granted_by),
             status: part(job, &status, "attempt status")?,
+            unavailable_since_ms: unavailable,
         });
     }
 
@@ -402,16 +461,54 @@ pub(crate) fn write_transition(
         )?;
         last_seq = conn.last_insert_rowid();
         first_seq.get_or_insert(last_seq);
-        if let ManagedEvent::AttemptObserved {
-            attempt, status, ..
-        } = event
-        {
+        let evidence = match event {
+            ManagedEvent::AttemptObserved {
+                attempt, status, ..
+            } => match status {
+                AttemptStatus::Checkpointed { snapshot } => Some((
+                    *attempt,
+                    "checkpoint",
+                    snapshot.to_string(),
+                    Some(snapshot.to_bytes()),
+                )),
+                AttemptStatus::Succeeded | AttemptStatus::Failed | AttemptStatus::Cancelled => {
+                    Some((
+                        *attempt,
+                        "exit",
+                        attempt_status_name(status).to_owned(),
+                        None,
+                    ))
+                }
+                _ => None,
+            },
+            ManagedEvent::CheckpointCaptured {
+                attempt,
+                snapshot,
+                cut,
+                ..
+            } => Some((
+                *attempt,
+                "checkpoint",
+                snapshot.to_string(),
+                Some(cut.to_bytes()),
+            )),
+            ManagedEvent::CheckpointAcknowledged { ack } => Some((
+                ack.attempt,
+                "checkpoint_ack",
+                ack.snapshot.to_string(),
+                Some(ack.cut.to_bytes()),
+            )),
+            _ => None,
+        };
+        if let Some((attempt, kind, reference, evidence_digest)) = evidence {
             write_evidence(
                 conn,
                 job,
-                *attempt,
+                attempt,
                 transition.revision,
-                status,
+                kind,
+                &reference,
+                evidence_digest,
                 digest,
                 last_seq,
             )?;
@@ -466,14 +563,22 @@ pub(crate) fn write_transition(
             AttemptStatus::Checkpointed { snapshot } => Some(snapshot.to_bytes()),
             _ => None,
         };
+        let acknowledged = after
+            .acknowledged()
+            .into_iter()
+            .find(|a| a.attempt == attempt.id)
+            .map(|a| a.snapshot.to_bytes());
         let ended = (!attempt.status.may_run()).then_some(at);
         conn.execute(
             "INSERT INTO attempts (attempt_id, task_id, job_id, generation, resource,
                                    initial_checkpoint, granted_by, status, status_body,
-                                   last_checkpoint, granted_ms, ended_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                   last_checkpoint, granted_ms, ended_ms, last_acknowledged,
+                                   unavailable_since_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT (attempt_id) DO UPDATE SET status = ?8, status_body = ?9,
-                                                    last_checkpoint = ?10, ended_ms = ?12",
+                                                    last_checkpoint = ?10, ended_ms = ?12,
+                                                    last_acknowledged = ?13,
+                                                    unavailable_since_ms = ?14",
             params![
                 attempt.id.to_bytes(),
                 attempt.task.to_bytes(),
@@ -487,8 +592,31 @@ pub(crate) fn write_transition(
                 checkpoint,
                 at,
                 ended,
+                acknowledged,
+                attempt.unavailable_since_ms.map(sql_u64).transpose()?,
             ],
         )?;
+    }
+    // An acknowledgement changes no attempt row by itself; its column does.
+    if let Some(old) = &old {
+        for attempt in &after.attempts {
+            if old.attempt(attempt.id) != Some(attempt) {
+                continue;
+            }
+            let newest = |s: &ManagedState| {
+                s.acknowledged()
+                    .into_iter()
+                    .find(|a| a.attempt == attempt.id)
+                    .map(|a| a.snapshot.to_bytes())
+            };
+            let (before, now) = (newest(old), newest(&after));
+            if before != now {
+                conn.execute(
+                    "UPDATE attempts SET last_acknowledged = ?2 WHERE attempt_id = ?1",
+                    params![attempt.id.to_bytes(), now],
+                )?;
+            }
+        }
     }
 
     for progress in &after.operations {
@@ -505,27 +633,23 @@ pub(crate) fn write_transition(
     Ok(after)
 }
 
-/// Records evidence for an attempt's checkpoint or end: a reference, never a claim.
+/// Records evidence for an attempt's checkpoint, acknowledgement or end:
+/// a reference, never a claim.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row's columns, written from one place"
+)]
 fn write_evidence(
     conn: &Connection,
     job: JobId,
     attempt: AttemptId,
     revision: WorkRevision,
-    status: &AttemptStatus,
+    kind: &str,
+    reference: &str,
+    digest: Option<[u8; 32]>,
     event: EventDigest,
     seq: i64,
 ) -> Result<(), CommitError> {
-    let (kind, reference, digest) = match status {
-        AttemptStatus::Checkpointed { snapshot } => (
-            "checkpoint",
-            snapshot.to_string(),
-            Some(snapshot.to_bytes()),
-        ),
-        AttemptStatus::Succeeded | AttemptStatus::Failed | AttemptStatus::Cancelled => {
-            ("exit", attempt_status_name(status).to_owned(), None)
-        }
-        _ => return Ok(()),
-    };
     let mut evidence_id = [0u8; 16];
     evidence_id.copy_from_slice(&event.to_bytes()[..16]);
     conn.execute(

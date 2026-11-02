@@ -96,5 +96,5 @@ pub use model::{
 };
 pub use transition::{
     accept_command, acknowledge, admit_recovery, apply_batch, apply_observation, dedupe,
-    mark_operation, recovery_decision, replay,
+    mark_operation, record_recovery_block, recovery_decision, replay,
 };

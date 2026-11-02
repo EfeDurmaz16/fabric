@@ -692,7 +692,7 @@ pub(crate) fn accept(
 ) -> Result<Result<Transition, DomainError>, CommitError> {
     let accepted = accept_command(state, envelope, ids);
     match (accepted, state, &envelope.body) {
-        (Ok(transition), Some(state), Command::StartAttempt { .. }) => {
+        (Ok(transition), Some(state), Command::StartAttempt { .. } | Command::Recover { .. }) => {
             Ok(match blockers(conn, state.job.id)?.first() {
                 Some(blocker) => Err(DomainError::ReplacementBlocked {
                     operation: blocker.operation(),

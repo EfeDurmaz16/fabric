@@ -2,7 +2,10 @@
 //! state machine, the replacement barrier, cleanup and abandonment
 //! (docs/managed-jobs.md, ADR 0021 and ADR 0022).
 
-use fabric_core::managed::{Command, Observation, OperationMark, StoredResult};
+use fabric_core::id::SnapshotId;
+use fabric_core::managed::{
+    AttemptStatus, Command, Generation, Observation, OperationMark, ResourceRef, StoredResult,
+};
 
 use super::*;
 use crate::tests::{Fixture, create, envelope, start};
@@ -105,7 +108,7 @@ fn created(f: &mut Fixture, n: u8) {
 /// The job's attempt is lost, so a replacement may be asked for.
 fn lose(f: &mut Fixture) {
     f.journal
-        .mark(
+        .mark_authority(
             JOB,
             OperationId::from_bytes([2; 16]),
             OperationMark::Dispatched,
@@ -113,7 +116,7 @@ fn lose(f: &mut Fixture) {
         )
         .unwrap();
     f.journal
-        .observe(
+        .observe_authority(
             JOB,
             &Observation::Lost {
                 attempt: ATTEMPT,
@@ -926,4 +929,119 @@ fn residuals_list_what_no_cleanup_removed() {
             },
         ]
     );
+}
+
+/// A `Recover` is a grant: the M4 replacement barrier refuses it while a
+/// provider effect of the job may still act, exactly as a `StartAttempt`.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the capture, the acknowledgement and the barrier read best in one place"
+)]
+fn a_recover_is_blocked_like_a_start_attempt() {
+    use fabric_core::managed::{CheckpointAck, CutDigest, GrantToken};
+    let mut f = granted();
+    f.journal
+        .mark_authority(
+            JOB,
+            OperationId::from_bytes([2; 16]),
+            OperationMark::Dispatched,
+            3,
+        )
+        .unwrap();
+    let token = GrantToken {
+        job: JOB,
+        attempt: ATTEMPT,
+        generation: Generation::FIRST,
+    };
+    f.journal
+        .observe(
+            &token,
+            None,
+            &Observation::Started {
+                attempt: ATTEMPT,
+                generation: Generation::FIRST,
+            },
+            4,
+        )
+        .unwrap()
+        .unwrap();
+    let snapshot = SnapshotId::of(b"m6 checkpoint");
+    let cut = CutDigest::of(b"m6 cut");
+    f.journal
+        .observe(
+            &token,
+            None,
+            &Observation::Captured {
+                attempt: ATTEMPT,
+                generation: Generation::FIRST,
+                snapshot,
+                cut,
+            },
+            5,
+        )
+        .unwrap()
+        .unwrap();
+    f.journal
+        .acknowledge(
+            JOB,
+            &CheckpointAck {
+                attempt: ATTEMPT,
+                generation: Generation::FIRST,
+                snapshot,
+                cut,
+                manifests: 1,
+                chunks: 1,
+                bytes: 10,
+                fetched_from: crate::tests::NODE,
+            },
+            6,
+        )
+        .unwrap();
+    // A create of the attempt is unknown: its resource cannot be named.
+    begin(&mut f, &dispatch(1));
+    to(&mut f, 1, ProviderStatus::Unknown, None);
+    f.journal
+        .observe_authority(
+            JOB,
+            &Observation::ResourceUnavailable {
+                attempt: ATTEMPT,
+                generation: Generation::FIRST,
+                last_heartbeat_ms: None,
+                at_ms: 20_000,
+            },
+            20_000,
+        )
+        .unwrap();
+    let recover = Command::Recover {
+        attempt: ATTEMPT,
+        resource: ResourceRef::Node {
+            node: crate::tests::NODE,
+        },
+        from: snapshot,
+        reason: "test".into(),
+    };
+    let refused = f.submit("recover-1", Some(JOB), recover.clone()).result;
+    assert_eq!(blocked_by(&refused), Some(op(1)));
+    let s = f.journal.job(JOB).unwrap().unwrap();
+    assert_eq!(s.attempts.len(), 1, "nothing granted behind the barrier");
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    // A supersede grants nothing, so the barrier does not hold it: the
+    // grant is taken away and the cleanup of ADR 0022 can proceed.
+    let answer = f
+        .submit(
+            "supersede-1",
+            Some(JOB),
+            Command::Supersede {
+                attempt: ATTEMPT,
+                reason: "test".into(),
+            },
+        )
+        .result;
+    assert!(matches!(answer, StoredResult::Accepted(_)), "{answer:?}");
+    let s = f.journal.job(JOB).unwrap().unwrap();
+    assert_eq!(s.attempts.len(), 1);
+    assert_eq!(s.attempts[0].status, AttemptStatus::Superseded { by: None });
+    assert_eq!(blocked_by(&replace(&mut f, "start-2")), Some(op(1)));
+    f.journal.verify().unwrap();
 }

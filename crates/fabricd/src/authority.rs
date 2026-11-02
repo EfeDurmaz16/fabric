@@ -247,12 +247,13 @@ impl Authority {
         self.call(|reply| Call::Submit(envelope, reply)).await
     }
 
-    /// Records what an executor reports about an attempt or an operation.
+    /// Records the authority's own observation of an attempt or an
+    /// operation: no runner presents a grant, so no fence runs.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the executor wiring of M3 reports through it")
     )]
-    pub(crate) async fn observe(
+    pub(crate) async fn observe_authority(
         &self,
         job: JobId,
         observation: Observation,
@@ -261,12 +262,13 @@ impl Authority {
             .await
     }
 
-    /// Marks an operation, `Dispatched` right before its effect is asked for.
+    /// Marks an operation on the authority's own behalf, `Dispatched`
+    /// right before its effect is asked for.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
     )]
-    pub(crate) async fn mark(
+    pub(crate) async fn mark_authority(
         &self,
         job: JobId,
         operation: OperationId,
@@ -410,13 +412,13 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
             Call::Observe(job, observation, reply) => {
                 let _ = reply.send(
                     open(&mut holder, job)
-                        .and_then(|j| Ok(j.observe(job, &observation, now_ms())?)),
+                        .and_then(|j| Ok(j.observe_authority(job, &observation, now_ms())?)),
                 );
             }
             Call::Mark(job, operation, mark, reply) => {
                 let _ = reply.send(
                     open(&mut holder, job)
-                        .and_then(|j| Ok(j.mark(job, operation, mark, now_ms())?)),
+                        .and_then(|j| Ok(j.mark_authority(job, operation, mark, now_ms())?)),
                 );
             }
             Call::Job(job, reply) => {

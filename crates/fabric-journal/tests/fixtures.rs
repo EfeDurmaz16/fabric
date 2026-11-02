@@ -2,7 +2,9 @@
 //! binary opens each one, migrates it when it is older and verifies it.
 //! `tests/fixtures/v1.sqlite` was made by `make_v1_fixture` with schema
 //! version 1, and `tests/fixtures/v2.sqlite` by `make_v2_fixture` from it;
-//! the tests below pin what each holds.
+//! the tests below pin what each holds. `tests/fixtures/v2-pre-m6.sqlite`
+//! is the version 2 file the M4 code wrote before ADR 0028 amended the
+//! tables; it is kept so the refusal of that draft stays tested.
 
 #![allow(
     clippy::unwrap_used,
@@ -15,8 +17,9 @@ use std::path::{Path, PathBuf};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
-    AttemptId, AttemptStatus, Command, Envelope, ExitOutcome, Intent, JobPolicy, JobState, NewIds,
-    Observation, OperationId, OperationKey, OperationMark, OperationStatus, RecoveryPolicy,
+    AttemptId, AttemptStatus, CheckpointAck, Command, CoveredPath, CutDigest, Envelope,
+    ExitOutcome, FenceVerdict, GrantToken, Intent, JobPolicy, JobState, NewIds, Observation,
+    OperationId, OperationKey, OperationMark, OperationStatus, RecoveryBlock, RecoveryPolicy,
     ResourceRef, RestartPolicy, SourceBinding, StoredResult, TaskId, TaskKind, TaskOutcome,
     TaskState, WorkRevision,
 };
@@ -24,12 +27,23 @@ use fabric_core::managed::{Generation, RequestDigest};
 use fabric_core::path::AbsPath;
 use fabric_journal::{
     AbandonApproval, Acknowledged, Blocker, EffectClass, FILE_NAME, Journal, LocatorRecord,
-    ProviderAnswer, ProviderDispatch, ProviderStatus, Purpose, ResourceKey, SCHEMA_VERSION,
+    OpenError, ProviderAnswer, ProviderDispatch, ProviderStatus, Purpose, ResourceKey,
+    SCHEMA_VERSION,
 };
 
 const NODE: NodeId = NodeId::from_bytes([4; 32]);
+const RUNNER: NodeId = NodeId::from_bytes([6; 32]);
 const FIRST: JobId = JobId::from_bytes([0x01; 16]);
 const SECOND: JobId = JobId::from_bytes([0x02; 16]);
+const THIRD: JobId = JobId::from_bytes([0x03; 16]);
+
+/// The operations and jobs each fixture holds, as `verify` counts them.
+fn pinned(version: u32) -> (u64, u64) {
+    match version {
+        1 => (2, 8),
+        _ => (3, 12),
+    }
+}
 
 fn fixture(version: u32) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -125,7 +139,7 @@ fn make_v1_fixture() {
     let first = AttemptId::from_bytes([3; 16]);
     let g1 = fabric_core::managed::Generation::FIRST;
     journal
-        .mark(
+        .mark_authority(
             FIRST,
             OperationId::from_bytes([3; 16]),
             OperationMark::Dispatched,
@@ -133,7 +147,7 @@ fn make_v1_fixture() {
         )
         .unwrap();
     journal
-        .observe(
+        .observe_authority(
             FIRST,
             &Observation::Started {
                 attempt: first,
@@ -143,7 +157,7 @@ fn make_v1_fixture() {
         )
         .unwrap();
     journal
-        .observe(
+        .observe_authority(
             FIRST,
             &Observation::Lost {
                 attempt: first,
@@ -162,7 +176,7 @@ fn make_v1_fixture() {
     let second = AttemptId::from_bytes([4; 16]);
     let g2 = g1.next().unwrap();
     journal
-        .mark(
+        .mark_authority(
             FIRST,
             OperationId::from_bytes([4; 16]),
             OperationMark::Dispatched,
@@ -170,7 +184,7 @@ fn make_v1_fixture() {
         )
         .unwrap();
     journal
-        .observe(
+        .observe_authority(
             FIRST,
             &Observation::Checkpointed {
                 attempt: second,
@@ -181,7 +195,7 @@ fn make_v1_fixture() {
         )
         .unwrap();
     journal
-        .observe(
+        .observe_authority(
             FIRST,
             &Observation::Exited {
                 attempt: first,
@@ -199,7 +213,7 @@ fn make_v1_fixture() {
         ids(FIRST, 5),
     );
     journal
-        .mark(
+        .mark_authority(
             FIRST,
             OperationId::from_bytes([5; 16]),
             OperationMark::Dispatched,
@@ -207,7 +221,7 @@ fn make_v1_fixture() {
         )
         .unwrap();
     journal
-        .observe(
+        .observe_authority(
             FIRST,
             &Observation::Unknown {
                 operation: OperationId::from_bytes([5; 16]),
@@ -393,7 +407,333 @@ fn make_v2_fixture() {
             at + 12,
         )
         .unwrap();
+    m6_job(&mut journal, at + 100);
     journal.verify().unwrap();
+}
+
+/// The M6 part of the v2 fixture (ADR 0028): a third job on a runner
+/// node with a captured and an acknowledged checkpoint, a covered write
+/// the fence refused, an attempt that went unavailable and was recovered
+/// from the acknowledged checkpoint, a blocked automatic recovery, and a
+/// second attempt superseded with nothing granted. Every M6 event kind
+/// is in it, so `verify` replays each.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture's steps read best as one script"
+)]
+fn m6_job(journal: &mut Journal, at: u64) {
+    let create = match create("third") {
+        Command::CreateJob { intent, source, .. } => Command::CreateJob {
+            intent,
+            source,
+            policy: JobPolicy {
+                restart: RestartPolicy::ExplicitOnly,
+                recovery: RecoveryPolicy::RestartFromAcknowledged,
+            },
+        },
+        other => other,
+    };
+    submit(journal, "create-3", None, create, ids(THIRD, 9));
+    let primary = TaskId::from_bytes([9; 16]);
+    let on_runner = Command::StartAttempt {
+        task: primary,
+        resource: ResourceRef::Node { node: RUNNER },
+        initial_checkpoint: None,
+    };
+    submit(journal, "start-3-1", Some(THIRD), on_runner, ids(THIRD, 10));
+    let g1 = Generation::FIRST;
+    let token1 = GrantToken {
+        job: THIRD,
+        attempt: AttemptId::from_bytes([10; 16]),
+        generation: g1,
+    };
+    journal
+        .mark_authority(
+            THIRD,
+            OperationId::from_bytes([10; 16]),
+            OperationMark::Dispatched,
+            at,
+        )
+        .unwrap();
+    journal
+        .observe(
+            &token1,
+            Some(RUNNER),
+            &Observation::Started {
+                attempt: token1.attempt,
+                generation: g1,
+            },
+            at + 1,
+        )
+        .unwrap()
+        .unwrap();
+    let (snapshot, cut) = (m6_snapshot(1), m6_cut(1));
+    journal
+        .observe(
+            &token1,
+            Some(RUNNER),
+            &Observation::Captured {
+                attempt: token1.attempt,
+                generation: g1,
+                snapshot,
+                cut,
+            },
+            at + 2,
+        )
+        .unwrap()
+        .unwrap();
+    journal
+        .acknowledge(THIRD, &m6_ack(&token1, snapshot, cut), at + 3)
+        .unwrap();
+    // A second capture that is never acknowledged.
+    journal
+        .observe(
+            &token1,
+            Some(RUNNER),
+            &Observation::Captured {
+                attempt: token1.attempt,
+                generation: g1,
+                snapshot: m6_snapshot(2),
+                cut: m6_cut(2),
+            },
+            at + 4,
+        )
+        .unwrap()
+        .unwrap();
+    // A ledger append from the wrong node: refused and recorded.
+    let refused = journal
+        .fence(&token1, CoveredPath::LedgerAppend, Some(NODE), at + 5)
+        .unwrap();
+    assert!(matches!(refused, Err(FenceVerdict::WrongNode { .. })));
+    // The runner goes silent; an automatic recovery is blocked once, then
+    // the authority recovers from the acknowledged checkpoint onto itself.
+    journal
+        .observe_authority(
+            THIRD,
+            &Observation::ResourceUnavailable {
+                attempt: token1.attempt,
+                generation: g1,
+                last_heartbeat_ms: Some(at + 4),
+                at_ms: at + 15_000,
+            },
+            at + 15_000,
+        )
+        .unwrap();
+    journal
+        .recovery_blocked(
+            THIRD,
+            token1.attempt,
+            RecoveryBlock::NoEligibleNode {
+                exclusions: vec![fabric_core::managed::Exclusion {
+                    node: RUNNER,
+                    reason: "unavailable".into(),
+                }],
+            },
+            at + 15_001,
+        )
+        .unwrap();
+    submit(
+        journal,
+        "recover-3-1",
+        Some(THIRD),
+        Command::Recover {
+            attempt: token1.attempt,
+            resource: ResourceRef::Node { node: NODE },
+            from: snapshot,
+            reason: "the fixture's runner went silent".into(),
+        },
+        ids(THIRD, 11),
+    );
+    // The old runner's late exit is refused by the fence and recorded.
+    let late = journal
+        .observe(
+            &token1,
+            Some(RUNNER),
+            &Observation::Exited {
+                attempt: token1.attempt,
+                generation: g1,
+                outcome: ExitOutcome::Succeeded,
+            },
+            at + 15_002,
+        )
+        .unwrap();
+    assert!(matches!(
+        late,
+        Err(FenceVerdict::Superseded { by: Some(_) })
+    ));
+    // The recovered attempt runs, goes silent and is superseded by hand.
+    let g2 = g1.next().unwrap();
+    let token2 = GrantToken {
+        job: THIRD,
+        attempt: AttemptId::from_bytes([11; 16]),
+        generation: g2,
+    };
+    journal
+        .mark_authority(
+            THIRD,
+            OperationId::from_bytes([11; 16]),
+            OperationMark::Dispatched,
+            at + 15_003,
+        )
+        .unwrap();
+    journal
+        .observe(
+            &token2,
+            None,
+            &Observation::Started {
+                attempt: token2.attempt,
+                generation: g2,
+            },
+            at + 15_004,
+        )
+        .unwrap()
+        .unwrap();
+    journal
+        .observe_authority(
+            THIRD,
+            &Observation::ResourceUnavailable {
+                attempt: token2.attempt,
+                generation: g2,
+                last_heartbeat_ms: None,
+                at_ms: at + 30_000,
+            },
+            at + 30_000,
+        )
+        .unwrap();
+    journal
+        .observe_authority(
+            THIRD,
+            &Observation::ResourceReachable {
+                attempt: token2.attempt,
+                generation: g2,
+            },
+            at + 30_001,
+        )
+        .unwrap();
+    journal
+        .observe_authority(
+            THIRD,
+            &Observation::ResourceUnavailable {
+                attempt: token2.attempt,
+                generation: g2,
+                last_heartbeat_ms: Some(at + 30_001),
+                at_ms: at + 45_000,
+            },
+            at + 45_000,
+        )
+        .unwrap();
+    submit(
+        journal,
+        "supersede-3-2",
+        Some(THIRD),
+        Command::Supersede {
+            attempt: token2.attempt,
+            reason: "the fixture's operator took the grant away".into(),
+        },
+        ids(THIRD, 12),
+    );
+}
+
+fn m6_snapshot(n: u8) -> SnapshotId {
+    SnapshotId::of(&[0x60 + n; 4])
+}
+
+fn m6_cut(n: u8) -> CutDigest {
+    CutDigest::of(&[0x70 + n; 4])
+}
+
+fn m6_ack(token: &GrantToken, snapshot: SnapshotId, cut: CutDigest) -> CheckpointAck {
+    CheckpointAck {
+        attempt: token.attempt,
+        generation: token.generation,
+        snapshot,
+        cut,
+        manifests: 3,
+        chunks: 11,
+        bytes: 65_536,
+        fetched_from: RUNNER,
+    }
+}
+
+#[test]
+fn the_v2_fixture_holds_the_m6_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE_NAME);
+    std::fs::copy(fixture(2), &path).unwrap();
+    let journal = Journal::open(&path).unwrap();
+    let third = journal.job(THIRD).unwrap().unwrap();
+    assert_eq!(
+        third.job.policy.recovery,
+        RecoveryPolicy::RestartFromAcknowledged
+    );
+    assert_eq!(third.job.generation.get(), 2);
+    let statuses: Vec<_> = third.attempts.iter().map(|a| a.status.clone()).collect();
+    assert_eq!(
+        statuses,
+        vec![
+            AttemptStatus::Superseded {
+                by: Some(Generation::new(2).unwrap())
+            },
+            AttemptStatus::Superseded { by: None },
+        ]
+    );
+    assert_eq!(third.attempts[1].initial_checkpoint, Some(m6_snapshot(1)));
+    assert_eq!(
+        third.attempts[1].unavailable_since_ms, None,
+        "superseded clears it"
+    );
+    let acknowledged = journal.acknowledged(THIRD).unwrap();
+    assert_eq!(acknowledged.len(), 1);
+    assert_eq!(acknowledged[0].snapshot, m6_snapshot(1));
+    assert_eq!(acknowledged[0].fetched_from, RUNNER);
+    assert_eq!(
+        third.captured_only(),
+        vec![(third.attempts[0].id, Generation::FIRST, m6_snapshot(2))]
+    );
+    let kinds: Vec<_> = journal
+        .events(THIRD, None, 100)
+        .unwrap()
+        .iter()
+        .map(|e| e.frame.event.name())
+        .collect();
+    for kind in [
+        "checkpoint_captured",
+        "checkpoint_acknowledged",
+        "covered_write_refused",
+        "attempt_unavailable",
+        "attempt_reachable",
+        "grant_superseded",
+        "recovery_blocked",
+    ] {
+        assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
+    }
+    assert!(third.live_attempt().is_none());
+    journal.verify().unwrap();
+}
+
+#[test]
+fn the_pre_m6_version_2_draft_is_refused_unwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE_NAME);
+    let draft = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2-pre-m6.sqlite");
+    std::fs::copy(&draft, &path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let refused = Journal::open(&path).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            OpenError::DraftSchema {
+                version: 2,
+                amendment: "m6"
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the draft was written to"
+    );
 }
 
 #[test]
@@ -464,8 +804,9 @@ fn every_version_fixture_opens_migrates_and_verifies() {
         let journal = Journal::open(&path).unwrap();
         assert_eq!(journal.schema_version().unwrap(), SCHEMA_VERSION);
         let report = journal.verify().unwrap();
-        assert_eq!(report.jobs, 2, "v{version}");
-        assert_eq!(report.operations, 8, "v{version}");
+        let (jobs, operations) = pinned(version);
+        assert_eq!(report.jobs, jobs, "v{version}");
+        assert_eq!(report.operations, operations, "v{version}");
     }
 }
 
