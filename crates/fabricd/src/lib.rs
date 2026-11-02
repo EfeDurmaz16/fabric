@@ -29,6 +29,7 @@ mod managed;
 pub mod node;
 mod ops;
 pub mod paths;
+mod recovery;
 mod service;
 mod stamp;
 pub mod tool_env;
