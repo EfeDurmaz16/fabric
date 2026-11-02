@@ -116,12 +116,27 @@ impl Provider {
     }
 }
 
+// The v1 correction of 2026-11-02 gives every profile a `max_timeout_ms`,
+// the bound on an exec's `timeout_ms` advertised in `hello_ack`. The
+// on-disk profile carries it once the Ship step copies the Capsule-written
+// fixtures; until then this adds the bound v1 names for the fixture
+// profile, 60000 ms, when it is absent. Remove with that copy.
+fn with_timeout_bound(mut value: Value) -> Value {
+    if let Some(limits) = value["limits"].as_object_mut() {
+        limits
+            .entry("max_timeout_ms")
+            .or_insert_with(|| 60_000.into());
+    }
+    value
+}
+
 fn profiles() -> Option<Vec<Profile>> {
     [FIXTURE, DOCKER]
         .iter()
         .map(|text| {
             serde_json::from_str::<Value>(text)
                 .ok()
+                .map(with_timeout_bound)
                 .and_then(|v| Profile::from_value(&v).ok())
         })
         .collect()

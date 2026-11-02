@@ -32,12 +32,26 @@ use tokio::sync::oneshot;
 
 const PROFILE: &str = include_str!("../../../protocol/bridge/v1/profiles/fixture.json");
 
+// The v1 correction of 2026-11-02 gives every profile a `max_timeout_ms`,
+// the bound on an exec's `timeout_ms` advertised in `hello_ack`. The
+// on-disk profile carries it once the Ship step copies the Capsule-written
+// fixtures; until then this adds the bound v1 names for the fixture
+// profile, 60000 ms, when it is absent. Remove with that copy.
+fn with_timeout_bound(mut value: Value) -> Value {
+    if let Some(limits) = value["limits"].as_object_mut() {
+        limits
+            .entry("max_timeout_ms")
+            .or_insert_with(|| 60_000.into());
+    }
+    value
+}
+
 fn ack(hello: &Value) -> Value {
     json!({
         "type": "hello_ack",
         "protocol": 1,
         "worker": "stream-test/0",
-        "profile": serde_json::from_str::<Value>(PROFILE).unwrap(),
+        "profile": with_timeout_bound(serde_json::from_str::<Value>(PROFILE).unwrap()),
         "limits": hello["limits"].clone(),
     })
 }
@@ -1034,5 +1048,119 @@ async fn a_not_found_destroy_keeps_the_barrier_while_nothing_finds_its_resource_
     );
     assert_eq!(journal.residuals(job).unwrap().len(), 1);
     assert_eq!(played.await.unwrap().len(), 3);
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// An exec of `target` as operation `n` with these bounds.
+fn exec_of(
+    n: u8,
+    target: &fabric_bridge::wire::Locator,
+    timeout_ms: u64,
+    max_output_bytes: u64,
+) -> Effect {
+    Effect {
+        operation: operation(n),
+        scope: common::scope(),
+        action: Action::Exec {
+            target: target.clone(),
+            params: ExecParams {
+                argv: vec!["true".into()],
+                stdin: None,
+                cwd: None,
+                timeout_ms,
+                max_output_bytes,
+                secret_names: Vec::new(),
+            },
+        },
+        approval: None,
+        policy: None,
+        deadline_ms: 5000,
+    }
+}
+
+/// What the profile in `ack` bounds an exec's `timeout_ms` and
+/// `max_output_bytes` at.
+fn exec_bounds() -> (u64, u64) {
+    let hello = json!({"limits": {}});
+    let profile = fabric_bridge::wire::Profile::from_value(&ack(&hello)["profile"]).unwrap();
+    (
+        profile.limits.max_timeout_ms,
+        profile.limits.max_output_bytes,
+    )
+}
+
+/// An exec whose `timeout_ms` or `max_output_bytes` is above the bound
+/// the profile advertises in `hello_ack`, and a destroy or an exec whose
+/// target has an empty `native_id`, are refused before sending with the
+/// code and reason the worker would answer, `invalid`/`out_of_range` and
+/// `invalid`/`missing_field`, and recorded `rejected`: the first frame the
+/// worker reads is the request within the bounds that follows them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_above_the_profile_bounds_or_at_no_resource_is_refused_before_sending() {
+    fn exec_done(request: &Value) -> Value {
+        assert_eq!(request["type"], "request", "{request}");
+        let stream = json!({"text": "", "captured_bytes": 0, "truncated": false, "lossy": false});
+        completed(
+            request,
+            &request["target"],
+            &json!({"exit_code": 0, "stdout": stream, "stderr": stream}),
+        )
+    }
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (reader, writer) = tokio::io::split(worker);
+    let played = play(reader, writer, vec![exec_done]);
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let (max_timeout_ms, max_output_bytes) = exec_bounds();
+    let target = fx("key-1");
+    let mut unnamed = target.clone();
+    unnamed.native_id = String::new();
+    let refused = [
+        (
+            exec_of(1, &target, max_timeout_ms + 1, 1024),
+            "out_of_range",
+        ),
+        (
+            exec_of(2, &target, 1000, max_output_bytes + 1),
+            "out_of_range",
+        ),
+        (exec_of(3, &unnamed, 1000, 1024), "missing_field"),
+        (destroy_of(4, &unnamed, "apr-destroy-1"), "missing_field"),
+    ];
+    for (effect, reason) in refused {
+        let n = effect.operation.id.to_bytes()[0];
+        let result = bridge.request(&mut log, effect).await;
+        match result {
+            Err(BridgeError::RefusedLocally(refusal)) => {
+                assert_eq!((refusal.code, refusal.reason), ("invalid", reason), "{n}");
+            }
+            other => panic!("{n}: {other:?}"),
+        }
+        let entry = log
+            .entry(OperationId::from_bytes([n; 16]))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{n}: recorded rejected"));
+        assert_eq!(entry.status, ProviderStatus::Rejected, "{n}");
+    }
+    let within = bridge
+        .request(
+            &mut log,
+            exec_of(5, &target, max_timeout_ms, max_output_bytes),
+        )
+        .await
+        .unwrap()
+        .finish(&mut log)
+        .await
+        .unwrap();
+    assert_eq!(within.status, ProviderStatus::Succeeded);
+    let read = played.await.unwrap();
+    assert_eq!(read.len(), 1, "nothing refused reached the worker");
+    assert_eq!(
+        read[0]["operation"]["id"],
+        OperationId::from_bytes([5; 16]).to_string()
+    );
     assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
 }
