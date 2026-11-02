@@ -1,6 +1,6 @@
 # ADR 0025: Source bindings, secret references and the export policy
 
-Status: proposed, 2026-11-03.
+Status: proposed 2026-11-03, built 2026-11-03 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request).
 
 Adopts the external draft P05 ("Source access import and secret references", 2026-10-25, Proposed) for the M5 campaign. Draft P05 left open the source registration surface, the export rules, the first resolver, retention and the active-checkout support matrix. Each is selected below. The selections were selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe, and Efe can veto any of them at the pull request. The types are in [docs/managed-jobs.md](../managed-jobs.md), section "Placement and planned continuity (M5)", part "Source bindings and secrets (P05)". It extends ADR 0004 (content-addressed snapshots), ADR 0007 (environment spec and secrets), ADR 0011 (path identity) and ADR 0012 (dependency carry).
 
@@ -54,3 +54,7 @@ An imported snapshot follows the store's existing retention: it is a snapshot li
 
 - Which short-lived broker becomes the second resolver, and how a ref names it.
 - The active-checkout adoption matrix: which roots, which writers, which markers.
+
+## As built (M5)
+
+Built on 2026-11-03 by owner A. `GitUri`, `CommitId`, `SecretRef` and `SecretValue` are as decided. The local resolver drops a trailing newline from a file value and checks the ref's resource scope; the attempt scope is the caller's check. `Repository { path }` prepares as `SourceError::Adoption` on every node: the M2 form stays accepted on the local socket and is never adopted by an executor. The export allowlist is `fabric_store::policy::IgnorePolicy::allow_export`: a named path, or one under it, is not denied by a secret pattern and gets a negation line in the excludes file, and `sources::import_from` applies it. The rest is in docs/managed-jobs.md, "As built (M5): P03 to P05".
