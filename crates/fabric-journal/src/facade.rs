@@ -222,27 +222,47 @@ mod tests {
             journal.token_by_digest(&first.digest).unwrap(),
             Some(first.clone())
         );
-        assert_eq!(journal.token_by_digest(&token_digest(&[8; 32])).unwrap(), None);
+        assert_eq!(
+            journal.token_by_digest(&token_digest(&[8; 32])).unwrap(),
+            None
+        );
         assert!(journal.token_mint(&record(1, 8)).is_err(), "the id is used");
-        assert!(journal.token_mint(&record(2, 7)).is_err(), "the digest is used");
+        assert!(
+            journal.token_mint(&record(2, 7)).is_err(),
+            "the digest is used"
+        );
         let any = FacadeTokenRecord {
             jobs: JobScope::AnyOwned,
             resources: ResourceScope::Any,
             ..record(2, 8)
         };
         journal.token_mint(&any).unwrap();
-        assert_eq!(journal.token_by_digest(&any.digest).unwrap(), Some(any.clone()));
+        assert_eq!(
+            journal.token_by_digest(&any.digest).unwrap(),
+            Some(any.clone())
+        );
 
         assert!(journal.token_revoke(first.id, 500).unwrap());
-        assert!(!journal.token_revoke(first.id, 600).unwrap(), "revoked once");
-        assert!(!journal.token_revoke(TokenId::from_bytes([5; 16]), 600).unwrap());
+        assert!(
+            !journal.token_revoke(first.id, 600).unwrap(),
+            "revoked once"
+        );
+        assert!(
+            !journal
+                .token_revoke(TokenId::from_bytes([5; 16]), 600)
+                .unwrap()
+        );
         let revoked = journal.token_by_digest(&first.digest).unwrap().unwrap();
         assert_eq!(revoked.revoked_ms, Some(500));
 
         drop(journal);
         let reopened = Journal::open(&dir.path().join(crate::FILE_NAME)).unwrap();
         assert_eq!(
-            reopened.token_by_digest(&first.digest).unwrap().unwrap().revoked_ms,
+            reopened
+                .token_by_digest(&first.digest)
+                .unwrap()
+                .unwrap()
+                .revoked_ms,
             Some(500)
         );
         reopened.verify().unwrap();

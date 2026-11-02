@@ -22,10 +22,11 @@ use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, Snapsho
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Author, LedgerError};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
-use fabric_net::rpc::{JobFuture, Service};
+use fabric_net::rpc::{Advertise, JobFuture, Service};
 use fabric_net::wire::{
-    Appended, Facts, Fault, FaultText, Fenced, KnownWriter, ManifestChunks, MoveRequested,
-    MoveState, Offered, Pulled, RecordBytes, RecordPage, Tools, VersionText,
+    AdvertWire, Appended, FacadeAnswer, FacadeMessage, Facts, Fault, FaultText, Fenced,
+    KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, Pulled, RecordBytes,
+    RecordPage, Tools, VersionText,
 };
 use fabric_store::objects::ObjectError;
 use fabric_store::store::StoreError;
@@ -188,6 +189,27 @@ impl Service for Node {
                 facts.measure_acp(program, &harness_env);
             }
             Ok(facts.to_wire())
+        })
+    }
+
+    fn advertise(&self, _peer: NodeId, ask: Advertise) -> BoxFuture<'_, Result<AdvertWire, Fault>> {
+        // What this node offers for one job's placement, measured now
+        // (ADR 0026): the asking authority is a paired peer, and the
+        // answer names no secret value, only which names resolve here.
+        Box::pin(async move { Ok(self.own_advert(&ask).await) })
+    }
+
+    fn facade(
+        &self,
+        _peer: NodeId,
+        message: FacadeMessage,
+    ) -> BoxFuture<'_, Result<FacadeAnswer, Fault>> {
+        // One facade message for this node's authority (ADR 0027): the
+        // token inside it is what authorizes the command, not the peer
+        // that carried it.
+        Box::pin(async move {
+            let answer = self.facade_serve(message.as_bytes()).await;
+            FacadeAnswer::new(answer).map_err(|e| internal(&e))
         })
     }
 }

@@ -177,10 +177,20 @@ impl Node {
                 )
                 .await?,
             ),
+            request @ (Request::ManagedStatus { .. } | Request::ManagedList) => {
+                self.managed(request).await?
+            }
             request @ (Request::ManagedCreate { .. }
             | Request::ManagedCancel { .. }
-            | Request::ManagedStatus { .. }
-            | Request::ManagedList) => self.managed(request).await?,
+            | Request::ManagedSubmit { .. }
+            | Request::ManagedNote { .. }
+            | Request::ManagedCheckpoint { .. }
+            | Request::ManagedContinue { .. }
+            | Request::ManagedInspect { .. }
+            | Request::ManagedImport { .. }
+            | Request::FacadeMint { .. }
+            | Request::FacadeRevoke { .. }
+            | Request::FacadeCall { .. }) => self.managed_m5(request).await?,
             Request::LaunchCheck {
                 job,
                 epoch,
@@ -6420,8 +6430,10 @@ pub(crate) mod tests {
             .unwrap(),
             goal: "goal".to_owned(),
             harness: HarnessKind::Codex,
+            acceptance: Vec::new(),
+            policy: None,
         };
-        match node.managed(request).await.unwrap() {
+        match node.managed_m5(request).await.unwrap() {
             Reply::ManagedCreate(made) => made.job.job,
             other => panic!("{other:?}"),
         }
@@ -6491,8 +6503,10 @@ pub(crate) mod tests {
                 program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
                 args: vec!["--api-key".to_owned(), token.clone()],
             },
+            acceptance: Vec::new(),
+            policy: None,
         };
-        let refused = node.managed(request).await;
+        let refused = node.managed_m5(request).await;
         assert!(
             matches!(refused, Err(NodeError::HarnessConfig(_))),
             "{refused:?}"
