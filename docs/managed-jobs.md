@@ -1,6 +1,6 @@
 # Managed jobs: identity, journal v1, operation states and replay
 
-Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; its "As built (M4)" notes record where the code differs.
+Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; its "As built (M4)" notes record where the code differs. The section "Unexpected-loss recovery (M6)" was added 2026-11-02 with ADR 0028; its types and signatures are the contract the M6 implementation builds to, and its "As built (M6)" notes will record where the code differs.
 
 ## Identity
 
@@ -833,3 +833,42 @@ M4 exposes provider operations as library calls only (ADR 0022, selection 6). Ef
 | Acceptance (M5) | Surfaces | Tests |
 |---|---|---|
 | A client reads, for one managed job, every provider operation as the journal holds it (its status, with `unknown`, `attached`, `observed` and `abandoned` shown as they are and never folded into another; its action, effect class, purpose and the create a cleanup cleans; its target and locator; the scope its last absent attach searched; its abandonment reason), the job's replacement blockers (`CreateUnresolved`, `ExecMayRun`, `StopNotConfirmed`, each with its operation and status, from `Journal::replacement_blockers`) and its residuals (each create's locator, or the scope an absent attach searched, from `Journal::residuals`). The read writes nothing and sends nothing to a worker. | one read op of the node's client API beside `managed_status`; the matching `fabric-client` method; the TypeScript SDK method beside `managedStatus`; a `fabric managed` subcommand beside `status` | written first and failing on the M4 code: a node test over a journal seeded with an operation in each of `unknown` (with and without a searched scope), `attached`, `observed` and `abandoned`, a blocker of each kind and a residual of each kind, answered through the client API with each value as the journal holds it and the journal unchanged after the read; the TypeScript SDK test of the same op against the node built in the same run; a CLI test of the subcommand's sentences for each status, blocker and residual |
+
+## Unexpected-loss recovery (M6)
+
+Status: proposed with ADR 0028, 2026-11-02; not implemented. Every selection in this section was selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02, never approved by Efe. This section is types and signatures; the code is the authority once it exists, and "As built (M6)" notes will say where it differs. It stacks on the M5 sections (ADR 0023 to 0027: task kinds and outcome policies, the checkpoint cut, source bindings, placement, the facade protocol) and names their types where it needs them.
+
+Acceptance (roadmap M6): a real partition and an old-runner wake prove that covered writes cannot resume under obsolete authority; an independent acknowledged checkpoint; termination and fencing coverage stated; recovery policies per job.
+
+### What M2 and M4 already provide
+
+M6 adds only what is missing. These are in the M2 to M4 code and tests and do not change:
+
+| Need | Existing mechanism | Where |
+|---|---|---|
+| One generation per grant, unique in the job | `Generation` on every `Attempt`; first grant is 1, each later grant the latest plus one; `UNIQUE (job_id, generation)` on `attempts` | `fabric-core` `managed::model`, `fabric-journal` `schema.rs` |
+| The live grant | `ManagedState::live_attempt()`: the one attempt whose status `may_run()` (`granted`, `running`, `unknown`); `grant_may_dispatch` offers a grant for dispatch only while its attempt is `granted` at the job's current generation | `fabric-core` `managed::model` |
+| A report at an older generation changes nothing | `apply_observation` records `StaleObservationRefused { attempt, generation, current }` and refuses with `DomainError::StaleGeneration` (replay rule 7) | `fabric-core` `managed::transition`, `fabric-core/tests/managed_rules.rs` |
+| No new grant behind an attempt that may run | `StartAttempt`, `FinishTask` and `CancelJob` wait while any attempt is `granted`, `running` or `unknown` (`DomainError::AttemptStillLive`) | `fabric-core` `managed::transition` |
+| A provider effect from a stale attempt is refused before any frame | `provider_begin` refuses an attempt that is not the job's current grant, `granted` or `running`, at the job's generation (M3), and the replacement barrier refuses a `StartAttempt` while an effect may still act (M4) | `fabric-journal` `provider.rs`, `only_the_current_live_attempt_dispatches`, `replacement_blockers` |
+| One serialized authority writer | `fabricd::authority`: one OS thread over one `Journal`, fed by a bounded queue of 64 calls (`Submit`, `Observe`, `Mark`, `Job`, `List`); the answer is sent after the commit | `crates/fabricd/src/authority.rs` |
+| Hash-chained history, append-only, replayed on open | `events` with `digest` and `prev_digest`; `verify` replays every job and compares the projection; a new event shape is a new `kind` or a new format byte | `fabric-journal` `lib.rs`, `project.rs` |
+| A checkpoint the runner captured | `Observation::Checkpointed { attempt, generation, snapshot }` moves the attempt to `checkpointed`, writes `attempts.last_checkpoint` and an `evidence` row of kind `checkpoint` whose `ref` is the snapshot id | `fabric-journal` `project.rs` `write_evidence` |
+| A verified stop on the authority's own host | `Journal::recover(at_ms, probe)` with `Liveness::{Gone, Running, CannotTell}`: `Gone` is `Observation::Lost`; `CannotTell` leaves the attempt as it is; nothing is granted (replay rules 2 to 4) | `fabric-journal` `lib.rs` |
+| Bytes move by content, verified by the receiver | `fetch_snapshot` walks the bundle chain, fetches each manifest and its data chunks, keeps a chunk only when its bytes hash to the id, publishes each manifest after every object it names is on disk and checks the published id equals the asked id; `WantSnapshot` and `WantChunks` carry no fencing token because the id is the bytes | `crates/fabricd/src/transfer.rs`, ADR 0013, ADR 0014 |
+| A snapshot is whole or absent on a node | `Store::snapshot(id)` answers only after `publish` wrote the row, which happens after every object was written or verified (`is_complete`) | `fabric-store` `store.rs`, `transfer.rs` |
+| Authenticated peers, and a connection that notices silence | the peer book (ed25519 ids, TLS 1.3, no resumption); a side that wrote nothing for 10 s sends `KeepAlive` and a side that read no byte for 30 s ends the connection; an unpair ends live connections within 5 s; `Session::ping` | `fabric-net` `peers.rs`, `rpc.rs`, ADR 0013 |
+| Fencing on the wire for standalone jobs | per-job requests carry `FencingToken { job_id, epoch }` and are answered inside `Fenced<T>` with `StaleEpoch` or `AheadOfUs`; an epoch is never written for a managed job | `fabric-net` `rpc.rs`, ADR 0019 |
+| Crash points and two-process tests | `checkpoint::reached` in `fabric-net` and `fabric-store`, the e2e suite that runs daemons under `FABRIC_HOME` with separate state roots | `crates/fabric-net/src/checkpoint.rs`, `crates/fabric/tests/e2e` |
+
+What is missing, and what M6 adds:
+
+| Gap after M5 | M6 addition |
+|---|---|
+| A captured checkpoint says nothing about where its bytes are | `Observation::Captured`, the authority's fetch and verify, and `CheckpointAck` written as `CheckpointAcknowledged` |
+| The generation fences the journal and the bridge only | the covered write set, `GrantToken` on each covered path and one `fence` rule run before any of them writes |
+| A silent runner has no state and no recorded reason | heartbeats per live attempt, `ResourceUnavailable` and `ResourceReachable` as observations, the attempt `unknown` while unavailable |
+| Nothing can grant while an attempt may still run, even when fencing makes it safe | `Command::Supersede` and `Command::Recover`, the status `superseded`, `GrantSuperseded` |
+| No policy says what the authority may do by itself | `JobPolicy.recovery: RecoveryPolicy { Block, RestartFromAcknowledged }`, default `Block`, with its admission rule and its fallback |
+| The executor never learns it lost its grant | the `Fenced` answer on every covered path, and the executor's stop of the attempt's group on `superseded` |
+| No proof under a real partition | the relay, the two-daemon harness and the three scenarios of "Proof harness" |
