@@ -44,6 +44,15 @@ export const OPS = [
   "managed_list",
   "job_repair",
   "job_export",
+  "managed_note",
+  "managed_checkpoint",
+  "managed_continue",
+  "managed_inspect",
+  "managed_submit",
+  "managed_import",
+  "facade_mint",
+  "facade_revoke",
+  "facade_call",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -888,6 +897,141 @@ function utf8Path(variable: string, value: string): string {
 const env = optional(ClientEnv);
 
 /** What a client asks a node; an unknown op is an error. */
+// M5: sources, policies, notes, the inspection and the facade's scopes
+// (docs/managed-jobs.md, "Placement and planned continuity"; ADR 0027).
+
+/** Where a managed job's workspace comes from; `repository` and `directory` are paths on the node and never cross the facade. */
+export const ManagedSource = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("repository"), path: SystemPath }),
+  z.object({ kind: z.literal("snapshot"), snapshot: SnapshotId }),
+  z.object({ kind: z.literal("git"), uri: UnicodeText, commit: UnicodeText }),
+  z.object({ kind: z.literal("empty") }),
+  z.object({ kind: z.literal("directory"), path: SystemPath }),
+]);
+export type ManagedSource = z.infer<typeof ManagedSource>;
+
+/** How a continuation may carry a session (ADR 0024), from highest. */
+export const FIDELITIES = ["native_session", "new_native_session_with_package", "workspace_only"] as const;
+export const Fidelity = z.enum(FIDELITIES);
+export type Fidelity = z.infer<typeof Fidelity>;
+
+/** A secret a job's tasks need by name (ADR 0025): `name` is `[A-Z0-9_]{1,64}`, `attempt` is `any` or `current`. */
+export const SecretRef = z.object({
+  name: z.string().regex(/^[A-Z0-9_]{1,64}$/, "not a secret name"),
+  attempt: UnicodeText,
+  resource_kinds: z.array(UnicodeText),
+});
+export type SecretRef = z.infer<typeof SecretRef>;
+
+/** A managed job's policy (M5): every field optional, each taking its default on the node; `pin` is written as `null` when none. */
+export const ManagedPolicy = z.object({
+  drain_budget_ms: optional(z.number().int().min(0).max(U32_MAX)),
+  allowed_fidelity: optional(z.array(Fidelity)),
+  secrets: optional(z.array(SecretRef)),
+  export_allowlist: optional(z.array(UnicodeText)),
+  disk_bytes: optional(count),
+  pin: NodeId.nullable().default(null),
+});
+export type ManagedPolicy = z.infer<typeof ManagedPolicy>;
+
+/** A note on a managed job's history (ADR 0024): an object with one key naming its kind. */
+export const Note = z.union([
+  z.object({ decision: z.object({ what: UnicodeText, reason: UnicodeText }) }),
+  z.object({ question: z.object({ text: UnicodeText }) }),
+  z.object({ answer: z.object({ question: Counter, text: UnicodeText }) }),
+]);
+export type Note = z.infer<typeof Note>;
+
+/** One recorded note with the revision it was recorded at. */
+export const NoteAt = z.intersection(z.object({ revision: Counter }), Note);
+export type NoteAt = z.infer<typeof NoteAt>;
+
+/** Anything JSON, kept as it came: a rank or exclusion reason this client does not know, or a facade message. */
+export const FacadeJson: z.ZodType<unknown> = z.unknown();
+
+/** One rank reason (ADR 0026): a name such as `bundle_chain`, or an object such as `{ load: 120 }`, kept as it came. */
+export const Rank = z.union([UnicodeText, z.record(UnicodeText, FacadeJson)]);
+export type Rank = z.infer<typeof Rank>;
+
+/** One exclusion reason (ADR 0026): a name such as `no_answer`, or an object with the values compared, kept as it came. */
+export const Exclusion = z.union([UnicodeText, z.record(UnicodeText, FacadeJson)]);
+export type Exclusion = z.infer<typeof Exclusion>;
+
+/** A node's verdict in a placement: an object with one key, `eligible` or `excluded`. */
+export const PlacementVerdict = z.union([
+  z.object({ eligible: z.object({ rank: z.array(Rank) }) }),
+  z.object({ excluded: z.object({ reasons: z.array(Exclusion) }) }),
+]);
+export type PlacementVerdict = z.infer<typeof PlacementVerdict>;
+
+/** One placement decision as the journal recorded it; `chosen` is `null` when the job was parked. */
+export const Placement = z.object({
+  seq: Counter,
+  kind: UnicodeText,
+  chosen: NodeId.nullable(),
+  candidates: z.array(z.object({ node: NodeId, verdict: PlacementVerdict })),
+});
+export type Placement = z.infer<typeof Placement>;
+
+/** One continuation as the journal recorded it (ADR 0024). */
+export const Continuation = z.object({
+  attempt: AttemptId,
+  from: AttemptId,
+  achieved: UnicodeText,
+  package: optional(z.string().regex(HEX_32, "not 64 lowercase hex digits")),
+});
+export type Continuation = z.infer<typeof Continuation>;
+
+/** One provider operation as the journal holds it (ADR 0021, ADR 0022). */
+export const ProviderOperation = z.object({
+  operation: OperationId,
+  attempt: AttemptId,
+  generation: Counter,
+  profile: UnicodeText,
+  action: UnicodeText,
+  effect: UnicodeText,
+  status: UnicodeText,
+  locator: optional(UnicodeText),
+  cleans: optional(OperationId),
+});
+export type ProviderOperation = z.infer<typeof ProviderOperation>;
+
+/** One reason no replacement attempt may be granted (ADR 0022). */
+export const Blocker = z.object({ kind: UnicodeText, operation: OperationId, status: UnicodeText });
+export type Blocker = z.infer<typeof Blocker>;
+
+/** A provider resource that may still exist (ADR 0022). */
+export const Residual = z.object({ creating: OperationId, status: UnicodeText, locator: optional(UnicodeText) });
+export type Residual = z.infer<typeof Residual>;
+
+/** The fields of an inspection (M5): the body of `managed_inspect` and of the facade's `inspection`. */
+const inspection = {
+  job: z.lazy(() => ManagedJob),
+  parked: z.boolean(),
+  placements: z.array(Placement),
+  continuations: z.array(Continuation),
+  notes: z.array(NoteAt),
+  provider_operations: z.array(ProviderOperation),
+  blockers: z.array(Blocker),
+  residuals: z.array(Residual),
+};
+
+/** Everything the journal holds about one managed job. */
+export const Inspection = z.object(inspection);
+export type Inspection = z.infer<typeof Inspection>;
+
+/** Who acts under a facade token: 1 to 64 characters of `[A-Za-z0-9._-]`. */
+export const Actor = z.string().regex(/^[A-Za-z0-9._-]{1,64}$/, "not an actor name");
+export type Actor = z.infer<typeof Actor>;
+
+/** The jobs a facade token may act on: `any`, or a list. */
+export const JobScope = z.union([z.literal("any"), z.array(JobId)]);
+export type JobScope = z.infer<typeof JobScope>;
+
+/** The nodes a facade token may pin or place on: `any`, or a list. */
+export const ResourceScope = z.union([z.literal("any"), z.array(NodeId)]);
+export type ResourceScope = z.infer<typeof ResourceScope>;
+
 export const Request = z.discriminatedUnion("op", [
   z.object({ op: z.literal("node_id") }),
   z.object({ op: z.literal("node_add"), node: NodeId, addr: optional(UnicodeText) }),
@@ -946,6 +1090,8 @@ export const Request = z.discriminatedUnion("op", [
     repo: SystemPath,
     goal: Goal,
     harness: RequestHarness,
+    acceptance: optional(z.array(UnicodeText)),
+    policy: optional(ManagedPolicy),
   }),
   z.object({
     op: z.literal("managed_cancel"),
@@ -953,11 +1099,57 @@ export const Request = z.discriminatedUnion("op", [
     job: JobId,
     expected_revision: optional(Counter),
     reason: UnicodeText,
+    task: optional(TaskId),
   }),
   z.object({ op: z.literal("managed_status"), job: JobId }),
   z.object({ op: z.literal("managed_list") }),
   z.object({ op: z.literal("job_repair"), job: JobId }),
   z.object({ op: z.literal("job_export"), job: JobId, path: optional(SystemPath), env }),
+  z.object({
+    op: z.literal("managed_note"),
+    operation_key: OperationKey,
+    job: JobId,
+    expected_revision: optional(Counter),
+    note: Note,
+  }),
+  z.object({
+    op: z.literal("managed_checkpoint"),
+    operation_key: OperationKey,
+    job: JobId,
+    expected_revision: optional(Counter),
+  }),
+  z.object({
+    op: z.literal("managed_continue"),
+    operation_key: OperationKey,
+    job: JobId,
+    expected_revision: optional(Counter),
+    fidelity: optional(z.array(Fidelity)),
+    pin: optional(NodeId),
+  }),
+  z.object({ op: z.literal("managed_inspect"), job: JobId }),
+  z.object({
+    op: z.literal("managed_submit"),
+    operation_key: OperationKey,
+    goal: Goal,
+    harness: RequestHarness,
+    acceptance: optional(z.array(UnicodeText)),
+    source: ManagedSource,
+    policy: optional(ManagedPolicy),
+  }),
+  z.object({
+    op: z.literal("managed_import"),
+    path: SystemPath,
+    export_allowlist: optional(z.array(UnicodeText)),
+  }),
+  z.object({
+    op: z.literal("facade_mint"),
+    actor: Actor,
+    jobs: JobScope,
+    resources: ResourceScope,
+    expires_ms: count,
+  }),
+  z.object({ op: z.literal("facade_revoke"), token_id: UnicodeText }),
+  z.object({ op: z.literal("facade_call"), authority: NodeId, message: FacadeJson }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -995,12 +1187,32 @@ const runPlan = {
 };
 const lease = { owner: NodeId, epoch: Epoch };
 
-/** One task of a managed job; `state` is `open`, `succeeded`, `failed` or `cancelled`, and a newer node may send another. */
+/**
+ * A task receipt (ADR 0023): `status` is `running`, `exited`, `interrupted`,
+ * `checkpointed` or `blocked`, and a newer node may send another; an
+ * interrupted test never passed.
+ */
+export const Receipt = z.object({
+  status: UnicodeText,
+  exit: optional(signedCount),
+  interrupted: z.boolean(),
+  snapshot: optional(SnapshotId),
+  reason: optional(UnicodeText),
+});
+export type Receipt = z.infer<typeof Receipt>;
+
+/**
+ * One task of a managed job; `state` is `open`, `succeeded`, `failed` or
+ * `cancelled`, `class` (M5) is `build`, `test`, `harness` or `opaque`, and
+ * a newer node may send another of either.
+ */
 export const ManagedTask = z.object({
   task: TaskId,
   parent: optional(TaskId),
   label: optional(UnicodeText),
   state: UnicodeText,
+  class: optional(UnicodeText),
+  receipt: optional(Receipt),
 });
 export type ManagedTask = z.infer<typeof ManagedTask>;
 
@@ -1110,6 +1322,15 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("managed_list"), jobs: z.array(ManagedJob), left_out: optional(count) }),
   z.object({ kind: z.literal("job_repair"), peer: NodeId, outcome: RepairOutcome }),
   z.object({ kind: z.literal("job_export"), snapshot: SnapshotId, root: Path, chain: z.array(SnapshotId) }),
+  z.object({ kind: z.literal("managed_note"), ...managedOperation }),
+  z.object({ kind: z.literal("managed_checkpoint"), ...managedOperation }),
+  z.object({ kind: z.literal("managed_continue"), ...managedOperation }),
+  z.object({ kind: z.literal("managed_inspect"), ...inspection }),
+  z.object({ kind: z.literal("managed_submit"), ...managedOperation }),
+  z.object({ kind: z.literal("managed_import"), snapshot: SnapshotId }),
+  z.object({ kind: z.literal("facade_mint"), token_id: UnicodeText, bearer: z.string().regex(HEX_32, "not 64 lowercase hex") }),
+  z.object({ kind: z.literal("facade_revoke"), revoked: z.boolean() }),
+  z.object({ kind: z.literal("facade_call"), message: FacadeJson }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -1127,7 +1348,13 @@ export type Suspended = ReplyTo<"job_suspend">;
 export type Lease = ReplyTo<"job_move" | "job_steal">;
 export type Registered = ReplyTo<"harness_started">;
 export type SessionRecorded = ReplyTo<"harness_session">;
-export type ManagedOperation = ReplyTo<"managed_create" | "managed_cancel">;
+export type ManagedOperation = ReplyTo<
+  "managed_create" | "managed_cancel" | "managed_note" | "managed_checkpoint" | "managed_continue" | "managed_submit"
+>;
+export type ManagedInspection = ReplyTo<"managed_inspect">;
+export type Imported = ReplyTo<"managed_import">;
+export type Minted = ReplyTo<"facade_mint">;
+export type Revoked = ReplyTo<"facade_revoke">;
 export type ManagedStatus = ReplyTo<"managed_status">;
 export type ManagedJobs = ReplyTo<"managed_list">;
 export type Repaired = ReplyTo<"job_repair">;
