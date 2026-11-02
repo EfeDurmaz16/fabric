@@ -1,6 +1,6 @@
 # ADR 0024: The portable work package and continuation fidelity
 
-Status: proposed, 2026-11-03.
+Status: proposed 2026-11-03, built 2026-11-03 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request).
 
 Adopts the external draft P04 ("Portable work package and continuation fidelity", 2026-10-25, Proposed) for the M5 campaign. Draft P04 left open the package's fields and limits, the allowed context size, how evidence is selected and the default allowed fidelity. Each is selected below. The selections were selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe, and Efe can veto any of them at the pull request. The types are in [docs/managed-jobs.md](../managed-jobs.md), section "Placement and planned continuity (M5)", part "Work package and fidelity (P04)". It extends ADR 0006 (harness adapters) and keeps ADR 0011 (path identity) as it is.
 
@@ -49,3 +49,7 @@ ADR 0011 stands: `native_session` needs the same root and the same home on the t
 
 - Which adapter profiles can prove a different root or home for `native_session`, and what the proof is.
 - Whether a package should carry a signed digest chain of its own once it leaves the owner's nodes (draft P07's open questions on principals).
+
+## As built (M5)
+
+Built on 2026-11-03 by owner A. `build_package`, the limits and the credential refusal are as decided; the package's canonical JSON is written by a private writer with sorted keys and every number as a decimal string. `RecordNote` refuses a credential-like text and a decision with an empty reason before the journal records it. A `Continued` observation whose achieved fidelity the continue did not allow is `FidelityRefused`, so a refusal is never recorded as a lower fidelity; the requested fidelity travels in the history as `EffectRequested` and is written into `ContinuationRecorded`. `offered_fidelity` compares the target's harness version with the session's newest writer by semver order. The rest is in docs/managed-jobs.md, "As built (M5): P03 to P05".
