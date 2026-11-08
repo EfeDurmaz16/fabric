@@ -1219,7 +1219,7 @@ pub struct PlacementInput<'a> {
 }
 pub enum Exclusion {
     NoAnswer { within_ms: u32 },
-    Stale { age_ms: u64 },                   // measured_at_ms older than now_ms minus PROBE_BOUND_MS
+    Stale { age_ms: u64 },                   // measured_at_ms older than now_ms minus PROBE_BOUND_MS; fabricd stamps measured_at_ms with its own clock when the answer arrives and decides no later than the round's bound, so neither a silent peer nor a peer's clock makes an answer stale
     Platform { need: Platform, have: Platform },
     HarnessMissing { kind: HarnessKind },
     HarnessVersion { kind: HarnessKind, need: HarnessVersion, have: HarnessVersion },

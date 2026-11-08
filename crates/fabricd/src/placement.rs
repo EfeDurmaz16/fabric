@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fabric_core::BoxFuture;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{NodeId, SnapshotId};
 use fabric_core::managed::placement::{
@@ -187,9 +188,10 @@ impl Node {
     }
 
     /// Probes this node and every paired peer for `job` in parallel, each
-    /// within `PROBE_BOUND`, and returns one probe per node. A peer that
+    /// within `PROBE_BOUND` of the round's start, and returns one probe per
+    /// node and the time of the decision (see [`probe_round`]). A peer that
     /// does not answer in time is a probe without an advert.
-    pub(crate) async fn probe_candidates(self: &Arc<Self>, ask: &Advertise) -> Vec<Probe> {
+    pub(crate) async fn probe_candidates(self: &Arc<Self>, ask: &Advertise) -> (Vec<Probe>, u64) {
         let mut peers: Vec<NodeId> = self
             .peers
             .snapshot()
@@ -198,37 +200,37 @@ impl Node {
             .collect();
         peers.sort();
         peers.truncate(MAX_CANDIDATES.saturating_sub(1));
-        let mut probes = Vec::with_capacity(peers.len() + 1);
-        let started = tokio::time::Instant::now();
-        let own = self.own_advert(ask).await;
-        probes.push(probe_of(self.id, Some(&own), elapsed_ms(started)));
-        let asks = peers.iter().map(|peer| {
+        let mut asks: Vec<(NodeId, BoxFuture<'static, Option<AdvertWire>>)> =
+            Vec::with_capacity(peers.len() + 1);
+        let own = Arc::clone(self);
+        let own_ask = ask.clone();
+        asks.push((
+            self.id,
+            Box::pin(async move { Some(own.own_advert(&own_ask).await) }),
+        ));
+        for peer in peers {
             let node = Arc::clone(self);
             let ask = ask.clone();
-            let peer = *peer;
-            async move {
-                let started = tokio::time::Instant::now();
-                let answer = tokio::time::timeout(
-                    PROBE_BOUND,
-                    node.call(peer, |session| {
-                        let ask = ask.clone();
-                        async move { session.advertise(ask, PROBE_BOUND).await }
-                    }),
-                )
-                .await;
-                let advert = match answer {
-                    Ok(Ok(advert)) => Some(advert),
-                    Ok(Err(e)) => {
-                        tracing::info!(%peer, error = %e, "a peer did not advertise for a placement");
-                        None
+            asks.push((
+                peer,
+                Box::pin(async move {
+                    match node
+                        .call(peer, |session| {
+                            let ask = ask.clone();
+                            async move { session.advertise(ask, PROBE_BOUND).await }
+                        })
+                        .await
+                    {
+                        Ok(advert) => Some(advert),
+                        Err(e) => {
+                            tracing::info!(%peer, error = %e, "a peer did not advertise for a placement");
+                            None
+                        }
                     }
-                    Err(_) => None,
-                };
-                probe_of(peer, advert.as_ref(), elapsed_ms(started))
-            }
-        });
-        probes.extend(futures_join_all(asks).await);
-        probes
+                }),
+            ));
+        }
+        probe_round(asks).await
     }
 
     /// Decides where `job`'s task runs: one probe round, then `place`.
@@ -265,7 +267,7 @@ impl Node {
                 .map(|s| SecretNameText::truncated(s.name.as_str()))
                 .collect(),
         };
-        let candidates = self.probe_candidates(&advertise).await;
+        let (candidates, decided_ms) = self.probe_candidates(&advertise).await;
         place(&PlacementInput {
             job,
             task: ask.task,
@@ -273,9 +275,44 @@ impl Node {
             required_layout: ask.required_layout.clone(),
             current: ask.current,
             candidates,
-            now_ms: now_ms(),
+            now_ms: decided_ms,
         })
     }
+}
+
+/// One probe round: every ask runs at once and is cut at `PROBE_BOUND`
+/// from the round's start. Returns one probe per node, in the order
+/// asked, and the decision's time.
+///
+/// Every advert is stamped with this node's clock when its answer
+/// arrived, never with the time the answering node wrote in it: a peer's
+/// clock may be far from this one, and freshness is this node's to judge.
+/// The decision's time is now, but never later than the round's bound,
+/// so a peer that stays silent for the whole bound makes no answer that
+/// came within it stale; it is `no_answer` alone.
+pub(crate) async fn probe_round(
+    asks: Vec<(NodeId, BoxFuture<'static, Option<AdvertWire>>)>,
+) -> (Vec<Probe>, u64) {
+    let started = tokio::time::Instant::now();
+    let round_start_ms = now_ms();
+    let answers = futures_join_all(asks.into_iter().map(|(node, ask)| async move {
+        let advert = tokio::time::timeout(PROBE_BOUND, ask).await.ok().flatten();
+        let received_ms = now_ms();
+        (node, advert, elapsed_ms(started), received_ms)
+    }))
+    .await;
+    let probes = answers
+        .iter()
+        .map(|(node, advert, probe_ms, received_ms)| {
+            let mut probe = probe_of(*node, advert.as_ref(), *probe_ms);
+            if let Some(advert) = probe.advert.as_mut() {
+                advert.measured_at_ms = (*received_ms).max(round_start_ms);
+            }
+            probe
+        })
+        .collect();
+    let decided_ms = now_ms().min(round_start_ms.saturating_add(u64::from(PROBE_BOUND_MS)));
+    (probes, decided_ms.max(round_start_ms))
 }
 
 fn elapsed_ms(started: tokio::time::Instant) -> u32 {
@@ -505,6 +542,79 @@ mod tests {
             &decision.candidates[0].verdict,
             Verdict::Excluded { reasons } if matches!(reasons[0], Exclusion::Secret { .. })
         ));
+    }
+
+    /// A wire advert for `node` that can run `job_on`'s job, measured at `at_ms`.
+    fn runnable(node: NodeId, at_ms: u64) -> AdvertWire {
+        AdvertWire {
+            node,
+            os: PlatformText::truncated("macos"),
+            arch: PlatformText::truncated("arm64"),
+            harnesses: BoundedList::new(vec![(
+                HarnessKind::Acp {
+                    program: fabric_core::harness::ProgramName::parse("sh").unwrap(),
+                    args: Vec::new(),
+                },
+                VersionText::truncated(UNVERSIONED),
+            )])
+            .unwrap(),
+            home: AbsPath::parse("/Users/me").unwrap(),
+            root: AbsPath::parse("/Users/me/fabric/j").unwrap(),
+            load_1m_milli: 120,
+            free_disk_bytes: 1 << 40,
+            bundle_chain: false,
+            workspace: false,
+            measured_at_ms: at_ms,
+            secrets_unresolved: BoundedList::default(),
+        }
+    }
+
+    fn decide(job: &ManagedJob, probes: Vec<Probe>, decided_ms: u64) -> PlacementDecision {
+        place(&PlacementInput {
+            job,
+            task: job.primary,
+            kind: PlacementKind::Initial,
+            required_layout: None,
+            current: None,
+            candidates: probes,
+            now_ms: decided_ms,
+        })
+    }
+
+    /// A peer that never answers (a laptop asleep) costs the round its
+    /// bound and nothing more: the node that answered at once is placed,
+    /// not excluded as stale, and the silent one is `no_answer`.
+    #[tokio::test]
+    async fn a_silent_peer_does_not_make_the_answering_nodes_stale() {
+        let (_dir, node) = node();
+        let job = job_on(&node, None);
+        let (me, asleep) = (node.id, NodeId::from_bytes([9; 32]));
+        let own = runnable(me, now_ms());
+        let (probes, decided_ms) = probe_round(vec![
+            (me, Box::pin(async move { Some(own) })),
+            (asleep, Box::pin(std::future::pending())),
+        ])
+        .await;
+        let decision = decide(&job, probes, decided_ms);
+        assert_eq!(decision.chosen, Some(me), "{decision:?}");
+        assert!(matches!(
+            &decision.candidates[1].verdict,
+            Verdict::Excluded { reasons } if matches!(reasons[..], [Exclusion::NoAnswer { .. }])
+        ));
+    }
+
+    /// A peer whose clock is a minute behind this node's is judged by when
+    /// its answer arrived here, not by the time it wrote in the advert.
+    #[tokio::test]
+    async fn a_peer_with_a_skewed_clock_is_not_stale() {
+        let (_dir, node) = node();
+        let job = job_on(&node, None);
+        let peer = NodeId::from_bytes([4; 32]);
+        let behind = runnable(peer, now_ms().saturating_sub(60_000));
+        let (probes, decided_ms) =
+            probe_round(vec![(peer, Box::pin(async move { Some(behind) }))]).await;
+        let decision = decide(&job, probes, decided_ms);
+        assert_eq!(decision.chosen, Some(peer), "{decision:?}");
     }
 
     /// A harness's `--version` output is advertised as the version in it,
