@@ -569,6 +569,18 @@ fn chosen_decision(kind: PlacementKind, node: NodeId) -> PlacementDecision {
     }
 }
 
+/// The handoff cut's receipt: the harness, checkpointed by its suspend path.
+fn handoff_harness(task: TaskId, snapshot: SnapshotId) -> TaskReceipt {
+    TaskReceipt {
+        task,
+        class: TaskClass::Harness,
+        status: ReceiptStatus::Checkpointed { snapshot },
+        exit: None,
+        interrupted: true,
+        workspace: None,
+    }
+}
+
 fn interrupted_test(task: TaskId) -> TaskReceipt {
     TaskReceipt {
         task,
@@ -705,7 +717,7 @@ fn write_v3_history(journal: &mut Journal) {
                 attempt: first.id,
                 generation: first.generation,
                 snapshot: handoff,
-                cut: cut(handoff, Vec::new()),
+                cut: cut(handoff, vec![handoff_harness(primary, handoff)]),
             },
             at + 6,
         )
@@ -839,8 +851,14 @@ fn check_v3(journal: &mut Journal) {
         )]
     );
     // The in-place checkpoint's receipts said the test was interrupted;
-    // the handoff cut recorded none, and the last cut wins.
-    assert_eq!(journal.receipts(fourth.attempts[0].id).unwrap(), Vec::new());
+    // the handoff cut's say the harness was checkpointed, and the last cut wins.
+    assert_eq!(
+        journal.receipts(fourth.attempts[0].id).unwrap(),
+        vec![handoff_harness(
+            fourth.job.primary,
+            SnapshotId::of(b"fixture handoff cut")
+        )]
+    );
     assert!(
         journal
             .job(FOURTH)

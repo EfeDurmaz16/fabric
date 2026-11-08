@@ -372,7 +372,19 @@ fn a_refusal_is_never_lowered() {
     let first = state.attempts[0].id;
     let cut = CheckpointCut {
         snapshot: SnapshotId::of(b"s"),
-        receipts: Vec::new(),
+        // One receipt per open task: the harness and its test child.
+        receipts: state
+            .tasks
+            .iter()
+            .map(|task| TaskReceipt {
+                task: task.id,
+                class: task.class,
+                status: ReceiptStatus::Interrupted,
+                exit: None,
+                interrupted: true,
+                workspace: None,
+            })
+            .collect(),
         facts: Vec::new(),
         evidence: Vec::new(),
     };

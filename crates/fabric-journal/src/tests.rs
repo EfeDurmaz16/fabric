@@ -410,7 +410,14 @@ fn events_and_evidence_are_append_only_and_tampering_is_found() {
                 snapshot,
                 cut: fabric_core::managed::CheckpointCut {
                     snapshot,
-                    receipts: Vec::new(),
+                    receipts: vec![fabric_core::managed::TaskReceipt {
+                        task: attempt.task,
+                        class: fabric_core::managed::TaskClass::Harness,
+                        status: fabric_core::managed::ReceiptStatus::Checkpointed { snapshot },
+                        exit: None,
+                        interrupted: true,
+                        workspace: None,
+                    }],
                     facts: Vec::new(),
                     evidence: Vec::new(),
                 },

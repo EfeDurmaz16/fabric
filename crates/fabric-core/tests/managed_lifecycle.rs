@@ -351,14 +351,17 @@ fn a_continue_cuts_places_grants_and_records_the_fidelity_achieved() {
     ));
     // The cut: the attempt ends checkpointed, the receipts say the test was interrupted.
     let snapshot = SnapshotId::of(b"cut");
-    let receipts = vec![TaskReceipt {
-        task: test,
-        class: TaskClass::Test,
-        status: ReceiptStatus::Interrupted,
-        exit: None,
-        interrupted: true,
-        workspace: None,
-    }];
+    let receipts = vec![
+        harness_receipt(primary, snapshot),
+        TaskReceipt {
+            task: test,
+            class: TaskClass::Test,
+            status: ReceiptStatus::Interrupted,
+            exit: None,
+            interrupted: true,
+            workspace: None,
+        },
+    ];
     let the_cut = cut(snapshot, receipts.clone());
     let digest = the_cut.digest();
     let t = kept
@@ -431,7 +434,7 @@ fn a_continue_with_no_live_attempt_places_from_the_last_checkpoint() {
         attempt: first.id,
         generation: first.generation,
         snapshot,
-        cut: cut(snapshot, Vec::new()),
+        cut: cut(snapshot, vec![harness_receipt(primary, snapshot)]),
     })
     .unwrap();
     let (cont, _) = kept
@@ -512,7 +515,7 @@ fn a_checkpoint_leaves_the_attempt_running_and_a_blocked_one_fails_the_command()
             attempt: first.id,
             generation: first.generation,
             snapshot,
-            cut: cut(snapshot, Vec::new()),
+            cut: cut(snapshot, vec![harness_receipt(first.task, snapshot)]),
         })
         .unwrap();
     assert!(matches!(
@@ -764,4 +767,205 @@ fn notes_are_recorded_at_commit_and_bounded() {
         },
     )
     .unwrap();
+}
+
+/// The receipt of a harness task the suspend path checkpointed.
+fn harness_receipt(task: TaskId, snapshot: SnapshotId) -> TaskReceipt {
+    TaskReceipt {
+        task,
+        class: TaskClass::Harness,
+        status: ReceiptStatus::Checkpointed { snapshot },
+        exit: None,
+        interrupted: true,
+        workspace: None,
+    }
+}
+
+/// A continue after the attempt was lost starts from the newest cut of
+/// the task, a checkpoint command's included, not from the last attempt
+/// that ended checkpointed.
+#[test]
+fn a_continue_starts_from_the_newest_cut_a_checkpoint_command_made() {
+    let (mut kept, _) = running();
+    let primary = kept.state().job.primary;
+    let first = kept.state().attempts[0].clone();
+    let s2 = SnapshotId::of(b"s2");
+    let (cp, _) = kept
+        .submit("cp", Command::Checkpoint { attempt: first.id })
+        .unwrap();
+    kept.mark(cp, OperationMark::Dispatched).unwrap();
+    kept.observe(&Observation::Checkpointed {
+        attempt: first.id,
+        generation: first.generation,
+        snapshot: s2,
+        cut: cut(s2, vec![harness_receipt(primary, s2)]),
+    })
+    .unwrap();
+    kept.observe(&Observation::Lost {
+        attempt: first.id,
+        generation: first.generation,
+    })
+    .unwrap();
+    let (cont, _) = kept
+        .submit(
+            "continue",
+            Command::Continue {
+                task: primary,
+                fidelity: AllowedFidelity::DEFAULT,
+                pin: None,
+            },
+        )
+        .unwrap();
+    kept.observe(&Observation::Placed {
+        operation: cont,
+        task: primary,
+        decision: decision(PlacementKind::Failover, Some(NODE)),
+    })
+    .unwrap();
+    assert_eq!(kept.state().attempts[1].initial_checkpoint, Some(s2));
+}
+
+/// `new_native_session_with_package` is the fidelity of a handed package:
+/// a continuation that reports it with no package is refused.
+#[test]
+fn a_package_fidelity_needs_a_package() {
+    let (mut kept, _) = running();
+    let primary = kept.state().job.primary;
+    let first = kept.state().attempts[0].clone();
+    let (cont, _) = kept
+        .submit(
+            "continue",
+            Command::Continue {
+                task: primary,
+                fidelity: AllowedFidelity::DEFAULT,
+                pin: None,
+            },
+        )
+        .unwrap();
+    kept.mark(cont, OperationMark::Dispatched).unwrap();
+    let snapshot = SnapshotId::of(b"cut");
+    kept.observe(&Observation::Checkpointed {
+        attempt: first.id,
+        generation: first.generation,
+        snapshot,
+        cut: cut(snapshot, vec![harness_receipt(primary, snapshot)]),
+    })
+    .unwrap();
+    kept.observe(&Observation::Placed {
+        operation: cont,
+        task: primary,
+        decision: decision(PlacementKind::PlannedHandoff, Some(NODE)),
+    })
+    .unwrap();
+    let second = kept.state().attempts[1].clone();
+    assert!(matches!(
+        kept.observe(&Observation::Continued {
+            attempt: second.id,
+            generation: second.generation,
+            from: first.id,
+            achieved: Fidelity::NewNativeSessionWithPackage,
+            package: None,
+        }),
+        Err(DomainError::MissingPackage { .. })
+    ));
+    assert_eq!(kept.status(cont), OperationStatus::Dispatched);
+}
+
+/// A checkpoint command belongs to the attempt it names: when that
+/// attempt ends first, the command fails, and a later attempt's cut is
+/// that attempt's own end, never the command's success.
+#[test]
+fn a_checkpoint_of_an_attempt_that_ended_fails_and_claims_no_later_cut() {
+    let (mut kept, _) = running();
+    let primary = kept.state().job.primary;
+    let first = kept.state().attempts[0].clone();
+    let (cp, _) = kept
+        .submit("cp", Command::Checkpoint { attempt: first.id })
+        .unwrap();
+    kept.mark(cp, OperationMark::Dispatched).unwrap();
+    kept.observe(&Observation::Exited {
+        attempt: first.id,
+        generation: first.generation,
+        outcome: ExitOutcome::Failed { code: Some(1) },
+    })
+    .unwrap();
+    assert_eq!(kept.status(cp), OperationStatus::Failed);
+    let (_, _) = kept
+        .submit(
+            "start-b",
+            Command::StartAttempt {
+                task: primary,
+                resource: ResourceRef::Node { node: NODE },
+                initial_checkpoint: None,
+            },
+        )
+        .unwrap();
+    let second = kept.state().attempts[1].clone();
+    let snapshot = SnapshotId::of(b"b");
+    kept.observe(&Observation::Checkpointed {
+        attempt: second.id,
+        generation: second.generation,
+        snapshot,
+        cut: cut(snapshot, vec![harness_receipt(primary, snapshot)]),
+    })
+    .unwrap();
+    assert_eq!(
+        kept.state().attempts[1].status,
+        AttemptStatus::Checkpointed { snapshot }
+    );
+}
+
+/// A cut carries one receipt per open task of the attempt: one that
+/// leaves a task out, or an empty one, is refused.
+#[test]
+fn a_cut_that_misses_an_open_task_is_refused() {
+    let (mut kept, _) = running();
+    let primary = kept.state().job.primary;
+    let first = kept.state().attempts[0].clone();
+    let (_, t) = kept
+        .submit(
+            "child",
+            Command::RegisterTask {
+                parent: primary,
+                kind: TaskKind::Child {
+                    label: "tests".into(),
+                },
+                restart: RestartPolicy::Block,
+                class: TaskClass::Test,
+            },
+        )
+        .unwrap();
+    let ManagedEvent::TaskRegistered { task: test, .. } = t.events[1] else {
+        panic!("no task")
+    };
+    let snapshot = SnapshotId::of(b"cut");
+    for (receipts, missing) in [
+        (Vec::new(), primary),
+        (vec![harness_receipt(primary, snapshot)], test),
+    ] {
+        assert_eq!(
+            kept.observe(&Observation::Checkpointed {
+                attempt: first.id,
+                generation: first.generation,
+                snapshot,
+                cut: cut(snapshot, receipts),
+            }),
+            Err(DomainError::MissingReceipt { task: missing })
+        );
+    }
+}
+
+/// A checkpoint or continue accepted and not yet dispatched is in flight
+/// too: a second one is refused instead of piling up.
+#[test]
+fn an_accepted_checkpoint_refuses_a_second_one() {
+    let (mut kept, _) = running();
+    let first = kept.state().attempts[0].clone();
+    let (cp, _) = kept
+        .submit("cp", Command::Checkpoint { attempt: first.id })
+        .unwrap();
+    assert!(matches!(
+        kept.submit("cp-2", Command::Checkpoint { attempt: first.id }),
+        Err(DomainError::EffectInFlight { operation }) if operation == cp
+    ));
 }

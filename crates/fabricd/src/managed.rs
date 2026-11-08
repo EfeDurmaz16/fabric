@@ -64,6 +64,8 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::NoteTooLong { .. } => "note_too_long",
         DomainError::CredentialLike { .. } => "credential_like",
         DomainError::EffectInFlight { .. } => "effect_in_flight",
+        DomainError::MissingReceipt { .. } => "missing_receipt",
+        DomainError::MissingPackage { .. } => "missing_package",
     }
 }
 

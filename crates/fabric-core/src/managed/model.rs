@@ -1150,6 +1150,20 @@ pub enum DomainError {
         /// The operation.
         operation: OperationId,
     },
+    /// A checkpoint cut has no receipt for an open task of its attempt
+    /// (ADR 0023: one receipt per task); M5.
+    #[error("the cut has no receipt for open task {task}")]
+    MissingReceipt {
+        /// The task.
+        task: TaskId,
+    },
+    /// A continuation at `new_native_session_with_package` named no
+    /// package (ADR 0024); M5.
+    #[error("attempt {attempt} continued with a package fidelity and no package")]
+    MissingPackage {
+        /// The attempt that continued.
+        attempt: AttemptId,
+    },
 }
 
 /// The ids and the time a command may need, made by the authority before it applies one.
@@ -1180,6 +1194,10 @@ pub struct ManagedState {
     pub operations: Vec<OperationProgress>,
     /// The effects its M5 commands asked for, in order; M5.
     pub requests: Vec<(OperationId, EffectRequest)>,
+    /// The snapshot of every checkpoint cut recorded, by attempt, in the
+    /// order recorded; M5. A continue starts from the newest of its task.
+    #[serde(default)]
+    pub cuts: Vec<(AttemptId, crate::id::SnapshotId)>,
 }
 
 impl ManagedState {

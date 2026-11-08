@@ -170,7 +170,31 @@ pub(crate) fn load_state(
         attempts: load_attempts(conn, job)?,
         operations: load_operations(conn, job)?,
         requests: load_requests(conn, job)?,
+        cuts: load_cuts(conn, job)?,
     }))
+}
+
+/// The job's checkpoint cuts, read from their events: one per
+/// `checkpoint_cut_recorded`, in order, as the replay folds them.
+fn load_cuts(
+    conn: &Connection,
+    job: JobId,
+) -> Result<Vec<(fabric_core::managed::AttemptId, fabric_core::id::SnapshotId)>, CommitError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT body FROM events WHERE job_id = ?1 AND kind = 'checkpoint_cut_recorded' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([job.to_bytes()], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let frame = EventFrame::decode(&row?).map_err(|e| corrupt(job, e))?;
+        if let ManagedEvent::CheckpointCutRecorded {
+            attempt, snapshot, ..
+        } = frame.event
+        {
+            out.push((attempt, snapshot));
+        }
+    }
+    Ok(out)
 }
 
 /// The effects the job's M5 commands asked for, read from their events:
