@@ -25,7 +25,9 @@
 //! the session this node already holds, if any, and goes on only when
 //! its messages are a prefix of the incoming ones; anything else is work
 //! done here after the job left, and the restore stops with
-//! `StateDiverged`, as for a rollout.
+//! `StateDiverged`, as for a rollout. An import that fails part way keeps
+//! the rows it wrote, so the adapter then deletes the session
+//! (`opencode session delete <id>`), which holds nothing the job lacks.
 //!
 //! A resume runs `opencode run -s <id>` (headless, `--format json`) or
 //! `opencode -s <id>` (terminal) with the model and agent of the last
@@ -419,6 +421,38 @@ impl OpenCode {
         }
     }
 
+    /// Deletes `session` from the store after an import of it failed.
+    /// `opencode import` 1.18.34 writes the session row and each message in
+    /// turn and stops at the first one it refuses, keeping what it wrote
+    /// (checked on 2026-11-08 against the installed binary with a
+    /// synthetic export), and a message left without all its parts would
+    /// read as diverged on every later restore. The import ran only when
+    /// this node held nothing the incoming export lacks (`Held::Absent` or
+    /// `Held::Prefix`), so deleting loses nothing the job does not carry,
+    /// and the next restore imports into an empty store. A failed delete
+    /// is logged; the import's error is the one returned.
+    async fn take_back(&self, session: &SessionId, cwd: &Path) {
+        match self
+            .helper(&["session", "delete", session.as_str()], cwd)
+            .await
+        {
+            Ok((true, _, _)) => {
+                info!(%session, "opencode: removed the session a failed import left");
+            }
+            Ok((false, _, stderr)) if stderr.contains(NOT_FOUND) => {}
+            Ok((false, _, stderr)) => tracing::warn!(
+                %session,
+                error = %crate::harness::shown(stderr.trim()),
+                "opencode: could not remove the session a failed import left"
+            ),
+            Err(e) => tracing::warn!(
+                %session,
+                error = %e,
+                "opencode: could not remove the session a failed import left"
+            ),
+        }
+    }
+
     /// Refuses while any process holds the database open: OpenCode keeps
     /// it open while it runs, and its writer rule is not read yet.
     fn refuse_open_store(&self) -> Result<(), HarnessError> {
@@ -576,7 +610,13 @@ impl OpenCode {
             pipeline::blocking(move || adapter.restore_sync(&tree, manifest)).await?;
         let continues = match held {
             Held::Same => session.clone(),
-            _ => self.import(&self.export_file(&session), &cwd).await?,
+            _ => match self.import(&self.export_file(&session), &cwd).await {
+                Ok(id) => id,
+                Err(e) => {
+                    self.take_back(&session, &cwd).await;
+                    return Err(e);
+                }
+            },
         };
         if continues != session {
             restored.fidelity = Fidelity::NewNativeSessionWithPackage;

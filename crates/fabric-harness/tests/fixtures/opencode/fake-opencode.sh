@@ -7,9 +7,12 @@
 # message with its parts per line). It answers export, import and run as
 # 1.18.34 does: export prints the JSON with "Exporting session: <id>" on
 # its error output, or "Error: Session not found: <id>" and exit 1; import
-# adds the rows the store lacks and prints "Imported session: <id>", a new
-# id under FAKE_OPENCODE_NEW_ID; run --format json prints step_start, text
-# and step_finish events. A prompt that asks for the first turn is
+# adds the rows the store lacks in order and prints "Imported session: <id>"
+# (a new id when fake-new-id exists); like 1.18.34 it refuses an assistant
+# message without parentID, mode, path, cost or tokens with "Missing key"
+# and exit 1, keeping the rows it wrote before it; session delete <id>
+# removes a session or says "Session not found" and exits 1; run --format
+# json prints step_start, text and step_finish events. A prompt that asks for the first turn is
 # answered from the store, so an answer proves the transcript travelled.
 version=1.18.34
 [ -z "$FAKE_OPENCODE_VERSION" ] || version=$FAKE_OPENCODE_VERSION
@@ -37,10 +40,28 @@ case "$1" in
     [ ! -f "$data/fake-new-id" ] || new=ses_0fabric0minted0by0import1
     [ -f "$rows/$new.info" ] || sed -n '1s/^{"info":\(.*\),$/\1/p' "$file" | sed "s/$id/$new/g" > "$rows/$new.info"
     touch "$rows/$new.msgs"
-    sed '1,2d;$d' "$file" | sed 's/,$//' | sed "s/$id/$new/g" | while IFS= read -r line; do
+    sed '1,2d;$d' "$file" | sed 's/,$//' | sed "s/$id/$new/g" > "$rows/.importing"
+    while IFS= read -r line; do
+      case "$line" in *'"role":"assistant"'*)
+        for key in parentID mode path cost tokens; do
+          case "$line" in *"\"$key\":"*) ;; *)
+            rm -f "$rows/.importing"
+            printf 'Error: Unexpected error\nMissing key\n  at ["%s"]\n' "$key" >&2
+            exit 1 ;;
+          esac
+        done ;;
+      esac
       grep -qxF -e "$line" "$rows/$new.msgs" || printf '%s\n' "$line" >> "$rows/$new.msgs"
-    done
+    done < "$rows/.importing"
+    rm -f "$rows/.importing"
     echo "Imported session: $new"
+    exit 0 ;;
+  session)
+    [ "$2" = delete ] || exit 1
+    id=$3
+    if [ ! -f "$rows/$id.info" ]; then echo "Error: Session not found: $id" >&2; exit 1; fi
+    rm -f "$rows/$id.info" "$rows/$id.msgs"
+    echo "Session $id deleted"
     exit 0 ;;
 esac
 printf '%s\n' "$@" > "$HOME/opencode-args"
@@ -81,8 +102,8 @@ case "$prompt" in
 esac
 printf '{"info":{"role":"user","agent":"%s","model":{"providerID":"%s","modelID":"%s"},"id":"msg_u%s","sessionID":"%s"},"parts":[{"type":"text","text":"%s","id":"prt_u%s"}]}\n' \
   "$agent" "$provider" "$name" "$n" "$session" "$prompt" "$n" >> "$rows/$session.msgs"
-printf '{"info":{"role":"assistant","agent":"%s","providerID":"%s","modelID":"%s","id":"msg_a%s","sessionID":"%s"},"parts":[{"type":"text","text":"%s","id":"prt_a%s"}]}\n' \
-  "$agent" "$provider" "$name" "$n" "$session" "$answer" "$n" >> "$rows/$session.msgs"
+printf '{"info":{"role":"assistant","parentID":"msg_u%s","mode":"%s","path":{"cwd":"%s","root":"%s"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"agent":"%s","providerID":"%s","modelID":"%s","id":"msg_a%s","sessionID":"%s"},"parts":[{"type":"text","text":"%s","id":"prt_a%s"}]}\n' \
+  "$n" "$agent" "$(pwd -P)" "$(pwd -P)" "$agent" "$provider" "$name" "$n" "$session" "$answer" "$n" >> "$rows/$session.msgs"
 printf '{"type":"step_start","timestamp":1,"sessionID":"%s","part":{"type":"step-start"}}\n' "$session"
 printf '{"type":"text","timestamp":2,"sessionID":"%s","part":{"type":"text","text":"%s"}}\n' "$session" "$answer"
 printf '{"type":"step_finish","timestamp":3,"sessionID":"%s","part":{"type":"step-finish","reason":"stop"}}\n' "$session"

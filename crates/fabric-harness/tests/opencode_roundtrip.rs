@@ -388,3 +388,25 @@ async fn a_stale_copy_of_the_export_does_not_block_a_restore() {
     assert_eq!(restored.fidelity, Fidelity::NativeSession);
     assert!(node.messages(SESSION).contains("name the greeting file"));
 }
+
+/// `opencode import` 1.18.34 writes the session row and every message
+/// before the one it refuses, then exits 1. A restore it fails takes that
+/// partial session back out, so the node holds what it held before.
+#[tokio::test]
+async fn an_import_that_fails_part_way_leaves_no_partial_session() {
+    let node = Node::new("1.18.34");
+    let unimportable = MESSAGES.replace("\"parentID\":\"msg_0fabric0user000000000001\",", "");
+    node.seed("1.18.34", &unimportable);
+    let out = node.home.join("state");
+    let adapter = node.adapter();
+    let manifest = adapter.capture(&node.work, &session(), &out).await.unwrap();
+    adapter.confirm_departure(&manifest).await.unwrap();
+    node.forget();
+    let err = adapter.restore(&node.work, &out).await.unwrap_err();
+    assert!(matches!(err, HarnessError::ProcessQuery { .. }), "{err}");
+    assert!(
+        !node.rows().join(format!("{SESSION}.info")).exists(),
+        "a partial session was left in the store"
+    );
+    assert_eq!(node.messages(SESSION), "");
+}
