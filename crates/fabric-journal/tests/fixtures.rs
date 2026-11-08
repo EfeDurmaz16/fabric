@@ -23,7 +23,8 @@ use fabric_core::managed::{
 use fabric_core::managed::{Generation, RequestDigest};
 use fabric_core::path::AbsPath;
 use fabric_journal::{
-    FILE_NAME, Journal, ProviderAnswer, ProviderDispatch, ProviderStatus, SCHEMA_VERSION,
+    AbandonApproval, Acknowledged, Blocker, EffectClass, FILE_NAME, Journal, LocatorRecord,
+    ProviderAnswer, ProviderDispatch, ProviderStatus, Purpose, ResourceKey, SCHEMA_VERSION,
 };
 
 const NODE: NodeId = NodeId::from_bytes([4; 32]);
@@ -244,8 +245,9 @@ fn make_v1_fixture() {
 
 /// The provider operations the v2 fixture adds to the v1 one, on the
 /// first job's live third attempt: one of each status a worker's answer
-/// leaves, two with the locator the worker reported, and the exec and the
-/// destroy with the target Fabric sent them to.
+/// leaves, two with the locator the worker reported, the exec and the
+/// destroy with the target Fabric sent them to, a lost create an attach
+/// did not find, and an exec the owner abandoned.
 fn provider_dispatch(n: u8, action: &str) -> ProviderDispatch {
     ProviderDispatch {
         operation: OperationId::from_bytes([0x40 + n; 16]),
@@ -255,12 +257,34 @@ fn provider_dispatch(n: u8, action: &str) -> ProviderDispatch {
         task: TaskId::from_bytes([1; 16]),
         attempt: AttemptId::from_bytes([5; 16]),
         generation: Generation::new(3).unwrap(),
+        profile: "fixture".into(),
         action: action.into(),
-        target: matches!(action, "sandbox.exec" | "sandbox.destroy").then(|| LOCATOR.to_owned()),
+        effect: match action {
+            "sandbox.create" => EffectClass::Create,
+            "sandbox.destroy" => EffectClass::Destroy,
+            _ => EffectClass::Mutate,
+        },
+        purpose: Purpose::Effect,
+        target: matches!(action, "sandbox.exec" | "sandbox.destroy").then(locator),
     }
 }
 
-const LOCATOR: &str = r#"{"provider":"fixture","scope":{"account":"acct-a","project":"proj-1"},"kind":"sandbox","native_id":"fx-provider-1"}"#;
+/// The fixture's one sandbox, as the bridge stores its locator; the key
+/// is fabric-bridge's `resource_key` of it.
+fn locator() -> LocatorRecord {
+    LocatorRecord {
+        text: r#"{"kind":"sandbox","native_id":"fx-provider-1","provider":"fixture","scope":{"account":"acct-a","project":"proj-1"}}"#.into(),
+        key: ResourceKey::from_bytes(LOCATOR_KEY),
+    }
+}
+
+const LOCATOR_KEY: [u8; 32] = [
+    0x45, 0xf7, 0xbf, 0xd0, 0xc8, 0xe0, 0x20, 0xec, 0xfc, 0xfb, 0xc8, 0x87, 0xec, 0xb4, 0x2e, 0x3b,
+    0x95, 0x78, 0x46, 0x5a, 0xbd, 0xc2, 0xd8, 0x8e, 0xf2, 0x28, 0x56, 0xca, 0xc8, 0x2d, 0x98, 0x4e,
+];
+
+const SEARCHED: &str =
+    r#"{"kind":"sandbox","provider":"fixture","scope":{"account":"acct-a","project":"proj-1"}}"#;
 
 fn answer(code: &str, reason: &str, effect: &str) -> ProviderAnswer {
     ProviderAnswer {
@@ -281,15 +305,16 @@ fn make_v2_fixture() {
     std::fs::copy(fixture(1), &path).unwrap();
     let mut journal = Journal::open(&path).unwrap();
     let at = 1_760_000_001_000;
+    let op = |n: u8| OperationId::from_bytes([0x40 + n; 16]);
     journal
         .provider_begin(&provider_dispatch(1, "sandbox.create"), None, at)
         .unwrap();
     journal
         .provider_record(
-            OperationId::from_bytes([0x41; 16]),
+            op(1),
             ProviderStatus::Succeeded,
             &ProviderAnswer::default(),
-            Some(LOCATOR),
+            Some(&locator()),
             at + 1,
         )
         .unwrap();
@@ -305,7 +330,7 @@ fn make_v2_fixture() {
         .unwrap();
     journal
         .provider_record(
-            OperationId::from_bytes([0x43; 16]),
+            op(3),
             ProviderStatus::Unknown,
             &ProviderAnswer::default(),
             None,
@@ -317,11 +342,54 @@ fn make_v2_fixture() {
         .unwrap();
     journal
         .provider_record(
-            OperationId::from_bytes([0x44; 16]),
+            op(4),
             ProviderStatus::Dispatched,
             &answer("pending", "observation_deadline", "pending"),
-            Some(LOCATOR),
+            Some(&locator()),
             at + 6,
+        )
+        .unwrap();
+    journal
+        .provider_begin(&provider_dispatch(5, "sandbox.create"), None, at + 7)
+        .unwrap();
+    journal
+        .provider_record(
+            op(5),
+            ProviderStatus::Unknown,
+            &ProviderAnswer::default(),
+            None,
+            at + 8,
+        )
+        .unwrap();
+    journal
+        .provider_searched(
+            op(5),
+            &answer("unknown", "absent", "unknown"),
+            SEARCHED,
+            at + 9,
+        )
+        .unwrap();
+    journal
+        .provider_begin(&provider_dispatch(6, "sandbox.exec"), None, at + 10)
+        .unwrap();
+    journal
+        .provider_record(
+            op(6),
+            ProviderStatus::Unknown,
+            &ProviderAnswer::default(),
+            None,
+            at + 11,
+        )
+        .unwrap();
+    journal
+        .provider_abandon(
+            &AbandonApproval {
+                operation: op(6),
+                expected: ProviderStatus::Unknown,
+                acknowledged: Acknowledged::Resource(locator().key),
+                reason: "the fixture's owner gave up on it".into(),
+            },
+            at + 12,
         )
         .unwrap();
     journal.verify().unwrap();
@@ -333,43 +401,56 @@ fn the_v2_fixture_holds_what_it_was_made_with() {
     let path = dir.path().join(FILE_NAME);
     std::fs::copy(fixture(2), &path).unwrap();
     let mut journal = Journal::open(&path).unwrap();
-    let statuses: Vec<_> = (1..=4)
-        .map(|n| {
-            journal
-                .provider_operation(OperationId::from_bytes([0x40 + n; 16]))
-                .unwrap()
-                .unwrap()
-        })
+    let op = |n: u8| OperationId::from_bytes([0x40 + n; 16]);
+    let rows: Vec<_> = (1..=6)
+        .map(|n| journal.provider_operation(op(n)).unwrap().unwrap())
         .collect();
-    assert_eq!(statuses[0].dispatch, provider_dispatch(1, "sandbox.create"));
-    assert_eq!(statuses[0].status, ProviderStatus::Succeeded);
-    assert_eq!(statuses[0].locator.as_deref(), Some(LOCATOR));
-    assert_eq!(statuses[1].status, ProviderStatus::Rejected);
-    assert_eq!(statuses[1].answer, answer("unsupported", "action", "none"));
-    assert_eq!(statuses[2].dispatch, provider_dispatch(3, "sandbox.exec"));
-    assert_eq!(statuses[2].status, ProviderStatus::Unknown);
-    assert_eq!(statuses[2].locator, None, "the exec reported no locator");
-    assert_eq!(statuses[2].dispatch.target.as_deref(), Some(LOCATOR));
+    assert_eq!(rows[0].dispatch, provider_dispatch(1, "sandbox.create"));
+    assert_eq!(rows[0].status, ProviderStatus::Succeeded);
+    assert_eq!(rows[0].locator, Some(locator()));
+    assert_eq!(rows[1].status, ProviderStatus::Rejected);
+    assert_eq!(rows[1].answer, answer("unsupported", "action", "none"));
+    assert_eq!(rows[2].dispatch, provider_dispatch(3, "sandbox.exec"));
+    assert_eq!(rows[2].status, ProviderStatus::Unknown);
+    assert_eq!(rows[2].locator, None, "the exec reported no locator");
+    assert_eq!(rows[2].dispatch.target, Some(locator()));
+    assert_eq!(rows[3].dispatch, provider_dispatch(4, "sandbox.destroy"));
+    assert_eq!(rows[3].status, ProviderStatus::Dispatched);
+    assert_eq!(rows[3].locator, Some(locator()));
+    assert_eq!(rows[4].status, ProviderStatus::Unknown);
+    assert_eq!(rows[4].searched.as_deref(), Some(SEARCHED));
+    assert_eq!(rows[5].status, ProviderStatus::Abandoned);
     assert_eq!(
-        statuses[3].dispatch,
-        provider_dispatch(4, "sandbox.destroy")
+        rows[5].abandon_reason.as_deref(),
+        Some("the fixture's owner gave up on it")
     );
-    assert_eq!(statuses[3].status, ProviderStatus::Dispatched);
-    assert_eq!(statuses[3].locator.as_deref(), Some(LOCATOR));
     // Restart recovery makes the dispatched one unknown and sends nothing.
     let recovery = journal
         .recover(1_760_000_002_000, |_| fabric_journal::Liveness::CannotTell)
         .unwrap();
-    assert_eq!(
-        recovery.provider_unknown,
-        vec![(FIRST, OperationId::from_bytes([0x44; 16]))]
-    );
-    let pending = journal
-        .provider_operation(OperationId::from_bytes([0x44; 16]))
-        .unwrap()
-        .unwrap();
+    assert_eq!(recovery.provider_unknown, vec![(FIRST, op(4))]);
+    let pending = journal.provider_operation(op(4)).unwrap().unwrap();
     assert_eq!(pending.status, ProviderStatus::Unknown);
-    assert_eq!(pending.locator.as_deref(), Some(LOCATOR));
+    assert_eq!(pending.locator, Some(locator()));
+    // The lost create, the exec that may run and the unconfirmed stop
+    // block a replacement; the sandbox and the lost create are residuals.
+    let blockers: Vec<_> = journal
+        .replacement_blockers(FIRST)
+        .unwrap()
+        .iter()
+        .map(Blocker::operation)
+        .collect();
+    assert_eq!(blockers, vec![op(3), op(4), op(5), op(6)]);
+    let residuals: Vec<_> = journal
+        .residuals(FIRST)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.creating, r.searched))
+        .collect();
+    assert_eq!(
+        residuals,
+        vec![(op(1), None), (op(5), Some(SEARCHED.to_owned()))]
+    );
     journal.verify().unwrap();
 }
 

@@ -23,18 +23,21 @@
 //!   deadline. A caller that stops waiting cannot leave part of a frame
 //!   behind, and a worker that stops reading its input is lost and
 //!   terminated at the deadline instead of holding the bridge forever.
-//! - No request or observe is written after `shutdown`. A request admitted
-//!   before it whose frame was not queued yet is recorded `rejected`
-//!   (`unavailable`, `shutting_down`) and never sent.
+//! - No request, observe or attach is written after `shutdown`. A request
+//!   admitted before it whose frame was not queued yet is recorded
+//!   `rejected` (`unavailable`, `shutting_down`) and never sent.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use fabric_core::managed::{OperationId, RequestDigest};
-use fabric_journal::{ProviderAnswer, ProviderDispatch, ProviderStatus};
+use fabric_core::managed::{OperationId, OperationKey, RequestDigest};
+use fabric_journal::{
+    CleanupRefusal, EffectClass, LocatorRecord, ProviderAnswer, ProviderDispatch, ProviderStatus,
+    Purpose,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -44,9 +47,10 @@ use tokio::time::Instant;
 use crate::frames::{self, FrameFault};
 use crate::log::{Entry, LogError, OperationLog, Recorder};
 use crate::wire::{
-    Action, Cancel, CancelState, ErrorCode, ErrorMessage, Expect, Hello, Limits, Locator,
-    MAX_PROGRESS, Observe, OperationRef, Phase, Profile, Refusal, Request, RequestPolicy,
-    ResultMessage, ResultState, Scope, ToFabric, ToWorker, Unresolved, Versions,
+    Action, Attach, Cancel, CancelState, Digest, ErrorCode, ErrorMessage, Expect, Hello, Limits,
+    Locator, MAX_PROGRESS, Observe, OperationRef, Phase, Profile, Refusal, Request, RequestPolicy,
+    ResultMessage, ResultState, Scope, ToFabric, ToWorker, Unresolved, Versions, locator_record,
+    request_digest, resource_key,
 };
 
 /// How Fabric runs a worker.
@@ -135,9 +139,27 @@ pub enum BridgeError {
     /// The bridge is shutting down; nothing was recorded or sent.
     #[error("the bridge is shutting down")]
     ShuttingDown,
-    /// The operation is not one the log holds as `dispatched` or `unknown`.
+    /// The operation is not one the log holds as `dispatched`, `unknown`,
+    /// `attached` or `observed`.
     #[error("operation {0} has nothing to observe")]
     NotObservable(OperationId),
+    /// The log holds no operation `unknown` without a target or a locator
+    /// under this profile for this id. Nothing was sent.
+    #[error("operation {operation} is not attached: {why}")]
+    NotAttachable {
+        /// The operation.
+        operation: OperationId,
+        /// Why.
+        why: String,
+    },
+    /// The cleanup was refused before anything was written.
+    #[error("no cleanup of create {creating}: {refusal}")]
+    Cleanup {
+        /// The create it named.
+        creating: OperationId,
+        /// Why.
+        refusal: CleanupRefusal,
+    },
     /// The observe names another action or another resource than the
     /// operation's own in the log, or the log holds no locator to observe
     /// it by. Nothing was sent and the log is unchanged.
@@ -196,6 +218,7 @@ enum Incoming {
 enum Kind {
     Request,
     Observe,
+    Attach,
     Control,
 }
 
@@ -223,6 +246,13 @@ struct State {
     expired: VecDeque<Expired>,
     /// The locators late answers named, by operation, not yet in the log.
     found: HashMap<OperationId, Locator>,
+    /// Requests whose caller stopped waiting, not yet recorded `unknown`.
+    dropped: Vec<OperationId>,
+    /// Operations whose request is in flight here, from its dispatch
+    /// until its `InFlight` settled it or was dropped: that request's own
+    /// answer, deadline or loss settles the operation, so a read of it
+    /// that learned nothing changes nothing meanwhile.
+    open: HashSet<OperationId>,
     lost: Option<String>,
     shutting_down: bool,
     late: u64,
@@ -250,9 +280,21 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stops waiting on `id`. A request is remembered, so that the
-    /// locator its late answer names is still recorded.
+    /// Stops waiting on `id` at its deadline; the caller settles the
+    /// operation. A request is remembered, so that the locator its late
+    /// answer names is still recorded.
     fn expire(&self, id: &str) {
+        self.stop_waiting(id, false);
+    }
+
+    /// Stops waiting on `id` because its caller did: nothing will settle
+    /// the operation, so a request is also due to be recorded `unknown`,
+    /// as one whose deadline passed, by the next call handed the log.
+    fn give_up(&self, id: &str) {
+        self.stop_waiting(id, true);
+    }
+
+    fn stop_waiting(&self, id: &str, by_caller: bool) {
         let mut state = self.lock();
         let Some(waiter) = state.waiters.remove(id) else {
             return;
@@ -268,16 +310,52 @@ impl Shared {
             operation,
             progress: waiter.progress,
         });
+        if by_caller {
+            state.dropped.push(operation);
+        }
     }
 
-    /// Records in `log` each locator a late answer named. One for an
-    /// operation `log` does not hold is dropped; when the log fails, what
-    /// is left is kept for the next call.
-    fn record_found<L: OperationLog>(&self, log: &mut L) -> Result<(), LogError> {
+    /// Whether a request of `operation` is in flight here, not yet
+    /// settled by its own `InFlight`.
+    fn request_open(&self, operation: OperationId) -> bool {
+        self.lock().open.contains(&operation)
+    }
+
+    /// Whether `catch_up` has anything to record.
+    fn behind(&self) -> bool {
+        let state = self.lock();
+        !state.dropped.is_empty() || !state.found.is_empty()
+    }
+
+    /// Records in `log` what the calls that stopped waiting left: each
+    /// request whose caller gave up `unknown`, as at its deadline, then
+    /// each locator a late answer named. One for an operation `log` does
+    /// not hold, or that moved on, is dropped; when the log fails, what is
+    /// left is kept for the next call.
+    fn catch_up<L: OperationLog>(&self, log: &mut L) -> Result<(), LogError> {
+        let dropped = std::mem::take(&mut self.lock().dropped);
+        let mut rest = dropped.into_iter();
+        while let Some(operation) = rest.next() {
+            match log.record(
+                operation,
+                ProviderStatus::Unknown,
+                &ProviderAnswer::default(),
+                None,
+            ) {
+                Ok(()) | Err(LogError::Transition(_)) => {}
+                Err(e) => {
+                    let mut state = self.lock();
+                    let kept = std::mem::take(&mut state.dropped);
+                    state.dropped.extend(std::iter::once(operation).chain(rest));
+                    state.dropped.extend(kept);
+                    return Err(e);
+                }
+            }
+        }
         let found = std::mem::take(&mut self.lock().found);
         let mut rest = found.into_iter();
         while let Some((operation, locator)) = rest.next() {
-            match log.locate(operation, &locator_text(&locator)) {
+            match log.locate(operation, &locator_record(&locator)) {
                 Ok(()) | Err(LogError::Transition(_)) => {}
                 Err(e) => {
                     let mut state = self.lock();
@@ -644,16 +722,17 @@ impl Bridge {
         self.shared.lock().late
     }
 
-    /// Records in `log` the locators that answers to requests Fabric
-    /// stopped waiting on named since the last call; the status each
-    /// operation holds stays. `InFlight::next` does this first, and so do
-    /// `request` and `observe` once they pass their first check; one
-    /// refused there as shutting down, lost or busy records nothing, these
-    /// included, while one refused when it registers has recorded them
-    /// before it waited on the log. A caller needs it while it makes none
-    /// of those, or after a refusal.
+    /// Records in `log` what Fabric stopped waiting on since the last
+    /// call: a request whose caller dropped it `unknown`, as at its
+    /// deadline, and the locator each late answer named, with the status
+    /// the operation holds kept. `InFlight::next` does this first, and so
+    /// do `request`, `observe` and `attach` once they pass their first
+    /// check; one refused there as shutting down, lost or busy records
+    /// nothing, these included, while one refused when it registers has
+    /// recorded them before it waited on the log. A caller needs it while
+    /// it makes none of those, or after a refusal.
     pub async fn record_late<L: Recorder>(&self, log: &mut L) -> Result<(), BridgeError> {
-        Ok(record_found(&self.shared, log).await?)
+        Ok(catch_up(&self.shared, log).await?)
     }
 
     /// Why the worker is gone, if it is.
@@ -683,9 +762,9 @@ impl Bridge {
     }
 
     /// Refuses new work of `kind` before anything else is done for it: a
-    /// request or an observe once the bridge is shutting down, anything
-    /// once the worker is gone, and a request or an observe at the
-    /// worker's in-flight limit.
+    /// request, an observe or an attach once the bridge is shutting down,
+    /// anything once the worker is gone, and a request, an observe or an
+    /// attach at the worker's in-flight limit.
     fn admissible(&self, state: &State, kind: Kind) -> Result<(), BridgeError> {
         // A shutdown ends with the worker's exit, which the reader marks
         // lost when it reads the end of the worker's output, so new work
@@ -795,8 +874,8 @@ impl Bridge {
 
     /// `register` and `reserve` together, then `write` queued, all under
     /// the one lock `shutdown` sets its flag and queues its frame under:
-    /// an observe admitted before a shutdown is written before it, and
-    /// nothing is left registered when the queue refuses.
+    /// an observe or an attach admitted before a shutdown is written
+    /// before it, and nothing is left registered when the queue refuses.
     fn enlist(
         &self,
         id: &str,
@@ -852,7 +931,7 @@ impl Bridge {
         // request is refused as shutting down whatever else is wrong with
         // it, and nothing is recorded for it.
         self.admission(Kind::Request)?;
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         let request = Request {
             request_id: self.request_id(),
             operation: effect.operation,
@@ -862,6 +941,17 @@ impl Bridge {
             policy: effect.policy,
             deadline_ms: effect.deadline_ms,
         };
+        self.send_request(log, request, Purpose::Effect).await
+    }
+
+    /// Records `request` under `purpose` and queues its frame, as
+    /// `request` says.
+    async fn send_request<L: Recorder>(
+        &self,
+        log: &mut L,
+        request: Request,
+        purpose: Purpose,
+    ) -> Result<InFlight, BridgeError> {
         let dispatch = ProviderDispatch {
             operation: request.operation.id,
             key: request.operation.key.clone(),
@@ -870,8 +960,11 @@ impl Bridge {
             task: request.scope.task,
             attempt: request.scope.attempt,
             generation: request.scope.generation,
+            profile: self.profile.profile.clone(),
             action: request.action.name().to_owned(),
-            target: request.action.target().map(locator_text),
+            effect: effect_class(&self.profile, &request.action),
+            purpose,
+            target: request.action.target().map(locator_record),
         };
         if let Err(refusal) = self.as_worker_reads(&ToWorker::Request(Box::new(request.clone()))) {
             return Err(refuse(log, dispatch, refusal).await);
@@ -902,6 +995,7 @@ impl Bridge {
                 return Err(e);
             }
         };
+        self.shared.lock().open.insert(dispatch.operation);
         let wait = Duration::from_millis(request.deadline_ms) + self.config.grace;
         let mut flight = InFlight {
             request_id: request.request_id,
@@ -953,12 +1047,13 @@ impl Bridge {
         Ok(flight)
     }
 
-    /// Reads the resource of an operation the log holds as `dispatched`
-    /// or `unknown`, by its original id, waiting at most `wait_ms`. A
-    /// bridge that is shutting down, a worker that is gone and a worker at
-    /// its in-flight limit refuse it first, as `request` does. An action
-    /// the profile does not observe, or a wait over its limit, is refused
-    /// before the log is read, and nothing is sent.
+    /// Reads the resource of an operation the log holds as `dispatched`,
+    /// `unknown`, `attached` or `observed`, by its original id, waiting at
+    /// most `wait_ms`. A bridge that is shutting down, a worker that is
+    /// gone and a worker at its in-flight limit refuse it first, as
+    /// `request` does. An action the profile does not observe, or a wait
+    /// over its limit, is refused before the log is read, and nothing is
+    /// sent.
     ///
     /// `action` and `resource` must be the operation's own as the log
     /// holds them: its action, and the target it was sent to or, for an
@@ -979,7 +1074,7 @@ impl Bridge {
     ) -> Result<InFlight, BridgeError> {
         self.admission(Kind::Observe)?;
         // A late answer may have named the resource this observe reads.
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         crate::wire::observable(action, &resource, wait_ms, &self.profile)
             .map_err(BridgeError::RefusedLocally)?;
         let entry = log
@@ -987,12 +1082,7 @@ impl Bridge {
             .await?
             .run(move |log| log.entry(operation))
             .await??;
-        let entry = entry.filter(|e| {
-            matches!(
-                e.status,
-                ProviderStatus::Dispatched | ProviderStatus::Unknown
-            )
-        });
+        let entry = entry.filter(|e| !e.status.is_terminal());
         let Some(entry) = entry else {
             return Err(BridgeError::NotObservable(operation));
         };
@@ -1036,6 +1126,149 @@ impl Bridge {
             shared: Arc::clone(&self.shared),
             done: false,
         })
+    }
+
+    /// Finds the resource of a create whose answer was lost, by the
+    /// operation's identity, waiting at most `wait_ms` (docs/bridge-protocol.md,
+    /// Reconciliation). It only reads: nothing is created again.
+    ///
+    /// Refused first, as `request` is, when the bridge is shutting down,
+    /// the worker is gone or at its in-flight limit. Refused before
+    /// anything is sent: a `wait_ms` of 0 or over the
+    /// profile's, and an action the profile does not attach, as the worker
+    /// would (`RefusedLocally`); an operation the log does not hold as
+    /// `unknown` with no target and no locator, or dispatched under
+    /// another profile (`NotAttachable`: one with a locator is observed
+    /// instead). The attach carries the operation's own id, key, scope and
+    /// action as the log holds them, never ones the caller names. A worker
+    /// lost or a deadline passed during it changes nothing: it was a read.
+    pub async fn attach<L: Recorder>(
+        &self,
+        log: &mut L,
+        operation: OperationId,
+        wait_ms: u64,
+    ) -> Result<InFlight, BridgeError> {
+        self.admission(Kind::Attach)?;
+        catch_up(&self.shared, log).await?;
+        if wait_ms == 0 || wait_ms > self.profile.limits.max_observe_wait_ms {
+            return Err(BridgeError::RefusedLocally(Refusal {
+                code: "invalid",
+                reason: "limit",
+                detail: "wait_ms is 0 or above the profile's".into(),
+            }));
+        }
+        let entry = log
+            .reserve()
+            .await?
+            .run(move |log| log.entry(operation))
+            .await??;
+        let not = |why: String| BridgeError::NotAttachable { operation, why };
+        let entry = entry.ok_or_else(|| not("the log does not hold it".into()))?;
+        crate::wire::attachable(&entry.action, wait_ms, &self.profile)
+            .map_err(BridgeError::RefusedLocally)?;
+        if entry.profile != self.profile.profile {
+            return Err(not(format!(
+                "it was dispatched under profile {}, not {}",
+                entry.profile, self.profile.profile
+            )));
+        }
+        if entry.status != ProviderStatus::Unknown {
+            return Err(not(format!("it is {}, not unknown", entry.status.name())));
+        }
+        if entry.target.is_some() || entry.locator.is_some() {
+            return Err(not("it names its resource: observe it".into()));
+        }
+        let attach = Attach {
+            request_id: self.request_id(),
+            operation_id: operation,
+            key: entry.key,
+            scope: entry.scope,
+            action: entry.action,
+            wait_ms,
+        };
+        let message = ToWorker::Attach(attach.clone());
+        self.as_worker_reads(&message)
+            .map_err(BridgeError::RefusedLocally)?;
+        let frame = frames::encode(&message.to_value(), cap_of(self.limits.max_request_bytes))
+            .map_err(|fault| {
+                BridgeError::RefusedLocally(Refusal {
+                    code: "invalid",
+                    reason: "limit",
+                    detail: fault.to_string(),
+                })
+            })?;
+        let deadline = Instant::now() + Duration::from_millis(wait_ms) + self.config.grace;
+        let rx = self.enlist(
+            &attach.request_id,
+            Some(operation),
+            Some(&attach.action),
+            Kind::Attach,
+            Write { frame, deadline },
+        )?;
+        Ok(InFlight {
+            request_id: attach.request_id,
+            operation,
+            kind: Kind::Attach,
+            rx,
+            deadline,
+            shared: Arc::clone(&self.shared),
+            done: false,
+        })
+    }
+
+    /// Destroys the resource a create of the log made, as a cleanup
+    /// (docs/managed-jobs.md, the fresh cleanup approval flow): an
+    /// ordinary `sandbox.destroy` request whose scope and target are the
+    /// create's own as the log holds them, under the approval reference
+    /// supplied for this call, which is never stored. It is accepted after
+    /// the attempt ended and after the job closed; the log records which
+    /// create it cleans.
+    ///
+    /// Refused first, as `request` is, when the bridge is shutting down,
+    /// the worker is gone or at its in-flight limit. Refused before
+    /// anything is written with `Cleanup` when the log's
+    /// rules refuse it (no such create, no locator, still dispatched,
+    /// destroyed already, a destroy of it in flight); then as `request`.
+    pub async fn cleanup<L: Recorder>(
+        &self,
+        log: &mut L,
+        cleanup: Cleanup,
+    ) -> Result<InFlight, BridgeError> {
+        self.admission(Kind::Request)?;
+        catch_up(&self.shared, log).await?;
+        let creating = cleanup.creating;
+        let target = log
+            .reserve()
+            .await?
+            .run(move |log| log.cleanup_target(creating))
+            .await??;
+        let (scope, locator) =
+            target.map_err(|refusal| BridgeError::Cleanup { creating, refusal })?;
+        let target = serde_json::from_str::<serde_json::Value>(&locator.text)
+            .ok()
+            .and_then(|value| Locator::from_value(&value).ok())
+            .filter(|target| resource_key(target) == locator.key)
+            .ok_or_else(|| {
+                BridgeError::Log(LogError::Storage(format!(
+                    "the locator of create {creating} does not read back"
+                )))
+            })?;
+        let mut request = Request {
+            request_id: self.request_id(),
+            operation: OperationRef {
+                id: cleanup.id,
+                key: cleanup.key,
+                digest: Digest([0; 32]),
+            },
+            scope,
+            action: Action::Destroy { target },
+            approval: Some(cleanup.approval),
+            policy: None,
+            deadline_ms: cleanup.deadline_ms,
+        };
+        request.operation.digest = request_digest(&request);
+        self.send_request(log, request, Purpose::Cleanup { cleans: creating })
+            .await
     }
 
     /// Asks the worker to stop waiting on the outstanding request
@@ -1128,11 +1361,11 @@ impl Bridge {
         // Taken before the lock: a queue that refuses reads `lost`.
         let reserved = self.reserve();
         // The flag is set and the frame queued under one lock, the one a
-        // request's or an observe's frame is queued under once the flag
-        // was read, so no such frame is ever written after this one. It is
-        // set only once the frame is queued: a refused shutdown sent
-        // nothing, and the state it found, such as a lost worker, is what
-        // later requests must see.
+        // request's, an observe's or an attach's frame is queued under
+        // once the flag was read, so no such frame is ever written after
+        // this one. It is set only once the frame is queued: a refused
+        // shutdown sent nothing, and the state it found, such as a lost
+        // worker, is what later requests must see.
         let mut state = self.shared.lock();
         let frame = frame.map_err(BridgeError::Frame)?;
         let rx = self.admit(&mut state, &request_id, None, None, Kind::Control)?;
@@ -1201,6 +1434,22 @@ pub struct Effect {
     pub approval: Option<String>,
     /// Fabric's narrowing of policy.
     pub policy: Option<RequestPolicy>,
+    /// Milliseconds from when the worker reads the frame.
+    pub deadline_ms: u64,
+}
+
+/// A cleanup to send: the destroy of a create's resource
+/// (`Bridge::cleanup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cleanup {
+    /// The create whose resource is destroyed.
+    pub creating: OperationId,
+    /// A fresh operation id for the cleanup itself.
+    pub id: OperationId,
+    /// A fresh key for it.
+    pub key: OperationKey,
+    /// The approval reference for this call; never stored.
+    pub approval: String,
     /// Milliseconds from when the worker reads the frame.
     pub deadline_ms: u64,
 }
@@ -1292,7 +1541,10 @@ pub struct InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.done {
-            self.shared.expire(&self.request_id);
+            self.shared.give_up(&self.request_id);
+            if self.kind == Kind::Request {
+                self.shared.lock().open.remove(&self.operation);
+            }
         }
     }
 }
@@ -1313,7 +1565,10 @@ impl InFlight {
     /// The next step: a locator reported early, or the answer. Past
     /// Fabric's deadline the answer is `TimedOut` and the operation
     /// `unknown`; a later answer leaves the status as it is and only the
-    /// locator it names is recorded (`Bridge::record_late`).
+    /// locator it names is recorded (`Bridge::record_late`). A caller that
+    /// drops a request instead leaves it the same way: `unknown`, recorded
+    /// by the next call handed the log, with the locator its late answer
+    /// names. A read dropped, lost or timed out changes nothing.
     ///
     /// Room on the log is taken before a frame is: a step taken from the
     /// worker is then recorded, on the log's side, even when the caller
@@ -1322,7 +1577,7 @@ impl InFlight {
         if self.done {
             return Err(BridgeError::Lost("the request was already answered".into()));
         }
-        record_found(&self.shared, log).await?;
+        catch_up(&self.shared, log).await?;
         let slot = log.reserve().await?;
         let incoming = tokio::time::timeout_at(self.deadline, self.rx.recv()).await;
         let operation = self.operation;
@@ -1334,8 +1589,9 @@ impl InFlight {
             Ok(None) => Answer::Lost("the bridge reader stopped".into()),
             Ok(Some(Incoming::Lost(why))) => Answer::Lost(why),
             Ok(Some(Incoming::Progress(locator))) => {
-                let text = locator_text(&locator);
-                slot.run(move |log| log.locate(operation, &text)).await??;
+                let record = locator_record(&locator);
+                slot.run(move |log| log.locate(operation, &record))
+                    .await??;
                 return Ok(Event::Progress(locator));
             }
             Ok(Some(Incoming::Answer(message))) => match *message {
@@ -1349,8 +1605,13 @@ impl InFlight {
             },
         };
         let (kind, said) = (self.kind, Said::of(&answer));
-        let settled = slot.run(move |log| settle(log, operation, kind, said));
+        // A read settles nothing a request in flight here will settle.
+        let request_open = kind != Kind::Request && self.shared.request_open(operation);
+        let settled = slot.run(move |log| settle(log, operation, kind, request_open, said));
         self.done = true;
+        if kind == Kind::Request {
+            self.shared.lock().open.remove(&operation);
+        }
         let status = settled.await??;
         Ok(Event::Done(Outcome { status, answer }))
     }
@@ -1370,12 +1631,14 @@ impl InFlight {
 #[derive(Debug)]
 enum Said {
     /// A `result` in this state, naming this locator.
-    Result(ResultState, String),
-    /// An `error`: what the log keeps of it, and the locator it named.
+    Result(ResultState, LocatorRecord),
+    /// An `error`: what the log keeps of it, the locator it named, and the
+    /// scope an `absent` read searched.
     Error {
         code: ErrorCode,
         record: ProviderAnswer,
-        locator: Option<String>,
+        locator: Option<LocatorRecord>,
+        searched: Option<String>,
     },
     /// No answer: Fabric's deadline passed, or the worker went away.
     Nothing,
@@ -1384,7 +1647,7 @@ enum Said {
 impl Said {
     fn of(answer: &Answer) -> Said {
         match answer {
-            Answer::Result(r) => Said::Result(r.state, locator_text(&r.resource)),
+            Answer::Result(r) => Said::Result(r.state, locator_record(&r.resource)),
             Answer::Error(e) => {
                 let body = &e.error;
                 Said::Error {
@@ -1394,7 +1657,8 @@ impl Said {
                         reason: Some(body.reason.clone()),
                         effect: Some(body.effect.name().to_owned()),
                     },
-                    locator: body.resource.as_ref().map(locator_text),
+                    locator: body.resource.as_ref().map(locator_record),
+                    searched: body.searched.as_ref().map(crate::wire::Searched::canonical),
                 }
             }
             Answer::TimedOut | Answer::Lost(_) => Said::Nothing,
@@ -1403,62 +1667,160 @@ impl Said {
 }
 
 /// Records what `said` asks for `operation`, an answer to a `kind`, and
-/// returns the status the log holds after it.
+/// returns the status the log holds after it (docs/managed-jobs.md, the
+/// transition table). A request's answer moves a `dispatched` operation
+/// on; a destroy answered `provider_failed`/`not_found` goes `unknown`,
+/// not `failed`, with the answer on its row, since the provider did not
+/// find the resource and nothing says it is gone from the scope. A read
+/// (an observe or an attach) settles what it saw terminal; of an
+/// operation it found after its answer was lost (`unknown`, `attached`,
+/// `observed`), what it saw under way makes it `attached` (an attach) or
+/// `observed` (an observe). An observe of a destroy's resource answered
+/// `absent` settles the destroy `succeeded` with the scope it searched:
+/// absence in that scope is what the destroy was to bring about. A read
+/// that learned nothing, a refusal, an `absent` attach or absent observe
+/// of anything but a destroy, or a read lost or timed out, changes no
+/// status: an `absent` read of an `unknown` operation stores what it
+/// searched, an `unknown` with a locator stores the locator. One
+/// exception: an observe of a `dispatched` operation whose request was
+/// answered under way (M3's `exec_observe_after_worker_loss`) that learns
+/// nothing, or is lost or timed out, makes it `unknown`, since no answer
+/// is coming for it; not while its request is in flight here
+/// (`request_open`), whose own answer, deadline or loss settles it.
 fn settle<L: OperationLog>(
     log: &mut L,
     operation: OperationId,
     kind: Kind,
+    request_open: bool,
     said: Said,
 ) -> Result<ProviderStatus, LogError> {
-    let before = log
-        .entry(operation)?
-        .map_or(ProviderStatus::Dispatched, |e| e.status);
+    use ProviderStatus::{Attached, Cancelled, Dispatched, Failed, Observed, Rejected, Succeeded};
+    let entry = log.entry(operation)?;
+    let before = entry.as_ref().map_or(Dispatched, |e| e.status);
+    let destroy = entry
+        .as_ref()
+        .is_some_and(|e| e.effect == EffectClass::Destroy);
+    // The resource the operation acts on, as the journal holds it: the
+    // target of a destroy or an exec, else the locator a create was given.
+    let own = entry.and_then(|e| e.target.or(e.locator));
+    if before.is_terminal() {
+        return Ok(before);
+    }
+    // After a loss, a read that saw the effect under way.
+    let under_way = match (kind, before) {
+        (Kind::Attach, _) => Attached,
+        (Kind::Observe, Dispatched) | (Kind::Request | Kind::Control, _) => before,
+        (Kind::Observe, _) => Observed,
+    };
     let (status, record, locator) = match said {
-        Said::Result(state, locator) => match state {
-            ResultState::Completed => (
-                ProviderStatus::Succeeded,
-                ProviderAnswer::default(),
-                Some(locator),
-            ),
-            ResultState::Cancelled => (
-                ProviderStatus::Cancelled,
-                ProviderAnswer::default(),
-                Some(locator),
-            ),
-            ResultState::Accepted | ResultState::Running => {
-                (before, ProviderAnswer::default(), Some(locator))
+        Said::Result(state, locator) => {
+            let status = match state {
+                ResultState::Completed => Succeeded,
+                ResultState::Cancelled => Cancelled,
+                ResultState::Accepted | ResultState::Running => under_way,
+            };
+            (status, ProviderAnswer::default(), Some(locator))
+        }
+        // An `absent` read: the worker found no resource in the scope it
+        // searched. Of a destroy, that is the destroy done; of anything
+        // else it settles nothing, and what was searched is kept for an
+        // operation still `unknown`. An observe names a resource, and
+        // absence is evidence about it only when the worker searched
+        // where it is (its provider, scope and kind): a worker bound to
+        // another scope, or one that misreports, learns nothing for the
+        // journal, which owns identity and fencing and trusts the worker
+        // with neither.
+        Said::Error {
+            code: ErrorCode::Unknown,
+            record,
+            searched: Some(searched),
+            ..
+        } if kind != Kind::Request => {
+            if kind == Kind::Observe && !searched_own(&searched, own.as_ref()) {
+                return Ok(before);
             }
-        },
+            if kind == Kind::Observe && destroy {
+                log.absent(operation, &record, &searched)?;
+                return Ok(Succeeded);
+            }
+            if kind == Kind::Attach || before == ProviderStatus::Unknown {
+                log.searched(operation, &record, &searched)?;
+            }
+            return Ok(before);
+        }
         Said::Error {
             code,
             record,
             locator,
+            searched: _,
         } => {
+            let not_found = record.reason.as_deref() == Some("not_found");
             let status = match (code, kind) {
-                (ErrorCode::Pending, _) => before,
-                (ErrorCode::Unknown, _) => ProviderStatus::Unknown,
-                (code, Kind::Request) if code.is_refusal() => ProviderStatus::Rejected,
-                (ErrorCode::ProviderFailed, Kind::Request) => ProviderStatus::Failed,
-                // A refused or failed observe says nothing new about the
-                // operation it read.
+                (ErrorCode::Pending, _) => under_way,
+                (ErrorCode::Unknown, Kind::Attach) => {
+                    if locator.is_none() {
+                        return Ok(before);
+                    }
+                    Attached
+                }
+                (ErrorCode::Unknown, _) if before == Dispatched && !request_open => {
+                    ProviderStatus::Unknown
+                }
+                (ErrorCode::Unknown, _) if locator.is_some() => before,
+                (code, Kind::Request) if code.is_refusal() => Rejected,
+                // The provider did not find the resource a destroy names:
+                // that says nothing about where it went, so the destroy
+                // is `unknown` with the reason on its row until an observe
+                // finds the resource absent.
+                (ErrorCode::ProviderFailed, Kind::Request) if destroy && not_found => {
+                    if before == Dispatched {
+                        ProviderStatus::Unknown
+                    } else {
+                        before
+                    }
+                }
+                (ErrorCode::ProviderFailed, Kind::Request) => Failed,
+                // A refused or failed read, or one that learned nothing,
+                // says nothing new about the operation it read.
                 _ => return Ok(before),
             };
             (status, record, locator)
         }
-        Said::Nothing => {
-            let status = if before == ProviderStatus::Dispatched {
-                ProviderStatus::Unknown
-            } else {
-                before
-            };
-            (status, ProviderAnswer::default(), None)
+        Said::Nothing if before == Dispatched && !request_open => {
+            (ProviderStatus::Unknown, ProviderAnswer::default(), None)
         }
+        Said::Nothing => return Ok(before),
     };
-    if before.is_terminal() {
-        return Ok(before);
-    }
-    log.record(operation, status, &record, locator.as_deref())?;
+    log.record(operation, status, &record, locator.as_ref())?;
     Ok(status)
+}
+
+/// Whether `searched`, the canonical scope an `absent` read searched, is
+/// where the resource `own` is: the same provider, scope and kind.
+fn searched_own(searched: &str, own: Option<&LocatorRecord>) -> bool {
+    let Some(own) = own else {
+        return false;
+    };
+    let (Ok(searched), Ok(resource)) = (
+        serde_json::from_str::<serde_json::Value>(searched),
+        serde_json::from_str::<serde_json::Value>(&own.text),
+    ) else {
+        return false;
+    };
+    ["provider", "scope", "kind"]
+        .iter()
+        .all(|field| searched[*field] == resource[*field])
+}
+
+/// The effect class of `action` in `profile`; an action outside it,
+/// which Fabric refuses before sending, is recorded as a mutation, which
+/// neither names a new resource nor removes one.
+fn effect_class(profile: &Profile, action: &Action) -> EffectClass {
+    match profile.action(action.name()).map(|spec| spec.effect) {
+        Some(crate::wire::Effect::Create) => EffectClass::Create,
+        Some(crate::wire::Effect::Destroy) => EffectClass::Destroy,
+        Some(crate::wire::Effect::Mutate) | None => EffectClass::Mutate,
+    }
 }
 
 /// Records `dispatch` `rejected` for `refusal`, which Fabric found before
@@ -1492,27 +1854,23 @@ fn rejected(refusal: &Refusal) -> ProviderAnswer {
     }
 }
 
-/// Records in `log` each locator a late answer named
-/// (`Shared::record_found`), on the log's side; with none, it makes no call.
-async fn record_found<L: Recorder>(shared: &Arc<Shared>, log: &mut L) -> Result<(), LogError> {
-    if shared.lock().found.is_empty() {
+/// Records in `log` what the calls that stopped waiting left
+/// (`Shared::catch_up`), on the log's side; with nothing, it makes no call.
+async fn catch_up<L: Recorder>(shared: &Arc<Shared>, log: &mut L) -> Result<(), LogError> {
+    if !shared.behind() {
         return Ok(());
     }
     let shared = Arc::clone(shared);
     log.reserve()
         .await?
-        .run(move |log| shared.record_found(log))
+        .run(move |log| shared.catch_up(log))
         .await?
-}
-
-fn locator_text(locator: &Locator) -> String {
-    locator.to_value().to_string()
 }
 
 /// Whether `action` on `resource` is the operation's own as `entry` holds
 /// it: its action, and its target, or for an action without one the
-/// locator its worker reported. A row that names no locator has nothing
-/// to be observed by.
+/// locator its worker reported, compared by the key of their identity. A
+/// row that names no locator has nothing to be observed by.
 fn own_resource(entry: &Entry, action: &str, resource: &Locator) -> Result<(), String> {
     if entry.action != action {
         return Err(format!(
@@ -1520,14 +1878,11 @@ fn own_resource(entry: &Entry, action: &str, resource: &Locator) -> Result<(), S
             entry.action
         ));
     }
-    let Some(text) = entry.target.as_deref().or(entry.locator.as_deref()) else {
+    let Some(own) = entry.target.as_ref().or(entry.locator.as_ref()) else {
         return Err("the log holds no locator for it".into());
     };
-    let own = serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .and_then(|value| Locator::from_value(&value).ok());
-    if own.as_ref() != Some(resource) {
-        return Err(format!("{text} is its resource, not the one named"));
+    if own.key != resource_key(resource) {
+        return Err(format!("{} is its resource, not the one named", own.text));
     }
     Ok(())
 }
@@ -1654,12 +2009,20 @@ fn route(shared: &Shared, message: ToFabric) -> Result<(), String> {
     if operation.is_some() && waiter.kind != Kind::Control && operation != waiter.operation {
         return Err(format!("an answer to {id} names another operation"));
     }
+    let absent = matches!(&message, ToFabric::Error(e)
+        if e.error.code == ErrorCode::Unknown && e.error.reason == "absent");
     let fits = match (&message, waiter.kind) {
+        // Only a read, an attach or an observe, is answered absent.
+        _ if absent => matches!(waiter.kind, Kind::Attach | Kind::Observe),
         // A terminal-only action answers a result only once terminal.
         (ToFabric::Result(r), Kind::Request) => {
             !(waiter.terminal_only
                 && matches!(r.state, ResultState::Accepted | ResultState::Running))
         }
+        // An attach reports a terminal state found, or an error; it makes
+        // no effect, so it never fails one.
+        (ToFabric::Result(r), Kind::Attach) => r.state == ResultState::Completed,
+        (ToFabric::Error(e), Kind::Attach) => e.error.code != ErrorCode::ProviderFailed,
         (ToFabric::Result(_) | ToFabric::Error(_) | ToFabric::Progress { .. }, kind) => {
             kind != Kind::Control
         }

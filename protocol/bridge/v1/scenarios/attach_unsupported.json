@@ -1,0 +1,150 @@
+{
+  "scenario": "attach_unsupported",
+  "summary": "Only a create whose profile dedupes by key or label can be attached: an attach of an exec or a destroy is unsupported, and of an action outside the profile unsupported as an action, each before any effect.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-create-1",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "operation": "01K8W3A00000000000000000P1",
+        "status": "ready"
+      }
+    ],
+    "script": []
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "attach",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A00000000000000000P2",
+        "key": "key-exec-1",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.exec",
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A00000000000000000P2",
+        "error": {
+          "code": "unsupported",
+          "reason": "attach",
+          "message": "unsupported: attach",
+          "effect": "none"
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "send": {
+        "type": "attach",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A00000000000000000P3",
+        "key": "key-destroy-1",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A00000000000000000P3",
+        "error": {
+          "code": "unsupported",
+          "reason": "attach",
+          "message": "unsupported: attach",
+          "effect": "none"
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "send": {
+        "type": "attach",
+        "request_id": "r-3",
+        "operation_id": "01K8W3A00000000000000000P5",
+        "key": "key-unsup-1",
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.snapshot",
+        "wait_ms": 1000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-3",
+        "operation_id": "01K8W3A00000000000000000P5",
+        "error": {
+          "code": "unsupported",
+          "reason": "action",
+          "message": "unsupported: action",
+          "effect": "none"
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    }
+  ]
+}

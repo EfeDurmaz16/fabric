@@ -31,6 +31,7 @@ mod log;
 pub mod wire;
 
 pub use client::{
-    Answer, Bridge, BridgeError, Config, Control, Effect, Event, InFlight, Outcome, Pending,
+    Answer, Bridge, BridgeError, Cleanup, Config, Control, Effect, Event, InFlight, Outcome,
+    Pending,
 };
 pub use log::{Entry, LogError, LogThread, MemoryLog, OperationLog, Recorder, Slot};

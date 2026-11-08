@@ -2,7 +2,11 @@
 
 Terms used in the architecture page and the ADRs. One meaning each. If a word is not here, it has its ordinary English meaning.
 
+**Abandoned.** The status of a provider operation the owner approved giving up on after its outcome stayed uncertain (ADR 0022). The approval names the status the owner saw and what may remain; abandoning never says that the effect did not happen or that anything stopped.
+
 **ACP** (Agent Client Protocol). A JSON-RPC protocol for driving coding agents. Fabric uses it as the generic harness path. Methods Fabric cares about: `session/new`, `session/load`, `session/prompt`, `session/cancel`.
+
+**Attach.** The bridge message that finds the resource an earlier create made, by the operation that made it, when its answer never reached Fabric (ADR 0022, docs/bridge-protocol.md). It reads and never creates; only a create whose profile dedupes by key or label can be attached.
 
 **Attempt.** One execution of one task of a managed job on one resource, under one generation. A retry is a new attempt; an attempt that disappears is `lost`, never `cancelled` (ADR 0019).
 
@@ -89,6 +93,10 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Placement.** Choosing which node runs a job. In this phase the user names it: `fabric job move --to` on the owner, or `fabric resume` on the node that wants it. The root is the recorded root.
 
 **Provider operation.** One effect a managed attempt asks a provider worker for over the bridge, such as creating a sandbox. The journal records it `dispatched` before the request is written, fenced on the job's current live attempt, and never sends its id or key twice (schema version 2, `provider_operations`).
+
+**Replacement barrier.** The rule that refuses a new attempt while an effect of an earlier one may still act: a destroy not confirmed, an exec not settled whose sandbox was not destroyed, or a create whose resource no one can name (ADR 0022).
+
+**Residual.** A resource a managed job's create may have left that no destroy has removed, listed by the journal so a cleanup with a fresh approval can remove it (ADR 0022).
 
 **Restore.** Writing a snapshot into a fresh workspace on a node, or in place into a workspace whose marker says it holds only published bytes. No path rewrites, because the root is the same on every node.
 
