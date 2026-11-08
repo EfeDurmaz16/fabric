@@ -5,7 +5,7 @@ A node sends one OpenTelemetry span per operation that changes state, as OTLP/HT
 ## What a span will never carry
 
 - An environment value or a secret value, a job's goal, a harness or task argv, a repository, workspace, home or socket path, a user name, a locator's text or a native id, an error message, or any process's output.
-- A raw idempotency key or a raw approval ref. Both appear as SHA-256 hex (`fabric.operation.key_digest`, `fabric.approval.ref_digest`), so a span joins to the journal row without carrying the value.
+- A raw idempotency key or a raw approval ref. A key appears as SHA-256 hex in `fabric.operation.key_digest`, so a span joins to the journal row without carrying the value. `fabric.approval.ref_digest` is reserved for an approval ref the same way; no node operation takes an approval ref yet, so no span carries it today.
 - An error's text. A failed span's status message, and `fabric.error.type`, are the error's type name only, such as `Io` or `Unreachable`. A refusal is its snake-case code in `fabric.refusal.reason`.
 
 This holds by type, not by convention: a span is a closed struct with one typed field per attribute below, and the exporter builds the JSON from those fields alone. No `tracing` event or field reaches the exporter.
@@ -27,11 +27,13 @@ Without `--otlp-endpoint`, `fabric serve` reads `OTEL_EXPORTER_OTLP_ENDPOINT`, a
 
 ## Trace identity
 
-An operation's trace id and span id are the first 32 and the next 16 hex of `sha256("fabric.operation:" + operation_id)`, with the operation id as its ULID text. This is the context the Capsule bridge worker links each of its spans to (`fabricOperationLink` in its `trace.ts`), so a backend joins both sides without a protocol change.
+An operation's trace id and span id are the first 32 and the next 16 hex of `sha256("fabric.operation:" + operation_id)`, with the operation id as its ULID text. This is the context the Capsule bridge worker links each of its spans to (`fabricOperationLink` in its `trace.ts`), so a backend joins both sides without a protocol change. Only the first accepted answer of an operation carries these ids; a replay of it is a child span with an id of its own, so no two spans share them.
 
-An attempt's trace is `sha256("fabric.attempt:" + attempt_id)` the same way. The node that runs the attempt makes its root span (`fabric peer.launch`). Its reports and instructions, and the authority's observations of them, are children of it. So the spans of both nodes of one attempt are in one trace. A grant links to the attempt's trace.
+What has a span in that context today: managed commands and placements (`observe.placed`). A provider operation, the one a Capsule worker names in its link, has none yet: on main no node operation dispatches a bridge worker or writes `provider_operations`, so a worker's link points at a context no Fabric span fills, and the joined Fabric and Capsule trace waits for that call site.
 
-Each process an attempt spawns (the harness, a build or test task) gets `TRACEPARENT=00-<attempt trace>-<attempt span>-01` while the node exports, so a Capsule worker started inside the attempt links to it. A bridge worker that Fabric spawns gets the `TRACEPARENT` its `Config::traceparent` names, and never one it inherited.
+An attempt's trace is `sha256("fabric.attempt:" + attempt_id)` the same way. The node that runs the attempt makes its root span (`fabric peer.launch`) when it accepts the launch; a launch it refuses (the plan sent again after a restart, answered `already_launched`) is a child of that root with its own id. Its reports and instructions, and the authority's observations of them, are children of it. So the spans of both nodes of one attempt are in one trace. A grant links to the attempt's trace.
+
+Each process an attempt spawns (the harness, a build or test task) gets `TRACEPARENT=00-<attempt trace>-<attempt span>-01` while the node exports, so a Capsule worker started inside the attempt links to it. `fabric-bridge` gives a worker the `TRACEPARENT` its `Config::traceparent` names, and never one it inherited; no node operation spawns a bridge worker yet, so this is the library's rule, not a path a node runs today.
 
 ## Span attributes
 
