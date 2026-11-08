@@ -1,0 +1,31 @@
+# Red first, in one scratch copy of 281635c built into the same target (deleted after)
+
+## The fence forced to Live (fabric-core managed/fence.rs: fence returns Live first)
+test partition::old_runner_sigkill_then_restart ... FAILED
+test partition::block_policy_waits_until_an_operator_recovers has been running for over 60 seconds
+test partition::old_runner_sigstop_then_sigcont has been running for over 60 seconds
+test partition::block_policy_waits_until_an_operator_recovers ... FAILED
+test partition::old_runner_sigstop_then_sigcont ... FAILED
+test partition::relay_paused_runner_alive has been running for over 60 seconds
+test partition::relay_paused_runner_alive ... FAILED
+thread 'partition::old_runner_sigkill_then_restart' (406419324) panicked at crates/fabric/tests/e2e/partition.rs:668:5:
+Error: "the runner never obeyed:\n2026-11-08T23:09:12.472724Z  INFO fabricd::node: node started node=fab126p2hyaqo6b2najrcjvb24jlzxg2rw43o4xh6lmbyomglndbpv7q addr=Some(127.0.0.1:26962)\nnode fab126p2h
+Error: "the runner never obeyed:\n2026-11-08T23:09:39.693197Z  INFO fabricd::node: node started node=fab17uomaqek3le4x6gx7faaznbt27fpisljmol2feshq2f5ko4olzna addr=Some(127.0.0.1:26965)\nnode fab17uoma
+Error: "the runner never obeyed:\n2026-11-08T23:10:43.855479Z  INFO fabricd::node: node started node=fab1ohtmha7cpmpvlkotbw44cf34m46h3pbyjwbrb7n3tdfefqhqalrq addr=Some(127.0.0.1:26967)\nnode fab1ohtmh
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 108 filtered out; finished in 181.85s
+
+## The acknowledgement check removed (recovery_decision and Recover take a captured checkpoint)
+test partition::captured_but_not_acknowledged_is_never_restarted_and_says_why has been running for over 60 seconds
+test partition::captured_but_not_acknowledged_is_never_restarted_and_says_why ... FAILED
+Error: "no recovery_blocked within 60s: [Object {\"operation\": String(\"01M6YPZZWKEM405DZDSQA1HNVG\"), \"key\": String(\"m6-captured\"), \"command\": String(\"create_job\"), \"effect\": Bool(true), \
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 111 filtered out; finished in 65.46s
+
+## Unit mutations: ends_grant only for Stale, the failover exclusion removed, present_taken a no-op
+test a_failover_excludes_the_unavailable_node_whatever_it_offers ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+test runner::tests::a_restarted_runner_presents_its_taken_grants_and_resumes_none ... FAILED
+test runner::tests::every_report_refusal_that_ends_the_grant_stops_the_attempt ... ok
+test runner::tests::every_heartbeat_verdict_that_ends_the_grant_stops_the_attempt ... FAILED
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 370 filtered out; finished in 30.23s
+test runner::tests::every_report_refusal_that_ends_the_grant_stops_the_attempt ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 372 filtered out; finished in 30.17s

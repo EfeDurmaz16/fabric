@@ -22,6 +22,7 @@ What was run to prove a claim, kept in the repository: gate logs, A/B performanc
 | [m4](../evidence/m4/README.md) | M4 evidence: the seam between Fabric and Capsule |
 | [m4-reconcile](../evidence/m4-reconcile/README.md) | M4 evidence: reconciliation and cleanup in Fabric |
 | [m5](../evidence/m5/README.md) | M5 evidence: intent-first placement and the observed job |
+| [m6](../evidence/m6/README.md) | M6 evidence: loss recovery on the merged tree |
 | [perf-ab](../evidence/perf-ab/README.md) | A/B of main and the M2 branch |
 | [perf-cli-protocol-ops](../evidence/perf-cli-protocol-ops/README.md) | A/B of the cli-protocol-ops work against the anchor |
 | [perf-durability](../evidence/perf-durability/README.md) | Durability flushes: items 3, 12 and 16, and the restore |
