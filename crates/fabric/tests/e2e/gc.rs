@@ -151,12 +151,15 @@ fn e2e_gc_after_a_kill_lists_and_removes_only_what_superseded_tenures_left() -> 
         !pids.contains(&i64::from(pid)),
         "the live harness is listed: {found:#}"
     );
+    // The live job is its tenure, or busy while an operation of the run
+    // holds its lock at that moment: either way live, never judged.
     assert!(
         found["live"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|l| l["holds"] == "tenure" && l["label"]["job"] == live.as_str()),
+            .any(|l| (l["holds"] == "tenure" || l["holds"] == "busy")
+                && l["label"]["job"] == live.as_str()),
         "{found:#}"
     );
     let paths: BTreeSet<PathBuf> = residuals.iter().filter_map(|r| r.1.clone()).collect();
