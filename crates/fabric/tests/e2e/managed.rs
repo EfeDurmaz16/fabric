@@ -381,3 +381,200 @@ fn e2e_the_cli_registers_a_test_task_with_its_program() -> Fallible {
     assert!(wrong.contains("build or test"), "{wrong}");
     Ok(())
 }
+
+/// The provider read surface carried from M4, through the CLI: a job's
+/// journal seeded, while its daemon is down, with provider operations in
+/// `unknown` (with and without the scope an absent attach searched),
+/// `attached`, `observed`, `abandoned` and a destroy `dispatched`, which the
+/// restarted daemon reconciles to `unknown`; `fabric managed
+/// inspect` prints each status as it is, each blocker kind and each
+/// residual kind, with the target, the search and the abandonment reason.
+#[test]
+#[expect(clippy::too_many_lines, reason = "the seed reads best as one script")]
+fn e2e_the_cli_inspects_provider_operations_blockers_and_residuals() -> Fallible {
+    use fabric_core::id::NodeId;
+    use fabric_core::managed::{
+        AttemptId, Command, Envelope, NewIds, OperationId, RequestDigest, ResourceRef, TaskId,
+    };
+    use fabric_journal::{
+        AbandonApproval, Acknowledged, EffectClass, Journal, LocatorRecord, ProviderAnswer,
+        ProviderDispatch, ProviderStatus, Purpose, ResourceKey,
+    };
+
+    let env = Env::new()?;
+    let mut node = Node::new(&env, "a", Wire::TcpTls)?;
+    node.start(None)?;
+    // Pinned to a node that is not paired: the job is parked and no
+    // attempt of it runs anywhere while the journal is seeded.
+    let elsewhere = "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq";
+    let made = node.ok(&[
+        "managed",
+        "create",
+        "--empty",
+        "--goal",
+        "provision a sandbox",
+        "--harness",
+        "codex",
+        "--pin",
+        elsewhere,
+        "--operation-key",
+        "make-1",
+    ])?;
+    let job: JobId = made.lines().next().ok_or("nothing printed")?.parse()?;
+    node.kill()?;
+
+    let path = node.state().join("managed").join(fabric_journal::FILE_NAME);
+    let mut journal = Journal::open(&path)?;
+    let state = journal.job(job)?.ok_or("the job is not in the journal")?;
+    let at = 1_762_128_000_000;
+    journal.submit(
+        &Envelope {
+            key: key("start-seeded")?,
+            job: Some(job),
+            expected: None,
+            body: Command::StartAttempt {
+                task: state.job.primary,
+                resource: ResourceRef::Node {
+                    node: elsewhere.parse::<NodeId>()?,
+                },
+                initial_checkpoint: None,
+            },
+        },
+        NewIds {
+            job,
+            task: TaskId::from_bytes([0x61; 16]),
+            attempt: AttemptId::from_bytes([0x62; 16]),
+            operation: OperationId::from_bytes([0x63; 16]),
+            at_ms: at,
+        },
+    )?;
+    let attempt = journal
+        .job(job)?
+        .and_then(|s| s.attempts.last().cloned())
+        .ok_or("no attempt was granted")?;
+    let locator = LocatorRecord {
+        text: r#"{"kind":"sandbox","native_id":"sb-1","provider":"fixture"}"#.into(),
+        key: ResourceKey::from_bytes([0x45; 32]),
+    };
+    let searched = r#"{"kind":"sandbox","provider":"fixture"}"#;
+    let op = |n: u8| OperationId::from_bytes([0x40 + n; 16]);
+    let dispatch =
+        |n: u8, action: &str, target: Option<LocatorRecord>| -> Fallible<ProviderDispatch> {
+            Ok(ProviderDispatch {
+                operation: op(n),
+                key: key(&format!("provider-{n}"))?,
+                digest: RequestDigest::from_bytes([n; 32]),
+                job,
+                task: attempt.task,
+                attempt: attempt.id,
+                generation: attempt.generation,
+                profile: "fixture".into(),
+                action: action.into(),
+                effect: match action {
+                    "sandbox.create" => EffectClass::Create,
+                    "sandbox.destroy" => EffectClass::Destroy,
+                    _ => EffectClass::Mutate,
+                },
+                purpose: Purpose::Effect,
+                target,
+            })
+        };
+    let lost = ProviderAnswer {
+        code: Some("timeout".into()),
+        reason: Some("timeout".into()),
+        effect: Some("unknown".into()),
+    };
+    let none = ProviderAnswer::default();
+    for n in [1, 2, 3] {
+        journal.provider_begin(&dispatch(n, "sandbox.create", None)?, None, at)?;
+    }
+    journal.provider_record(op(1), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_record(op(2), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_searched(op(2), &lost, searched, at)?;
+    journal.provider_record(op(3), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_record(op(3), ProviderStatus::Attached, &none, Some(&locator), at)?;
+    journal.provider_begin(
+        &dispatch(4, "sandbox.exec", Some(locator.clone()))?,
+        None,
+        at,
+    )?;
+    journal.provider_record(op(4), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_record(op(4), ProviderStatus::Observed, &none, None, at)?;
+    journal.provider_begin(
+        &dispatch(5, "sandbox.exec", Some(locator.clone()))?,
+        None,
+        at,
+    )?;
+    journal.provider_record(op(5), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_abandon(
+        &AbandonApproval {
+            operation: op(5),
+            expected: ProviderStatus::Unknown,
+            acknowledged: Acknowledged::Resource(locator.key),
+            reason: "the console shows it ended".into(),
+        },
+        at,
+    )?;
+    journal.provider_begin(
+        &dispatch(6, "sandbox.destroy", Some(locator.clone()))?,
+        None,
+        at,
+    )?;
+    drop(journal);
+
+    node.start(None)?;
+    let shown = node.ok(&["managed", "inspect", &job.to_string()])?;
+    for (n, status) in [
+        (1, "unknown"),
+        (2, "unknown"),
+        (3, "attached"),
+        (4, "observed"),
+        (5, "abandoned"),
+        // Recorded dispatched; the daemon's start-up reconciliation made it
+        // unknown, since nobody can tell whether it reached the provider.
+        (6, "unknown"),
+    ] {
+        let line = format!("provider operation {}: ", op(n));
+        let at = shown
+            .find(&line)
+            .ok_or_else(|| format!("no line for {}: {shown}", op(n)))?;
+        let line = shown[at..].lines().next().unwrap_or_default();
+        assert!(
+            line.ends_with(&format!("({status})")) || line.contains(&format!("({status}) at ")),
+            "{line}"
+        );
+    }
+    assert!(shown.contains(&format!("  searched {searched}")), "{shown}");
+    assert!(
+        shown.contains(&format!("  sent to {}", locator.text)),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("  abandoned: the console shows it ended"),
+        "{shown}"
+    );
+    for (kind, n, status) in [
+        ("create_unresolved", 1, "unknown"),
+        ("exec_may_run", 5, "abandoned"),
+        ("stop_not_confirmed", 6, "unknown"),
+    ] {
+        let line = format!("blocks a replacement: {kind} {} ({status})", op(n));
+        assert!(shown.contains(&line), "{line} in {shown}");
+    }
+    assert!(
+        shown.contains(&format!(
+            "may remain: the resource of {} (attached) at {}",
+            op(3),
+            locator.text
+        )),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!(
+            "may remain: the resource of {} (unknown), not found in {searched}",
+            op(2)
+        )),
+        "{shown}"
+    );
+    Ok(())
+}

@@ -345,6 +345,7 @@ dependencies = [
  "fabric-core",
  "fabric-env",
  "fabric-harness",
+ "fabric-journal",
  "fabric-net",
  "fabricd",
  "nix",
