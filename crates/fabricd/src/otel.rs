@@ -3,7 +3,7 @@
 //! `<endpoint>/v1/traces` when `fabric serve --otlp-endpoint` (or
 //! `OTEL_EXPORTER_OTLP_ENDPOINT`) names one, and nothing at all when not.
 //!
-//! Invariant: a span carries only what [`OpSpan`] has a field for, and it
+//! Invariant: a span carries only what `OpSpan` has a field for, and it
 //! has none for an env value, a secret, an argv, a goal, a path, a raw
 //! operation key, a raw approval ref, an error message or any process
 //! output. An idempotency key and an approval ref travel as SHA-256 hex,
