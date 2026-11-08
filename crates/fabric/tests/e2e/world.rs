@@ -185,8 +185,11 @@ impl Env {
     /// seconds for the node's session record of the job and writes `yes`
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
     /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
-    /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
-    /// to `codex-signal` before it exits with 130. With
+    /// starts one `sleep` child it holds for the whole turn (a child in
+    /// its group that no node registered: an escaped child, present at
+    /// every moment a quiescence may look), touches `codex-waiting` and
+    /// runs until a `SIGINT`, which it writes to `codex-signal` before it
+    /// ends the child and exits with 130. With
     /// `FAKE_CODEX_PROBE_WAIT` set, `--version` touches `codex-probing`
     /// and answers three seconds later. With `FAKE_CODEX_LATE_STDERR` set
     /// it leaves a process behind that writes `codex: late diagnostics` to
@@ -232,9 +235,11 @@ impl Env {
                  while [ ! -f \"$record\" ] && [ $tries -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
                  if [ -f \"$record\" ]; then echo yes > \"$HOME/codex-saw-session\"; else echo no > \"$HOME/codex-saw-session\"; fi\n\
                  if [ -n \"$FAKE_CODEX_WAIT\" ]; then\n\
-                   trap 'echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
+                   sleep 3600 &\n\
+                   child=$!\n\
+                   trap 'kill \"$child\" 2>/dev/null; echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
                    touch \"$HOME/codex-waiting\"\n\
-                   while :; do sleep 0.1; done\n\
+                   wait \"$child\"\n\
                  fi\n\
                  if [ -n \"$FAKE_CODEX_LATE_STDERR\" ]; then\n\
                    ( exec >/dev/null; sleep 0.5; echo 'codex: late diagnostics' >&2 ) &\n\

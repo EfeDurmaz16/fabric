@@ -419,7 +419,7 @@ async fn e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b()
     let mut a = Node::new(&env, "a", Wire::TcpTls)?;
     let mut b = Node::new(&env, "b", Wire::TcpTls)?;
     for node in [&mut a, &mut b] {
-        // Its loop forks a `sleep` per tick: an escaped child.
+        // It holds a `sleep` child for the whole turn: an escaped child.
         node.daemon_env("FAKE_CODEX_WAIT", OsString::from("1"));
     }
     a.start(None)?;
