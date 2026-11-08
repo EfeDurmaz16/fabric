@@ -520,6 +520,14 @@ fn inspection_lines(inspection: &fabric_client::api::Inspection) -> Vec<String> 
             serde_json::to_string(&note.note).unwrap_or_default()
         ));
     }
+    lines.extend(provider_lines(inspection));
+    lines
+}
+
+/// What an inspection shows of provider operations: each with what it
+/// acts on and how it ended, what blocks a replacement, and what may remain.
+fn provider_lines(inspection: &fabric_client::api::Inspection) -> Vec<String> {
+    let mut lines = Vec::new();
     for op in &inspection.provider_operations {
         lines.push(format!(
             "provider operation {}: {} {} {} ({}){}",

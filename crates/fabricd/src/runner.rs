@@ -715,6 +715,7 @@ impl Runner {
                 return Ok(false);
             }
         };
+        tracing::debug!(%attempt, blockers = quiescence.blockers.len(), receipts = quiescence.receipts.len(), "quiesced");
         if !quiescence.blockers.is_empty() {
             reporter
                 .send(Observation::HandoffBlocked {
@@ -748,6 +749,7 @@ impl Runner {
                 return Ok(false);
             }
         };
+        tracing::debug!(%attempt, snapshot = %cut.snapshot, "cut");
         let answer = reporter
             .send(Observation::Checkpointed {
                 attempt,
@@ -854,6 +856,7 @@ impl Reporter<'_> {
                     self.runner.reports_sent.fetch_add(1, Ordering::Relaxed);
                     if let ReportAnswer::Refused { reason } = &answer {
                         self.runner.reports_refused.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(attempt = %self.token.attempt, ?reason, "a report was refused");
                         if matches!(reason, ReportRefusal::StaleGeneration { .. }) {
                             return Err(Ended::Stale);
                         }

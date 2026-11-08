@@ -507,6 +507,10 @@ fn note_of(
 }
 
 /// The request `command` sends.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per command, so the whole mapping reads in one place"
+)]
 fn request(command: ManagedCommand) -> Result<Request> {
     Ok(match command {
         ManagedCommand::Create {
