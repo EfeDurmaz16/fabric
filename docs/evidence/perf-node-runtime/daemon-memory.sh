@@ -59,7 +59,9 @@ measure() {
   "$1" serve --listen 127.0.0.1:0 --wire tcp-tls >"$run/out" 2>"$run/err" &
   pid=$!
   tries=0
-  until grep -q '^listening on' "$run/out" 2>/dev/null; do
+  # A build from before the CLI contract prints `listening on` on stdout,
+  # a later one on stderr: wait on either, so both builds still measure.
+  until grep -q '^listening on' "$run/out" "$run/err" 2>/dev/null; do
     tries=$((tries + 1))
     if [ "$tries" -gt 500 ]; then
       echo "daemon-memory: $1 did not start" >&2
@@ -68,17 +70,20 @@ measure() {
     fi
     sleep 0.01
   done
-  "$1" node id >/dev/null
-  "$1" job ls >/dev/null
+  # After the CLI contract the commands' context is on stderr; only the
+  # measurement prints.
+  "$1" node id >/dev/null 2>&1
+  "$1" job ls >/dev/null 2>&1
   if [ "$mode" = ops ]; then
-    job=$("$1" job new --repo "$repo" --goal bench --harness codex | head -n 1)
+    # The id is the first line of stdout before the contract and all of it after.
+    job=$("$1" job new --repo "$repo" --goal bench --harness codex 2>/dev/null | head -n 1)
     work=$run/home/fabric/jobs/$job/work
-    "$1" job suspend "$job" >/dev/null
+    "$1" job suspend "$job" >/dev/null 2>&1
     head -c 16384 /dev/urandom >"$work/f0.bin"
     echo edit >"$work/new.txt"
-    "$1" job suspend "$job" >/dev/null
-    "$1" job log "$job" >/dev/null
-    "$1" job status "$job" >/dev/null
+    "$1" job suspend "$job" >/dev/null 2>&1
+    "$1" job log "$job" >/dev/null 2>&1
+    "$1" job status "$job" >/dev/null 2>&1
   fi
   sleep 0.5
   rss=$(ps -o rss= -p "$pid" | tr -d ' ')

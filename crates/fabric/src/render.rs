@@ -18,6 +18,8 @@ use fabric_client::api::{
     Registered, RepairOutcome, Reply, SessionRecorded, SnapshotSession, View, WorkspaceState,
 };
 use fabric_client::sentences::{NO_SESSION, carry_lines, named, row};
+use fabric_core::id::JobId;
+use serde_json::{Value, json};
 
 /// The lines an event prints: none for a kind this CLI does not know, and
 /// none for the session a launch continues, which the CLI says itself once
@@ -137,7 +139,7 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                         "{:>4} epoch {} at {} {}",
                         left_out.saturating_add(n),
                         record.epoch,
-                        record.at,
+                        iso_utc(record.at),
                         ledger_event(&record.event)
                     )
                 }))
@@ -589,5 +591,230 @@ mod tests {
             None
         );
         assert_eq!(refused_move(&[row("os", Outcome::Warn)], None), None);
+    }
+}
+
+/// A reply as a command prints it in words: the result, for standard
+/// output, and the notes around it, for standard error.
+pub(crate) struct Answer {
+    pub(crate) result: Vec<String>,
+    pub(crate) notes: Vec<String>,
+}
+
+/// Splits a reply's lines into the result and the notes
+/// (docs/cli-contract.md, Streams): a read prints its data, a change
+/// prints the bare identifier of what it changed or made, and a hint, a
+/// count of left-out rows or a sentence about the change is a note. `job`
+/// is the job the request named, for a change whose reply does not.
+pub(crate) fn answer(reply: &Reply, job: Option<JobId>) -> Answer {
+    let mut lines = self::reply(reply);
+    let id = |text: String| Answer {
+        result: vec![text],
+        notes: Vec::new(),
+    };
+    // The first line, when the reply printed a cut or an empty-list hint first.
+    let first_is_note = match reply {
+        Reply::NodeList(list) => list.left_out > 0 || list.peers.is_empty(),
+        Reply::JobList(list) => {
+            list.left_out > 0 || (list.jobs.is_empty() && list.closed.is_empty())
+        }
+        Reply::JobLog(log) => log.left_out > 0,
+        _ => false,
+    };
+    match reply {
+        Reply::NodeId(identity) => Answer {
+            result: vec![identity.node.to_string()],
+            notes: lines.split_off(1),
+        },
+        Reply::NodeAdd(paired) => Answer {
+            notes: lines,
+            ..id(paired.node.to_string())
+        },
+        Reply::JobNew(created) => Answer {
+            notes: lines.split_off(1),
+            ..id(created.job.to_string())
+        },
+        Reply::ManagedCreate(operation) | Reply::ManagedCancel(operation) => Answer {
+            notes: lines.split_off(1),
+            ..id(operation.job.job.to_string())
+        },
+        Reply::JobExport(exported) => Answer {
+            notes: lines,
+            ..id(exported.snapshot.to_string())
+        },
+        Reply::JobExportPsf(exported) => Answer {
+            notes: lines,
+            ..id(exported.digest.clone())
+        },
+        Reply::JobSuspend(_)
+        | Reply::JobMove(_)
+        | Reply::JobSteal(_)
+        | Reply::JobDecide(_)
+        | Reply::JobRepair(_) => Answer {
+            result: job.map(|job| vec![job.to_string()]).unwrap_or_default(),
+            notes: lines,
+        },
+        Reply::NodeList(_) | Reply::JobList(_) | Reply::JobLog(_)
+            if first_is_note && !lines.is_empty() =>
+        {
+            let rest = lines.split_off(1);
+            Answer {
+                result: rest,
+                notes: lines,
+            }
+        }
+        // A read prints its data. No arm catches the rest, so a reply
+        // added later fails to compile until it says which kind it is.
+        Reply::NodeList(_)
+        | Reply::NodePing(_)
+        | Reply::JobList(_)
+        | Reply::JobStatus(_)
+        | Reply::JobLog(_)
+        | Reply::Doctor { .. }
+        | Reply::ManagedStatus(_)
+        | Reply::ManagedList(_)
+        // A launch's own replies: `job run` and `job resume` hand
+        // standard output to the harness and never answer with these.
+        | Reply::JobRun(_)
+        | Reply::JobResume(_)
+        | Reply::HarnessStarted(_)
+        | Reply::HarnessSession(_)
+        | Reply::HarnessExited
+        | Reply::LaunchCheck => Answer {
+            result: lines,
+            notes: Vec::new(),
+        },
+    }
+}
+
+/// A reply as the one JSON document of `--json` (docs/cli-contract.md,
+/// JSON): the client API's own fields, keyed by the noun, with the
+/// outcome of a change. `job` is the job the request named.
+pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
+    let mut fields = serde_json::to_value(reply).unwrap_or_default();
+    if let Some(object) = fields.as_object_mut() {
+        object.remove("kind");
+    }
+    let with_job = |mut fields: Value| {
+        if let (Some(object), Some(job)) = (fields.as_object_mut(), job) {
+            object.insert("job".to_owned(), Value::from(job.to_string()));
+        }
+        fields
+    };
+    match reply {
+        Reply::NodeId(_) | Reply::NodePing(_) => json!({ "node": fields }),
+        Reply::NodeAdd(_) => json!({ "node": fields, "outcome": "added" }),
+        Reply::JobNew(_) => json!({ "job": fields, "outcome": "created" }),
+        Reply::JobStatus(_) | Reply::ManagedStatus(_) => json!({ "job": fields }),
+        Reply::JobSuspend(_) => json!({ "job": with_job(fields), "outcome": "suspended" }),
+        Reply::JobMove(_) => json!({ "job": with_job(fields), "outcome": "moved" }),
+        Reply::JobSteal(_) => json!({ "job": with_job(fields), "outcome": "stolen" }),
+        Reply::JobDecide(_) => json!({ "job": with_job(fields), "outcome": "recorded" }),
+        Reply::JobRepair(_) => json!({ "job": with_job(fields), "outcome": "repaired" }),
+        Reply::JobExport(_) => json!({ "snapshot": with_job(fields), "outcome": "exported" }),
+        Reply::JobExportPsf(_) => json!({ "container": with_job(fields), "outcome": "exported" }),
+        Reply::ManagedCreate(operation) | Reply::ManagedCancel(operation) => {
+            let outcome = match (reply, operation.replayed) {
+                (_, true) => "unchanged",
+                (Reply::ManagedCreate(_), false) => "created",
+                _ => "canceled",
+            };
+            json!({ "operation": fields, "outcome": outcome })
+        }
+        // A list's fields are already keyed by its noun, and a doctor's
+        // report is its own. No arm catches the rest, so a reply added
+        // later fails to compile until it names its noun and outcome.
+        Reply::NodeList(_)
+        | Reply::JobList(_)
+        | Reply::JobLog(_)
+        | Reply::ManagedList(_)
+        | Reply::Doctor { .. }
+        // A launch's own replies, which no `--json` command answers with.
+        | Reply::JobRun(_)
+        | Reply::JobResume(_)
+        | Reply::HarnessStarted(_)
+        | Reply::HarnessSession(_)
+        | Reply::HarnessExited
+        | Reply::LaunchCheck => fields,
+    }
+}
+
+/// Milliseconds since the Unix epoch as an ISO 8601 time in UTC, such as
+/// `2026-11-08T09:30:00.250Z`.
+pub(crate) fn iso_utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX);
+    let rest = secs % 86_400;
+    // Howard Hinnant's days-to-civil, for the proleptic Gregorian calendar.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60,
+        ms % 1000
+    )
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use fabric_client::api::{JobCreated, JobList, Reply};
+    use fabric_core::harness::HarnessKind;
+    use fabric_core::id::{Epoch, JobId};
+
+    use super::{answer, document, iso_utc};
+
+    fn created() -> (JobId, Reply) {
+        let job: JobId = "01JABCDEFGHJKMNPQRSTVWXYZ0".parse().unwrap();
+        let reply = Reply::JobNew(JobCreated {
+            job,
+            root: "/home/u/fabric/jobs/x/work".into(),
+            repo: "/home/u/repo".into(),
+            harness: HarnessKind::Codex,
+            epoch: Epoch::FIRST,
+        });
+        (job, reply)
+    }
+
+    /// A change prints its bare id on stdout and its sentences as notes,
+    /// so `id=$(fabric job new ...)` holds the id alone.
+    #[test]
+    fn a_change_answers_with_its_bare_id() {
+        let (job, reply) = created();
+        let said = answer(&reply, None);
+        assert_eq!(said.result, vec![job.to_string()]);
+        assert_eq!(said.notes.len(), 2);
+        let doc = document(&reply, None);
+        assert_eq!(doc["outcome"], "created");
+        assert_eq!(doc["job"]["job"], job.to_string());
+    }
+
+    /// An empty list is no result at all, with its hint as a note.
+    #[test]
+    fn an_empty_list_prints_nothing_but_its_hint() {
+        let reply = Reply::JobList(JobList {
+            jobs: Vec::new(),
+            closed: Vec::new(),
+            left_out: 0,
+        });
+        let said = answer(&reply, None);
+        assert!(said.result.is_empty());
+        assert_eq!(said.notes.len(), 1);
+        assert_eq!(document(&reply, None)["jobs"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_ledger_time_prints_as_iso_8601_in_utc() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_utc(1_794_151_814_167), "2026-11-08T15:30:14.167Z");
+        assert_eq!(iso_utc(951_782_400_000), "2000-02-29T00:00:00.000Z");
     }
 }

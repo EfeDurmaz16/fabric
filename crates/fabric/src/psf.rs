@@ -14,7 +14,7 @@ use fabric_core::id::JobId;
 use fabric_core::version::HarnessVersion;
 use fabric_psf::{Achieved, Container, Target, achievable, hex, read_container, read_manifest};
 
-use crate::{Notes, write_lines};
+use crate::{Notes, contract, write_lines};
 
 /// Read a Portable Session Format container without a node.
 #[derive(Debug, Subcommand)]
@@ -34,7 +34,7 @@ pub(crate) enum PsfCommand {
     },
 }
 
-pub(crate) fn run(command: PsfCommand) -> Result<ExitCode> {
+pub(crate) fn run(command: PsfCommand, _run: &contract::Run) -> Result<ExitCode> {
     match command {
         PsfCommand::Inspect { path } => {
             let (container, digest) = read(&path)?;
@@ -98,7 +98,12 @@ fn read(path: &Path) -> Result<(Container, String)> {
 /// names; then it reports the fidelity this node achieves and the command
 /// that continues the job. Otherwise it fails and names the node that
 /// wrote the document, from which `fabric job resume --on` pulls it.
-pub(crate) async fn import(client: &Client, home: &Path, dir: &Path) -> Result<ExitCode> {
+pub(crate) async fn import(
+    client: &Client,
+    home: &Path,
+    dir: &Path,
+    _run: &contract::Run,
+) -> Result<ExitCode> {
     let container =
         read_container(dir).map_err(|r| anyhow!("{} is refused: {r}", dir.display()))?;
     let parts = container.manifest.parts();

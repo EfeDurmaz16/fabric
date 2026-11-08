@@ -108,6 +108,8 @@ fabric job status <job>
 fabric job log <job>
 ```
 
+Every command prints its answer on standard output and everything else (progress, notes, hints, errors) on standard error, so `job=$(fabric job new ...)` holds the job id alone; `--json` prints one JSON document instead, and a failure as one JSON line on standard error. [docs/cli-contract.md](docs/cli-contract.md) has the rules and the exit codes, and [docs/reference/cli.md](docs/reference/cli.md) the help of every command.
+
 The headless turn prints the answer and a last line `codex session <thread>` (or `claude-code session <id>`); the resume continues that session, and the `continuing ... session` line names the model, effort and sandbox it carried. Pick the harness `doctor` says is logged in. `claude.login` is what `claude` itself answers when the node asks it, so a node started from a shell whose `claude` login has lapsed, or over SSH, where the Keychain is closed to it, says `no`, and a headless Claude turn then fails with Claude's own `Failed to authenticate` message; log `claude` in from that shell, or start the node from the desktop session, and run it again.
 
 A managed job (ADR 0019) lives in the journal, not a ledger. Every command takes an operation key, and the same key asks the same command again:
