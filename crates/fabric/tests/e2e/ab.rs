@@ -1445,16 +1445,119 @@ fn memory_series(samples: &[Sample]) -> Vec<Series> {
             ));
         }
     }
-    for (metric, title) in [
-        ("cli_maxrss_kib", "CLI peak resident size"),
-        ("cli_footprint_kib", "CLI peak physical footprint"),
-    ] {
+    for (metric, title) in CLI_SIZES {
         let found = counted_size_pairs(samples, metric);
         if !found.is_empty() {
-            memory.push((format!("{title}, KiB per counted op"), found));
+            memory.push((cli_row(title), found));
         }
     }
     memory
+}
+
+/// The CLI's peak sizes the gate holds, as (metric, title): one row each,
+/// over every counted op.
+const CLI_SIZES: [(&str, &str); 2] = [
+    ("cli_maxrss_kib", "CLI peak resident size"),
+    ("cli_footprint_kib", "CLI peak physical footprint"),
+];
+
+fn cli_row(title: &str) -> String {
+    format!("{title}, KiB per counted op")
+}
+
+/// One op's CLI peak size: the medians of its counted runs and the median
+/// of their ratios.
+struct OpSize {
+    op: String,
+    anchor: f64,
+    candidate: f64,
+    ratio: f64,
+}
+
+/// The ops behind a failing CLI row: each op's counted pairs of `metric`,
+/// largest ratio first. The row pools every op, so its verdict alone names
+/// no op; these do.
+fn cli_sizes_by_op(samples: &[Sample], metric: &str) -> Vec<OpSize> {
+    let mut sizes: Vec<OpSize> = ops_in(samples, "counted")
+        .into_iter()
+        .filter_map(|op| {
+            let found = pairs(samples, "counted", &op, metric);
+            if found.is_empty() {
+                return None;
+            }
+            let mut anchor: Vec<f64> = found.iter().map(|pair| pair.0).collect();
+            let mut candidate: Vec<f64> = found.iter().map(|pair| pair.1).collect();
+            let mut ratios: Vec<f64> = found
+                .iter()
+                .filter(|pair| pair.0 > 0.0)
+                .map(|pair| pair.1 / pair.0)
+                .collect();
+            Some(OpSize {
+                op,
+                anchor: median(&mut anchor),
+                candidate: median(&mut candidate),
+                ratio: median(&mut ratios),
+            })
+        })
+        .collect();
+    sizes.sort_by(|a, b| b.ratio.total_cmp(&a.ratio));
+    sizes
+}
+
+/// How many ops of the CLI row `row` are larger, and the largest of them,
+/// as one sentence; `None` when `row` is not a CLI row.
+fn cli_ops_named(samples: &[Sample], row: &str) -> Option<String> {
+    let (metric, _) = CLI_SIZES.iter().find(|(_, title)| cli_row(title) == row)?;
+    let sizes = cli_sizes_by_op(samples, metric);
+    let larger: Vec<&OpSize> = sizes.iter().filter(|size| size.ratio > 1.0).collect();
+    let largest: Vec<String> = larger
+        .iter()
+        .take(5)
+        .map(|size| {
+            format!(
+                "`{}` {:.3} ({:.0} -> {:.0} KiB)",
+                size.op, size.ratio, size.anchor, size.candidate
+            )
+        })
+        .collect();
+    let spread = if larger.len() == sizes.len() {
+        "every op, so the cost is in every CLI process, not in one op's path"
+    } else {
+        "the ops below, so look in their paths first"
+    };
+    Some(format!(
+        "{row}: larger in {} of {} ops, {spread}; the largest: {}.",
+        larger.len(),
+        sizes.len(),
+        if largest.is_empty() {
+            "none".to_owned()
+        } else {
+            largest.join(", ")
+        }
+    ))
+}
+
+/// Each op's CLI peak size for the failing CLI rows in `failed`, as a table
+/// under the memory rows.
+fn cli_op_tables(samples: &[Sample], failed: &[String], out: &mut String) {
+    for (metric, title) in CLI_SIZES {
+        if !failed.contains(&cli_row(title)) {
+            continue;
+        }
+        let _ = write!(
+            out,
+            "\n#### {title} by op\n\n\
+             KiB, medians over each op's counted runs, largest ratio first.\n\n\
+             | op | anchor | candidate | ratio |\n|---|---:|---:|---:|\n"
+        );
+        for size in cli_sizes_by_op(samples, metric) {
+            let _ = writeln!(
+                out,
+                "| {} | {:.0} | {:.0} | {:.3} |",
+                size.op, size.anchor, size.candidate, size.ratio
+            );
+        }
+    }
 }
 
 /// The counter checks of the gate, one per counted op, with their table.
@@ -1501,6 +1604,20 @@ fn counter_checks(samples: &[Sample], out: &mut String) -> Vec<Check> {
     }
 
     checks
+}
+
+/// The ops behind the failing CLI rows in `failed`, a line each, after a
+/// blank line; empty when none of them is a CLI row.
+fn named(samples: &[Sample], failed: &[String]) -> String {
+    let lines: Vec<String> = failed
+        .iter()
+        .filter_map(|row| cli_ops_named(samples, row))
+        .collect();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", lines.join("\n\n"))
+    }
 }
 
 /// The verdict of a run against the performance rule, as markdown, and
@@ -1555,7 +1672,14 @@ fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
              fails when it lies above 1.\n\n",
             memory.len()
         );
-        checks.extend(family_checks(&memory, &mut out)?);
+        let rows = family_checks(&memory, &mut out)?;
+        let failed: Vec<String> = rows
+            .iter()
+            .filter(|check| check.fails)
+            .map(|check| check.row.clone())
+            .collect();
+        cli_op_tables(&samples, &failed, &mut out);
+        checks.extend(rows);
     }
 
     checks.extend(counter_checks(&samples, &mut out));
@@ -1575,10 +1699,11 @@ fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
     } else {
         format!(
             "### Perf gate: fail\n\n{} of {} checks break the performance rule \
-             (CONTRIBUTING.md): {}.\n",
+             (CONTRIBUTING.md): {}.\n{}",
             failed.len(),
             checks.len(),
-            failed.join("; ")
+            failed.join("; "),
+            named(&samples, &failed)
         )
     };
     Ok((head + &out, failed))
@@ -1611,11 +1736,12 @@ fn confirmed_verdict(first: &str, again: Option<&str>) -> Fallible<(String, Vec<
     let mut out = format!(
         "### Perf gate: {}\n\n\
          The first run failed {}, so CI ran both builds again; the confirmation \
-         failed {}. A check fails only when it fails in both runs: {}.\n",
+         failed {}. A check fails only when it fails in both runs: {}.\n{}",
         if failed.is_empty() { "pass" } else { "fail" },
         list(&first_failed),
         list(&again_failed),
-        list(&failed)
+        list(&failed),
+        named(&parse_samples(again)?, &failed)
     );
     for (title, verdict) in [
         ("First run", first_verdict),
@@ -1934,5 +2060,38 @@ fn a_confirmed_gate_matches_each_counter_of_an_op() -> Fallible {
     let (verdict, failed) = confirmed_verdict(&spawn_and_flush, Some(&spawn))?;
     assert_eq!(failed, ["acp new: more process starts"], "{verdict}");
     assert!(verdict.starts_with("### Perf gate: fail"), "{verdict}");
+    Ok(())
+}
+
+/// A failing CLI row pools every op, so the verdict names the ops behind
+/// it, largest ratio first, and says when every op is larger.
+#[test]
+fn a_failing_cli_row_names_its_ops() -> Fallible {
+    let mut samples = gate_samples(1.0, 1.0, 0);
+    for run in 1..=5 {
+        for (op, larger) in [("cli version", 1.14), ("cli ls", 1.07), ("acp new", 1.07)] {
+            for (side, kib) in [("anchor", 3000.0), ("candidate", 3000.0 * larger)] {
+                let _ = writeln!(
+                    samples,
+                    "counted\t{run}\t{op}\t{side}\tanchor\tcli_footprint_kib\t{kib:.0}"
+                );
+            }
+        }
+    }
+    let row = "CLI peak physical footprint, KiB per counted op";
+    let (verdict, failed) = confirmed_verdict(&samples, Some(&samples))?;
+    assert_eq!(failed, [row], "{verdict}");
+    let (head, _) = verdict.split_once("### First run").ok_or("no first run")?;
+    assert!(
+        head.contains(&format!(
+            "{row}: larger in 3 of 3 ops, every op, so the cost is in every CLI process, \
+             not in one op's path; the largest: `cli version` 1.140 (3000 -> 3420 KiB), "
+        )),
+        "{verdict}"
+    );
+    assert!(
+        verdict.contains("| cli version | 3000 | 3420 | 1.140 |"),
+        "{verdict}"
+    );
     Ok(())
 }
