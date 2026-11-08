@@ -189,7 +189,31 @@ A limit is a refusal (`too_large`), never a truncation. A writer that would exce
 
 - `policy` has one value in v1, `never_inside`. A document with another value is refused `secret_policy` before anything else in it is trusted. This is deliberate: a later version that allowed a secret inside would be v2, and a v1 reader must not read such a document under v1 rules.
 - `left_behind` lists the workspace paths a secret pattern or `.fabricignore` kept on the writing node (the snapshot manifest's `left_behind`), so the reader can tell the user what to recreate. `allowlist` lists the paths the job allowed to travel although a pattern matched them (ADR 0025); they are in the revision, named, not hidden.
-- A reader refuses `credential_like` any text field that holds a token with one of the shared prefixes and bodies: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` (36 or more alphanumerics), `github_pat_` (22 or more of `[A-Za-z0-9_-]`), `glpat-` (20 or more), `npm_` (36 or more alphanumerics), `xoxb-`, `xoxp-` (10 or more of `[A-Za-z0-9_-]`), `sk-` (20 or more), `AKIA` (16 or more of `[A-Z0-9]`), `sk_live_`, `sk_test_`, `rk_live_`, `rk_test_` (24 or more alphanumerics), `AIza` (35 or more of `[A-Za-z0-9_-]`), `hf_` (34 or more alphanumerics), plus a URL whose userinfo holds a password and a PEM private key header. This is `fabric_core::credential::looks_like_credential`, and the three readers implement the same list; the fixture `refuse_credential_like` pins one shape.
+- A reader refuses `credential_like` any key or string value (section 10, step 13) that holds a PEM header (`-----BEGIN`), a URL whose userinfo holds a password (`://user:pass@host`), or a token: one of the prefixes below, not preceded by a character of `[A-Za-z0-9_-]` (so `foo_ghp_...` is not a token), followed by at least the given number of characters of its alphabet. This is `fabric_core::credential::looks_like_credential`, and the three readers implement the same list; a test in that module checks this table against it row by row, and the fixture `refuse_credential_like` pins one shape.
+
+| Prefix | At least | Of |
+|---|---|---|
+| `ghp_` | 36 | `[A-Za-z0-9]` |
+| `gho_` | 36 | `[A-Za-z0-9]` |
+| `ghu_` | 36 | `[A-Za-z0-9]` |
+| `ghs_` | 36 | `[A-Za-z0-9]` |
+| `ghr_` | 36 | `[A-Za-z0-9]` |
+| `github_pat_` | 22 | `[A-Za-z0-9_-]` |
+| `glpat-` | 20 | `[A-Za-z0-9_-]` |
+| `npm_` | 36 | `[A-Za-z0-9]` |
+| `xoxb-` | 10 | `[A-Za-z0-9_-]` |
+| `xoxp-` | 10 | `[A-Za-z0-9_-]` |
+| `sk-` | 20 | `[A-Za-z0-9_-]` |
+| `AKIA` | 16 | `[A-Z0-9]` |
+| `sk_live_` | 24 | `[A-Za-z0-9]` |
+| `sk_test_` | 24 | `[A-Za-z0-9]` |
+| `rk_live_` | 24 | `[A-Za-z0-9]` |
+| `rk_test_` | 24 | `[A-Za-z0-9]` |
+| `AIza` | 35 | `[A-Za-z0-9_-]` |
+| `hf_` | 34 | `[A-Za-z0-9]` |
+| `pypi-` | 50 | `[A-Za-z0-9_-]` |
+| `glptt-` | 20 | `[A-Za-z0-9_-]` |
+
 - No reader promises to find a secret inside an attachment. The attachment's own writer redacts (Fabric's harness capture redacts by pattern and records the redactions in the state manifest); PSF records nothing about the blob's contents but its digest and length.
 - A writer never puts a login, a credentials file, a Keychain item, `~/.claude.json`, `auth.json` or `config.toml` into an attachment. Fabric's denylist (ADR 0006) is the rule for its own attachments; another writer's attachment is trusted as far as its format's documentation says.
 
