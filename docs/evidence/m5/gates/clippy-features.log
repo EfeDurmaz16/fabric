@@ -1,0 +1,23 @@
+== fabric-harness features []
+    Checking hashbrown v0.17.1
+    Checking ulid v3.0.0
+    Checking tokio v1.54.1
+    Checking rand v0.10.3
+    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
+    Checking proptest v1.12.0
+    Checking indexmap v2.14.2
+    Checking serde_json v1.0.154
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.98s
+== fabric-harness features [acp]
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.26s
+== fabric-harness features [claude]
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.21s
+== fabric-harness features [codex]
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.36s
+== fabricd features [faults]
+    Checking fabricd v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabricd)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.07s
