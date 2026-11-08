@@ -203,6 +203,23 @@ The section is optional because a standalone job (M1) has no package, and becaus
 
 A reader checks in this order and stops at the first failure. Each code is closed in v1; a new code is a v2 change. The `field` is a dotted path with `[i]` for an array index, or empty for the whole document.
 
+So that every reader names the same code and the same field, the order is exact. Each check after `not_canonical` is one pass over the whole value in canonical order: keys by their bytes, depth first, a node before its children, the first value that breaks the check wins. `crates/fabric-psf/src/check.rs` is the reference; the other two readers follow it phase by phase, and their tests diff all three.
+
+1. `too_large`: more than 1,048,576 bytes, field empty.
+2. `not_json`: not UTF-8, not one JSON object, a lone surrogate in a string or key, a JSON constant such as `NaN`, or nesting of 128 levels or more (the limit of `serde_json`, the Rust reader's parser), field empty.
+3. `not_canonical`: the first JSON number or key outside `[a-z0-9_]+` in canonical order, at its path; otherwise, when the re-serialized bytes differ, field empty.
+4. `unsupported_version`: `psf` present and not the string `"1"`.
+5. `missing_field`: the keys of section 5 in canonical order, depth first. A required key absent, a non-nullable value `null`, or any value of the wrong JSON type is missing; so is an empty `produced.writer` or `attachments[].format`. `source` checks `kind` first, then the keys its kind requires (`commit` and `uri` for `git`, `snapshot` for `snapshot`). A `caches[].key` that is an object needs a string `kind`, and every value in it is a string. A non-null `package` needs `job`, `version` and `workspace.bundle_head` and `workspace.ledger_head` as strings; the rest of it is opaque here.
+6. `unknown_requirement`: `requires` not empty, at `requires[0]` (a v1.0 reader implements no extension).
+7. `too_large`: the list and name limits of section 7, every string under `package` as a text field, and `package` itself over 262,144 bytes of canonical JSON.
+8. `bad_id`: the forms of section 4, rules 7 and 8, and the integer strings of rule 4 (`produced.at_ms`, `attachments[].bytes`, and `workspace.epoch`, which is also refused at `"0"`). A node id is `fab1` and 52 characters of `[a-z2-7]` whose last is `a` or `q`, so its four padding bits are zero; a ULID starts with `0` to `7`.
+9. `bad_path`, 10. `bad_enum`: as the table says.
+11. `duplicate`: attachments by `name`, then caches by `path`, each strictly ascending by bytes, at the later entry's key.
+12. `secret_policy`.
+13. `credential_like`: every key and every string value of the document in canonical order, not only the text fields, so a remote URL with a password or a token in `harness.args` is refused too.
+14. `fidelity_mismatch`: first a `native_session` attachment of another harness, at `attachments[i].harness`; then `fidelity.level` against the attachments (or `fidelity.reason` for a reason given or missing); then `package` when the level is `new_native_session_with_package` and the package is `null`.
+15. `package_mismatch`: `package.version`, `package.job`, `package.workspace.bundle_head`, `package.workspace.ledger_head`, in that order.
+
 | Code | When |
 |---|---|
 | `too_large` | the bytes are over 1,048,576 before parsing; a text field, a list or the package is over its limit (section 7) |
@@ -228,7 +245,7 @@ Container level, after the manifest was read:
 | `blob_mismatch` | a file under `blobs/` does not hash to its name, or its length is not the `bytes` the manifest declares |
 | `blob_unlisted` | a file under `blobs/`, or anywhere else in the directory, that the manifest does not name |
 
-An absent blob is not a refusal (section 3): the attachment is reported detached.
+An absent blob is not a refusal (section 3): the attachment is reported detached. A container whose manifest is refused reports the manifest's code with the path `manifest.json` and the manifest's field. Entries are checked in the byte order of their relative paths; a symbolic link is never followed and counts as unlisted.
 
 A reader never repairs a document: no key order fix, no number to string, no path rewrite. A writer that wants its document read writes it canonically.
 
@@ -265,11 +282,19 @@ and move the pin in `psf_fixtures.rs`. An accepted case's `expect.digest` is `pr
 
 ## 13. Readers
 
-Three independent readers are the acceptance of PR 4 of the 2026-11-08 roadmap; none is in this change. Their shared contract is: read bytes, return the manifest and the document digest, or one refusal code with its field; read a directory, return the manifest, the present and detached attachments, or one container code with its path; and compute the achieved fidelity for a given root, home and set of installed harnesses.
+Three independent readers share one contract: read bytes, return the manifest and the document digest, or one refusal code with its field; read a directory, return the manifest, the present and detached attachments, or one container code with its path; and compute the achieved fidelity for a given root, home and set of installed harnesses.
 
-- `crates/fabric-psf` (Rust, depends on `fabric-core` for the id and path types and on `serde_json`; no other workspace crate): `read_manifest(bytes) -> Result<Manifest, Refusal>`, `read_container(dir) -> Result<Container, ContainerRefusal>`, `Manifest::digest() -> [u8; 32]`, `Manifest::achievable(&Target) -> Achieved`, and `write_manifest(&Manifest) -> Vec<u8>` producing canonical bytes.
-- `sdk/typescript` (zod at the boundary, the same fixtures in `test/psf.test.ts`): `readManifest(bytes: Uint8Array): Manifest`, `readContainer(dir: string): Promise<Container>`, `manifestDigest(bytes): string`, `achievable(manifest, target): Achieved`, with refusals as a typed `PsfError { code, field }`.
-- `scripts/psf-read.py` (Python 3.9, standard library only, the independence check): `python3 -I scripts/psf-read.py <manifest.json | dir>` prints the digest, the offered fidelity and the detached attachments, or exits 1 with `<code> <field>`; `--fixtures protocol/psf/v1` runs every case and container and exits non-zero on the first disagreement.
+- `crates/fabric-psf` (Rust, depends on `fabric-core` for the path rules and the credential list, and on `serde_json`): `read_manifest(bytes) -> Result<Manifest, Refusal>`, `read_container(dir) -> Result<Container, ContainerRefusal>`, `Manifest::digest() -> [u8; 32]`, `Manifest::achievable(&Target) -> Achieved` (and `achievable(manifest, target, detached)` for a container), `Manifest::new(&Parts)`, which writes canonically and reads the bytes back under every rule, and `write_manifest(&Manifest) -> Vec<u8>`. `harness_state::pack` writes `fabric.harness_state.v1`: a ustar archive of the state tree, entries in byte order, directories 0755 and files 0644, owner and time 0, so one tree gives one blob.
+- `sdk/typescript/src/psf.ts` (zod types the accepted value): `readManifest(bytes: Uint8Array): Manifest`, `readContainer(dir: string): Promise<Container>`, `manifestDigest(bytes): string`, `achievable(manifest, target, detached?): Achieved`, with refusals as `PsfError { code, field }` and `PsfContainerError { code, path, field }`.
+- `scripts/psf_check.py` (Python 3.9, standard library only, the independence check): `python3 -I scripts/psf_check.py <manifest.json | dir>` prints the digest, the offered fidelity and the detached attachments, or exits 1 with `<code> <field>`; `--fixtures protocol/psf/v1` checks every case and container against its `expect` and exits 1 on the first disagreement; `--verdicts` and `--lines` print the verdict lines below.
+
+Each reader prints one verdict line per document: compact JSON, keys sorted, `{"achieved", "digest", "fidelity", "name", "outcome", "package"}` for an accepted case, `{"code", "field", "name", "outcome"}` for a refused one, and for a container `detached` in place of `fidelity` and `package`, or `path` beside `code`. `achieved` is the level on one fixed target: the fixtures' root and home, with `claude_code` 2.1.294 and `codex` 0.163.0 installed. `crates/fabric-psf/tests/conformance.rs` diffs the Rust and Python lines over the fixtures and over about eight thousand documents made by removing each value of the accepted fixtures or replacing it with each of a set of edge values; `sdk/typescript/test/psf.test.ts` diffs the TypeScript lines with the Python ones over the same two sets, and with `fabric psf verdicts` when `FABRIC_BIN` names a built `fabric`.
+
+### Fabric as a writer and a reader
+
+`fabric job export <job> --psf <dir>` asks the node to write the job's latest snapshot as a container (the `job_export_psf` op, additive under ADR 0018). The node fills the manifest from the ledger and the snapshot manifest: the bundle head is the latest snapshot, the ledger head the hash of the last record, `source` the `remote.origin.url` and the commit `HEAD` named, or the first snapshot of the bundle chain when the repository has no remote, `caches` the cache rows with their carry keys (their `digest` is `null` in this writer), and `secrets.left_behind` the snapshot's left-behind paths. The captured harness state, when it is the job's harness's, is the one `native_session` attachment, bound to the root and home it was captured under. No workspace byte is read for the export, so a secret in the workspace cannot reach the container; the end-to-end test plants one and checks every file.
+
+`fabric job import --psf <dir>` reads the container and matches it to the job on this node: it succeeds when this node's head for the job is the document's bundle head, and prints the fidelity this node achieves, why it fell, what to recreate, and the command that continues the job. When this node does not hold that revision it fails and names the writing node, from which `fabric job resume <job> --on <node>` pulls it: the container names a revision, it does not carry one. `fabric psf inspect <path>` reads a container or a lone manifest without a node.
 
 ## 14. Sources
 

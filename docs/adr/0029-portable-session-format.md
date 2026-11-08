@@ -40,7 +40,7 @@ The manifest is at most 1 MiB (the client API's parse cap), a text field 16 KiB 
 
 ### What this change ships, and what it does not
 
-This change is the contract: the format document, this ADR, the fixtures (one per fidelity, two with a package, one per refusal code, one over a limit, five containers) and the pin test. The three readers (Rust `fabric-psf`, the TypeScript SDK, a standard-library Python script) are specified in section 13 of the format document and built in the follow-up; the node's `job export` and `job import` of a container, and the RFC post, come with them. Nothing in the node changes here.
+The contract is the format document, this ADR, the fixtures (one per fidelity, two with a package, one per refusal code, one over a limit, five containers) and the pin test. The same change builds the three readers of section 13 (Rust `fabric-psf`, the TypeScript SDK, the standard-library `scripts/psf_check.py`), the conformance tests that diff them, the node's `job_export_psf` op behind `fabric job export --psf`, and `fabric job import --psf` and `fabric psf inspect`. The RFC post is not in it.
 
 ## Alternatives considered
 
@@ -58,7 +58,7 @@ This change is the contract: the format document, this ADR, the fixtures (one pe
 - A second program can read a Fabric job in transit without Fabric: the format, not the node, is the product boundary the roadmap asked for.
 - The WorkPackage and the fidelity ladder of the M5 branch are now named in a public document; a change to either on that branch is a change to this format and goes through its fixtures.
 - Fabric's own harness state tree gets a public name, `fabric.harness_state.v1`, and a tar form; the `fabric-psf` crate writes and reads it.
-- The fixture discipline of ADR 0018 and ADR 0021 extends to a third set with its own version: `scripts/check-fixtures.sh` does not watch `protocol/psf`, and the pin test is the guard until the crate lands with its own check.
+- The fixture discipline of ADR 0018 and ADR 0021 extends to a third set with its own version: `scripts/check-fixtures.sh` does not watch `protocol/psf`, and the pin test and the three readers' fixture tests are the guard.
 - A sha256 implementation already lives in `fabric-client`'s tests; it moves to a shared test module so two pin tests use one copy. No new dependency.
 
 ## Open questions
