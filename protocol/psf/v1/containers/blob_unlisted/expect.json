@@ -1,0 +1,9 @@
+{
+  "container": "blob_unlisted",
+  "summary": "A blob the manifest does not name; a container holds nothing its manifest does not account for.",
+  "expect": {
+    "outcome": "refuse",
+    "code": "blob_unlisted",
+    "path": "blobs/3853943cff49df7a166ec32dd6067f82cbbe123ecdffde8d9b92b68fd1a7dda3"
+  }
+}

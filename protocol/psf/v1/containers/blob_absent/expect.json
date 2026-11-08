@@ -1,0 +1,11 @@
+{
+  "container": "blob_absent",
+  "summary": "A manifest alone: the blob it names is detached, the document is still read, and the fidelity a reader can achieve falls.",
+  "expect": {
+    "outcome": "accept",
+    "digest": "bc580de7c3540c96290ac0e18bb226ce823f3d4a9175fe706a2df1b85a4735e7",
+    "detached": [
+      "claude-state"
+    ]
+  }
+}

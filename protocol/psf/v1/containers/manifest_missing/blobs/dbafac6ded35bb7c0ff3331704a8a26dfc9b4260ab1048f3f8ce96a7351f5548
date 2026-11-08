@@ -1,0 +1,1 @@
+opaque harness state tree of a claude_code session; the adapter reads it, the format does not

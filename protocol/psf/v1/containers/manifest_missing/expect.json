@@ -1,0 +1,9 @@
+{
+  "container": "manifest_missing",
+  "summary": "Blobs without a manifest.json are not a container.",
+  "expect": {
+    "outcome": "refuse",
+    "code": "manifest_missing",
+    "path": "manifest.json"
+  }
+}
