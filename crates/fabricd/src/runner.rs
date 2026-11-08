@@ -140,12 +140,41 @@ pub(crate) struct Counters {
     pub heartbeats: u64,
     /// Verdicts or refusals that ended a grant, obeyed by a stop.
     pub stale_obeyed: u64,
+    /// Grants taken before a restart and presented after it.
+    pub presented: u64,
 }
 
-/// The durable record of a launch taken, which answers a launch sent again.
+/// The durable record of a launch taken, which answers a launch sent
+/// again: the local marker of a grant this node ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Taken {
-    token: GrantToken,
+pub(crate) struct Taken {
+    pub(crate) token: GrantToken,
+    /// The authority that granted it; `None` is this node's own.
+    #[serde(default)]
+    pub(crate) from: Option<NodeId>,
+    /// How this node's part in the grant ended; `None` while it may run.
+    #[serde(default)]
+    pub(crate) ended: Option<TakenEnd>,
+}
+
+/// How a grant this node took ended here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TakenEnd {
+    /// Its loop ran to its end on this node.
+    Finished,
+    /// The authority's verdict ended it; nothing more was reported.
+    GrantEnded {
+        /// The verdict's or the refusal's name.
+        verdict: String,
+    },
+    /// This node restarted while it ran: it is never resumed here. The
+    /// authority's answer when the grant was presented after the restart
+    /// is kept; a grant still live there is left to fall silent, so the
+    /// authority's own loss handling decides it (ADR 0028).
+    Abandoned {
+        /// The name of the verdict the presentation got.
+        verdict: String,
+    },
 }
 
 /// Work the attempt's own task does on an instruction.
@@ -180,6 +209,7 @@ pub(crate) struct Runner {
     reports_refused: AtomicU64,
     heartbeats: AtomicU64,
     stale_obeyed: AtomicU64,
+    presented: AtomicU64,
 }
 
 impl std::fmt::Debug for Runner {
@@ -211,8 +241,9 @@ fn blocked(task: fabric_core::managed::TaskId, reason: String) -> TaskReceipt {
 /// Why an attempt's loop ended early.
 enum Ended {
     /// The authority said the grant ended (a verdict or a refusal for
-    /// which `ends_grant` holds); everything is stopped.
-    Stale,
+    /// which `ends_grant` holds), by that verdict's name; everything is
+    /// stopped.
+    Stale(&'static str),
 }
 
 impl Runner {
@@ -230,6 +261,7 @@ impl Runner {
             reports_refused: AtomicU64::new(0),
             heartbeats: AtomicU64::new(0),
             stale_obeyed: AtomicU64::new(0),
+            presented: AtomicU64::new(0),
         }
     }
 
@@ -259,6 +291,7 @@ impl Runner {
             reports_refused: self.reports_refused.load(Ordering::Relaxed),
             heartbeats: self.heartbeats.load(Ordering::Relaxed),
             stale_obeyed: self.stale_obeyed.load(Ordering::Relaxed),
+            presented: self.presented.load(Ordering::Relaxed),
         }
     }
 
@@ -330,7 +363,16 @@ impl Runner {
                 path: self.taken.clone(),
                 source,
             })
-            .and_then(|()| local::write(&self.taken_path(token.attempt), &Taken { token }))
+            .and_then(|()| {
+                local::write(
+                    &self.taken_path(token.attempt),
+                    &Taken {
+                        token,
+                        from,
+                        ended: None,
+                    },
+                )
+            })
         {
             return refused(LaunchRefusal::Internal {
                 reason: e.to_string(),
@@ -458,7 +500,7 @@ impl Runner {
         let budget = DrainBudget::new(request.policy.drain_budget_ms).unwrap_or_default();
         // Step 7's heartbeat runs beside everything else: a verdict that
         // the grant is stale reaches every wait below.
-        let (stale_tx, stale) = watch::channel(false);
+        let (stale_tx, stale) = watch::channel::<Option<&'static str>>(None);
         let retry = Arc::new(Notify::new());
         let beat = tokio::spawn(heartbeat_loop(
             Arc::clone(&self),
@@ -663,8 +705,11 @@ impl Runner {
             loop {
                 tokio::select! {
                     changed = stale.changed() => {
-                        if changed.is_err() || *stale.borrow() {
-                            return Err(Ended::Stale);
+                        if changed.is_err() {
+                            return Err(Ended::Stale("unknown_job"));
+                        }
+                        if let Some(verdict) = *stale.borrow() {
+                            return Err(Ended::Stale(verdict));
                         }
                     }
                     code = &mut exit => {
@@ -709,10 +754,17 @@ impl Runner {
             }
         }
         .await;
-        if let Err(Ended::Stale) = outcome {
-            self.stale_obeyed.fetch_add(1, Ordering::Relaxed);
-            let _ = self.executor.stop(attempt, budget).await;
-        }
+        let end = match &outcome {
+            Err(Ended::Stale(verdict)) => {
+                self.stale_obeyed.fetch_add(1, Ordering::Relaxed);
+                let _ = self.executor.stop(attempt, budget).await;
+                TakenEnd::GrantEnded {
+                    verdict: (*verdict).to_owned(),
+                }
+            }
+            Ok(()) => TakenEnd::Finished,
+        };
+        self.mark_ended(token, from, end);
         beat.abort();
         let _ = self.executor.end(attempt).await;
         host.attempt_root(attempt, None);
@@ -827,6 +879,111 @@ impl Runner {
     }
 }
 
+/// The name a report refusal is recorded under in a taken marker.
+fn refusal_name(reason: &ReportRefusal) -> &'static str {
+    match reason {
+        ReportRefusal::StaleGeneration { .. } => "stale",
+        ReportRefusal::UnknownJob => "unknown_job",
+        ReportRefusal::UnknownAttempt => "unknown_attempt",
+        ReportRefusal::WrongNode => "wrong_node",
+        ReportRefusal::Superseded { .. } => "superseded",
+        ReportRefusal::NotWritable { .. } => "not_writable",
+        ReportRefusal::TokenMismatch => "token_mismatch",
+        ReportRefusal::NotReportable => "not_reportable",
+        ReportRefusal::Domain { .. } => "domain",
+        ReportRefusal::Unavailable => "unavailable",
+    }
+}
+
+impl Runner {
+    /// Writes how this node's part in `token`'s grant ended into its
+    /// marker; a marker that cannot be written is logged, never retried
+    /// into a second run.
+    fn mark_ended(&self, token: GrantToken, from: Option<NodeId>, end: TakenEnd) {
+        let marker = Taken {
+            token,
+            from,
+            ended: Some(end),
+        };
+        if let Err(e) = local::write(&self.taken_path(token.attempt), &marker) {
+            tracing::warn!(attempt = %token.attempt, error = %e, "the taken marker was not updated");
+        }
+    }
+
+    /// After a restart: every grant this node had taken and not seen end
+    /// is presented to its authority in a heartbeat until the authority
+    /// answers it, and its marker records the answer. None is resumed: the
+    /// node's handles on its processes died with the previous run, and
+    /// what that run left running was stopped before this one started
+    /// (`Executor::recover`). A grant the authority still holds live is
+    /// left to fall silent, so its loss handling and recovery policy
+    /// decide it (ADR 0028). Returns the markers it wrote, in attempt order.
+    pub(crate) async fn present_taken(&self) -> Vec<Taken> {
+        let Some(host) = self.host.get().cloned() else {
+            return Vec::new();
+        };
+        let mut open: Vec<Taken> = match std::fs::read_dir(&self.taken) {
+            Ok(entries) => {
+                let mut found: Vec<Taken> = entries
+                    .flatten()
+                    .filter_map(|e| local::read::<Taken>(&e.path()).ok().flatten())
+                    .filter(|t| t.ended.is_none())
+                    .collect();
+                found.sort_by_key(|t| t.token.attempt);
+                found
+            }
+            Err(_) => Vec::new(),
+        };
+        let running = self.attempts.lock().await;
+        open.retain(|t| !running.contains_key(&t.token.attempt));
+        drop(running);
+        let mut written = Vec::new();
+        let mut interval = tokio::time::interval(self.heartbeat);
+        while !open.is_empty() {
+            interval.tick().await;
+            let mut still = Vec::new();
+            for taken in open {
+                let answer = host
+                    .heartbeat(
+                        taken.from,
+                        Heartbeat {
+                            attempts: vec![taken.token],
+                        },
+                    )
+                    .await;
+                let verdict = answer.ok().and_then(|a| {
+                    a.verdicts
+                        .into_iter()
+                        .find(|(attempt, _)| *attempt == taken.token.attempt)
+                        .map(|(_, v)| v)
+                });
+                let Some(verdict) = verdict else {
+                    still.push(taken);
+                    continue;
+                };
+                self.presented.fetch_add(1, Ordering::Relaxed);
+                let end = if verdict.ends_grant() {
+                    TakenEnd::GrantEnded {
+                        verdict: verdict.name().to_owned(),
+                    }
+                } else {
+                    TakenEnd::Abandoned {
+                        verdict: verdict.name().to_owned(),
+                    }
+                };
+                tracing::info!(attempt = %taken.token.attempt, verdict = verdict.name(), "a grant taken before the restart was presented; it is not resumed");
+                self.mark_ended(taken.token, taken.from, end.clone());
+                written.push(Taken {
+                    ended: Some(end),
+                    ..taken
+                });
+            }
+            open = still;
+        }
+        written
+    }
+}
+
 /// Where a continuation's package is written: beside the root.
 fn package_path(root: &AbsPath, attempt: AttemptId) -> PathBuf {
     let root = std::path::Path::new(root.as_str());
@@ -843,7 +1000,7 @@ async fn heartbeat_loop(
     host: Arc<dyn Host>,
     to: Option<NodeId>,
     token: GrantToken,
-    stale: watch::Sender<bool>,
+    stale: watch::Sender<Option<&'static str>>,
     retry: Arc<Notify>,
 ) {
     let mut interval = tokio::time::interval(runner.heartbeat);
@@ -870,7 +1027,7 @@ async fn heartbeat_loop(
         match verdict {
             Some(verdict) if verdict.ends_grant() => {
                 tracing::info!(attempt = %token.attempt, verdict = verdict.name(), "the grant ended; stopping the attempt");
-                let _ = stale.send(true);
+                let _ = stale.send(Some(verdict.name()));
                 return;
             }
             // Live, `unknown` (the authority not knowing), or an answer
@@ -889,15 +1046,15 @@ struct Reporter<'a> {
     from: Option<NodeId>,
     token: GrantToken,
     retry: Arc<Notify>,
-    stale: watch::Receiver<bool>,
+    stale: watch::Receiver<Option<&'static str>>,
 }
 
 impl Reporter<'_> {
     async fn send(&self, observation: Observation) -> Result<ReportAnswer, Ended> {
         let mut stale = self.stale.clone();
         loop {
-            if *stale.borrow() {
-                return Err(Ended::Stale);
+            if let Some(verdict) = *stale.borrow() {
+                return Err(Ended::Stale(verdict));
             }
             let report = Report {
                 token: self.token,
@@ -919,7 +1076,7 @@ impl Reporter<'_> {
                         self.runner.reports_refused.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(attempt = %self.token.attempt, ?reason, "a report was refused");
                         if reason.ends_grant() {
-                            return Err(Ended::Stale);
+                            return Err(Ended::Stale(refusal_name(reason)));
                         }
                     }
                     return Ok(answer);
@@ -1606,6 +1763,8 @@ mod tests {
     struct Script {
         /// The verdict every heartbeat gets.
         verdict: Option<FenceVerdict>,
+        /// A verdict for a named attempt, before `verdict`.
+        verdicts_by_attempt: Vec<(AttemptId, FenceVerdict)>,
         /// What every report is refused with.
         refuse: Option<ReportRefusal>,
         /// How many reports fail on the link before one goes through.
@@ -1715,18 +1874,20 @@ mod tests {
         ) -> BoxFuture<'_, Result<HeartbeatAnswer, String>> {
             Box::pin(async move {
                 self.log.lock().unwrap().push("heartbeat");
-                let verdict = self
-                    .script
-                    .lock()
-                    .unwrap()
-                    .verdict
-                    .clone()
-                    .unwrap_or(FenceVerdict::Live);
+                let script = self.script.lock().unwrap();
+                let verdict = script.verdict.clone().unwrap_or(FenceVerdict::Live);
                 Ok(HeartbeatAnswer {
                     verdicts: beat
                         .attempts
                         .iter()
-                        .map(|t| (t.attempt, verdict.clone()))
+                        .map(|t| {
+                            let named = script
+                                .verdicts_by_attempt
+                                .iter()
+                                .find(|(a, _)| *a == t.attempt)
+                                .map(|(_, v)| v.clone());
+                            (t.attempt, named.unwrap_or_else(|| verdict.clone()))
+                        })
                         .collect(),
                 })
             })
@@ -2151,6 +2312,89 @@ mod tests {
                 )
                 .await,
             instruct_refused(InstructRefusal::NotRunning)
+        );
+    }
+
+    /// After a restart, every grant taken and not seen end is presented to
+    /// its authority and never resumed: a superseded one is marked ended by
+    /// the verdict, a live one abandoned, and neither starts a harness or
+    /// sends a report; a marker that ended is not presented again, and the
+    /// grant is not taken a second time.
+    #[tokio::test]
+    async fn a_restarted_runner_presents_its_taken_grants_and_resumes_none() {
+        let b = bench(Script::default());
+        let superseded = token(1);
+        let live = token(2);
+        let finished = token(3);
+        std::fs::create_dir_all(b.dir.path().join("taken")).unwrap();
+        for (t, ended) in [
+            (superseded, None),
+            (live, None),
+            (finished, Some(TakenEnd::Finished)),
+        ] {
+            local::write(
+                &b.dir
+                    .path()
+                    .join("taken")
+                    .join(format!("{}.json", t.attempt)),
+                &Taken {
+                    token: t,
+                    from: None,
+                    ended,
+                },
+            )
+            .unwrap();
+        }
+        // The authority answers the first superseded and the second live.
+        b.host.script.lock().unwrap().verdicts_by_attempt = vec![
+            (superseded.attempt, FenceVerdict::Superseded { by: None }),
+            (live.attempt, FenceVerdict::Live),
+        ];
+        let written = b.runner.present_taken().await;
+        let ends: Vec<_> = written.iter().map(|t| (t.token, t.ended.clone())).collect();
+        assert_eq!(
+            ends,
+            vec![
+                (
+                    superseded,
+                    Some(TakenEnd::GrantEnded {
+                        verdict: "superseded".into()
+                    })
+                ),
+                (
+                    live,
+                    Some(TakenEnd::Abandoned {
+                        verdict: "live".into()
+                    })
+                ),
+            ]
+        );
+        assert_eq!(b.runner.counters().presented, 2);
+        assert!(
+            b.host.harness_pids.lock().unwrap().is_empty(),
+            "nothing resumed"
+        );
+        assert!(!names(&b.host).contains(&"report"), "nothing reported");
+        // The markers say so on disk, and a second start presents nothing.
+        let marker: Taken = local::read(
+            &b.dir
+                .path()
+                .join("taken")
+                .join(format!("{}.json", superseded.attempt)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            marker.ended,
+            Some(TakenEnd::GrantEnded {
+                verdict: "superseded".into()
+            })
+        );
+        assert!(b.runner.present_taken().await.is_empty());
+        // The grant is not taken again.
+        assert_eq!(
+            b.runner.launch(None, request(1)).await,
+            refused(LaunchRefusal::AlreadyLaunched)
         );
     }
 

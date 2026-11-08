@@ -260,6 +260,18 @@ impl Node {
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "the runner's launch records do not read"),
         }
+        // Every grant taken before a restart is presented to its
+        // authority and never resumed (ADR 0028).
+        let runner = Arc::clone(&self.runner);
+        tokio::spawn(async move {
+            let presented = runner.present_taken().await;
+            if !presented.is_empty() {
+                tracing::info!(
+                    presented = presented.len(),
+                    "presented the grants taken before the restart"
+                );
+            }
+        });
         tokio::spawn(Arc::clone(&self).recover());
         // The authority's clock (ADR 0028): a tick every heartbeat
         // interval; nothing runs while no managed job exists.
