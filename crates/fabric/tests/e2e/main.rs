@@ -34,6 +34,7 @@ mod headless;
 mod launch;
 mod legacy;
 mod managed;
+mod observability;
 mod opencode;
 mod pi;
 mod placement;
