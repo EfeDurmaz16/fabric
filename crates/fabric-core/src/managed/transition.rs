@@ -783,9 +783,12 @@ pub fn apply_observation(
             status: OperationMark::Failed,
         });
     }
-    // A cancel that stopped the attempt now ends the job or the task.
-    if status == AttemptStatus::Cancelled {
-        if let Some(op) = job.in_flight(CommandKind::CancelJob)
+    // A cancel in flight is settled by the attempt's end, whatever ended
+    // it: the cancel's stop, the harness exiting on its own first, or a
+    // start that failed before the stop was taken. Nothing of the attempt
+    // runs any more, so the job or the task ends as the cancel asked.
+    if matches!(observation, Observation::Exited { .. }) {
+        if let Some(op) = cancel_in_flight(job, CommandKind::CancelJob)
             && let Some(EffectRequest::CancelJob { reason }) = job.request(op.id)
         {
             events.push(ManagedEvent::JobCancelled {
@@ -795,7 +798,7 @@ pub fn apply_observation(
                 operation: op.id,
                 status: OperationMark::Succeeded,
             });
-        } else if let Some(op) = job.in_flight(CommandKind::CancelTask)
+        } else if let Some(op) = cancel_in_flight(job, CommandKind::CancelTask)
             && let Some(EffectRequest::CancelTask { task, .. }) = job.request(op.id)
             && *task == attempt.task
         {
@@ -810,6 +813,18 @@ pub fn apply_observation(
         }
     }
     transition(events)
+}
+
+/// The cancel of `kind` whose stop was sent: dispatched, or of unknown
+/// outcome (its node was not reached, or a restart came between).
+fn cancel_in_flight(job: &ManagedState, kind: CommandKind) -> Option<&OperationProgress> {
+    job.operations.iter().find(|o| {
+        o.kind == kind
+            && matches!(
+                o.status,
+                OperationStatus::Dispatched | OperationStatus::Unknown
+            )
+    })
 }
 
 /// The events of a `Placed` observation: the decision, and the grant on
