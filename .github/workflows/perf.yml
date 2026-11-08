@@ -110,6 +110,8 @@ jobs:
           out=$RUNNER_TEMP/perf
           status=0
           scripts/bench-ab.sh --release --gate "$out" || status=$?
+          # Trial only: every run is confirmed.
+          [ "$status" -eq 0 ] && status=1
           [ "$status" -eq 1 ] || exit "$status"
           echo "::notice::the first run fails the gate; both builds run again to confirm"
           scripts/bench-ab.sh --release --pairs 15 --counted 5 --candidate-first \
