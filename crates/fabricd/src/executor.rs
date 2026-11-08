@@ -716,13 +716,33 @@ impl Executor {
                     .unwrap_or_else(|_| DrainBudget::new(DrainBudget::MIN_MS).unwrap_or_default());
                 interrupt(running, grace, &self.signals).await;
             }
-            self.captures.fetch_add(1, Ordering::Relaxed);
-            let receipt = match self
-                .capturer
-                .checkpoint_harness(attempt, running.task, harness_run)
-                .await
-            {
-                Ok(snapshot) => TaskReceipt {
+            let (receipt, failed) = self.checkpoint_harness(attempt, running, harness_run).await;
+            blockers.extend(failed);
+            receipts[at] = Some(receipt);
+        }
+        drop(run);
+        Ok(Quiescence {
+            receipts: receipts.into_iter().flatten().collect(),
+            blockers,
+        })
+    }
+
+    /// The receipt of a harness task's checkpoint through the capturer,
+    /// and the blocker a failed one makes.
+    async fn checkpoint_harness(
+        &self,
+        attempt: AttemptId,
+        running: &Running,
+        run: HarnessRun,
+    ) -> (TaskReceipt, Option<HandoffBlocker>) {
+        self.captures.fetch_add(1, Ordering::Relaxed);
+        match self
+            .capturer
+            .checkpoint_harness(attempt, running.task, run)
+            .await
+        {
+            Ok(snapshot) => (
+                TaskReceipt {
                     task: running.task,
                     class: running.class,
                     status: ReceiptStatus::Checkpointed { snapshot },
@@ -731,28 +751,25 @@ impl Executor {
                     interrupted: true,
                     workspace: None,
                 },
-                Err(reason) => {
-                    blockers.push(HandoffBlocker::CheckpointFailed {
-                        task: running.task,
+                None,
+            ),
+            Err(reason) => (
+                TaskReceipt {
+                    task: running.task,
+                    class: running.class,
+                    status: ReceiptStatus::Blocked {
                         reason: reason.clone(),
-                    });
-                    TaskReceipt {
-                        task: running.task,
-                        class: running.class,
-                        status: ReceiptStatus::Blocked { reason },
-                        exit: None,
-                        interrupted: false,
-                        workspace: None,
-                    }
-                }
-            };
-            receipts[at] = Some(receipt);
+                    },
+                    exit: None,
+                    interrupted: false,
+                    workspace: None,
+                },
+                Some(HandoffBlocker::CheckpointFailed {
+                    task: running.task,
+                    reason,
+                }),
+            ),
         }
-        drop(run);
-        Ok(Quiescence {
-            receipts: receipts.into_iter().flatten().collect(),
-            blockers,
-        })
     }
 
     /// Tells the capturer that the cut of `attempt` is recorded, so the
