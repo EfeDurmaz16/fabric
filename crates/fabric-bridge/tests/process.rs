@@ -568,6 +568,27 @@ async fn an_observe_of_an_unknown_operation_settles_it_and_a_refused_one_changes
 }
 
 #[tokio::test]
+async fn the_worker_gets_the_traceparent_fabric_names_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("traceparent");
+    let parent = "00-6ef37855f4b6f479dea9ebe4a32063db-f6ef0f9115858ef9-01";
+    let mut named = config();
+    named.traceparent = Some(parent.to_owned());
+    let mut command = double();
+    command.env("FABRIC_BRIDGE_DOUBLE_TRACEPARENT", &seen);
+    drop(Bridge::spawn(command, named).await.unwrap());
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), parent);
+    // A TRACEPARENT the command would inherit is not passed on.
+    let mut command = double();
+    command.env("FABRIC_BRIDGE_DOUBLE_TRACEPARENT", &seen).env(
+        "TRACEPARENT",
+        "00-11111111111111111111111111111111-2222222222222222-01",
+    );
+    drop(Bridge::spawn(command, config()).await.unwrap());
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), "unset");
+}
+
+#[tokio::test]
 async fn a_handshake_that_raises_a_limit_or_names_another_profile_is_refused() {
     for (script, reason) in [
         ("raise_limit", "limit_raised"),
