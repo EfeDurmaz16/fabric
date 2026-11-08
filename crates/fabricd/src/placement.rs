@@ -153,10 +153,10 @@ impl Node {
         let platform = facts.platform();
         let mut harnesses: Vec<(HarnessKind, VersionText)> = Vec::new();
         if let Some(version) = facts.get(name::CLAUDE) {
-            harnesses.push((HarnessKind::ClaudeCode, VersionText::truncated(version)));
+            harnesses.push((HarnessKind::ClaudeCode, advertised_version(version)));
         }
         if let Some(version) = facts.get(name::CODEX) {
-            harnesses.push((HarnessKind::Codex, VersionText::truncated(version)));
+            harnesses.push((HarnessKind::Codex, advertised_version(version)));
         }
         if let HarnessKind::Acp { program, .. } = &ask.harness
             && find_on_path(program.as_str(), env.path_var()).is_some()
@@ -366,6 +366,17 @@ pub(crate) fn probe_of(node: NodeId, advert: Option<&AdvertWire>, probe_ms: u32)
     }
 }
 
+/// The version a harness's `--version` output names, as the advert
+/// carries it: `codex-cli 0.155.1` is `0.155.1`, the form the asking node
+/// parses. Output with no version in it is carried as it came, and the
+/// asking node then lists the harness as absent.
+fn advertised_version(output: &str) -> VersionText {
+    HarnessVersion::from_output(output).map_or_else(
+        |_| VersionText::truncated(output),
+        |version| VersionText::truncated(&version.to_string()),
+    )
+}
+
 /// The advert in the core's form; a harness whose version does not parse
 /// is left out, as if not installed, so no node is admitted on a version
 /// nobody can compare.
@@ -550,6 +561,19 @@ mod tests {
             &decision.candidates[0].verdict,
             Verdict::Excluded { reasons } if matches!(reasons[0], Exclusion::Secret { .. })
         ));
+    }
+
+    /// A harness's `--version` output is advertised as the version in it,
+    /// so the asking node admits a real Codex or Claude Code.
+    #[test]
+    fn a_version_output_is_advertised_as_its_version() {
+        assert_eq!(advertised_version("codex-cli 0.155.1").as_str(), "0.155.1");
+        assert_eq!(advertised_version("2.1.3 (Claude Code)").as_str(), "2.1.3");
+        assert!(HarnessVersion::parse(advertised_version("codex-cli 0.155.1").as_str()).is_ok());
+        assert_eq!(
+            advertised_version("no version here").as_str(),
+            "no version here"
+        );
     }
 
     /// A wire advert whose harness version does not parse lists that
