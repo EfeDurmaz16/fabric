@@ -148,6 +148,8 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "actor" | "ACTOR" => "e2e".to_owned(),
         "token_id" | "TOKEN_ID" => "01JABCDEFGHJKMNPQRSTVWXYZ1".to_owned(),
         "parent" | "TASK" => "01JABCDEFGHJKMNPQRSTVWXYZ2".to_owned(),
+        "attempt" | "ATTEMPT" => "01JABCDEFGHJKMNPQRSTVWXYZ3".to_owned(),
+        "since" | "until" | "TIME" => "2026-11-08".to_owned(),
         "class" => "build".to_owned(),
         "argv" => "true".to_owned(),
         "ttl_ms" => "60000".to_owned(),
@@ -425,6 +427,41 @@ fn serve_refuses_an_otlp_endpoint_it_cannot_post_to() {
         assert_eq!(output.status.code(), Some(2), "{value} --json");
         let doc = error_document(&output, value);
         assert_eq!(doc["reason"], "invalid_arguments", "{value}: {doc}");
+    }
+}
+
+/// An audit window that does not read, or ends before it starts, is a
+/// usage error before any node is asked.
+#[test]
+fn audit_export_refuses_a_window_that_is_not_one() {
+    let sandbox = Sandbox::new();
+    for args in [
+        ["audit", "export", "--since", "yesterday"].as_slice(),
+        ["audit", "export", "--until", "2026-11-08T25:00:00Z"].as_slice(),
+        [
+            "audit",
+            "export",
+            "--since",
+            "2026-11-08",
+            "--until",
+            "2026-11-08",
+        ]
+        .as_slice(),
+    ] {
+        let mut args = words(args);
+        let output = sandbox.run(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), "", "{args:?}");
+        args.push("--json".to_owned());
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let doc = error_document(&output, "audit export");
+        assert_eq!(doc["reason"], "invalid_arguments", "{args:?}: {doc}");
     }
 }
 

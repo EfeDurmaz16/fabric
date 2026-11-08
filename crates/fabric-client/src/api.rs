@@ -163,11 +163,15 @@ pub enum Op {
     ManagedRegister,
     /// [`Request::JobExportPsf`].
     JobExportPsf,
+    /// [`Request::Inspect`].
+    Inspect,
+    /// [`Request::AuditExport`].
+    AuditExport,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 36] = [
+    pub const ALL: [Op; 38] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -204,6 +208,8 @@ impl Op {
         Op::FacadeCall,
         Op::ManagedRegister,
         Op::JobExportPsf,
+        Op::Inspect,
+        Op::AuditExport,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -246,6 +252,8 @@ impl Op {
             Op::FacadeCall => "facade_call",
             Op::ManagedRegister => "managed_register",
             Op::JobExportPsf => "job_export_psf",
+            Op::Inspect => "inspect",
+            Op::AuditExport => "audit_export",
         }
     }
 }
@@ -907,6 +915,38 @@ pub enum Request {
         /// The container directory to create; it must not exist.
         dir: SystemPath,
     },
+    /// The whole managed state of one job, or of one of its attempts, as
+    /// the journal holds it (ADR 0031): the `inspect --json` schema in
+    /// docs/observability.md. Writes nothing.
+    Inspect {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// One attempt of the job, which narrows the attempts, the
+        /// generations, the evidence, the provider operations and the
+        /// last report to it.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        attempt: Option<AttemptId>,
+    },
+    /// One page of the journal's audit rows made in `[since_ms, until_ms)`,
+    /// in the audit order, after the cursor `after` (ADR 0031). No row
+    /// carries an event body, a raw evidence ref, a provider locator,
+    /// target or reason, or an idempotency key. Writes nothing.
+    AuditExport {
+        /// Unix milliseconds, inclusive; the journal's start when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_ms: Option<u64>,
+        /// Unix milliseconds, exclusive; no end when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_ms: Option<u64>,
+        /// The `next` of the page before; the first page when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
 }
 
 /// Every capability a node of this api version lists in its welcome, in
@@ -994,7 +1034,9 @@ impl Request {
             | Request::FacadeRevoke { .. }
             | Request::FacadeCall { .. }
             | Request::JobRepair { .. }
-            | Request::JobExportPsf { .. } => None,
+            | Request::JobExportPsf { .. }
+            | Request::Inspect { .. }
+            | Request::AuditExport { .. } => None,
         }
     }
 
@@ -1038,6 +1080,8 @@ impl Request {
             Request::FacadeCall { .. } => Op::FacadeCall,
             Request::ManagedRegister { .. } => Op::ManagedRegister,
             Request::JobExportPsf { .. } => Op::JobExportPsf,
+            Request::Inspect { .. } => Op::Inspect,
+            Request::AuditExport { .. } => Op::AuditExport,
         }
     }
 }
@@ -1429,6 +1473,10 @@ pub enum Reply {
     ManagedRegister(Box<ManagedOperation>),
     /// For [`Request::JobExportPsf`].
     JobExportPsf(PsfExported),
+    /// For [`Request::Inspect`].
+    Inspect(Box<InspectReport>),
+    /// For [`Request::AuditExport`].
+    AuditExport(AuditPage),
 }
 
 impl Reply {
@@ -1472,6 +1520,8 @@ impl Reply {
             Reply::FacadeCall(_) => Op::FacadeCall,
             Reply::ManagedRegister(_) => Op::ManagedRegister,
             Reply::JobExportPsf(_) => Op::JobExportPsf,
+            Reply::Inspect(_) => Op::Inspect,
+            Reply::AuditExport(_) => Op::AuditExport,
         }
     }
 }
@@ -2134,6 +2184,292 @@ pub struct Inspection {
     pub blockers: Vec<BlockerWire>,
     /// Provider resources that may still exist.
     pub residuals: Vec<ResidualWire>,
+}
+
+/// The version of the `inspect` schema; a field is only ever added.
+pub const INSPECT_SCHEMA: u32 = 1;
+
+/// The whole managed state of a job, or of one attempt (ADR 0031): the
+/// body of `inspect`. Every list is oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectReport {
+    /// [`INSPECT_SCHEMA`].
+    pub schema: u32,
+    /// The attempt the report is narrowed to, when one was asked for.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub attempt: Option<AttemptId>,
+    /// The job, its tasks with their last receipts, its placements
+    /// (`placements`), its continuations (`continuations`), notes, provider
+    /// operations, blockers and residuals, as `managed_inspect` shows them.
+    #[serde(flatten)]
+    pub inspection: Inspection,
+    /// Every attempt with where it runs and what granted it.
+    pub attempts: Vec<AttemptRecord>,
+    /// One row per generation: the grant that made it and what it superseded.
+    pub generations: Vec<GenerationRecord>,
+    /// Every operation the journal holds for the job, accepted or rejected.
+    pub operations: Vec<OperationRecord>,
+    /// Every evidence row: checkpoints and exits.
+    pub evidence: Vec<EvidenceRecord>,
+    /// The newest event a report recorded, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_report: Option<ReportRecord>,
+}
+
+/// An attempt as `inspect` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    /// The attempt.
+    #[serde(with = "text")]
+    pub attempt: AttemptId,
+    /// Its task.
+    #[serde(with = "text")]
+    pub task: TaskId,
+    /// Its generation.
+    pub generation: u64,
+    /// `granted`, `running`, `succeeded`, `failed`, `cancelled`,
+    /// `checkpointed`, `lost` or `unknown`.
+    pub status: String,
+    /// The node it runs on.
+    #[serde(with = "text")]
+    pub node: NodeId,
+    /// The operation that granted it.
+    #[serde(with = "text")]
+    pub granted_by: OperationId,
+    /// The snapshot it started from, 64 lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_checkpoint: Option<String>,
+    /// The newest checkpoint it left, 64 lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint: Option<String>,
+    /// Unix milliseconds of its grant.
+    pub granted_ms: u64,
+    /// Unix milliseconds of its end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
+}
+
+/// One generation of a job: the grant that made it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationRecord {
+    /// The generation.
+    pub generation: u64,
+    /// Its attempt.
+    #[serde(with = "text")]
+    pub attempt: AttemptId,
+    /// The operation that granted it.
+    #[serde(with = "text")]
+    pub granted_by: OperationId,
+    /// That operation's kind: `create_job`, `start_attempt` or `continue`.
+    pub granted_by_kind: String,
+    /// The generation this grant ended, for every grant after the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<u64>,
+}
+
+/// An operation as `inspect` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationRecord {
+    /// The operation.
+    #[serde(with = "text")]
+    pub operation: OperationId,
+    /// The caller's key.
+    pub operation_key: String,
+    /// The command's kind, as the journal names it.
+    pub kind: String,
+    /// `accepted`, `dispatched`, `succeeded`, `failed`, `cancelled`,
+    /// `rejected` or `unknown`.
+    pub status: String,
+    /// The job's revision after it; absent for a rejected one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// The refusal code of a rejected one, as `managed_refused` names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Unix milliseconds of its acceptance or rejection.
+    pub accepted_ms: u64,
+    /// Unix milliseconds of its last change.
+    pub updated_ms: u64,
+}
+
+/// An evidence row as `inspect` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceRecord {
+    /// The event that recorded it.
+    pub seq: u64,
+    /// `checkpoint` or `exit`.
+    pub kind: String,
+    /// The attempt it is evidence of.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub attempt: Option<AttemptId>,
+    /// The job's revision then.
+    pub revision: u64,
+    /// What it refers to: a snapshot id, or how the attempt exited.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// Its digest, 64 lowercase hex: a snapshot's, or a cut's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Unix milliseconds of its event.
+    pub at_ms: u64,
+}
+
+/// The newest event a report recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportRecord {
+    /// Its sequence number.
+    pub seq: u64,
+    /// The event kind, for example `attempt_observed` or `receipts_recorded`.
+    pub kind: String,
+    /// The attempt it names.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub attempt: Option<AttemptId>,
+    /// Unix milliseconds of its commit.
+    pub at_ms: u64,
+}
+
+/// One page of `audit_export`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditPage {
+    /// The rows, in the audit order.
+    pub records: Vec<AuditRecord>,
+    /// The cursor of the next page; absent on the last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// One audit row (ADR 0031). Digests are 64 lowercase hex; times are
+/// Unix milliseconds. The order is `at_ms`, then the type in the order
+/// below, then the row's id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuditRecord {
+    /// A command the authority accepted or rejected.
+    Operation {
+        /// When.
+        at_ms: u64,
+        /// The operation.
+        #[serde(with = "text")]
+        operation: OperationId,
+        /// The job it named.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        job: Option<JobId>,
+        /// The command's kind.
+        kind: String,
+        /// `accept` or `reject`.
+        decision: String,
+        /// Its status now.
+        status: String,
+        /// The refusal code of a rejected one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<String>,
+        /// SHA-256 of the caller's idempotency key.
+        key_digest: String,
+    },
+    /// An event of the job's chain, without its body.
+    Event {
+        /// When.
+        at_ms: u64,
+        /// Its sequence number.
+        seq: u64,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision of its batch.
+        revision: u64,
+        /// The operation whose command made it.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        operation: Option<OperationId>,
+        /// The event kind.
+        kind: String,
+        /// Its digest.
+        digest: String,
+        /// The previous event's digest; absent for a job's first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev_digest: Option<String>,
+    },
+    /// A checkpoint or exit evidence row.
+    Evidence {
+        /// When its event was recorded.
+        at_ms: u64,
+        /// That event.
+        seq: u64,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The attempt.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        attempt: Option<AttemptId>,
+        /// `checkpoint` or `exit`.
+        kind: String,
+        /// SHA-256 of its ref.
+        ref_digest: String,
+        /// Its own digest, when it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+    },
+    /// An effect asked of a provider over the bridge.
+    ProviderOperation {
+        /// When it was dispatched.
+        at_ms: u64,
+        /// The operation.
+        #[serde(with = "text")]
+        operation: OperationId,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The task.
+        #[serde(with = "text")]
+        task: TaskId,
+        /// The attempt.
+        #[serde(with = "text")]
+        attempt: AttemptId,
+        /// The generation.
+        generation: u64,
+        /// The worker profile.
+        profile: String,
+        /// The action.
+        action: String,
+        /// `create`, `mutate` or `destroy`.
+        effect_class: String,
+        /// `effect` or `cleanup`.
+        purpose: String,
+        /// Its status.
+        status: String,
+        /// The worker's answer code, when it is a code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// `none`, `applied`, `pending` or `unknown`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<String>,
+        /// The journal's digest of its locator.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locator_key: Option<String>,
+    },
 }
 
 /// The jobs a facade token may act on.

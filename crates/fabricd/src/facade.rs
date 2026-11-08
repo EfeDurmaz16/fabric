@@ -801,7 +801,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The inspection of `state`, read from the journal in the authority's thread.
-fn read_inspection(journal: &Journal, state: &ManagedState) -> Result<Inspection, AuthorityError> {
+pub(crate) fn read_inspection(
+    journal: &Journal,
+    state: &ManagedState,
+) -> Result<Inspection, AuthorityError> {
     let job = state.job.id;
     let mut managed = ManagedJob::from(state);
     // The last receipt of each task: the newest attempt's receipts first.

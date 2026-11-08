@@ -19,11 +19,12 @@ use fabric_core::version::HarnessVersion;
 use tokio::net::UnixStream;
 
 use crate::api::{
-    API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Exported, FidelityName, Hello,
-    HelloAnswer, Imported, Inspection, JobCreated, JobList, JobLog, JobScopeWire, JobStatus, Lease,
-    ManagedJob, ManagedJobs, ManagedOperation, Minted, NodeIdentity, NoteWire, Op, Paired,
-    PeerList, Pong, ProgramWire, PsfExported, Refusal, RegisterClass, Registered, Repaired, Reply,
-    Request, ResourceScopeWire, Revoked, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
+    API_VERSION, Answer, AuditPage, ClientEnv, Decision, DoctorReport, Event, Exported,
+    FidelityName, Hello, HelloAnswer, Imported, InspectReport, Inspection, JobCreated, JobList,
+    JobLog, JobScopeWire, JobStatus, Lease, ManagedJob, ManagedJobs, ManagedOperation, Minted,
+    NodeIdentity, NoteWire, Op, Paired, PeerList, Pong, ProgramWire, PsfExported, Refusal,
+    RegisterClass, Registered, Repaired, Reply, Request, ResourceScopeWire, Revoked, RunPlan,
+    SessionRecorded, Suspended, SystemPath, Welcome,
 };
 use crate::facade::{ClientMessage, FacadeAnswer, ProtocolViolation, Submit};
 use crate::frame::{self, FrameError};
@@ -440,6 +441,40 @@ impl Client {
         {
             Reply::JobExportPsf(reply) => Ok(reply),
             other => Err(unexpected(Op::JobExportPsf, &other)),
+        }
+    }
+
+    /// The whole managed state of `job`, or of one of its attempts (ADR 0031).
+    pub async fn inspect(
+        &self,
+        job: JobId,
+        attempt: Option<fabric_core::managed::AttemptId>,
+    ) -> Result<InspectReport, ClientError> {
+        match self
+            .call(&Request::Inspect { job, attempt }, |_| {})
+            .await?
+        {
+            Reply::Inspect(reply) => Ok(*reply),
+            other => Err(unexpected(Op::Inspect, &other)),
+        }
+    }
+
+    /// One page of the audit rows made in `[since_ms, until_ms)`, after
+    /// the cursor of the page before (ADR 0031).
+    pub async fn audit_export(
+        &self,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+        after: Option<String>,
+    ) -> Result<AuditPage, ClientError> {
+        let request = Request::AuditExport {
+            since_ms,
+            until_ms,
+            after,
+        };
+        match self.call(&request, |_| {}).await? {
+            Reply::AuditExport(reply) => Ok(reply),
+            other => Err(unexpected(Op::AuditExport, &other)),
         }
     }
 

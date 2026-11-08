@@ -63,6 +63,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod audit;
 pub mod contract;
 mod managed;
 mod psf;
@@ -96,6 +97,11 @@ enum Command {
     /// Read Portable Session Format containers.
     #[command(subcommand)]
     Psf(psf::PsfCommand),
+    /// Read a managed job's whole state, or one attempt's, from its authority.
+    Inspect(audit::InspectArgs),
+    /// Export the authority's journal for an audit, as JSON lines.
+    #[command(subcommand)]
+    Audit(audit::AuditCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
     Doctor {
         /// The node to compare with.
@@ -636,6 +642,8 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Psf(command) => psf::run(command, run),
+        Command::Inspect(args) => audit::inspect(&client, args, run).await,
+        Command::Audit(command) => audit::audit(&client, command, run).await,
     }
 }
 

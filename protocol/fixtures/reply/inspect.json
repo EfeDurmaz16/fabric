@@ -1,0 +1,315 @@
+{
+  "kind": "inspect",
+  "schema": 1,
+  "job": {
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "revision": "8",
+    "generation": "2",
+    "state": "active",
+    "goal": "fix the flaky test",
+    "harness": {
+      "kind": "codex"
+    },
+    "primary_task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+    "tasks": [
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "state": "open",
+        "class": "harness"
+      },
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+        "parent": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "label": "cargo test",
+        "state": "open",
+        "class": "test",
+        "receipt": {
+          "status": "interrupted",
+          "interrupted": true
+        }
+      }
+    ],
+    "attempts": [
+      {
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "generation": "1",
+        "status": "checkpointed",
+        "snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "generation": "2",
+        "status": "granted"
+      }
+    ]
+  },
+  "parked": false,
+  "placements": [
+    {
+      "seq": "3",
+      "kind": "initial",
+      "chosen": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+      "candidates": [
+        {
+          "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+          "verdict": {
+            "eligible": {
+              "rank": [
+                "bundle_chain",
+                "workspace",
+                {
+                  "load": 120
+                },
+                "identity"
+              ]
+            }
+          }
+        },
+        {
+          "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+          "verdict": {
+            "excluded": {
+              "reasons": [
+                "no_answer"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "seq": "11",
+      "kind": "planned_handoff",
+      "chosen": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+      "candidates": [
+        {
+          "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+          "verdict": {
+            "eligible": {
+              "rank": [
+                "current_healthy",
+                {
+                  "load": 80
+                },
+                "identity"
+              ]
+            }
+          }
+        },
+        {
+          "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+          "verdict": {
+            "excluded": {
+              "reasons": [
+                {
+                  "stale": {
+                    "age_ms": 9000
+                  }
+                },
+                {
+                  "disk": {
+                    "need": 2147483648,
+                    "free": 1073741824
+                  }
+                },
+                {
+                  "secret": {
+                    "name": "API_TOKEN"
+                  }
+                },
+                {
+                  "platform": {
+                    "need": {
+                      "os": "macos",
+                      "arch": "arm64"
+                    },
+                    "have": {
+                      "os": "linux",
+                      "arch": "x86_64"
+                    }
+                  }
+                },
+                {
+                  "harness_missing": {
+                    "harness": {
+                      "kind": "codex"
+                    }
+                  }
+                },
+                {
+                  "harness_version": {
+                    "harness": {
+                      "kind": "claude_code"
+                    },
+                    "need": "2.1.0",
+                    "have": "2.0.0"
+                  }
+                },
+                {
+                  "layout": {
+                    "need": {
+                      "home": "/Users/me",
+                      "root": "/Users/me/fabric/j"
+                    },
+                    "have": {
+                      "home": "/home/me",
+                      "root": "/home/me/fabric/j"
+                    }
+                  }
+                },
+                {
+                  "pin": {
+                    "pinned": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "continuations": [
+    {
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "from": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "achieved": "new_native_session_with_package",
+      "package": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "notes": [
+    {
+      "revision": "2",
+      "decision": {
+        "what": "Use the fake agent",
+        "reason": "the real one needs a login"
+      }
+    },
+    {
+      "revision": "4",
+      "question": {
+        "text": "Which branch?"
+      }
+    },
+    {
+      "revision": "5",
+      "answer": {
+        "question": "4",
+        "text": "main"
+      }
+    }
+  ],
+  "provider_operations": [
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ7",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "generation": "1",
+      "profile": "docker",
+      "action": "create",
+      "effect": "create",
+      "status": "unknown",
+      "locator": "container:abc"
+    },
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ8",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "generation": "1",
+      "profile": "docker",
+      "action": "destroy",
+      "effect": "destroy",
+      "status": "dispatched",
+      "cleans": "01JABCDEFGHJKMNPQRSTVWXYZ7"
+    }
+  ],
+  "blockers": [
+    {
+      "kind": "create_unresolved",
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ7",
+      "status": "unknown"
+    }
+  ],
+  "residuals": [
+    {
+      "creating": "01JABCDEFGHJKMNPQRSTVWXYZ7",
+      "status": "unknown",
+      "locator": "container:abc"
+    }
+  ],
+  "attempts": [
+    {
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+      "generation": 1,
+      "status": "checkpointed",
+      "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+      "granted_by": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+      "last_checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "granted_ms": 1762560000000,
+      "ended_ms": 1762560600000
+    },
+    {
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+      "generation": 2,
+      "status": "granted",
+      "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+      "granted_by": "01JABCDEFGHJKMNPQRSTVWXYZ7",
+      "initial_checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "granted_ms": 1762560600000
+    }
+  ],
+  "generations": [
+    {
+      "generation": 1,
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "granted_by": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+      "granted_by_kind": "create_job"
+    },
+    {
+      "generation": 2,
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "granted_by": "01JABCDEFGHJKMNPQRSTVWXYZ7",
+      "granted_by_kind": "continue",
+      "supersedes": 1
+    }
+  ],
+  "operations": [
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+      "operation_key": "create-1",
+      "kind": "create_job",
+      "status": "succeeded",
+      "revision": 1,
+      "accepted_ms": 1762560000000,
+      "updated_ms": 1762560000500
+    },
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ8",
+      "operation_key": "start-again",
+      "kind": "start_attempt",
+      "status": "rejected",
+      "refusal": "attempt_still_live",
+      "accepted_ms": 1762560100000,
+      "updated_ms": 1762560100000
+    }
+  ],
+  "evidence": [
+    {
+      "seq": 9,
+      "kind": "checkpoint",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "revision": 6,
+      "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "at_ms": 1762560600000
+    }
+  ],
+  "last_report": {
+    "seq": 12,
+    "kind": "attempt_observed",
+    "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+    "at_ms": 1762560700000
+  }
+}
