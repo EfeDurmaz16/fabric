@@ -63,7 +63,7 @@ fn md5_hex(text: &str) -> String {
     let out = std::process::Command::new("/bin/sh")
         .args([
             "-c",
-            "printf %s \"$1\" | { md5sum 2>/dev/null || md5 -q; } | cut -c1-32",
+            "printf %s \"$1\" | { md5sum 2>/dev/null || /sbin/md5 -q 2>/dev/null || md5 -q; } | cut -c1-32",
             "sh",
             text,
         ])
