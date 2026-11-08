@@ -35,13 +35,6 @@ use crate::secrets::LocalResolver;
 use crate::transfer::is_complete;
 
 /// The probe bound as a duration.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the authority's M5 dispatch (owner A) places through it"
-    )
-)]
 pub(crate) const PROBE_BOUND: Duration = Duration::from_millis(PROBE_BOUND_MS as u64);
 
 /// The version an ACP agent advertises: the agent reports none, and the
@@ -52,13 +45,6 @@ const UNVERSIONED: &str = "0.0.0";
 /// What a placement is for, beside the probes: the pure input without
 /// candidates, and what the probes ask each node about.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the authority's M5 dispatch (owner A) places through it"
-    )
-)]
 pub(crate) struct PlacementAsk {
     /// The task placed.
     pub(crate) task: TaskId,
@@ -203,13 +189,6 @@ impl Node {
     /// Probes this node and every paired peer for `job` in parallel, each
     /// within `PROBE_BOUND`, and returns one probe per node. A peer that
     /// does not answer in time is a probe without an advert.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the authority's M5 dispatch (owner A) places through it"
-        )
-    )]
     pub(crate) async fn probe_candidates(self: &Arc<Self>, ask: &Advertise) -> Vec<Probe> {
         let mut peers: Vec<NodeId> = self
             .peers
@@ -253,13 +232,6 @@ impl Node {
     }
 
     /// Decides where `job`'s task runs: one probe round, then `place`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the authority's M5 dispatch (owner A) places through it"
-        )
-    )]
     pub(crate) async fn place_job(
         self: &Arc<Self>,
         job: &ManagedJob,
@@ -306,25 +278,11 @@ impl Node {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the authority's M5 dispatch (owner A) places through it"
-    )
-)]
 fn elapsed_ms(started: tokio::time::Instant) -> u32 {
     u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
 /// Runs every future at once and collects the answers in order.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the authority's M5 dispatch (owner A) places through it"
-    )
-)]
 async fn futures_join_all<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>
 where
     F: std::future::Future + Send + 'static,
@@ -341,13 +299,6 @@ where
 }
 
 /// A probe from a peer's answer, or its silence.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the authority's M5 dispatch (owner A) places through it"
-    )
-)]
 pub(crate) fn probe_of(node: NodeId, advert: Option<&AdvertWire>, probe_ms: u32) -> Probe {
     let secrets_unresolved = advert
         .map(|a| {
@@ -380,13 +331,6 @@ fn advertised_version(output: &str) -> VersionText {
 /// The advert in the core's form; a harness whose version does not parse
 /// is left out, as if not installed, so no node is admitted on a version
 /// nobody can compare.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the authority's M5 dispatch (owner A) places through it"
-    )
-)]
 pub(crate) fn advert_from_wire(wire: &AdvertWire) -> NodeAdvert {
     NodeAdvert {
         node: wire.node,

@@ -16,6 +16,7 @@ mod carry;
 mod catchup;
 pub mod clock;
 mod control;
+mod dispatch;
 mod doctor;
 pub mod durable;
 pub mod error;

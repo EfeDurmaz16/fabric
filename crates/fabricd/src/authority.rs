@@ -144,6 +144,9 @@ enum Ids {
 #[derive(Debug, Clone)]
 pub(crate) struct Authority {
     writer: Arc<Mutex<Writer>>,
+    /// The commit counter once the thread runs, `None` before: what the
+    /// node's dispatch waits on without starting the thread itself.
+    started: Arc<watch::Sender<Option<watch::Receiver<u64>>>>,
     /// How many threads this authority started, for the tests.
     #[cfg(test)]
     spawned: Arc<std::sync::atomic::AtomicUsize>,
@@ -178,6 +181,7 @@ impl Authority {
         let journal = !matches!(managed_dir(state).join(FILE_NAME).try_exists(), Ok(false));
         let authority = Authority {
             writer: Arc::new(Mutex::new(Writer::Idle(state.clone(), node))),
+            started: Arc::new(watch::channel(None).0),
             #[cfg(test)]
             spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -213,6 +217,7 @@ impl Authority {
         #[cfg(test)]
         self.spawned
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started.send_replace(Some(commits.clone()));
         *writer = Writer::Running {
             calls: calls.clone(),
             ids: ids.clone(),
@@ -233,6 +238,14 @@ impl Authority {
                 "its thread did not start".into(),
             )),
         }
+    }
+
+    /// The commit counter, once the thread runs: waits without starting
+    /// it, so a node with no managed job starts no thread for its
+    /// dispatch. `None` when the authority is dropped before it starts.
+    pub(crate) async fn started(&self) -> Option<watch::Receiver<u64>> {
+        let mut started = self.started.subscribe();
+        started.wait_for(Option::is_some).await.ok()?.clone()
     }
 
     /// Runs `work` on the journal inside the authority's thread, after
@@ -307,10 +320,6 @@ impl Authority {
     }
 
     /// Records what an executor reports about an attempt or an operation.
-    #[allow(
-        dead_code,
-        reason = "the node's M5 dispatch loop reports through it; until it lands only the tests call it"
-    )]
     pub(crate) async fn observe(
         &self,
         job: JobId,
@@ -323,7 +332,7 @@ impl Authority {
     /// Marks an operation, `Dispatched` right before its effect is asked for.
     #[allow(
         dead_code,
-        reason = "the node's M5 dispatch loop marks through it; until it lands only the tests call it"
+        reason = "a launch's dispatch marks through it; no launch is dispatched by the node in M5, so only the tests call it"
     )]
     pub(crate) async fn mark(
         &self,
@@ -355,10 +364,6 @@ impl Authority {
     /// job first: what the node's dispatch loop takes next, after a
     /// restart as during a run. Each is dispatched once, after
     /// `mark(Dispatched)` or, for a create or a continue, by its `Placed`.
-    #[allow(
-        dead_code,
-        reason = "the node's M5 dispatch loop reads it; until it lands only the tests call it"
-    )]
     pub(crate) async fn pending(&self) -> Result<Vec<PendingEffect>, AuthorityError> {
         if self.idle() {
             return Ok(Vec::new());

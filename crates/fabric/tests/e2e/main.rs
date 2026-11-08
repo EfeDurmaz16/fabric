@@ -25,6 +25,7 @@ mod facade;
 mod headless;
 mod legacy;
 mod managed;
+mod placement;
 mod preflight;
 mod terminal;
 mod world;

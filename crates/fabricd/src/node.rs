@@ -212,6 +212,7 @@ impl Node {
             .take()
             .ok_or_else(|| NodeError::Task("the node is already running".to_owned()))?;
         tokio::spawn(Arc::clone(&self).recover());
+        tokio::spawn(crate::dispatch::run(Arc::clone(&self)));
         loop {
             tokio::select! {
                 accepted = self.endpoint.accept() => match accepted {
