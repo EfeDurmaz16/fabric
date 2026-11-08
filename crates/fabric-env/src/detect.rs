@@ -834,6 +834,39 @@ impl Detection {
     }
 }
 
+/// What the override file adds to a capture's policy: its secret patterns
+/// and the caches it declares, by class.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredPolicy {
+    /// Patterns that widen the built-in secret list.
+    pub secret_patterns: Vec<SecretPattern>,
+    /// Declared cache paths with their class, in file order.
+    pub caches: Vec<(CacheClass, RelPath)>,
+}
+
+/// Reads the secret patterns and declared caches of `.fabric/env.toml` at
+/// `root`, without detecting the rest of the environment.
+///
+/// For a capture that runs without a node, such as `fabric-sync`'s push:
+/// it widens the policy as a suspend does, and an ecosystem rule that
+/// would stop detection, such as two lockfiles with nothing to choose
+/// between them, does not stop it. A file that does not parse does.
+pub fn declared_policy(root: &Path) -> Result<DeclaredPolicy, DetectError> {
+    let root = fs::canonicalize(root).map_err(|source| DetectError::Root { source })?;
+    let overrides = match read_text(&root, OVERRIDE_FILE)? {
+        Some(text) => EnvOverride::parse(&text)?,
+        None => EnvOverride::default(),
+    };
+    Ok(DeclaredPolicy {
+        secret_patterns: overrides.secret_patterns,
+        caches: overrides
+            .caches
+            .into_iter()
+            .map(|cache| (cache.class, cache.path))
+            .collect(),
+    })
+}
+
 /// Detects the environment of the workspace at `root`, applying `.fabric/env.toml` when present.
 ///
 /// `recorded` is the `secret_patterns` of the job's last spec, empty for a

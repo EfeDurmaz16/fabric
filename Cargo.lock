@@ -347,6 +347,7 @@ dependencies = [
  "fabric-harness",
  "fabric-net",
  "fabric-psf",
+ "fabric-sync",
  "fabricd",
  "nix",
  "rustix",
@@ -488,6 +489,22 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "fabric-sync"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "fabric-core",
+ "fabric-env",
+ "fabric-store",
+ "fabric-sync",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "zstd",
 ]
 

@@ -47,6 +47,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
+# The sync scenario of the bench (tests/e2e/sync_bench.rs) drives the library.
+fabric-sync = { path = "../fabric-sync" }
 # The end-to-end test runs this package's binaries with the fault points,
 # the fake agent and the counted system tools built in; this turns them on
 # for test builds only.

@@ -34,7 +34,7 @@ pub(crate) enum ManagedCommand {
         /// The goal in your words.
         #[arg(long, value_name = "TEXT")]
         goal: String,
-        /// The harness: claude, codex or acp:<program>.
+        /// The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
         #[arg(long, default_value = "claude", value_parser = harness_arg, value_name = "HARNESS")]
         harness: HarnessKind,
         /// The command's key; the same key and arguments again give the same job.

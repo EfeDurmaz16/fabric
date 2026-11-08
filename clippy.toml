@@ -9,3 +9,5 @@ allow-print-in-tests = true
 disallowed-methods = [
   { path = "std::process::exit", reason = "return std::process::ExitCode from main so destructors run" },
 ]
+# Product names clippy's doc_markdown would otherwise ask to put in backticks.
+doc-valid-idents = ["..", "OpenCode"]

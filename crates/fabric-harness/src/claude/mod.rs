@@ -76,8 +76,8 @@ use tracing::{debug, info, warn};
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::{HarnessError, IoOp};
 use crate::harness::{
-    Harness, Installed, Launch, LaunchSettings, ModelName, NotCarried, Origin, PassedSetting,
-    Recorded, Restored, Running, SettingName, TurnReport,
+    Fidelity, Harness, Installed, Launch, LaunchSettings, ModelName, NotCarried, Origin,
+    PassedSetting, Recorded, Restored, Running, SettingName, TurnReport,
 };
 use crate::jsontext;
 use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
@@ -1084,6 +1084,10 @@ fn refuse_secret_overlay(path: &Path) -> Result<(), HarnessError> {
 impl Harness for ClaudeCode {
     fn kind(&self) -> HarnessKind {
         HarnessKind::ClaudeCode
+    }
+
+    fn fidelity(&self) -> Fidelity {
+        Fidelity::NativeSession
     }
 
     fn detect(&self) -> BoxFuture<'_, Result<Option<Installed>, HarnessError>> {

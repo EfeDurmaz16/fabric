@@ -1,20 +1,28 @@
 [package]
 name = "fabric-harness"
 version.workspace = true
-description = "Harness adapters: capture, restore and launch a Claude Code, Codex or ACP agent session"
+description = "Harness adapters: capture, restore and launch a Claude Code, Codex, OpenCode, pi, Gemini CLI, Cursor Agent or ACP agent session"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [features]
-default = ["acp", "claude", "codex"]
+default = ["acp", "claude", "codex", "cursor", "gemini", "opencode", "pi"]
 # The generic Agent Client Protocol adapter.
 acp = []
 # The Claude Code adapter.
 claude = ["dep:uuid"]
 # The Codex adapter.
 codex = ["dep:zstd"]
+# The Cursor Agent CLI adapter (PR 5, docs/harness-adapters.md).
+cursor = []
+# The Gemini CLI adapter (PR 5).
+gemini = []
+# The OpenCode adapter (PR 5).
+opencode = []
+# The pi adapter (PR 5).
+pi = []
 # Named crash points in capture and restore, for the crash tests only.
 crashpoints = []
 # For the end-to-end time budget only: the kill, lsof, pgrep and ps in the
@@ -66,6 +74,22 @@ required-features = ["codex"]
 [[test]]
 name = "crash"
 required-features = ["claude", "codex"]
+
+[[test]]
+name = "cursor_roundtrip"
+required-features = ["cursor"]
+
+[[test]]
+name = "gemini_roundtrip"
+required-features = ["gemini"]
+
+[[test]]
+name = "opencode_roundtrip"
+required-features = ["opencode"]
+
+[[test]]
+name = "pi_roundtrip"
+required-features = ["pi"]
 
 [lints]
 workspace = true

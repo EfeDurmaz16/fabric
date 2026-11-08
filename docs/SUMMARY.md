@@ -25,6 +25,7 @@
 - [Two Macs](guides/two-macs.md)
 - [Headless turns](guides/headless.md)
 - [Managed jobs](guides/managed-jobs.md)
+- [Sync alone](guides/sync-alone.md)
 
 # Reference
 

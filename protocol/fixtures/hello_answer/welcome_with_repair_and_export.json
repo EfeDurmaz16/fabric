@@ -1,6 +1,6 @@
 {
   "type": "welcome",
-  "api": 1,
+  "api": 2,
   "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
   "node_version": "0.1.0",
   "capabilities": [

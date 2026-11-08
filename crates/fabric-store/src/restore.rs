@@ -402,8 +402,10 @@ fn check_target_empty(target: &Path) -> Result<(), RestoreError> {
 ///
 /// A restore that was killed after it applied the recorded modes leaves
 /// read-only directories with files in them, which no unlink can empty.
-/// Links are never followed.
-pub(crate) fn open_up(dir: &Path) -> Result<(), RestoreError> {
+/// Links are never followed: each directory is opened with `O_NOFOLLOW`
+/// and changed through that descriptor, so a directory swapped for a link
+/// between the check and the change fails the open instead.
+pub fn open_up(dir: &Path) -> Result<(), RestoreError> {
     use rustix::fs::{Mode as RawBits, OFlags};
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = rustix::fs::open(dir, flags, RawBits::empty()).map_err(|e| io_err(dir, e.into()))?;
