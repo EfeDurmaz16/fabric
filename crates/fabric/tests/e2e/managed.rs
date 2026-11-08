@@ -274,3 +274,110 @@ fn e2e_the_cli_makes_reads_and_cancels_managed_jobs_under_their_keys() -> Fallib
     assert!(cancelled.contains("cancelled"), "{cancelled}");
     Ok(())
 }
+
+/// The launch path's client surface (docs/managed-jobs.md, "Launch path"):
+/// `fabric managed register` records a test task with its program under
+/// the job's primary task, the answer and `managed status` show it with
+/// what it runs, and a program that carries a credential is refused
+/// `bad_program` before the journal records anything.
+#[test]
+fn e2e_the_cli_registers_a_test_task_with_its_program() -> Fallible {
+    let env = Env::new()?;
+    let mut node = Node::new(&env, "a", Wire::TcpTls)?;
+    node.start(None)?;
+    let repo = env.repo.to_str().ok_or("the repository is not UTF-8")?;
+    let made = node.ok(&[
+        "managed",
+        "create",
+        "--repo",
+        repo,
+        "--goal",
+        "make the tests pass",
+        "--harness",
+        "codex",
+        "--operation-key",
+        "make-1",
+    ])?;
+    let job = made.lines().next().ok_or("nothing printed")?.to_owned();
+    let primary = made
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("task ")?
+                .strip_suffix(" (primary): open")
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| format!("no open primary task in {made}"))?;
+
+    let registered = node.ok(&[
+        "managed",
+        "register",
+        &job,
+        "--parent",
+        &primary,
+        "--label",
+        "unit tests",
+        "--class",
+        "test",
+        "--cwd",
+        "src",
+        "--env",
+        "CARGO_HOME",
+        "--operation-key",
+        "register-1",
+        "--",
+        "sh",
+        "-c",
+        "exit 0",
+    ])?;
+    assert!(
+        registered.contains("(unit tests): open"),
+        "the answer names the task: {registered}"
+    );
+    let runs = r#"  runs "sh" "-c" "exit 0" in src"#;
+    assert!(registered.contains(runs), "{registered}");
+    let status = node.ok(&["managed", "status", &job])?;
+    assert!(status.contains(runs), "status shows the program: {status}");
+
+    let again = node.ok(&[
+        "managed",
+        "register",
+        &job,
+        "--parent",
+        &primary,
+        "--label",
+        "unit tests",
+        "--class",
+        "test",
+        "--cwd",
+        "src",
+        "--env",
+        "CARGO_HOME",
+        "--operation-key",
+        "register-1",
+        "--",
+        "sh",
+        "-c",
+        "exit 0",
+    ])?;
+    assert!(
+        again.contains("answered again for key register-1"),
+        "{again}"
+    );
+
+    let token = format!("ghp_{}", "a".repeat(36));
+    let refused = node.fails(&[
+        "managed", "register", &job, "--parent", &primary, "--label", "leaky", "--class", "build",
+        "--", "curl", "-H", &token,
+    ])?;
+    assert!(refused.contains("bad_program"), "{refused}");
+    assert!(
+        !refused.contains(&token),
+        "the refusal echoes no credential: {refused}"
+    );
+    let wrong = node.fails(&[
+        "managed", "register", &job, "--parent", &primary, "--label", "x", "--class", "harness",
+        "--", "true",
+    ])?;
+    assert!(wrong.contains("build or test"), "{wrong}");
+    Ok(())
+}

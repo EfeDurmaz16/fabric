@@ -163,6 +163,7 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
         | Reply::ManagedCancel(operation)
         | Reply::ManagedSubmit(operation)
         | Reply::ManagedNote(operation)
+        | Reply::ManagedRegister(operation)
         | Reply::ManagedCheckpoint(operation)
         | Reply::ManagedContinue(operation) => {
             let mut lines = fabric_client::sentences::managed_job(&operation.job);
