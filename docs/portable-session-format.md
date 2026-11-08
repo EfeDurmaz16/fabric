@@ -252,7 +252,7 @@ A reader never repairs a document: no key order fix, no number to string, no pat
 
 The cases cover every fidelity (`valid_native_session`, `valid_new_native_session_with_package`, `valid_workspace_only`, `valid_unsupported`), two documents with a WorkPackage (`valid_native_session_with_package`, `valid_new_native_session_with_package`), every manifest-level refusal code at least once, and one document over a limit (`refuse_too_large_text`). The containers cover every container-level code and the detached case.
 
-`crates/fabric-client/tests/psf_fixtures.rs` pins the manifest's own sha256, checks every file against it and that none is missing or extra, and checks the shape of every case: the stem, the outcome, the digest of each accepted input, that each accepted input is canonical under section 4, that the covered codes are exactly the closed sets above and the covered fidelities exactly the four. It is not a reader; the readers come with their crates and test against these files.
+`crates/fabric-client/tests/psf_fixtures.rs` pins the manifest's own sha256, checks every file against it and that none is missing or extra, and checks the shape of every case: the stem, the outcome, the digest of each accepted input, that each accepted input is canonical under section 4 with its `caches` and `attachments` in order, that the covered codes are exactly the closed sets above and the covered fidelities exactly the four. It is not a reader; the readers come with their crates and test against these files.
 
 To regenerate the manifest after an edit, from `protocol/psf/v1`:
 
