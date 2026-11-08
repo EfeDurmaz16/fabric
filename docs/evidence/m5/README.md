@@ -74,9 +74,36 @@ Output: `test result: ok. 7 passed; 0 failed; 1 ignored`. The `launch` tests run
 
 Counters for that run: daemons started 11 (2, 2, 2, 2, 1, 1, 1), link captures 1291 bytes on `a` and 2339 on `b`, `fabric` processes left 0. Mutation: with the pin fix reverted the launch test fails at the handoff's chosen node (`launch.rs:302`); with the root fix reverted it fails `not continued`, the harness receipt `blocked` naming the missing `work.fabric-restoring`.
 
-## Blocked
+## Native session continuity, proved
 
-A native-session continuation. `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout` stays ignored: the launch restores the workspace from the cut and not the harness's own state, so `offered_fidelity` is asked with the layout never the same and no node offers `native_session` (docs/managed-jobs.md, "Launch path", owner B as built). The question for Efe: should M5 restore the harness's state on the target (the capturer already captures it through the adapter's suspend path) and offer `native_session` when the layout matches, or should M5 ship with `new_native_session_with_package` as the best fidelity and the native session move to M6 or later?
+The row blocked on 2026-11-08 because the launch restored the workspace from the cut and not the harness's own state. The selection "M5 native session continue" (made 2026-11-08 by the implementation agent under Efe's delegation of 2026-11-02, not approved by Efe) answers it: M5 restores the harness's state on the target and offers `native_session` when the layout matches. The contract is docs/managed-jobs.md, "Launch path", owner B as built.
+
+| Item | Result |
+|---|---|
+| The cut held no harness state | the harness receipt's snapshot held the state the suspend path captured, and the cut's own snapshot, the one a continuation starts from, held the workspace alone. `f9b3aa6` puts the same quiescence's harness state in the cut, once; `capturer::tests::a_cut_after_a_harness_checkpoint_holds_its_state` failed first (`the cut holds the harness state`) |
+| No native session was offered | `4870441` restores the cut's harness state with the workspace, compares the harness, the physical job root and the home with the captured ones (ADR 0011), restores the state through the adapter as `job resume` does and resumes the captured session; another layout offers the package. `runner::tests::a_native_session_is_restored_only_for_the_same_layout` holds the decision; with the layout comparison removed it fails on the other home |
+
+`acceptance/native-session.log` is the run, `acceptance/native-session-run.txt` its commit, load, and the `fabric` process count before and after (1 and 1: a daemon of another worktree, not of this run). Command, from the worktree, with a scratch `CARGO_TARGET_DIR`:
+
+```
+cargo test -j 4 --locked -p fabric --test e2e -- --exact \
+  continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout \
+  continuity::e2e_a_continue_on_a_node_with_another_layout_starts_a_new_session_with_the_package \
+  continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved \
+  launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package \
+  secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log \
+  managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on --test-threads 1
+```
+
+Output: `test result: ok. 6 passed; 0 failed`.
+
+| Row | Test | What is checked |
+|---|---|---|
+| A native session continues on a node with the same layout | `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout` | two daemons share one home, so the same user, home and job root, as two hosts with the same layout; the fake Codex's first turn runs on `b` (`--pin b`) with the goal as its prompt; `a` is started again held at `before_launch`, a continue pinned to `a` cuts the attempt on `b` and is placed on `a`; while `a` is held the test removes every rollout from the home, so the only copy of the session is the one in the cut. `a` pulls the cut from `b`, restores the harness state and resumes: the fake Codex runs `exec resume <thread>` with the first turn's thread, its rollout holds both turns, and it answers the question about the first turn (its prompt) from the restored session. `achieved: native_session` with no package in the inspection read from the journal and in `fabric managed inspect` |
+| The mirror: another layout starts a new session with the package | `continuity::e2e_a_continue_on_a_node_with_another_layout_starts_a_new_session_with_the_package` | the same script with a home per daemon: `achieved: new_native_session_with_package`, a 64-hex package digest in both reads, no resume, and nothing recalled of the first turn |
+| A restore failure is never a lower fidelity | `runner::tests::a_preparation_failure_is_reported_blocked_then_failed` | a preparation that fails, the adapter's restore among them, reports the harness receipt `Blocked { reason }` then `Exited { Failed }`; the continue fails and the task stays open |
+
+Changed with it: the planned-handoff test now moves the work to the other node, each daemon with a home of its own (a continue to the same node and home rightly achieves `native_session`), and the secrets test continues with `--allow-fidelity new_native_session_with_package`, the package being what it searches. Mutation: with the adapter's restore skipped, the native row fails waiting for the resumed turn (the thread holds one turn, not two). Before the two commits it failed at `left: "new_native_session_with_package"`.
 
 Not run here: a run on two hosts. Every test above is two processes on one host; a run with the second Mac needs its address paired with `fabric node add`.
 
