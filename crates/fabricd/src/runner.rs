@@ -1086,10 +1086,6 @@ async fn native_offer(
     let harness_env = node
         .harness_env(&node.node_env())
         .map_err(|e| e.to_string())?;
-    let captured = match state_dir {
-        Some(dir) => captured_in(dir)?,
-        None => None,
-    };
     let physical = std::fs::canonicalize(root.as_str())
         .ok()
         .and_then(|p| AbsPath::parse(p.to_str()?).ok())
@@ -1098,18 +1094,42 @@ async fn native_offer(
         home: harness_env.home.clone(),
         root: physical,
     };
-    let (offered, session) = continuation_offer(
+    offer_restoring(
         &request.intent.harness,
         ask.allowed,
-        captured.as_ref(),
+        state_dir,
+        std::path::Path::new(root.as_str()),
         &here,
         &advert,
-    );
+        || {
+            crate::harnesses::adapter(&request.intent.harness, &harness_env, None)
+                .map_err(|e| e.to_string())
+        },
+    )
+    .await
+}
+
+/// The offer of a node whose layout is `here` for a continuation from a
+/// cut whose harness state is in `state_dir`, and the session it restored
+/// for the workspace at `workspace` through the adapter `adapter` builds. A state that cannot be
+/// read, or a restore that refuses, is an error: never a lower fidelity.
+async fn offer_restoring(
+    harness: &HarnessKind,
+    allowed: AllowedFidelity,
+    state_dir: Option<&std::path::Path>,
+    workspace: &std::path::Path,
+    here: &PathLayout,
+    advert: &NodeAdvert,
+    adapter: impl FnOnce() -> Result<Box<dyn fabric_harness::Harness>, String>,
+) -> Result<(Vec<Fidelity>, Option<SessionId>), String> {
+    let captured = match state_dir {
+        Some(dir) => captured_in(dir)?,
+        None => None,
+    };
+    let (offered, session) = continuation_offer(harness, allowed, captured.as_ref(), here, advert);
     if let (Some(_), Some(dir)) = (&session, state_dir) {
-        let adapter = crate::harnesses::adapter(&request.intent.harness, &harness_env, None)
-            .map_err(|e| e.to_string())?;
-        adapter
-            .restore(std::path::Path::new(root.as_str()), dir)
+        adapter()?
+            .restore(workspace, dir)
             .await
             .map_err(|e| format!("the harness state was not restored: {e}"))?;
     }
@@ -2268,35 +2288,12 @@ mod tests {
     /// and a continuation that allows it; anything else offers the package.
     #[test]
     fn a_native_session_is_restored_only_for_the_same_layout() {
-        use fabric_core::managed::placement::{Capacity, HarnessInventory, Warmth};
-        use fabric_core::snapshot::Platform;
-
         let abs = |p: &str| AbsPath::parse(p).unwrap();
         let here = PathLayout {
             home: abs("/home/u"),
             root: abs("/home/u/fabric/jobs/j/work"),
         };
-        let advert = NodeAdvert {
-            node: NodeId::from_bytes([2; 32]),
-            platform: Platform {
-                os: "macos".to_owned(),
-                arch: "aarch64".to_owned(),
-            },
-            harnesses: vec![HarnessInventory {
-                kind: HarnessKind::Codex,
-                version: HarnessVersion::parse("0.155.1").unwrap(),
-            }],
-            layout: here.clone(),
-            capacity: Capacity {
-                load_1m_milli: 0,
-                free_disk_bytes: 0,
-            },
-            warmth: Warmth {
-                bundle_chain: false,
-                workspace: false,
-            },
-            measured_at_ms: 0,
-        };
+        let advert = codex_advert(&here);
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         let captured = CapturedSession {
             harness: HarnessKind::Codex,
@@ -2366,5 +2363,138 @@ mod tests {
             no_native.highest(&offered).unwrap(),
             Fidelity::NewNativeSessionWithPackage
         );
+    }
+
+    /// The advert of a node with Codex 0.155.1 and the layout `here`.
+    fn codex_advert(here: &PathLayout) -> NodeAdvert {
+        use fabric_core::managed::placement::{Capacity, HarnessInventory, Warmth};
+        use fabric_core::snapshot::Platform;
+
+        NodeAdvert {
+            node: NodeId::from_bytes([2; 32]),
+            platform: Platform {
+                os: "macos".to_owned(),
+                arch: "aarch64".to_owned(),
+            },
+            harnesses: vec![HarnessInventory {
+                kind: HarnessKind::Codex,
+                version: HarnessVersion::parse("0.155.1").unwrap(),
+            }],
+            layout: here.clone(),
+            capacity: Capacity {
+                load_1m_milli: 0,
+                free_disk_bytes: 0,
+            },
+            warmth: Warmth {
+                bundle_chain: false,
+                workspace: false,
+            },
+            measured_at_ms: 0,
+        }
+    }
+
+    /// A Codex session captured on a node with home `home` and root
+    /// `work`, its state in `out`, with the adapter that captured it.
+    async fn codex_state(
+        home: &std::path::Path,
+        work: &std::path::Path,
+        out: &std::path::Path,
+    ) -> (PathBuf, fabric_harness::codex::Codex) {
+        use fabric_harness::Harness;
+
+        const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
+        let day = home.join(".codex/sessions/2026/10/19");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-10-19T11-00-00-{THREAD}.jsonl"));
+        std::fs::write(
+            &rollout,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"{}\",\"cli_version\":\"0.155.1\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"hi\"}}]}}}}\n",
+                work.display()
+            ),
+        )
+        .unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(
+            &codex,
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo \"codex-cli 0.155.1\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let adapter = fabric_harness::codex::Codex::new(
+            AbsPath::parse(home.to_str().unwrap()).unwrap(),
+            bin.into_os_string(),
+        );
+        adapter
+            .capture(work, &SessionId::parse(THREAD).unwrap(), out)
+            .await
+            .unwrap();
+        (rollout, adapter)
+    }
+
+    /// A native session the layout allows is restored through the
+    /// adapter; when the adapter refuses, or the cut's state cannot be
+    /// read, the launch fails: the continuation never takes a lower
+    /// fidelity than the one it was offered.
+    #[tokio::test]
+    async fn a_restore_failure_fails_the_launch_never_a_lower_fidelity() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap().join("home");
+        let work = home.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let (rollout, adapter) = codex_state(&home, &work, &state).await;
+        let here = PathLayout {
+            home: AbsPath::parse(home.to_str().unwrap()).unwrap(),
+            root: AbsPath::parse(work.to_str().unwrap()).unwrap(),
+        };
+        let advert = codex_advert(&here);
+        let offer = |state: &std::path::Path| {
+            let adapter = adapter.clone();
+            let advert = advert.clone();
+            let here = here.clone();
+            let state = state.to_owned();
+            let work = work.clone();
+            async move {
+                offer_restoring(
+                    &HarnessKind::Codex,
+                    AllowedFidelity::DEFAULT,
+                    Some(&state),
+                    &work,
+                    &here,
+                    &advert,
+                    move || Ok(Box::new(adapter) as Box<dyn fabric_harness::Harness>),
+                )
+                .await
+            }
+        };
+
+        let (offered, session) = offer(&state).await.unwrap();
+        assert_eq!(offered[0], Fidelity::NativeSession);
+        assert!(session.is_some(), "the same layout restores the session");
+
+        // This node's copy of the thread grew after the cut was taken:
+        // the adapter refuses the restore as divergence.
+        let mut grown = std::fs::read(&rollout).unwrap();
+        grown.extend_from_slice(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"here\"}]}}\n");
+        std::fs::write(&rollout, &grown).unwrap();
+        let err = offer(&state).await.unwrap_err();
+        assert!(err.contains("the harness state was not restored"), "{err}");
+        assert_eq!(
+            std::fs::read(&rollout).unwrap(),
+            grown,
+            "nothing was placed"
+        );
+
+        // A state that is there and cannot be read.
+        let broken = dir.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("manifest.json"), b"{").unwrap();
+        let err = offer(&broken).await.unwrap_err();
+        assert!(err.contains("cannot be read"), "{err}");
     }
 }
