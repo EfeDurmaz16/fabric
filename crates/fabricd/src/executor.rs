@@ -318,6 +318,57 @@ impl Executor {
         Ok(())
     }
 
+    /// The job's secrets for a process of `attempt`, by name; a secret
+    /// scoped to the current attempt only while `is_current`.
+    fn resolve_secrets(
+        &self,
+        run: &AttemptRun,
+        attempt: AttemptId,
+        is_current: bool,
+    ) -> Result<Vec<(String, String)>, ExecutorError> {
+        let mut env = Vec::new();
+        for secret in &run.secrets {
+            if secret.scope.attempt == AttemptScope::Current && !is_current {
+                continue;
+            }
+            let value = self.resolver.resolve(run.job, attempt, secret)?;
+            env.push((
+                secret.name.as_str().to_owned(),
+                String::from_utf8_lossy(value.expose()).into_owned(),
+            ));
+        }
+        Ok(env)
+    }
+
+    /// The secrets a process of `attempt` that its adapter spawns gets in
+    /// its environment, under their names, resolved now, as
+    /// [`Executor::spawn`] resolves them: the harness task's (the launch
+    /// path, step 4). The caller hands them to the adapter and keeps none.
+    pub async fn secret_env(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<Vec<(String, String)>, ExecutorError> {
+        let run = self.run(attempt).await?;
+        let run = run.lock().await;
+        let is_current = self
+            .current
+            .lock()
+            .await
+            .get(&run.job)
+            .is_none_or(|current| *current <= run.generation);
+        self.resolve_secrets(&run, attempt, is_current)
+    }
+
+    /// The job's current generation as this node knows it, if it knows one.
+    pub async fn current(&self, job: JobId) -> Option<Generation> {
+        self.current.lock().await.get(&job).copied()
+    }
+
+    /// The secrets of `refs` that do not resolve on this node.
+    pub fn unresolved(&self, refs: &[SecretRef]) -> Vec<fabric_core::managed::SecretName> {
+        self.resolver.unresolved(refs)
+    }
+
     fn record_path(&self, attempt: AttemptId, task: TaskId) -> PathBuf {
         self.records
             .join(attempt.to_string())
@@ -352,17 +403,7 @@ impl Executor {
             .is_none_or(|current| *current <= run.generation);
         // Secrets are resolved now, never earlier and never kept: a
         // missing one refuses the launch before any process exists.
-        let mut env = Vec::new();
-        for secret in &run.secrets {
-            if secret.scope.attempt == AttemptScope::Current && !is_current {
-                continue;
-            }
-            let value = self.resolver.resolve(run.job, attempt, secret)?;
-            env.push((
-                secret.name.as_str().to_owned(),
-                String::from_utf8_lossy(value.expose()).into_owned(),
-            ));
-        }
+        let env = self.resolve_secrets(&run, attempt, is_current)?;
         let path = self.record_path(attempt, task);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| local::LocalError::Io {
@@ -381,7 +422,12 @@ impl Executor {
         // is durable and no process exists; a crash here leaves a record
         // with no pid, which recovery clears.
         local::write(&path, &record)?;
-        command.process_group(0).current_dir(run.root.as_str());
+        // A program names its directory under the root (the launch path);
+        // every other task runs in the root.
+        if command.get_current_dir().is_none() {
+            command.current_dir(run.root.as_str());
+        }
+        command.process_group(0);
         scrub_secrets(&mut command);
         for (key, value) in &env {
             command.env(key, value);
