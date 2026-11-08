@@ -82,8 +82,14 @@ pub fn accept_command(
         if intent.acceptance.iter().any(|a| a.len() > TEXT_MAX_BYTES) {
             return Err(bad_policy("acceptance"));
         }
+        let acp_args: &[String] = match &intent.harness {
+            crate::harness::HarnessKind::Acp { args, .. } => args,
+            _ => &[],
+        };
         if looks_like_credential(&intent.goal)
             || intent.acceptance.iter().any(|a| looks_like_credential(a))
+            || acp_args.iter().any(|a| looks_like_credential(a))
+            || looks_like_credential(&acp_args.join(" "))
         {
             return Err(DomainError::CredentialLike {
                 field: "intent".into(),

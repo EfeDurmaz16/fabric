@@ -214,6 +214,28 @@ fn planted_credentials_and_approvals_never_enter_a_package() {
         accept_command(None, &planted, &ids(1)),
         Err(DomainError::CredentialLike { .. })
     ));
+    // So is one in an ACP agent's arguments, which every path journals.
+    let in_args = Envelope {
+        key: OperationKey::parse("create-acp").unwrap(),
+        job: None,
+        expected: None,
+        body: Command::CreateJob {
+            intent: Intent {
+                goal: "fix the test".into(),
+                harness: HarnessKind::Acp {
+                    program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+                    args: vec!["--api-key".into(), token.clone()],
+                },
+                acceptance: Vec::new(),
+            },
+            source: SourceBinding::Empty,
+            policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
+        },
+    };
+    assert!(matches!(
+        accept_command(None, &in_args, &ids(2)),
+        Err(DomainError::CredentialLike { .. })
+    ));
     // And the builder refuses one that reached a history anyway.
     let state = state_planted(&format!("fix with {token}"), Vec::new());
     assert_eq!(

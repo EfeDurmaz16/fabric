@@ -323,6 +323,13 @@ impl Node {
     ) -> Result<FacadeAnswer, Refusal> {
         match message {
             ClientMessage::Submit { key, submit, .. } => {
+                // The owner's socket refuses the same before the authority;
+                // a secret in the harness arguments would be journaled and
+                // shown to every token that covers the job.
+                crate::harnesses::refuse_secret_kind(&submit.harness).map_err(|_| {
+                    Refusal::new(RefusalCode::Refused, "credential_like")
+                        .saying("the harness arguments hold what looks like a secret")
+                })?;
                 let source = remote_source(&submit.source)?;
                 let command = create_command(&submit, source)?;
                 self.facade_command(record, &key, None, None, command).await
@@ -1504,6 +1511,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, all);
+    }
+
+    /// An ACP harness whose arguments carry a secret is refused before the
+    /// authority sees the create, as on the owner's socket: the journal,
+    /// `watch` and `inspect` never hold it.
+    #[tokio::test]
+    async fn a_submit_with_a_secret_in_the_harness_arguments_is_refused() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let message = json!({
+            "type": "submit", "facade": 1, "token": hex_of(1), "key": "k-acp",
+            "intent": { "goal": "g", "harness": { "kind": "acp", "program": "opencode",
+                "args": ["--api-key", "sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"] }, "acceptance": [] },
+            "source": { "kind": "empty" }
+        });
+        let answer = node.facade_answer(&message, NOW).await;
+        refused_as(&answer, RefusalCode::Refused, "credential_like");
+        assert_eq!(jobs_held(&node).await, 0);
     }
 
     /// A watch with nothing to deliver waits on commits, not on its own
