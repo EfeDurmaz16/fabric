@@ -38,6 +38,7 @@
   - [Managed jobs and the journal](managed-jobs.md)
   - [Provider bridge](bridge-protocol.md)
   - [Portable Session Format](portable-session-format.md)
+  - [Observability](observability.md)
 - [Evidence](reference/evidence.md)
 - [Releases](release.md)
 
@@ -72,6 +73,7 @@
   - [ADR 0026: Resource placement among registered nodes](adr/0026-resource-placement.md)
   - [ADR 0027: The job facade: authenticated remote job operations over the node link](adr/0027-job-facade-protocol.md)
   - [ADR 0029: The Portable Session Format v1](adr/0029-portable-session-format.md)
+  - [ADR 0031: Operation spans, inspect and the audit export](adr/0031-observability-spans-inspect-and-audit-export.md)
 <!-- adr:end -->
 
 # Project

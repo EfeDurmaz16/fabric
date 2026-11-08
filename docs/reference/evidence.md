@@ -29,5 +29,6 @@ What was run to prove a claim, kept in the repository: gate logs, A/B performanc
 | [perf-launch-hold](../evidence/perf-launch-hold/README.md) | Launch hold: register while the trampoline starts |
 | [perf-node-runtime](../evidence/perf-node-runtime/README.md) | Node runtime: counters, not timings |
 | [perf-store-git](../evidence/perf-store-git/README.md) | The store-git group: counters against the anchor |
+| [pr12](../evidence/pr12/README.md) | PR 12: spans of a managed job through two fabricd processes |
 | [two-mac-gate-pending.md](../evidence/two-mac-gate-pending.md) | Checks that need the second Mac |
 | [usable-from-main](../evidence/usable-from-main/walk.md) | Walk of `main` on one Mac, 2026-11-03 |

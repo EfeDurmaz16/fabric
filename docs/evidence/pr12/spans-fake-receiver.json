@@ -1,0 +1,170 @@
+[
+  {
+    "node": "b",
+    "name": "fabric node.add",
+    "traceId": "90d0be7a273c1ec3e5d1cce8a5b08656",
+    "spanId": "2fdb09e649d82869",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "b",
+    "name": "fabric peer.launch",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "60e0bc5d746e0297",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "b",
+    "name": "fabric report",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "f9a9c906bdc823cb",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "b",
+    "name": "fabric peer.instruct",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "05b307a8e0f26054",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "b",
+    "name": "fabric peer.instruct",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "ba73d45e5b50b1ca",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "b",
+    "name": "fabric report",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "175b3b9187fe3407",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "b",
+    "name": "fabric peer.instruct",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "4afe121e5cebd8e7",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric node.add",
+    "traceId": "2b93a29c3d6ab0cf8358a90e9b2ce55b",
+    "spanId": "369b1f984f7aa0d2",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric managed.create_job",
+    "traceId": "45177b118bb1594601ed49699c9ebc92",
+    "spanId": "e29edf47126b355c",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric observe.placed",
+    "traceId": "45177b118bb1594601ed49699c9ebc92",
+    "spanId": "e5bd8e3ff098d6cd",
+    "parentSpanId": "e29edf47126b355c",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric observe.started",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "979d09e579c90a57",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric managed.register_task",
+    "traceId": "d06d7b33478e46a00eb35bdbf0b7f36d",
+    "spanId": "2ed49686695038e5",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric managed.checkpoint",
+    "traceId": "167c0a5ff8df309d50578fb40b66d830",
+    "spanId": "558c66fa9938dd97",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric observe.checkpointed",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "bd02a21e7f219d15",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric managed.continue",
+    "traceId": "68e763174bb10f33fd555c77f99825e5",
+    "spanId": "5ec673e300b08b13",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "b",
+    "name": "fabric report",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "28fb042c29971259",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric observe.checkpointed",
+    "traceId": "2555f863627405242e5e2c235a6a3b63",
+    "spanId": "ee5749b5eaabf3e2",
+    "parentSpanId": "60e0bc5d746e0297",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric observe.placed",
+    "traceId": "68e763174bb10f33fd555c77f99825e5",
+    "spanId": "4e341c35f5ddfa03",
+    "parentSpanId": "5ec673e300b08b13",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric peer.launch",
+    "traceId": "a35e2b0f9494d07bda54f609b08242dc",
+    "spanId": "3f2728be6b520656",
+    "parentSpanId": null,
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric observe.started",
+    "traceId": "a35e2b0f9494d07bda54f609b08242dc",
+    "spanId": "af48172929e467bb",
+    "parentSpanId": "3f2728be6b520656",
+    "result": "done"
+  },
+  {
+    "node": "a",
+    "name": "fabric observe.continued",
+    "traceId": "a35e2b0f9494d07bda54f609b08242dc",
+    "spanId": "0f2f60cee11c8348",
+    "parentSpanId": "3f2728be6b520656",
+    "result": "done"
+  }
+]
