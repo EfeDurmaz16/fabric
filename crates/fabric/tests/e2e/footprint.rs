@@ -10,7 +10,11 @@
 //! `DYLD_INSERT_LIBRARIES`, so the test runs on macOS only, and only where
 //! `cc` builds the library; elsewhere it says so and passes. The counts do
 //! not depend on load, so the budget can be tight: about twice what the
-//! test build makes (466), half of what the old parse made in it (1948).
+//! test build made when the budget was set (825 allocations of 303 KB on
+//! the tree with the M5 managed commands), well under half of what the
+//! old parse made (1948 of 784 KB). The tree grows with the command set,
+//! so a budget hit after new commands is read against the perf job's
+//! footprint table before it is raised.
 
 use std::path::Path;
 use std::process::Command;
@@ -19,10 +23,10 @@ use crate::ab::Page;
 use crate::world::Fallible;
 
 /// The allocations `fabric --version` may make, in the test build.
-const VERSION_MALLOCS: u64 = 1_000;
+const VERSION_MALLOCS: u64 = 1_600;
 
 /// The bytes those allocations may ask for, in the test build.
-const VERSION_MALLOC_BYTES: u64 = 300_000;
+const VERSION_MALLOC_BYTES: u64 = 600_000;
 
 #[test]
 fn version_allocates_under_its_budget() -> Fallible {
