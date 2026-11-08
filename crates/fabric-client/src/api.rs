@@ -1666,8 +1666,11 @@ pub struct GcLabel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcLive {
     /// `tenure` (a standalone job this node owns at `label.epoch`),
-    /// `attempt` (a managed attempt the journal holds granted or running
-    /// at its job's generation) or `busy` (an operation runs on the job).
+    /// `moving` (a standalone job a move this node started holds until its
+    /// target decides), `busy` (an operation runs on the job), `attempt`
+    /// (a managed attempt the journal holds `granted`, `running` or
+    /// `unknown`, at any generation) or `launch` (an attempt this node's
+    /// runner runs now).
     pub holds: String,
     /// Whose.
     pub label: GcLabel,
@@ -1677,12 +1680,14 @@ pub struct GcLive {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcResidual {
     /// `harness_state_next`, `harness_state_old`, `restore_staging`,
-    /// `harness_group`, `harness_record` or `provider_resource`.
+    /// `harness_group`, `harness_record`, `launch_record`, `launch_group`,
+    /// `restored_state`, `captured_state`, `work_package` or
+    /// `provider_resource` (docs/concepts/residuals.md).
     pub kind: String,
     /// Its path, for a file or a directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// The process group's leader, for a harness group.
+    /// The process group's leader, for a harness or a launch group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<NonZeroU32>,
     /// The create that made it, for a provider resource.
@@ -1708,8 +1713,8 @@ pub struct GcResidual {
 /// Something gc found and keeps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcKept {
-    /// What it is, as for a residual, or `departed_copy`, `orphan_copy`
-    /// or `unknown`.
+    /// What it is, as for a residual, or `taken_record`, `departed_copy`,
+    /// `orphan_copy` or `unknown`.
     pub kind: String,
     /// Its path, for a file or a directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1724,11 +1729,13 @@ pub struct GcKept {
     /// Whose, when that can be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<GcLabel>,
-    /// `preserved` (kept by design: a departed or orphan copy), `busy`
-    /// (an operation runs on the job), `only_copy` (the only harness state
-    /// the job has), `unlabeled` (no label gc can read), `other_node` (a
-    /// label naming another node), `unknown_job` (a job this node does
-    /// not hold) or `unlocated` (a provider create with no locator).
+    /// `preserved` (kept by design: a departed or orphan copy, a taken
+    /// record), `busy` (an operation runs on the job), `moving` (a move
+    /// holds the job), `only_copy` (the only harness state the job has),
+    /// `unlabeled` (no label gc can read), `other_node` (a label naming
+    /// another node), `unknown_job` (a job this node does not hold),
+    /// `unknown_attempt` (an attempt the journal here does not hold) or
+    /// `unlocated` (a provider create with no locator).
     pub reason: String,
 }
 

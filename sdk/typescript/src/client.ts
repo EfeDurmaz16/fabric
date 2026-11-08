@@ -67,6 +67,9 @@ import {
   type Repaired,
   type Exported,
   type PsfExported,
+  type GcApproval,
+  type GcReport,
+  type GcWorker,
   type Counter,
   type NodeId,
   OperationKey,
@@ -487,6 +490,29 @@ export class FabricClient {
    */
   jobExportPsf(job: JobId, dir: SystemPath, options?: CallOptions): Promise<PsfExported> {
     return this.call({ op: "job_export_psf", job, dir }, options);
+  }
+
+  /**
+   * Reports what crashed or ended work left on the node, and removes it when
+   * `remove` is set; a provider resource only through `worker`, each with its
+   * own approval from `approvals`, given for this call alone (ADR 0030).
+   */
+  gc(
+    options: CallOptions & {
+      readonly remove?: boolean;
+      readonly approvals?: readonly GcApproval[];
+      readonly worker?: GcWorker;
+    } = {},
+  ): Promise<GcReport> {
+    return this.call(
+      {
+        op: "gc",
+        remove: options.remove ?? false,
+        approvals: options.approvals?.length ? [...options.approvals] : undefined,
+        worker: options.worker,
+      },
+      options,
+    );
   }
 
   /**

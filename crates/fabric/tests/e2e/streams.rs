@@ -411,6 +411,15 @@ fn e2e_every_answer_keeps_its_streams_in_words_and_as_json() -> Fallible {
     asked.change(a, &cancel, &managed)?;
     asked.changed(a, &cancel, "operation", "unchanged")?;
 
+    // gc: a dry run is a read keyed by the report's own nouns, with no
+    // outcome; `--yes` is a change whose outcome is `removed`.
+    asked.words(a, &["gc"])?;
+    let report = asked.read(a, &["gc"], "residuals")?;
+    assert_eq!(report["removing"], false, "{report}");
+    let removed = asked.json(a, &["gc", "--yes"])?;
+    assert_eq!(removed["outcome"], "removed", "{removed}");
+    assert!(removed["residuals"].is_array(), "{removed}");
+
     // Every leaf command is held here or names the test that holds it.
     let elsewhere: BTreeSet<&str> = ELSEWHERE.iter().map(|(path, _)| *path).collect();
     for path in contract::paths() {

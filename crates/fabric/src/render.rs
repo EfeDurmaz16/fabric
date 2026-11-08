@@ -1111,6 +1111,63 @@ mod contract_tests {
         assert_eq!(document(&reply, None)["jobs"], serde_json::json!([]));
     }
 
+    /// A gc report prints one row per residual on standard output and what
+    /// it keeps as notes; a dry run is a read with no outcome, a removal a
+    /// change with `removed`.
+    #[test]
+    fn a_gc_report_prints_its_residuals_as_rows_and_the_rest_as_notes() {
+        use fabric_client::api::{GcKept, GcLabel, GcReport, GcResidual};
+        let job: JobId = "01JABCDEFGHJKMNPQRSTVWXYZ0".parse().unwrap();
+        let label = GcLabel {
+            job,
+            epoch: Some(Epoch::FIRST),
+            node: None,
+            task: None,
+            attempt: None,
+            generation: None,
+        };
+        let report = |removing: bool| {
+            Reply::Gc(GcReport {
+                removing,
+                live: Vec::new(),
+                residuals: vec![GcResidual {
+                    kind: "harness_state_next".into(),
+                    path: Some("/s/jobs/x/harness-state.next".into()),
+                    pid: None,
+                    operation: None,
+                    locator: None,
+                    label: label.clone(),
+                    state: if removing { "removed" } else { "found" }.into(),
+                    detail: None,
+                }],
+                kept: vec![GcKept {
+                    kind: "departed_copy".into(),
+                    path: Some("/h/departed/1".into()),
+                    operation: None,
+                    label: Some(label.clone()),
+                    reason: "preserved".into(),
+                }],
+            })
+        };
+        let said = answer(&report(false), None);
+        assert_eq!(
+            said.result,
+            vec![format!(
+                "harness_state_next found /s/jobs/x/harness-state.next job {job} epoch 1"
+            )]
+        );
+        assert!(
+            said.notes[0].starts_with("kept departed_copy /h/departed/1"),
+            "{:?}",
+            said.notes
+        );
+        assert!(said.notes.iter().any(|n| n.contains("fabric gc --yes")));
+        let doc = document(&report(false), None);
+        assert!(doc.get("outcome").is_none(), "{doc}");
+        assert_eq!(doc["residuals"][0]["kind"], "harness_state_next");
+        assert_eq!(document(&report(true), None)["outcome"], "removed");
+    }
+
     #[test]
     fn a_ledger_time_prints_as_iso_8601_in_utc() {
         assert_eq!(iso_utc(0), "1970-01-01T00:00:00.000Z");
