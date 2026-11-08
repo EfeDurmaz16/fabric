@@ -19,8 +19,8 @@ dist = false
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 unix-archive = ".tar.gz"
 checksum = "sha256"
-# The product name lives here and in packaging/homebrew-tap (the formula name and
-# the tap). A rename changes these two places and the crate name.
+# The product name lives here and in packaging/homebrew-tap (FORMULA in its
+# workflow). A rename changes these two places and the crate name.
 installers = ["homebrew"]
 tap = "EfeDurmaz16/homebrew-tap"
 formula = "fabric"

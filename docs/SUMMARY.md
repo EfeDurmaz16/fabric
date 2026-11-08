@@ -38,6 +38,7 @@
   - [Provider bridge](bridge-protocol.md)
   - [Portable Session Format](portable-session-format.md)
 - [Evidence](reference/evidence.md)
+- [Releases](release.md)
 
 # Decisions
 
