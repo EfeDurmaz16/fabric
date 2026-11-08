@@ -13,7 +13,6 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::{NAME, SyncError, faults, io_err};
@@ -117,24 +116,35 @@ pub(crate) fn remove_tree(path: &Path) -> Result<(), SyncError> {
     fs::remove_dir_all(path).map_err(io_err(path))
 }
 
+/// The store's walk, which opens each directory without following a link
+/// and changes it through that descriptor.
 fn open_up(dir: &Path) -> Result<(), SyncError> {
-    let meta = fs::symlink_metadata(dir).map_err(io_err(dir))?;
-    let mode = meta.permissions().mode();
-    if mode & 0o700 != 0o700 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700)).map_err(io_err(dir))?;
-    }
-    for entry in fs::read_dir(dir).map_err(io_err(dir))? {
-        let entry = entry.map_err(io_err(dir))?;
-        if entry.file_type().map_err(io_err(entry.path()))?.is_dir() {
-            open_up(&entry.path())?;
-        }
-    }
-    Ok(())
+    Ok(fabric_store::restore::open_up(dir)?)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    #[test]
+    fn removing_a_tree_never_changes_a_directory_behind_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(outside.join("ro")).unwrap();
+        fs::set_permissions(outside.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        // What a directory swapped for a link after the walk's check meets.
+        assert!(open_up(&link).is_err());
+        let mode = fs::metadata(outside.join("ro"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o500, "the chmod followed the link");
+        fs::set_permissions(outside.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     #[test]
     fn a_pull_cut_between_the_renames_is_finished() {

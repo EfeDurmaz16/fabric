@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use fabric_core::id::{JobId, SnapshotId};
@@ -280,22 +280,9 @@ impl Remote for DirTarget {
     }
 }
 
-/// Writes `bytes` to `path` through a flushed temp file and a rename, then flushes the directory.
+/// Replaces `path` with `bytes` through the store's durable write.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SyncError> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.tmp"));
-    let mut file = fs::File::create(&tmp).map_err(io_err(&tmp))?;
-    file.write_all(bytes).map_err(io_err(&tmp))?;
-    file.sync_all().map_err(io_err(&tmp))?;
-    drop(file);
-    fs::rename(&tmp, path).map_err(io_err(path))?;
-    fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(io_err(dir))
+    fabric_store::write_atomic(path, bytes).map_err(io_err(path))
 }
 
 #[cfg(test)]
@@ -343,5 +330,20 @@ mod tests {
         for bad in ["", ".git", "a/b", "..", "a b", &"x".repeat(101)] {
             assert!(TreeName::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_head_write_never_writes_through_a_planted_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "theirs").unwrap();
+        let heads = dir.path().join("heads");
+        fs::create_dir(&heads).unwrap();
+        std::os::unix::fs::symlink(&outside, heads.join(".app.tmp")).unwrap();
+        write_atomic(&heads.join("app"), b"ours").unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "theirs");
+        let meta = fs::symlink_metadata(heads.join("app")).unwrap();
+        assert!(meta.is_file(), "a link took the head's name");
+        assert_eq!(fs::read_to_string(heads.join("app")).unwrap(), "ours");
     }
 }
