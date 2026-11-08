@@ -178,7 +178,10 @@ impl Env {
     /// a restore placed it, and first writes the thread's first prompt, as
     /// it reads it there, to `codex-recalled`: the answer a resumed session
     /// gives about its first turn, empty when no rollout of the thread is
-    /// on the node. After `thread.started` it waits up to five
+    /// on the node. With `FAKE_CODEX_HOLD` set it then keeps the rollout
+    /// open until it is stopped, as a Codex that has the thread loaded
+    /// does, so the adapter refuses to capture it while it runs. Otherwise,
+    /// after `thread.started` it waits up to five
     /// seconds for the node's session record of the job and writes `yes`
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
     /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
@@ -223,7 +226,7 @@ impl Env {
                  printf '{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-sol\",\"effort\":\"xhigh\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\\n' >> \"$file\"\n\
                  printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
                  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
-                 [ -z \"$FAKE_CODEX_HOLD\" ] || exec sleep 3600\n\
+                 [ -z \"$FAKE_CODEX_HOLD\" ] || {{ exec 3>>\"$file\"; exec sleep 3600; }}\n\
                  record=\"$FABRIC_HOME/jobs/$(basename \"$(dirname \"$(pwd -P)\")\")/session\"\n\
                  tries=0\n\
                  while [ ! -f \"$record\" ] && [ $tries -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done\n\

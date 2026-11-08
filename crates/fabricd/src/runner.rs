@@ -726,7 +726,7 @@ impl Runner {
     ) -> Result<bool, Ended> {
         let token = reporter.token;
         let attempt = token.attempt;
-        let quiescence = match self.executor.quiesce(attempt, budget).await {
+        let quiescence = match self.executor.quiesce(attempt, budget, then).await {
             Ok(quiescence) => quiescence,
             Err(e) => {
                 tracing::warn!(%attempt, error = %e, "the quiescence failed");
@@ -788,6 +788,13 @@ impl Runner {
                 cut,
             })
             .await?;
+        if matches!(answer, ReportAnswer::Recorded { .. }) {
+            // Only a recorded cut is a departure: a refused one is never
+            // continued from, so its state must not count at a restore here.
+            if let Err(e) = self.executor.confirm_departure(attempt).await {
+                tracing::warn!(%attempt, error = %e, "the departure of the cut's harness state was not confirmed");
+            }
+        }
         if let Some(receipts) = stopped {
             if !matches!(answer, ReportAnswer::Recorded { .. }) {
                 // The cut was refused and nothing runs any more: the
@@ -1395,14 +1402,39 @@ impl Host for NodeHost {
     }
 }
 
-/// The adapters' suspend path, for the capturer.
+/// Builds the adapter of a harness on this node.
+type AdapterFor =
+    dyn Fn(&HarnessKind) -> Result<Box<dyn fabric_harness::Harness>, String> + Send + Sync;
+
+/// The adapters' suspend path, for the capturer: the capture `job
+/// suspend` makes, and the confirmation of its departure record.
 pub(crate) struct AdapterSuspend {
-    node: std::sync::Weak<crate::node::Node>,
+    adapter: Box<AdapterFor>,
 }
 
 impl AdapterSuspend {
     pub(crate) fn new(node: std::sync::Weak<crate::node::Node>) -> Self {
-        AdapterSuspend { node }
+        Self::with(move |harness| {
+            let node = node
+                .upgrade()
+                .ok_or_else(|| "the node is stopping".to_owned())?;
+            let env = node
+                .harness_env(&node.node_env())
+                .map_err(|e| e.to_string())?;
+            crate::harnesses::adapter(harness, &env, None).map_err(|e| e.to_string())
+        })
+    }
+
+    /// The suspend path over the adapters `adapter` builds.
+    pub(crate) fn with(
+        adapter: impl Fn(&HarnessKind) -> Result<Box<dyn fabric_harness::Harness>, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        AdapterSuspend {
+            adapter: Box::new(adapter),
+        }
     }
 }
 
@@ -1414,20 +1446,28 @@ impl crate::capturer::Suspend for AdapterSuspend {
         out: &'a std::path::Path,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let node = self
-                .node
-                .upgrade()
-                .ok_or_else(|| "the node is stopping".to_owned())?;
-            let env = node
-                .harness_env(&node.node_env())
-                .map_err(|e| e.to_string())?;
-            let adapter = crate::harnesses::adapter(&attempt.harness, &env, None)
-                .map_err(|e| e.to_string())?;
+            let adapter = (self.adapter)(&attempt.harness)?;
             adapter
                 .capture(std::path::Path::new(attempt.root.as_str()), session, out)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
+        })
+    }
+
+    fn confirm<'a>(
+        &'a self,
+        attempt: &'a crate::capturer::Attempt,
+        dir: &'a std::path::Path,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let manifest = fabric_harness::manifest::StateManifest::read(dir)
+                .map_err(|e| format!("the cut's harness state cannot be read: {e}"))?;
+            let adapter = (self.adapter)(&attempt.harness)?;
+            match adapter.confirm_departure(&manifest).await {
+                Ok(()) | Err(fabric_harness::HarnessError::DepartureNotPending { .. }) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
         })
     }
 }
@@ -1489,11 +1529,15 @@ mod tests {
             &self,
             attempt: AttemptId,
             _task: fabric_core::managed::TaskId,
+            _run: crate::executor::HarnessRun,
         ) -> BoxFuture<'_, Result<SnapshotId, String>> {
             Box::pin(async move { Ok(SnapshotId::of(&attempt.to_bytes())) })
         }
         fn capture(&self, attempt: AttemptId) -> BoxFuture<'_, Result<SnapshotId, String>> {
             Box::pin(async move { Ok(SnapshotId::of(&[attempt.to_bytes(), [1; 16]].concat())) })
+        }
+        fn confirm_departure(&self, _attempt: AttemptId) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
         }
         fn facts(&self) -> Vec<(String, String)> {
             vec![("os".into(), "test".into())]
