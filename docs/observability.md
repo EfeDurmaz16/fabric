@@ -15,7 +15,7 @@ This holds by type, not by convention: a span is a closed struct with one typed 
 Run a collector that takes OTLP over HTTP on port 4318. Jaeger's all-in-one image does:
 
 ```sh
-docker run --rm -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+docker run --rm -d --name jaeger -e COLLECTOR_OTLP_ENABLED=true -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:1.73.0
 fabric serve --otlp-endpoint http://localhost:4318
 ```
 
@@ -109,4 +109,4 @@ Times are Unix milliseconds and digests 64 lowercase hex.
 
 ## Evidence
 
-[evidence/pr12](evidence/pr12/README.md) holds the span list of a managed job run through two `fabricd` processes and what blocked the Jaeger run. The end-to-end test `observability::e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_secret` runs both daemons against an OTLP receiver of its own and fails if the job's secret, its goal, a task argv, an operation key or a home path reaches a span or the audit export.
+[evidence/pr12](evidence/pr12/README.md) holds a managed job run through two `fabricd` processes on one host into Jaeger, with the trace JSON its query API returned, and the same run against the test's own receiver. The end-to-end test `observability::e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_secret` runs both daemons against an OTLP receiver of its own and fails if the job's secret, its goal, a task argv, an operation key or a home path reaches a span or the audit export.
