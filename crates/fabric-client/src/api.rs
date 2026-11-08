@@ -1895,6 +1895,20 @@ pub struct ManagedPolicy {
     /// the slot is visible, as docs/facade-protocol.md asks.
     #[serde(default, with = "text::option")]
     pub pin: Option<NodeId>,
+    /// What the authority does when an attempt's node goes silent (ADR
+    /// 0028); `block` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryName>,
+}
+
+/// A job's recovery policy by its name on the wire (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryName {
+    /// The job waits for an operator with its state visible.
+    Block,
+    /// The authority restarts from an acknowledged checkpoint by itself.
+    RestartFromAcknowledged,
 }
 
 /// A note on a managed job's history (ADR 0024). On the wire it is an

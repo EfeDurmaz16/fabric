@@ -601,6 +601,8 @@ Options:
           The command's key; the same key and arguments again give the same job
       --pin <PIN>
           The one node the job may run on
+      --recovery <POLICY>
+          What the authority does when the job's node goes silent; block by default
       --repo <PATH>
           A repository on this node to clone into the job's workspace
       --secret <SECRETS>
@@ -969,6 +971,8 @@ Options:
           The command's key; the same key and arguments again give the same answer
       --pin <PIN>
           The one node the job may run on
+      --recovery <POLICY>
+          What the authority does when the job's node goes silent; block by default
       --secret <SECRETS>
           A secret the tasks need by name ([A-Z0-9_]); repeatable
       --snapshot <SNAPSHOT>

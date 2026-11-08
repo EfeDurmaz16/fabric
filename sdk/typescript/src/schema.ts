@@ -955,6 +955,8 @@ export const ManagedPolicy = z.object({
   export_allowlist: optional(z.array(UnicodeText)),
   disk_bytes: optional(count),
   pin: NodeId.nullable().default(null),
+  /** What the authority does when the job's node goes silent (ADR 0028); `block` when absent. */
+  recovery: optional(z.enum(["block", "restart_from_acknowledged"])),
 });
 export type ManagedPolicy = z.infer<typeof ManagedPolicy>;
 

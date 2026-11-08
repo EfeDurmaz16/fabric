@@ -785,6 +785,14 @@ fn parse_policy(value: &Value) -> Result<ManagedPolicy, Refusal> {
         Some(v) => Some(integer(v, "disk_bytes", Refusal::bad_request)?),
     };
     let pin = obj.id_nullable("pin")?;
+    let recovery = match obj.optional("recovery") {
+        None => None,
+        Some(v) => Some(match v.as_str() {
+            Some("block") => crate::api::RecoveryName::Block,
+            Some("restart_from_acknowledged") => crate::api::RecoveryName::RestartFromAcknowledged,
+            _ => return Err(Refusal::bad_request("bad_policy").saying("recovery")),
+        }),
+    };
     obj.finish()?;
     Ok(ManagedPolicy {
         drain_budget_ms,
@@ -793,6 +801,7 @@ fn parse_policy(value: &Value) -> Result<ManagedPolicy, Refusal> {
         export_allowlist,
         disk_bytes,
         pin,
+        recovery,
     })
 }
 

@@ -173,6 +173,14 @@ pub(crate) fn policy_from(policy: Option<&ManagedPolicy>) -> Result<JobPolicy, R
     if let Some(ms) = policy.drain_budget_ms {
         out.drain_budget_ms = ms;
     }
+    if let Some(recovery) = policy.recovery {
+        out.recovery = match recovery {
+            fabric_client::api::RecoveryName::Block => fabric_core::managed::RecoveryPolicy::Block,
+            fabric_client::api::RecoveryName::RestartFromAcknowledged => {
+                fabric_core::managed::RecoveryPolicy::RestartFromAcknowledged
+            }
+        };
+    }
     if let Some(allowed) = &policy.allowed_fidelity {
         out.allowed_fidelity = AllowedFidelity {
             native_session: allowed.contains(&FidelityName::NativeSession),
@@ -1136,6 +1144,11 @@ fn policy_json(policy: &JobPolicy) -> Value {
         ),
         disk_bytes: Some(policy.placement.disk_bytes),
         pin: policy.placement.pin,
+        // Named only when it is not the default, so a block job reads as
+        // it did before the field existed.
+        recovery: (policy.recovery
+            == fabric_core::managed::RecoveryPolicy::RestartFromAcknowledged)
+            .then_some(fabric_client::api::RecoveryName::RestartFromAcknowledged),
     })
 }
 

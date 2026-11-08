@@ -22,7 +22,7 @@ use clap::{Args, Subcommand};
 use fabric_client::Client;
 use fabric_client::api::{
     AnyWord, FidelityName, JobScopeWire, ManagedPolicy, ManagedSource, NoteWire, ProgramWire,
-    RegisterClass, Reply, Request, ResourceScopeWire, SecretRefWire,
+    RecoveryName, RegisterClass, Reply, Request, ResourceScopeWire, SecretRefWire,
 };
 use fabric_client::facade::{Bearer, ClientMessage, Submit};
 use fabric_core::env::EnvVarName;
@@ -113,6 +113,17 @@ pub(crate) struct PolicyArgs {
     /// The one node the job may run on.
     #[arg(long)]
     pin: Option<NodeId>,
+    /// What the authority does when the job's node goes silent; block by default.
+    #[arg(long, value_parser = recovery_arg, value_name = "POLICY")]
+    recovery: Option<RecoveryName>,
+}
+
+fn recovery_arg(text: &str) -> Result<RecoveryName, String> {
+    match text {
+        "block" => Ok(RecoveryName::Block),
+        "restart_from_acknowledged" => Ok(RecoveryName::RestartFromAcknowledged),
+        _ => Err("block or restart_from_acknowledged".to_owned()),
+    }
 }
 
 impl PolicyArgs {
@@ -122,7 +133,8 @@ impl PolicyArgs {
             || !self.secrets.is_empty()
             || !self.export.is_empty()
             || self.disk_bytes.is_some()
-            || self.pin.is_some();
+            || self.pin.is_some()
+            || self.recovery.is_some();
         given.then(|| ManagedPolicy {
             drain_budget_ms: self.drain_budget,
             allowed_fidelity: (!self.allow_fidelity.is_empty())
@@ -140,6 +152,7 @@ impl PolicyArgs {
             export_allowlist: (!self.export.is_empty()).then(|| self.export.clone()),
             disk_bytes: self.disk_bytes,
             pin: self.pin,
+            recovery: self.recovery,
         })
     }
 }
