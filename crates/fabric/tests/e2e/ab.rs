@@ -919,6 +919,14 @@ impl SplitMix {
 
 /// The 95% percentile bootstrap interval of the median of `values`.
 fn bootstrap(values: &[f64], resamples: usize) -> Fallible<(f64, f64)> {
+    bootstrap_tails(values, resamples, 1)
+}
+
+/// The percentile bootstrap interval of the median of `values` that holds
+/// the median with 95% confidence across `family` intervals at once: each
+/// leaves 2.5% / `family` of the resamples out on either side (Bonferroni).
+/// A `family` of 1 is the plain 95% interval.
+fn bootstrap_tails(values: &[f64], resamples: usize, family: usize) -> Fallible<(f64, f64)> {
     if values.is_empty() {
         return Ok((0.0, 0.0));
     }
@@ -932,8 +940,9 @@ fn bootstrap(values: &[f64], resamples: usize) -> Fallible<(f64, f64)> {
         medians.push(median(&mut drawn));
     }
     medians.sort_by(f64::total_cmp);
-    let low = resamples * 25 / 1000;
-    let high = (resamples * 975 / 1000).saturating_sub(1);
+    let out = resamples * 25 / (1000 * family.max(1));
+    let low = out;
+    let high = (resamples - out).saturating_sub(1);
     Ok((medians[low], medians[high]))
 }
 
@@ -1302,6 +1311,240 @@ fn counted_size_report(
     Ok(())
 }
 
+/// Resamples of each interval of the gate: its family intervals cut deeper
+/// into the tails than a 95% one, so they take more draws.
+const GATE_RESAMPLES: usize = 40_000;
+
+/// The load-free counters the gate holds per op: the candidate's median
+/// over the counted runs must not exceed the anchor's. Process starts and
+/// file flushes are what a slower op costs on any machine, and none of them
+/// depends on load or timing; bytes and allocations are tracked in the
+/// report, not gated.
+const GATED_COUNTERS: [(&str, &[&str]); 3] = [
+    ("process starts", &["spawns", "execs"]),
+    ("full and barrier flushes", &["fullfsync", "barrierfsync"]),
+    ("fsyncs", &["fsync"]),
+];
+
+/// One check of the gate.
+struct Check {
+    /// What it holds, as its table row begins.
+    row: String,
+    /// True when it breaks the rule.
+    fails: bool,
+}
+
+/// One paired series the gate holds with a family interval: its row label
+/// and its (anchor, candidate) pairs.
+type Series = (String, Vec<(f64, f64)>);
+
+/// Judges `series` as one family: each interval at 95% across the family,
+/// failing when its low end lies above 1.
+fn family_checks(series: &[Series], out: &mut String) -> Fallible<Vec<Check>> {
+    let family = series.len();
+    let mut checks = Vec::new();
+    out.push_str(
+        "| what | pairs | anchor | candidate | ratio | 95% interval | family interval | verdict |\n\
+         |---|---:|---:|---:|---:|---|---|---|\n",
+    );
+    for (label, found) in series {
+        let judged = judge(found)?;
+        let ratios: Vec<f64> = found
+            .iter()
+            .filter(|pair| pair.0 > 0.0)
+            .map(|pair| pair.1 / pair.0)
+            .collect();
+        let (low, high) = bootstrap_tails(&ratios, GATE_RESAMPLES, family)?;
+        let fails = low > 1.0;
+        let verdict = if fails {
+            "**fail**"
+        } else if judged.low > 1.0 {
+            "pass; its 95% interval alone is above 1"
+        } else {
+            "pass"
+        };
+        let _ = writeln!(
+            out,
+            "| {label} | {} | {:.1} | {:.1} | {:.3} | {:.3} to {:.3} | {low:.3} to {high:.3} | {verdict} |",
+            judged.pairs, judged.anchor, judged.candidate, judged.ratio, judged.low, judged.high
+        );
+        checks.push(Check {
+            row: label.clone(),
+            fails,
+        });
+    }
+    Ok(checks)
+}
+
+/// The pairs of counted `metric` over every op and run, for a size that
+/// every op reports.
+fn counted_size_pairs(samples: &[Sample], metric: &str) -> Vec<(f64, f64)> {
+    let mut by_op: BTreeMap<(usize, &str), [Option<f64>; 2]> = BTreeMap::new();
+    for sample in samples {
+        if sample.phase == "counted" && sample.metric == metric {
+            by_op.entry((sample.run, sample.op.as_str())).or_default()[sample.side] =
+                Some(sample.value);
+        }
+    }
+    by_op
+        .values()
+        .filter_map(|pair| Some((pair[0]?, pair[1]?)))
+        .collect()
+}
+
+/// The verdict of a run against the performance rule, as markdown, and
+/// the rows that break it. Times: no op's family interval above 1, the 95%
+/// interval across all timed ops at once, so that two equal builds fail
+/// one run in 20 at most however many ops there are. Memory: no daemon's
+/// resident size or physical footprint and no CLI's peak resident size or
+/// physical footprint with a family interval above 1, across the memory
+/// rows. Counters: no op with more process starts or flushes than the
+/// anchor, medians over the counted runs.
+fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
+    let samples = parse_samples(text)?;
+    let mut out = String::new();
+    let mut checks = Vec::new();
+
+    let timed: Vec<Series> = ops_in(&samples, "timed")
+        .into_iter()
+        .filter(|op| !op.starts_with("daemon "))
+        .map(|op| {
+            let found = pairs(&samples, "timed", &op, "us");
+            (op, found)
+        })
+        .filter(|(_, found)| !found.is_empty())
+        .map(|(op, found)| {
+            let ms = found
+                .iter()
+                .map(|(a, c)| (a / 1000.0, c / 1000.0))
+                .collect();
+            (op, ms)
+        })
+        .collect();
+    if !timed.is_empty() {
+        let _ = write!(
+            out,
+            "\n#### Times\n\n\
+             Medians in ms. The family interval is the 95% interval across all {} ops at \
+             once (Bonferroni); an op fails when it lies above 1.\n\n",
+            timed.len()
+        );
+        checks.extend(family_checks(&timed, &mut out)?);
+    }
+
+    let mut memory: Vec<Series> = Vec::new();
+    for (metric, _, title, _) in DAEMON_SIZES {
+        let daemons: BTreeSet<&str> = samples
+            .iter()
+            .filter(|sample| sample.phase == "timed" && sample.metric == metric)
+            .map(|sample| sample.op.as_str())
+            .collect();
+        for daemon in daemons {
+            let found = pairs(&samples, "timed", daemon, metric);
+            memory.push((
+                format!("{title}, {daemon}, KiB after each timed run"),
+                found,
+            ));
+        }
+    }
+    for (metric, title) in [
+        ("cli_maxrss_kib", "CLI peak resident size"),
+        ("cli_footprint_kib", "CLI peak physical footprint"),
+    ] {
+        let found = counted_size_pairs(&samples, metric);
+        if !found.is_empty() {
+            memory.push((format!("{title}, KiB per counted op"), found));
+        }
+    }
+    if !memory.is_empty() {
+        let _ = write!(
+            out,
+            "\n#### Memory\n\n\
+             The family interval is the 95% interval across all {} rows at once; a row \
+             fails when it lies above 1.\n\n",
+            memory.len()
+        );
+        checks.extend(family_checks(&memory, &mut out)?);
+    }
+
+    let counted = ops_in(&samples, "counted");
+    if !counted.is_empty() {
+        out.push_str(
+            "\n#### Counters\n\n\
+             Medians over the counted runs, anchor -> candidate. An op fails when the \
+             candidate starts more processes or flushes more than the anchor.\n\n\
+             | op |",
+        );
+        for (title, _) in GATED_COUNTERS {
+            let _ = write!(out, " {title} |");
+        }
+        out.push_str(" verdict |\n|---|");
+        out.push_str(&"---:|".repeat(GATED_COUNTERS.len()));
+        out.push_str("---|\n");
+        for op in &counted {
+            let _ = write!(out, "| {op} |");
+            let mut over = Vec::new();
+            for (title, metrics) in GATED_COUNTERS {
+                let mut sum = [0.0, 0.0];
+                for metric in metrics {
+                    let [anchor, candidate] = counted_medians(&samples, op, metric);
+                    sum[0] += anchor;
+                    sum[1] += candidate;
+                }
+                if sum[1] > sum[0] {
+                    over.push(title);
+                }
+                let _ = write!(out, " {:.0} -> {:.0} |", sum[0], sum[1]);
+            }
+            let fails = !over.is_empty();
+            let _ = writeln!(out, " {} |", if fails { "**fail**" } else { "pass" });
+            checks.push(Check {
+                row: format!("{op}: more {}", over.join(", ")),
+                fails,
+            });
+        }
+    }
+
+    let failed: Vec<String> = checks
+        .iter()
+        .filter(|check| check.fails)
+        .map(|check| check.row.clone())
+        .collect();
+    let head = if checks.is_empty() {
+        return Err("no samples to judge".into());
+    } else if failed.is_empty() {
+        format!(
+            "### Perf gate: pass\n\nAll {} checks hold against the anchor.\n",
+            checks.len()
+        )
+    } else {
+        format!(
+            "### Perf gate: fail\n\n{} of {} checks break the performance rule \
+             (CONTRIBUTING.md): {}.\n",
+            failed.len(),
+            checks.len(),
+            failed.join("; ")
+        )
+    };
+    Ok((head + &out, failed))
+}
+
+/// Judges the samples in `FABRIC_AB_OUT` against the performance rule,
+/// writes `verdict.md` there and fails when a check breaks the rule.
+#[test]
+#[ignore = "judges the samples of an A/B run; scripts/bench-ab.sh --gate runs it"]
+fn gate() -> Fallible {
+    let out = path_var("FABRIC_AB_OUT")?;
+    let (verdict, failed) = judge_run(&fs::read_to_string(out.join("samples.tsv"))?)?;
+    fs::write(out.join("verdict.md"), &verdict)?;
+    println!("{verdict}");
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the perf gate fails: {}", failed.join("; ")).into())
+    }
+}
+
 /// The median and its interval follow the samples, and the same samples
 /// give the same interval every time.
 #[test]
@@ -1459,4 +1702,69 @@ fn a_spawn_line_reads_as_its_command() {
         "sh holding claude"
     );
     assert_eq!(command("kill -KILL -- -42"), "kill");
+}
+
+/// Samples of a run in which the candidate is `slower` times the anchor on
+/// `cli ls`, `larger` times on daemon a's footprint, and starts `extra`
+/// more processes in `acp new`; every other value is equal, give or take
+/// a percent that alternates between the builds.
+fn gate_samples(slower: f64, larger: f64, extra: u64) -> String {
+    let mut text = String::from("phase\trun\top\tside\tfirst\tmetric\tvalue\n");
+    for run in 0..15_u32 {
+        let wobble = if run % 2 == 0 { 1.01 } else { 0.99 };
+        for (side, jitter, slower, larger) in [
+            ("anchor", wobble, 1.0, 1.0),
+            ("candidate", 2.0 - wobble, slower, larger),
+        ] {
+            let ls = 3000.0 * jitter * slower;
+            let version = 2000.0 * jitter;
+            let footprint = 4000.0 * jitter * larger;
+            let _ = writeln!(text, "timed\t{run}\tcli ls\t{side}\tanchor\tus\t{ls:.0}");
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tcli version\t{side}\tanchor\tus\t{version:.0}"
+            );
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tdaemon a\t{side}\tanchor\tfootprint_kib\t{footprint:.0}"
+            );
+        }
+    }
+    for run in 1..=3 {
+        for (side, spawns) in [("anchor", 1), ("candidate", 1 + extra)] {
+            let _ = writeln!(
+                text,
+                "counted\t{run}\tacp new\t{side}\tanchor\tspawns\t{spawns}"
+            );
+            let _ = writeln!(
+                text,
+                "counted\t{run}\tacp new\t{side}\tanchor\tfullfsync\t3"
+            );
+        }
+    }
+    text
+}
+
+/// The gate passes two builds that differ by noise, and fails each of a
+/// slower op, a larger daemon and an op that starts one more process.
+#[test]
+fn the_gate_fails_a_slower_op_a_larger_daemon_and_one_more_process() -> Fallible {
+    let (verdict, failed) = judge_run(&gate_samples(1.0, 1.0, 0))?;
+    assert!(failed.is_empty(), "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: pass"), "{verdict}");
+
+    let (verdict, failed) = judge_run(&gate_samples(1.05, 1.0, 0))?;
+    assert_eq!(failed, ["cli ls"], "{verdict}");
+
+    let (verdict, failed) = judge_run(&gate_samples(1.0, 1.05, 0))?;
+    assert_eq!(
+        failed,
+        ["Daemon physical footprint, daemon a, KiB after each timed run"],
+        "{verdict}"
+    );
+
+    let (verdict, failed) = judge_run(&gate_samples(1.0, 1.0, 1))?;
+    assert_eq!(failed, ["acp new: more process starts"], "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: fail"), "{verdict}");
+    Ok(())
 }

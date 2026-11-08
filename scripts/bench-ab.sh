@@ -24,9 +24,14 @@
 # run changes nothing. The counters need macOS and a C compiler; elsewhere
 # the counted phase is skipped.
 #
+# CI runs this on every pull request (the perf job of
+# .github/workflows/perf.yml) and judges the run with --gate; a local run is
+# optional.
+#
 # Usage:
 #   scripts/bench-ab.sh [options] <output-dir>
 #   scripts/bench-ab.sh --analyze <output-dir>
+#   scripts/bench-ab.sh --gate <output-dir>
 # Options:
 #   --anchor <commit>     the anchor (default 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5)
 #   --candidate <commit>  a commit instead of the working tree
@@ -38,6 +43,9 @@
 #   --release             build both in the release profile instead of test
 # The output directory must not exist yet, so an earlier record is never
 # overwritten. --analyze writes report.md again from its samples.tsv.
+# --gate judges its samples.tsv against the performance rule, writes
+# verdict.md and exits 1 when a check breaks the rule
+# (crates/fabric/tests/e2e/ab.rs, judge_run, says which checks).
 set -eu
 
 anchor=176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
@@ -46,10 +54,12 @@ pairs=15
 counted=3
 release=
 analyze=
+gate=
 
 usage() {
   echo "usage: scripts/bench-ab.sh [--anchor <commit>] [--candidate <commit>] [--pairs <n>] [--counted <n>] [--release] <output-dir>" >&2
   echo "       scripts/bench-ab.sh --analyze <output-dir>" >&2
+  echo "       scripts/bench-ab.sh --gate <output-dir>" >&2
   exit 2
 }
 
@@ -61,6 +71,7 @@ while [ "$#" -gt 1 ]; do
     --counted) counted=$2; shift 2 ;;
     --release) release=--release; shift ;;
     --analyze) analyze=1; shift ;;
+    --gate) gate=1; shift ;;
     *) usage ;;
   esac
 done
@@ -90,6 +101,23 @@ if [ -n "$analyze" ]; then
   FABRIC_AB_OUT=$out "$e2e" --ignored --exact ab::analyze --nocapture --test-threads=1 >/dev/null
   echo "bench-ab: wrote $out/report.md" >&2
   exit 0
+fi
+
+if [ -n "$gate" ]; then
+  [ -f "$out/samples.tsv" ] || { echo "bench-ab: no $out/samples.tsv" >&2; exit 2; }
+  e2e=$(driver)
+  out=$(cd "$out" && pwd)
+  if FABRIC_AB_OUT=$out "$e2e" --ignored --exact ab::gate --nocapture --test-threads=1 >"$out/gate.log" 2>&1; then
+    echo "bench-ab: the gate passes; see $out/verdict.md" >&2
+    exit 0
+  fi
+  if [ ! -f "$out/verdict.md" ]; then
+    tail -n 20 "$out/gate.log" >&2
+    echo "bench-ab: the gate could not judge the run" >&2
+    exit 2
+  fi
+  echo "bench-ab: the gate fails; see $out/verdict.md" >&2
+  exit 1
 fi
 
 if [ -e "$out" ]; then
