@@ -83,41 +83,75 @@ win time; find a cheaper way to do the same check.
 
 The rule gates the release build, the one a node runs (Efe, 2026-10-29):
 the A/B run that must show no op slower and no daemon or CLI larger than
-the anchor is `scripts/bench-ab.sh --release`. The test profile is
-tracked, not gated: its runs stay in the record, but an unoptimized binary
-keeps more code pages resident than the anchor's, so its resident size is
-not held to the anchor's. CI's time budget below is a separate, coarse
+the anchor is `scripts/bench-ab.sh --release`, which CI runs. The test
+profile is tracked, not gated: its runs stay in the record, but an
+unoptimized binary keeps more code pages resident than the anchor's, so
+its resident size is not held to the anchor's. CI's time budget below is a separate, coarse
 guard and still runs in the test profile.
 
-`scripts/bench-ab.sh` is the evidence. It builds the anchor once into a
-cache, builds this working tree (or `--candidate <commit>`), and runs the
-ignored test `ab::paired` in `crates/fabric/tests/e2e/ab.rs`, which drives
-both builds through the same fixture and ops, taking turns op by op:
+CI measures it, on every pull request and every push to `main`: the
+`perf` job of `.github/workflows/perf.yml` runs on `macos-15`, builds the
+anchor (cached by commit) and the candidate in release on the same runner,
+and runs `scripts/bench-ab.sh --release --pairs 15 --counted 5`, then
+`scripts/bench-ab.sh --gate`. The job fails when a check breaks the rule:
+
+- an op whose time ratio, candidate over anchor, has a family interval
+  above 1: the 95% bootstrap interval across all timed ops at once
+  (Bonferroni), so that two equal builds fail at most one run in 20
+  however many ops there are;
+- a daemon's resident size or physical footprint after the timed runs,
+  or the CLI's peak resident size or physical footprint over the counted
+  ops, whose ratio has a family interval above 1 across the memory rows;
+- an op that starts more processes, or makes more full or barrier
+  flushes, than the anchor, medians over the counted runs. These do not
+  depend on the runner's load, so they hold where a shared runner's times
+  are too noisy to: `new`, `launch`, `cold start` and the approvals, whose
+  family intervals span about 0.6 to 1.9 on the runner.
+
+A run that fails is confirmed: the job runs both builds again, with the
+candidate's fixture started first this time, and
+`scripts/bench-ab.sh --gate --confirm` fails a check only when it fails in
+both runs. 6 of 15 single runs of the anchor against itself on the runner
+failed a check; none of the four confirmed A/A jobs did. The runner does not count instructions (the
+`proc_pid_rusage` count reads 0 in its virtual machine), so there is no
+instruction gate; the report still shows them where the machine counts
+them, as a local Mac does.
+
+The verdict, the machine and the full report go to the job summary, every
+sample to the run's artifact (`perf-ab-<sha>-<attempt>`), and the verdict
+to one comment on the pull request, edited on each push (a pull request
+from a fork gets a read-only token, so it has the summary only).
+`docs/evidence/perf-ab/README.md` holds the runs that set this design. A
+pull request does not need a local run any more, and keeps none in
+`docs/evidence/`; the CI run is the record.
+
+A local run is optional, to see a change before pushing it.
+`scripts/bench-ab.sh` builds the anchor once into a cache, builds this
+working tree (or `--candidate <commit>`), and runs the ignored test
+`ab::paired` in `crates/fabric/tests/e2e/ab.rs`, which drives both builds
+through the same fixture and ops, taking turns op by op:
 
 ```sh
-scripts/bench-ab.sh docs/evidence/perf-ab/<name>            # test profile, 15 pairs
-scripts/bench-ab.sh --release --pairs 20 docs/evidence/perf-ab/<name>
-scripts/bench-ab.sh --pairs 0 docs/evidence/perf-ab/<name>  # counted phase only
-scripts/bench-ab.sh --analyze docs/evidence/perf-ab/<name>  # the report again
+scripts/bench-ab.sh --release <dir>             # what CI runs, 15 pairs
+scripts/bench-ab.sh --release --pairs 0 <dir>   # counted phase only
+scripts/bench-ab.sh --release --gate <dir>      # CI's verdict on that run
+scripts/bench-ab.sh --analyze <dir>             # the report again
 ```
 
 Its `report.md` gives each op's median ratio, candidate over anchor, with
-a 95% bootstrap interval from at least 15 pairs, and each daemon's
-resident size and physical footprint. The resident size, from `ps`, also
-counts the clean pages of the binary's code, which a larger build keeps
-resident; the physical footprint, from macOS's `footprint(1)`, counts only
-the pages the daemon dirtied. On macOS a counted phase also loads
-`scripts/perf-ab/counters.c` into every `fabric` process and reports what
-does not depend on load: processes started by command, file flushes by
-kind and file, bytes read and written, allocations, and each CLI's peak
-resident size and CPU time, and each daemon's resident size and
-physical footprint after every op. With `--pairs 0` only that counted
-phase runs: its numbers do not depend on load, so it is the run to make
-on a busy machine, and a timed
-run waits for a quiet one. A pull request that touches a hot path keeps
-its run under `docs/evidence/perf-ab/`. An interval above 1 is a
-regression; a median above 1 whose interval holds 1 is profiled before
-merge.
+a 95% bootstrap interval, and each daemon's resident size and physical
+footprint. The resident size, from `ps`, also counts the clean pages of
+the binary's code, which a larger build keeps resident; the physical
+footprint, from macOS's `footprint(1)`, counts only the pages the daemon
+dirtied. A counted phase loads `scripts/perf-ab/counters.c` into every
+`fabric` process and reports what does not depend on load: processes
+started by command, file flushes by kind and file, bytes read and written,
+allocations, the instructions every process retired where the machine
+counts them, each CLI's peak resident size, physical footprint and CPU
+time, and each daemon's resident size and physical footprint after every
+op. The counters are macOS only (`docs/evidence/perf-ab/README.md` says
+why); elsewhere the counted phase is skipped. A median above 1 whose
+interval holds 1 is profiled before merge.
 
 ## Time budget
 
