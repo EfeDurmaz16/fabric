@@ -28,6 +28,7 @@ mod legacy;
 mod managed;
 mod placement;
 mod preflight;
+mod secrets;
 mod terminal;
 mod world;
 
