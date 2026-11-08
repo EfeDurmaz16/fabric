@@ -1480,7 +1480,7 @@ Owner B's parts landed in five commits: the client API and the facade parsers (`
 Client API (owner B):
 
 - `managed_create` keeps its required `repo`: `protocol/required.txt` pins it under api 1, and making it optional is a change `scripts/check-fixtures.sh` refuses without a bump. A source that is not a repository on the node (`git`, `snapshot`, `empty`, `directory`) travels in a new op, `managed_submit`, whose body is the facade's `submit` (`goal`, `harness`, `acceptance`, `source`, `policy`). `managed_create` gains `acceptance` and `policy`, `managed_cancel` gains `task`, and a task of `ManagedJob` gains `class` and `receipt`, all optional on the wire.
-- `managed_inspect` and the facade's `inspection` are one object (`fabric_client::api::Inspection`): the job with each task's class and last receipt, `parked`, `placements`, `continuations`, `notes`, `provider_operations`, `blockers` and `residuals`. A rank reason and an exclusion reason are kept by a client as they came (a name, or an object keyed by the reason's name), so a reason a newer node sends still shows; their forms are in docs/facade-protocol.md, "Placements in an inspection".
+- `managed_inspect` and the facade's `inspection` are one object (`fabric_client::api::Inspection`): the job with each task's class and last receipt (the CLI prints the receipt under its task: status, exit code, cut, snapshot and reason), `parked`, `placements`, `continuations`, `notes`, `provider_operations`, `blockers` and `residuals`. A rank reason and an exclusion reason are kept by a client as they came (a name, or an object keyed by the reason's name), so a reason a newer node sends still shows; their forms are in docs/facade-protocol.md, "Placements in an inspection".
 - The nine new ops are `managed_note`, `managed_checkpoint`, `managed_continue`, `managed_inspect`, `managed_submit`, `managed_import`, `facade_mint`, `facade_revoke` and `facade_call`; `facade_call` carries the facade message and its answer as JSON values the node never rewrites.
 
 Placement (owner B, P06):
@@ -1630,7 +1630,11 @@ pub(crate) async fn run(node: Arc<Node>);
 //                                    no live attempt: place with PlannedHandoff from the task's last cut (domain, as built)
 //   Checkpoint accepted           -> mark Dispatched, Instruct(Checkpoint { then: Resume })
 //   CancelJob, CancelTask accepted with a live attempt -> mark Dispatched, Instruct(Stop { reason })
-//   RegisterTask accepted with Spawn requested -> mark Dispatched, Instruct(Spawn(TaskLaunch)); Accepted: Succeeded, Refused: Failed
+//   RegisterTask accepted with Spawn requested -> mark Dispatched, Instruct(Spawn(TaskLaunch)); Accepted: Succeeded,
+//                                    Refused Busy or Frozen: sent again on a later pass, any other refusal: Failed
+//   a cancel's Stop that did not reach its node or was answered Busy is sent again until its node takes it (a restart
+//     sends each unsettled one once more); NotRunning ends the attempt Exited { Cancelled } here, which settles the cancel
+//   a grant with a cancel pending is not launched; its Stop ends it unlaunched
 //   every attempt `granted` on a remote node -> launch::plan then launch::send; Accepted and AlreadyLaunched record nothing
 //     (Started comes by report); Superseded records nothing; any other refusal is observed as Receipts (harness receipt
 //     Blocked { reason }) then Exited { Failed { code: None } }, so the attempt fails and the task is free
@@ -1672,7 +1676,7 @@ Where the code differs from the shapes above, or adds to them:
 - `launch::send` and `launch::instruct` are the `Link` trait, which the dispatch takes so its tests can record what is sent; `NodeLink` is the node's. A grant on this node is sent through the node's own `Service::launch` with its own id as the peer, not by calling `Node::runner_launch(None, ..)`: owner B's service maps its own id to `None`, so the runner takes a launch from its own authority by the same path as from a peer, and this branch builds without the runner. `plan` answers `PlanError::{Authority, Blocked}`: a journal that cannot be read is tried again, a grant that cannot be launched as recorded (no package, a failing check) is failed like a refused launch.
 - `package::build_for_continue` answers `BuildError::{Journal, NoCut, Package}`. It reads two journal reads added for it: `Journal::head` (the job's newest event digest, the ledger head) and `Journal::last_cut` (the newest cut's snapshot and digest, the evidence; the cut's own evidence list is not journaled).
 - `report::accept` and `report::heartbeat` take the `Authority` and the node's id, so their tests need no daemon; `Node::accept_report` and `Node::accept_heartbeat` call them. A report the domain answers with `StaleObservationRefused` is answered `StaleGeneration { current }`; one that names a generation newer than the job's is the domain's `StaleGeneration` refusal and answered the same.
-- The dispatch launches only grants a `CreateJob` or a `Continue` made; a `StartAttempt` grant stays the CLI's to start, as in M2. One pass launches the grants first, then dispatches the pending effects, then places every dispatched continue whose attempt ended at its cut, then launches what that granted. A launch that does not reach its node is tried again after the next commit or `RETRY` (2 s); an instruction that does not reach its node marks its command `Unknown`, since the node may have taken it; a refused instruction marks it `Failed`; an effect whose attempt ended before it was dispatched is marked `Dispatched` then `Failed`.
+- The dispatch launches only grants a `CreateJob` or a `Continue` made; a `StartAttempt` grant stays the CLI's to start, as in M2. One pass launches the grants first, then dispatches the pending effects, then places every dispatched continue whose attempt ended at its cut, then launches what that granted. A launch that does not reach its node is tried again after the next commit or `RETRY` (2 s); a checkpoint or a spawn that does not reach its node marks its command `Unknown`, since the node may have taken it; a cancel's stop that does not reach its node, or finds it busy, is sent again until taken, and one answered `NotRunning` ends the attempt cancelled; a spawn answered `Busy` or `Frozen` is sent again on a later pass; any other refusal marks the command `Failed`; a cancel is settled by any exit of its attempt, not only a cancelled one; an effect whose attempt ended before it was dispatched is marked `Dispatched` then `Failed`.
 - `crash_tests::a_launch_killed_after_the_node_accepted_is_not_launched_twice` is `dispatch::crash_tests`, a restart simulated by a dispatch that remembers nothing over the same journal; the kill at `after_launch_accepted` with two daemons needs owner B's runner and belongs with the e2e acceptance.
 - The v3 fixture's test child is registered while the first job's grant may still run, so it asks for a spawn, marked dispatched then succeeded. `tests/fixtures/v3-draft.sqlite` is the v3 fixture before the `program` column, for the `DraftSchema { version: 3 }` test.
 
@@ -1700,13 +1704,17 @@ impl Node {
 //      (Executor::adopt, below). workspace_only starts no harness.
 //   5. Report Started; for a continuation then Report Continued { from, achieved, package: Some(digest) when used };
 //      workspace_only then reports Exited { Succeeded } and ends.
-//   6. Executor::spawn each TaskLaunch (class Build or Test) in the root, cwd under it, env_allowlist applied.
+//   6. Executor::spawn each TaskLaunch (class Build or Test) in the root, cwd under it, env_allowlist applied; one that
+//      does not start is reported in Receipts as Blocked { reason }.
 //   7. Heartbeat every HEARTBEAT_MS with every token this node runs; Stale or Unknown -> Executor::stop(budget), end,
-//      no report; a failed heartbeat is retried next interval and flushes the report queue when it answers.
+//      no report; a failed heartbeat, or an answer with no verdict for the grant (the authority could not read the
+//      job), is retried next interval and flushes the report queue when it answers.
 //   8. the harness process exits -> Report Receipts (every task as it stands) then Exited { Succeeded | Failed { code } }; end.
 //   9. Instruct Checkpoint { then }: Executor::quiesce(budget); blockers -> Report HandoffBlocked, Executor::resume;
-//      none -> Executor::cut, Report Checkpointed { snapshot, cut }; Recorded and Resume -> Executor::resume;
-//      Recorded and End -> Executor::stop(budget) of what still runs, Executor::end; Refused StaleGeneration -> stop, end.
+//      none -> Executor::cut; End -> Executor::stop(budget) of what still runs before the cut is reported, since the
+//      authority places the replacement once it is recorded; Report Checkpointed { snapshot, cut }; Recorded and
+//      Resume -> Executor::resume; Recorded and End -> Executor::end; End refused -> Report Receipts then
+//      Exited { Failed { code: None } }; Refused StaleGeneration -> stop, end.
 //  10. Instruct Stop { reason }: Executor::stop(budget) -> Report Receipts (interrupted) then Exited { Cancelled }; end.
 //  11. Instruct Spawn(t): Executor::spawn; Frozen or Busy are refused as such.
 //  Reports go out in order per attempt; one in flight; a link failure or `Unavailable` keeps the queue for the next
