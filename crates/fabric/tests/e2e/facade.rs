@@ -258,3 +258,70 @@ fn e2e_a_socket_only_op_on_a_managed_job_is_refused_as_managed_job() -> Fallible
     assert!(inspected.contains(&job), "{inspected}");
     Ok(())
 }
+
+#[test]
+fn e2e_a_watch_cursor_holds_across_an_authority_restart() -> Fallible {
+    let env = Env::new()?;
+    let (mut a, b, job, _token_id, bearer) = world(&env)?;
+    let authority = a.id.clone();
+    let watch = |after: Option<&str>| -> Fallible<Value> {
+        let mut args = vec![
+            "facade",
+            "watch",
+            "--authority",
+            &authority,
+            "--token",
+            &bearer,
+            &job,
+            "--wait-ms",
+            "0",
+        ];
+        if let Some(after) = after {
+            args.extend(["--after", after]);
+        }
+        answer(&b.ok(&args)?)
+    };
+    let first = watch(None)?;
+    let seen = seqs(&first);
+    assert!(!seen.is_empty(), "{first}");
+    let cursor = first["next"].as_str().ok_or("next")?.to_owned();
+
+    // The authority is killed and started again: its journal, its token
+    // rows and the job's event sequence survive, so the reader's cursor
+    // still names the same place in the same history.
+    a.kill()?;
+    a.start(None)?;
+    a.ok(&[
+        "managed",
+        "note",
+        &job,
+        "--question",
+        "after the restart?",
+        "--operation-key",
+        "note-after-restart",
+    ])?;
+    let resumed = watch(Some(&cursor))?;
+    let later = seqs(&resumed);
+    assert!(
+        later.iter().all(|seq| *seq > seen[seen.len() - 1]),
+        "nothing twice across the restart: {seen:?} then {later:?}"
+    );
+    assert!(
+        resumed["events"]
+            .as_array()
+            .ok_or("events")?
+            .iter()
+            .any(|e| e["event"]["kind"] == "note_recorded"),
+        "{resumed}"
+    );
+    // From the start again: every event once, in order, the same prefix.
+    let whole = seqs(&watch(None)?);
+    assert_eq!(
+        &whole[..seen.len()],
+        &seen[..],
+        "the history before the restart is unchanged"
+    );
+    assert!(whole.windows(2).all(|w| w[0] < w[1]), "{whole:?}");
+    assert_eq!(whole.len(), seen.len() + later.len(), "{whole:?}");
+    Ok(())
+}
