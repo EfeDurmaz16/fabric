@@ -162,6 +162,11 @@ pub fn prepare_in(
             if root.exists() {
                 fresh_root(root)?;
                 let _ = std::fs::remove_dir(root);
+            } else if let Some(parent) = root.parent() {
+                // The restore stages beside the root, so on a node that
+                // never held the job its parents are made first.
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| unavailable(format!("{}: {e}", parent.display())))?;
             }
             restore(
                 store,
@@ -410,6 +415,23 @@ mod tests {
         assert_eq!(restored.get("a.txt").unwrap(), b"alpha");
         assert_eq!(restored.get("sub/b.txt").unwrap(), b"beta");
         assert_eq!(tree(&src), before, "nor after the restore");
+    }
+
+    /// A snapshot restores on a node that never held the job, whose root's
+    /// parent directories do not exist yet, as a continuation's target.
+    #[test]
+    fn a_snapshot_restores_where_no_parent_of_the_root_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "alpha").unwrap();
+        let mut store = store(dir.path());
+        let snapshot = import_from(&mut store, NODE, &src, &[]).unwrap();
+        let root = dir.path().join("home/fabric/jobs/job/work");
+        let prepared =
+            prepare_in(&root, &SourceBinding::Snapshot { snapshot }, Some(&store)).unwrap();
+        assert!(matches!(prepared, Prepared::Restored { .. }));
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"alpha");
     }
 
     #[test]
