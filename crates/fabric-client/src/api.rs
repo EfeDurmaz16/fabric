@@ -143,11 +143,13 @@ pub enum Op {
     JobExport,
     /// [`Request::JobExportPsf`].
     JobExportPsf,
+    /// [`Request::Gc`].
+    Gc,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 26] = [
+    pub const ALL: [Op; 27] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -174,6 +176,7 @@ impl Op {
         Op::JobRepair,
         Op::JobExport,
         Op::JobExportPsf,
+        Op::Gc,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -206,6 +209,7 @@ impl Op {
             Op::JobRepair => "job_repair",
             Op::JobExport => "job_export",
             Op::JobExportPsf => "job_export_psf",
+            Op::Gc => "gc",
         }
     }
 }
@@ -683,6 +687,51 @@ pub enum Request {
         /// The container directory to create; it must not exist.
         dir: SystemPath,
     },
+    /// Reports what crashed or ended work left on this node, and removes
+    /// it when `remove` is set (docs/concepts/residuals.md, ADR 0030). The
+    /// live set (the tenures this node owns, the managed attempts the
+    /// journal holds live, the jobs an operation runs on now) is never
+    /// touched. A provider resource is removed only through `worker`, and
+    /// only with an approval in `approvals` given for this call and that
+    /// one resource; no approval is ever stored.
+    Gc {
+        /// Remove what the report lists; a dry run when false.
+        remove: bool,
+        /// One fresh approval per provider resource to remove.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "null_as_default"
+        )]
+        approvals: Vec<GcApproval>,
+        /// The provider worker the approved removals go through.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<GcWorker>,
+    },
+}
+
+/// An approval for one provider resource, given for one `gc` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcApproval {
+    /// The create that made the resource.
+    #[serde(with = "text")]
+    pub operation: OperationId,
+    /// The reference the worker resolves to a grant for `sandbox.destroy`
+    /// on that resource alone; never stored, never sent for another.
+    pub approval: String,
+}
+
+/// The provider worker a `gc` call removes approved resources through:
+/// `<program> --profile <profile>`, then `--config <config>` when given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcWorker {
+    /// The worker's program.
+    pub program: SystemPath,
+    /// The capability profile it serves.
+    pub profile: String,
+    /// Its configuration file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<SystemPath>,
 }
 
 /// Every capability a node of this api version lists in its welcome, in
@@ -760,7 +809,8 @@ impl Request {
             | Request::ManagedStatus { .. }
             | Request::ManagedList
             | Request::JobRepair { .. }
-            | Request::JobExportPsf { .. } => None,
+            | Request::JobExportPsf { .. }
+            | Request::Gc { .. } => None,
         }
     }
 
@@ -794,6 +844,7 @@ impl Request {
             Request::JobRepair { .. } => Op::JobRepair,
             Request::JobExport { .. } => Op::JobExport,
             Request::JobExportPsf { .. } => Op::JobExportPsf,
+            Request::Gc { .. } => Op::Gc,
         }
     }
 }
@@ -1165,6 +1216,8 @@ pub enum Reply {
     JobExport(Exported),
     /// For [`Request::JobExportPsf`].
     JobExportPsf(PsfExported),
+    /// For [`Request::Gc`].
+    Gc(GcReport),
 }
 
 impl Reply {
@@ -1198,6 +1251,7 @@ impl Reply {
             Reply::JobRepair(_) => Op::JobRepair,
             Reply::JobExport(_) => Op::JobExport,
             Reply::JobExportPsf(_) => Op::JobExportPsf,
+            Reply::Gc(_) => Op::Gc,
         }
     }
 }
@@ -1266,6 +1320,142 @@ pub struct PsfExported {
     pub attachments: Vec<String>,
     /// The workspace paths left behind on this node, which the reader must recreate.
     pub left_behind: Vec<String>,
+}
+
+/// What `gc` found and did (docs/concepts/residuals.md, ADR 0030).
+///
+/// Each list is sorted by kind, then by where the item is, so two reports
+/// of the same state are equal. A kind, a state or a reason this client
+/// does not know is kept as its text: the set grows with what Fabric makes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    /// Whether this call removed what it found, or only reported it.
+    pub removing: bool,
+    /// What the live set holds: never removed, never listed as a residual.
+    pub live: Vec<GcLive>,
+    /// What crashed or ended work left, with its label.
+    pub residuals: Vec<GcResidual>,
+    /// What gc found and keeps, and why: preserved by design, busy, or
+    /// not classified.
+    pub kept: Vec<GcKept>,
+}
+
+impl GcReport {
+    /// Whether nothing was found to remove.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.residuals.is_empty()
+    }
+}
+
+/// Whose an item is: the job, and the tenure (`epoch`, standalone) or the
+/// attempt and its generation (managed) it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcLabel {
+    /// The job.
+    #[serde(with = "text")]
+    pub job: JobId,
+    /// The standalone tenure, when the item belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<Epoch>,
+    /// The node that made the item, when its label names one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub node: Option<NodeId>,
+    /// The managed task.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub task: Option<TaskId>,
+    /// The managed attempt.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub attempt: Option<AttemptId>,
+    /// The attempt's generation.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub generation: Option<Generation>,
+}
+
+/// One member of the live set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcLive {
+    /// `tenure` (a standalone job this node owns at `label.epoch`),
+    /// `attempt` (a managed attempt the journal holds granted or running
+    /// at its job's generation) or `busy` (an operation runs on the job).
+    pub holds: String,
+    /// Whose.
+    pub label: GcLabel,
+}
+
+/// Something crashed or ended work left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcResidual {
+    /// `harness_state_next`, `harness_state_old`, `restore_staging`,
+    /// `harness_group`, `harness_record` or `provider_resource`.
+    pub kind: String,
+    /// Its path, for a file or a directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// The process group's leader, for a harness group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<NonZeroU32>,
+    /// The create that made it, for a provider resource.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub operation: Option<OperationId>,
+    /// The worker's locator of it, as the journal holds it, for a provider resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+    /// Whose.
+    pub label: GcLabel,
+    /// `found` (a dry run), `removed`, `failed`, or `approval_required`
+    /// (a provider resource no approval was given for in this call).
+    pub state: String,
+    /// Why it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Something gc found and keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcKept {
+    /// What it is, as for a residual, or `departed_copy`, `orphan_copy`
+    /// or `unknown`.
+    pub kind: String,
+    /// Its path, for a file or a directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// The create that made it, for a provider resource.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub operation: Option<OperationId>,
+    /// Whose, when that can be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<GcLabel>,
+    /// `preserved` (kept by design: a departed or orphan copy), `busy`
+    /// (an operation runs on the job), `only_copy` (the only harness state
+    /// the job has), `unlabeled` (no label gc can read), `other_node` (a
+    /// label naming another node), `unknown_job` (a job this node does
+    /// not hold) or `unlocated` (a provider create with no locator).
+    pub reason: String,
 }
 
 /// A managed job as the client API shows it (ADR 0019).

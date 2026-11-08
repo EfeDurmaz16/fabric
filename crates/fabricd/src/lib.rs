@@ -21,6 +21,7 @@ pub mod durable;
 pub mod error;
 mod facts;
 mod faults;
+mod gc;
 pub mod harnesses;
 mod job;
 mod ledger_file;

@@ -34,4 +34,4 @@ pub use client::{
     Answer, Bridge, BridgeError, Cleanup, Config, Control, Effect, Event, InFlight, Outcome,
     Pending,
 };
-pub use log::{Entry, LogError, LogThread, MemoryLog, OperationLog, Recorder, Slot};
+pub use log::{Entry, InPlace, LogError, LogThread, MemoryLog, OperationLog, Recorder, Slot};

@@ -93,6 +93,10 @@ impl AuthorityError {
 
 type Reply<T> = oneshot::Sender<Result<T, AuthorityError>>;
 
+/// A call that runs on the authority's thread with the journal, `None`
+/// when there is none yet, or why the authority stopped.
+type Run = Box<dyn FnOnce(Result<Option<&mut Journal>, String>) + Send>;
+
 enum Call {
     Submit(Envelope<Command>, Reply<Answer>),
     #[cfg_attr(
@@ -107,6 +111,7 @@ enum Call {
     Mark(JobId, OperationId, OperationMark, Reply<Transition>),
     Job(JobId, Reply<Option<ManagedState>>),
     List(Reply<Vec<ManagedState>>),
+    Run(Run),
 }
 
 /// The managed ids as the standalone paths read them, without the queue.
@@ -312,6 +317,30 @@ impl Authority {
         }
         self.call(Call::List).await
     }
+
+    /// Runs `run` on the authority's thread with the journal, after the
+    /// calls queued before it, and returns what it returns; with no
+    /// journal it runs with `None` and starts no thread. `gc` reads
+    /// residuals and records cleanups through it, so the journal keeps
+    /// one writer (ADR 0030).
+    pub(crate) async fn with_journal<T, F>(&self, run: F) -> Result<T, AuthorityError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Option<&mut Journal>) -> Result<T, CommitError> + Send + 'static,
+    {
+        if self.idle() {
+            return Ok(run(None)?);
+        }
+        self.call(move |reply: Reply<T>| {
+            Call::Run(Box::new(move |journal| {
+                let _ = reply.send(match journal {
+                    Ok(journal) => run(journal).map_err(AuthorityError::from),
+                    Err(reason) => Err(AuthorityError::Unavailable(reason)),
+                });
+            }))
+        })
+        .await
+    }
 }
 
 /// Where the authority keeps its journal and where standalone jobs live.
@@ -450,6 +479,11 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
             Call::List(reply) => {
                 let _ = reply.send(list(&holder));
             }
+            Call::Run(run) => match &mut holder {
+                Holder::Absent => run(Ok(None)),
+                Holder::Open(journal) => run(Ok(Some(journal))),
+                Holder::Stopped(reason) => run(Err(reason.clone())),
+            },
         }
     }
 }
