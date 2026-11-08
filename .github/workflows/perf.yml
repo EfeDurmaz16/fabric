@@ -98,10 +98,11 @@ jobs:
           path: ~/.cache/fabric-ab
           key: ${{ steps.anchor-cache.outputs.cache-primary-key }}
 
-      # A run that fails is confirmed by a second run of both builds, and
-      # a check fails only when it fails in both: a shared runner's times
-      # are noisy enough that one run of two equal builds can fail an op
-      # (docs/evidence/perf-ab/README.md, CI section).
+      # A run that fails is confirmed by a second run of both builds, with
+      # the candidate's fixture started first this time, and a check fails
+      # only when it fails in both: on a shared runner one run of two equal
+      # builds can fail an op on noise, or a daemon's size on the order the
+      # fixtures started in (docs/evidence/perf-ab/README.md, CI section).
       - name: Gate, and confirm a failure
         env:
           CANDIDATE: ${{ matrix.candidate || inputs.candidate }}
@@ -111,7 +112,7 @@ jobs:
           scripts/bench-ab.sh --release --gate "$out" || status=$?
           [ "$status" -eq 1 ] || exit "$status"
           echo "::notice::the first run fails the gate; both builds run again to confirm"
-          scripts/bench-ab.sh --release --pairs 15 --counted 5 \
+          scripts/bench-ab.sh --release --pairs 15 --counted 5 --candidate-first \
             ${CANDIDATE:+--candidate "$CANDIDATE"} "$out/confirm"
           scripts/bench-ab.sh --release --gate --confirm "$out/confirm" "$out"
 
