@@ -1,0 +1,51 @@
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -61,10 +61,11 @@
+           persist-credentials: false
+           submodules: recursive
+       - name: Install dist
+-        # we specify bash to get pipefail; it guards against the `curl` command
+-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+-        shell: bash
+-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.34.0/cargo-dist-installer.sh | sh"
++        # Pinned and checksummed (scripts/install-release-tool.sh), not an
++        # installer piped to a shell.
++        run: scripts/install-release-tool.sh dist
++      - name: Check release.yml against dist-workspace.toml
++        run: scripts/release-workflow.sh --check
+       - name: Cache dist
+         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+         with:
+@@ -124,19 +125,12 @@
+         with:
+           persist-credentials: false
+           submodules: recursive
+-      - name: Install Rust non-interactively if not already installed
+-        if: ${{ matrix.container }}
+-        run: |
+-          if ! command -v cargo > /dev/null 2>&1; then
+-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+-          fi
+       - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+         with:
+           key: ${{ join(matrix.targets, '-') }}
+           cache-provider: ${{ matrix.cache_provider }}
+       - name: Install dist
+-        run: ${{ matrix.install_dist.run }}
++        run: scripts/install-release-tool.sh dist
+       # Get the dist-manifest
+       - name: Fetch local artifacts
+         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+@@ -198,10 +192,7 @@
+           path: ~/.cargo/bin/
+       - run: chmod +x ~/.cargo/bin/dist
+       - name: Install cargo-cyclonedx
+-        # we specify bash to get pipefail; it guards against the `curl` command
+-        # failing. otherwise `sh` won't catch that `curl` return non-0
+-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.5/cargo-cyclonedx-installer.sh | sh"
+-        shell: bash
++        run: scripts/install-release-tool.sh cargo-cyclonedx
+       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
+       - name: Fetch local artifacts
+         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333

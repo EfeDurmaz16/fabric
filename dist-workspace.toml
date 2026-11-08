@@ -9,6 +9,14 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.34.0"
 ci = "github"
+# release.yml is dist's output with scripts/release-workflow.patch applied:
+# pinned, checksummed tool installs instead of curl | sh, least-privilege
+# job permissions, attestations only when publishing, and a refusal of tags
+# that are not on main. dist cannot express these, so it must not insist on
+# its own output; scripts/release-workflow.sh regenerates the file and its
+# --check, run by the plan job, fails when the file is not dist's output
+# plus that patch.
+allow-dirty = ["ci"]
 # No crate ships unless it says so: only crates/fabric opts in, with its one
 # `fabric` binary (crates/fabric/Cargo.toml). The test doubles stay out.
 dist = false
