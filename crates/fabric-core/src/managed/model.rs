@@ -351,6 +351,7 @@ impl CommandKind {
                 | CommandKind::CancelTask
                 | CommandKind::Checkpoint
                 | CommandKind::Continue
+                | CommandKind::RegisterTask
         )
     }
 

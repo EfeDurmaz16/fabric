@@ -92,7 +92,11 @@ fn with_child(state: ManagedState) -> ManagedState {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
-            program: None,
+            program: Some(fabric_core::managed::Program {
+                argv: vec!["cargo".into(), "test".into()],
+                cwd: None,
+                env_allowlist: Vec::new(),
+            }),
         },
     };
     let t = accept_command(Some(&state), &child, &ids(2)).unwrap();
