@@ -27,6 +27,7 @@ cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
 scripts/check-hygiene.sh origin/main
+scripts/check-fixtures.sh origin/main
 scripts/check-budget.sh origin/main
 ```
 
@@ -43,9 +44,19 @@ bun run build
 FABRIC_BIN="$PWD/../../target/debug/fabric" bun test
 ```
 
+The bridge tests against the real Capsule worker are ignored by default and
+run when `CAPSULE_BRIDGE_WORKER` names a worker built from a Capsule checkout
+(see docs/bridge-protocol.md, Against the Capsule worker); CI builds one from
+the Capsule commit pinned in `.github/workflows/ci.yml`.
+
 `scripts/check-hygiene.sh` fails on an em dash or an AI attribution line in any
 tracked file or in any commit message on the branch, from any directory in the
 repository. `scripts/test-check-hygiene.sh` proves it fires; CI runs it first.
+
+`scripts/check-fixtures.sh` fails when a fixture under `protocol/fixtures` that
+the base already had was edited, renamed or removed, or `protocol/required.txt`
+changed for one, without a bump of `API_VERSION` (ADR 0018: a client API
+version only grows); `scripts/test-check-fixtures.sh` proves it fires.
 
 `scripts/check-budget.sh` fails when the time budget changed without a new
 `[[change]]` entry, or when it loosens a limit (see Time budget);

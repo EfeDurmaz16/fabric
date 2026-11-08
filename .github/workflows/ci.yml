@@ -237,7 +237,8 @@ jobs:
           # Capsule's m4/reconciliation head: the M4 worker with its review
           # fixes (an approval ref bound to the first operation it resolves
           # for, a container kept when its start timed out), merged with
-          # Capsule main (M1 and M3). Move it, and the pin below, whenever
+          # Capsule main (M1 and M3), and itself on Capsule main since its
+          # #318 merge on 2026-11-08. Move it, and the pin below, whenever
           # the worker or a package it bundles changes.
           ref: b5d436cf5e44146e61db783e5992537255059f59
           path: capsule
