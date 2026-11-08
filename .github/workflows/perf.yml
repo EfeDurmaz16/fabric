@@ -1,0 +1,165 @@
+name: perf
+
+# The performance rule (CONTRIBUTING.md): no op slower and no daemon or CLI
+# larger than the anchor, main at 176622e, in the release build. This is
+# where it is measured: scripts/bench-ab.sh builds the anchor and this
+# commit in release on one runner and runs both through the e2e fixture,
+# taking turns op by op, then --gate judges the run (ab::judge_run in
+# crates/fabric/tests/e2e/ab.rs) and fails the job when a check breaks the
+# rule. The tables go to the job summary, every file of the run to an
+# artifact, and the verdict to a comment on the pull request.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: A commit to compare instead of the checked-out one (the anchor itself gives an A/A run)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ANCHOR: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
+
+jobs:
+  perf:
+    name: perf (macos-15)
+    # macOS, since the counters (scripts/perf-ab/counters.c) interpose with
+    # dyld and read proc_pid_rusage, and the flushes they count are
+    # macOS's F_FULLFSYNC and F_BARRIERFSYNC; docs/evidence/perf-ab/README.md
+    # says why there is no Linux port.
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The anchor is built from its commit with git archive.
+          fetch-depth: 0
+
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      # The candidate's release build. Only main saves it, so parallel PR
+      # branches do not evict it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: perf-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # bench-ab.sh keeps the anchor's binary under FABRIC_AB_CACHE by
+      # commit, profile and toolchain; the key holds all three. A cache
+      # saved on main serves every pull request; one saved on a pull
+      # request serves its later pushes.
+      - name: Name the anchor's build
+        id: anchor
+        run: echo "toolchain=$(git show "$ANCHOR:rust-toolchain.toml" | shasum -a 256 | cut -c1-16)" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/fabric-ab
+          key: perf-anchor-${{ env.ANCHOR }}-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.anchor.outputs.toolchain }}
+
+      # 15 pairs, the fewest the rule accepts, and 5 counted runs.
+      - name: A/B against the anchor
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+        run: |
+          scripts/bench-ab.sh --release --pairs 15 --counted 5 \
+            ${CANDIDATE:+--candidate "$CANDIDATE"} "$RUNNER_TEMP/perf"
+
+      - name: Gate
+        run: scripts/bench-ab.sh --release --gate "$RUNNER_TEMP/perf"
+
+      - name: Job summary
+        if: always()
+        run: |
+          out=$RUNNER_TEMP/perf
+          {
+            if [ -f "$out/verdict.md" ]; then
+              cat "$out/verdict.md"
+            else
+              echo "### Perf gate: no verdict"
+              echo
+              echo "The run did not finish; the end of its log:"
+              echo
+              echo '```'
+              tail -n 40 "$out/run.log" 2>/dev/null || echo "no run.log"
+              echo '```'
+            fi
+            echo
+            echo '### Machine'
+            echo
+            echo '```'
+            cat "$out/machine.txt" 2>/dev/null || echo "no machine.txt"
+            echo '```'
+            echo
+            cat "$out/report.md" 2>/dev/null || true
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the run
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-ab-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/perf
+          if-no-files-found: warn
+          retention-days: 90
+
+  # The verdict as one comment on the pull request, edited on each run. A
+  # job of its own, so the write token never meets the pull request's code;
+  # a fork's pull request gets a read-only token, so it has no comment and
+  # the summary is the record.
+  comment:
+    name: perf comment
+    needs: perf
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (needs.perf.result == 'success' || needs.perf.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: perf-ab-${{ github.sha }}-${{ github.run_attempt }}
+          path: perf
+
+      - name: Post or edit the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RESULT: ${{ needs.perf.result }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          marker='<!-- fabric-perf -->'
+          {
+            echo "$marker"
+            if [ -f perf/verdict.md ]; then
+              cat perf/verdict.md
+            else
+              echo "### Perf gate: no verdict ($RESULT)"
+            fi
+            echo
+            echo "Head ${HEAD_SHA}; the full report, the counters and every sample are in [the run]($RUN_URL), its summary and its artifact."
+          } >body.md
+          id=$(gh api "repos/$GH_REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GH_REPO/issues/comments/$id" -F body=@body.md >/dev/null
+          else
+            gh api "repos/$GH_REPO/issues/$PR/comments" -F body=@body.md >/dev/null
+          fi
