@@ -1,0 +1,12 @@
+{
+  "op": "facade_call",
+  "authority": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "message": {
+    "type": "watch",
+    "facade": 1,
+    "token": "1111111111111111111111111111111111111111111111111111111111111111",
+    "job": "01K8W3A00000000000000000J1",
+    "after": null,
+    "wait_ms": 10000
+  }
+}

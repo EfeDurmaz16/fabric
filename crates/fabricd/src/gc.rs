@@ -439,7 +439,7 @@ impl Node {
         let jobs: Vec<JobId> = states.iter().map(|state| state.job.id).collect();
         let creates = self
             .authority
-            .with_journal(move |journal| {
+            .with_journal_or_none(move |journal| {
                 let Some(journal) = journal else {
                     return Ok(Vec::new());
                 };
@@ -827,7 +827,7 @@ impl Node {
         let bridge = Arc::clone(bridge);
         let handle = tokio::runtime::Handle::current();
         self.authority
-            .with_journal(move |journal| {
+            .with_journal_or_none(move |journal| {
                 let Some(journal) = journal else {
                     return Ok(Err("the node has no managed journal".to_owned()));
                 };

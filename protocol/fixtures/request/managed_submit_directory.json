@@ -1,0 +1,12 @@
+{
+  "op": "managed_submit",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "goal": "Work on the copy",
+  "harness": {
+    "kind": "codex"
+  },
+  "source": {
+    "kind": "directory",
+    "path": "/Users/me/work/copy"
+  }
+}

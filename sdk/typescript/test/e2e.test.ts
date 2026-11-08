@@ -319,6 +319,48 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
     expect(await client.managedStatus(made.job.job)).toMatchObject({ kind: "managed_status", state: "cancelled" });
   });
 
+  test("the facade reaches this node's own authority through facade_call", async () => {
+    const { client, welcome } = the();
+    const minted = await client.facadeMint("sdk-e2e", "any", "any", Date.now() + 600_000);
+    expect(minted.bearer).toMatch(/^[0-9a-f]{64}$/);
+    const operationKey = newOperationKey();
+    const accepted = await client.facadeCall(welcome.node, {
+      type: "submit",
+      token: minted.bearer,
+      key: operationKey,
+      submit: { goal: "submitted over the facade", harness: { kind: "codex" }, acceptance: [], source: { kind: "empty" } },
+    });
+    if (accepted.type !== "accepted") throw new Error(`not accepted: ${JSON.stringify(accepted)}`);
+    expect(accepted).toMatchObject({ key: operationKey, replayed: false, revision: "1" });
+    const again = await client.facadeCall(welcome.node, {
+      type: "submit",
+      token: minted.bearer,
+      key: operationKey,
+      submit: { goal: "submitted over the facade", harness: { kind: "codex" }, acceptance: [], source: { kind: "empty" } },
+    });
+    expect(again).toMatchObject({ type: "accepted", replayed: true, job: accepted.job });
+    const inspected = await client.facadeCall(welcome.node, { type: "inspect", token: minted.bearer, job: accepted.job });
+    if (inspected.type !== "inspection") throw new Error(`not an inspection: ${JSON.stringify(inspected)}`);
+    expect(inspected.inspection.job).toMatchObject({ job: accepted.job, goal: "submitted over the facade" });
+    expect(inspected.inspection.job.tasks[0]?.class).toBe("harness");
+    const local = await client.managedInspect(accepted.job);
+    expect(local.job).toStrictEqual(inspected.inspection.job);
+    const events = await client.facadeCall(welcome.node, {
+      type: "watch",
+      token: minted.bearer,
+      job: accepted.job,
+      after: null,
+      wait_ms: 0,
+    });
+    if (events.type !== "events") throw new Error(`not events: ${JSON.stringify(events)}`);
+    expect(events.events[0]?.event.kind).toBe("command_accepted");
+    expect(events.lagged).toBe(false);
+    const revoked = await client.facadeRevoke(minted.token_id);
+    expect(revoked.revoked).toBe(true);
+    const refused = await client.facadeCall(welcome.node, { type: "inspect", token: minted.bearer, job: accepted.job });
+    expect(refused).toMatchObject({ type: "refused", refusal: { code: "unauthorized", reason: "revoked" } });
+  });
+
   test("a hello of another api version is answered incompatible", async () => {
     const socket = createConnection({ path: the().socketPath });
     await once(socket, "connect");

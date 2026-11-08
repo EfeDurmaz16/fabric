@@ -36,6 +36,12 @@ pub enum Point {
     /// A CLI asked to record the harness it launched, and the node has
     /// written nothing for it yet.
     BeforeHarnessRecord,
+    /// An accepted managed create is about to be placed, and no decision is recorded yet.
+    BeforePlacement,
+    /// A grant is committed and its launch is not sent yet.
+    BeforeLaunch,
+    /// The node the grant names accepted its launch, and nothing else happened.
+    AfterLaunchAccepted,
     /// `fabric serve` was told to stop and still holds the state directory.
     WhileStopping,
     /// A suspend captured the harness state into `harness-state.next` and
@@ -46,7 +52,7 @@ pub enum Point {
 impl Point {
     /// Every point, for parsing.
     #[cfg(feature = "faults")]
-    const ALL: [Point; 9] = [
+    const ALL: [Point; 12] = [
         Point::AfterQuiesce,
         Point::AfterSnapshotPublish,
         Point::AfterDepartingWrite,
@@ -54,6 +60,9 @@ impl Point {
         Point::BeforeImport,
         Point::AfterImportReceipt,
         Point::BeforeHarnessRecord,
+        Point::BeforePlacement,
+        Point::BeforeLaunch,
+        Point::AfterLaunchAccepted,
         Point::WhileStopping,
         Point::MidHarnessCapture,
     ];
@@ -67,6 +76,9 @@ impl Point {
             Point::BeforeImport => "before_import",
             Point::AfterImportReceipt => "after_import_receipt",
             Point::BeforeHarnessRecord => "before_harness_record",
+            Point::BeforePlacement => "before_placement",
+            Point::BeforeLaunch => "before_launch",
+            Point::AfterLaunchAccepted => "after_launch_accepted",
             Point::WhileStopping => "while_stopping",
             Point::MidHarnessCapture => "mid_harness_capture",
         }

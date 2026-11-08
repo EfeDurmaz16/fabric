@@ -14,6 +14,13 @@ use std::time::Duration;
 use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
+use fabric_core::managed::launch::{
+    GrantVerdict, Heartbeat, HeartbeatAnswer, Instruction, LaunchAnswer, LaunchRequest,
+    MAX_HEARTBEAT_ATTEMPTS,
+};
+use fabric_core::managed::{
+    AttemptId, Generation, GrantToken, Intent, JobPolicy, RestartPolicy, SourceBinding, TaskId,
+};
 use fabric_core::moves::MoveOffer;
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
@@ -113,6 +120,33 @@ fn not_here<T>() -> JobFuture<'static, T> {
 }
 
 impl Service for FakeService {
+    fn launch(
+        &self,
+        _: NodeId,
+        request: LaunchRequest,
+    ) -> BoxFuture<'_, Result<LaunchAnswer, Fault>> {
+        Box::pin(async move {
+            Ok(match request.check() {
+                Ok(()) => LaunchAnswer::Accepted,
+                Err(reason) => LaunchAnswer::Refused { reason },
+            })
+        })
+    }
+    fn heartbeat(
+        &self,
+        _: NodeId,
+        beat: Heartbeat,
+    ) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>> {
+        Box::pin(async move {
+            Ok(HeartbeatAnswer {
+                verdicts: beat
+                    .attempts
+                    .iter()
+                    .map(|t| (t.attempt, GrantVerdict::Live))
+                    .collect(),
+            })
+        })
+    }
     fn pull(&self, _: NodeId, _: FencingToken, _: Option<RecordHash>) -> JobFuture<'_, Pulled> {
         not_here()
     }
@@ -927,5 +961,88 @@ async fn a_dial_order_names_the_one_wire_a_dial_uses() -> TestResult {
         assert!(dialed.quic_failure().is_none());
         assert_eq!(accepting.await??.kind(), kind);
     }
+    Ok(())
+}
+
+/// The launch path's four messages reach the serving node's service and
+/// come back as their answers; a method the service does not take is
+/// refused, and a heartbeat past its bound never leaves the sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_launch_path_messages_reach_the_service_and_are_answered() -> TestResult {
+    let (a, b) = (Node::new()?, Node::new()?);
+    let server = b.bind(TransportKind::TcpTls, &[a.id()])?;
+    let client = a.bind(TransportKind::TcpTls, &[b.id()])?;
+    let serving = serve_one(
+        server.clone(),
+        b.id(),
+        b.version.clone(),
+        Arc::new(FakeService::new()),
+        None,
+    );
+    let session = connect(
+        client.as_ref(),
+        b.id(),
+        server.local_addr()?,
+        a.id(),
+        a.version.clone(),
+    )
+    .await?;
+    let token = GrantToken {
+        job: JobId::from_bytes([1; 16]),
+        attempt: AttemptId::from_bytes([2; 16]),
+        generation: Generation::FIRST,
+    };
+    let request = LaunchRequest {
+        token,
+        task: TaskId::from_bytes([3; 16]),
+        intent: Intent {
+            goal: "run".to_owned(),
+            harness: fabric_core::harness::HarnessKind::ClaudeCode,
+            acceptance: Vec::new(),
+        },
+        source: SourceBinding::Empty,
+        policy: JobPolicy::m2_defaults(RestartPolicy::Block),
+        initial_checkpoint: None,
+        snapshot_at: None,
+        tasks: Vec::new(),
+        continuation: None,
+        package: None,
+    };
+    assert_eq!(
+        session.launch(request, DEADLINE).await?,
+        LaunchAnswer::Accepted
+    );
+    let answer = session
+        .heartbeat(
+            Heartbeat {
+                attempts: vec![token],
+            },
+            DEADLINE,
+        )
+        .await?;
+    assert_eq!(answer.verdicts, vec![(token.attempt, GrantVerdict::Live)]);
+    let refused = session
+        .instruct(
+            token,
+            Instruction::Stop {
+                reason: "test".to_owned(),
+            },
+            DEADLINE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(RpcError::Fault(Fault::BadRequest(_)))),
+        "{refused:?}"
+    );
+    let over = Heartbeat {
+        attempts: vec![token; MAX_HEARTBEAT_ATTEMPTS + 1],
+    };
+    assert!(matches!(
+        session.heartbeat(over, DEADLINE).await,
+        Err(RpcError::Wire(_))
+    ));
+    session.ping(DEADLINE).await?;
+    session.close();
+    assert!(serving.await?.is_err(), "serve ends with the connection");
     Ok(())
 }

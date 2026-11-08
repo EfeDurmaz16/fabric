@@ -35,10 +35,10 @@ use std::sync::{Arc, Mutex};
 
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
-    AttemptId, Command, DomainError, Envelope, ManagedState, NewIds, Observation, OperationId,
-    OperationMark, StoredResult, TaskId, Transition,
+    AttemptId, Command, CommandKind, DomainError, Envelope, ManagedState, NewIds, Observation,
+    OperationId, OperationKey, OperationMark, OperationStatus, StoredResult, TaskId, Transition,
 };
-use fabric_journal::{Answer, CommitError, FILE_NAME, Journal, Liveness, OpenError};
+use fabric_journal::{Answer, CommitError, FILE_NAME, Journal, KeyedRequest, Liveness, OpenError};
 use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
 
@@ -93,25 +93,68 @@ impl AuthorityError {
 
 type Reply<T> = oneshot::Sender<Result<T, AuthorityError>>;
 
+enum Call {
+    Submit(Envelope<Command>, Reply<Answer>),
+    Observe(JobId, Observation, Reply<Transition>),
+    Mark(JobId, OperationId, OperationMark, Reply<Transition>),
+    Job(JobId, Reply<Option<ManagedState>>),
+    List(Reply<Vec<ManagedState>>),
+    Pending(Reply<Vec<PendingEffect>>),
+    /// Work on the open journal by the facade and the inspect read (owner
+    /// B, M5): the closure answers its own caller. `create` makes the
+    /// journal when there is none yet, as a first `CreateJob` does, for a
+    /// token minted before any job. `writes` says whether the work may
+    /// change the journal; only then is the commit counter moved, so a
+    /// read wakes no watcher (one tick per call that changed the journal).
+    With {
+        create: bool,
+        writes: bool,
+        work: JournalWork,
+    },
+    /// A command whose body is derived from the job's state, deduplicated
+    /// by the caller's request (`Authority::submit_derived`).
+    Derived(DerivedWork),
+    /// Work on the journal, or on `None` when there is none yet
+    /// (`Authority::with_journal_or_none`).
+    Run(Run),
+}
+
 /// A call that runs on the authority's thread with the journal, `None`
 /// when there is none yet, or why the authority stopped.
 type Run = Box<dyn FnOnce(Result<Option<&mut Journal>, String>) + Send>;
 
-enum Call {
-    Submit(Envelope<Command>, Reply<Answer>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 reports through it")
-    )]
-    Observe(JobId, Observation, Reply<Transition>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
-    )]
-    Mark(JobId, OperationId, OperationMark, Reply<Transition>),
-    Job(JobId, Reply<Option<ManagedState>>),
-    List(Reply<Vec<ManagedState>>),
-    Run(Run),
+/// An accepted operation whose effect the node has not asked for yet: a
+/// grant to launch, a create to place, or an M5 command to dispatch. The
+/// request an M5 command was asked with is in the job's state
+/// (`ManagedState::request`). Read anew from the journal every time, so a
+/// restart and a running daemon see the same list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingEffect {
+    /// The job.
+    pub job: JobId,
+    /// The operation.
+    pub operation: OperationId,
+    /// Its kind.
+    pub kind: CommandKind,
+}
+
+/// Work the facade or a read runs inside the authority's thread; it
+/// answers its own caller.
+type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
+
+type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder) + Send>;
+
+/// The digest of a caller's request for [`Authority::submit_derived`]:
+/// blake3 under its own domain over each part, length first, so two
+/// requests that differ in any part differ here.
+pub(crate) fn request_digest(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fabric.managed.request.v1\0");
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// The managed ids as the standalone paths read them, without the queue.
@@ -129,6 +172,9 @@ enum Ids {
 #[derive(Debug, Clone)]
 pub(crate) struct Authority {
     writer: Arc<Mutex<Writer>>,
+    /// The commit counter once the thread runs, `None` before: what the
+    /// node's dispatch waits on without starting the thread itself.
+    started: Arc<watch::Sender<Option<watch::Receiver<u64>>>>,
     /// How many threads this authority started, for the tests.
     #[cfg(test)]
     spawned: Arc<std::sync::atomic::AtomicUsize>,
@@ -149,6 +195,9 @@ enum Writer {
         calls: mpsc::Sender<Call>,
         /// The ids it publishes outside the queue.
         ids: watch::Receiver<Ids>,
+        /// How many calls have changed the journal; a watcher of the
+        /// facade waits on it (M5).
+        commits: watch::Receiver<u64>,
         /// The thread, joined when the last handle drops, so a dropped
         /// authority has closed its journal: `SQLite` unlinks the WAL and
         /// shm beside the journal on the last close, and a caller that
@@ -180,6 +229,7 @@ impl Authority {
         let journal = !matches!(managed_dir(state).join(FILE_NAME).try_exists(), Ok(false));
         let authority = Authority {
             writer: Arc::new(Mutex::new(Writer::Idle(state.clone(), node))),
+            started: Arc::new(watch::channel(None).0),
             #[cfg(test)]
             spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -208,18 +258,108 @@ impl Authority {
         };
         let (calls, queue) = mpsc::channel(QUEUE);
         let (publish, ids) = watch::channel(Ids::Loading);
+        let (committed, commits) = watch::channel(0_u64);
         let thread = std::thread::Builder::new()
             .name("fabric-authority".into())
-            .spawn(move || serve(&place, queue, &publish))?;
+            .spawn(move || serve(&place, queue, &publish, &committed))?;
         #[cfg(test)]
         self.spawned
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started.send_replace(Some(commits.clone()));
         *writer = Writer::Running {
             calls: calls.clone(),
             ids: ids.clone(),
+            commits,
             _thread: JoinOnDrop(Some(thread)),
         };
         Ok((calls, ids))
+    }
+
+    /// A counter of the calls that changed the journal, for a facade watch
+    /// that waits for the next event (M5): it starts the thread when none
+    /// runs, so a watch on an empty authority waits on a live counter.
+    pub(crate) fn commits(&self) -> Result<watch::Receiver<u64>, AuthorityError> {
+        self.running()
+            .map_err(|e| AuthorityError::Unavailable(format!("its thread did not start: {e}")))?;
+        match &*crate::node::lock(&self.writer) {
+            Writer::Running { commits, .. } => Ok(commits.clone()),
+            Writer::Idle(..) => Err(AuthorityError::Unavailable(
+                "its thread did not start".into(),
+            )),
+        }
+    }
+
+    /// The commit counter, once the thread runs: waits without starting
+    /// it, so a node with no managed job starts no thread for its
+    /// dispatch. `None` when the authority is dropped before it starts.
+    pub(crate) async fn started(&self) -> Option<watch::Receiver<u64>> {
+        let mut started = self.started.subscribe();
+        started.wait_for(Option::is_some).await.ok()?.clone()
+    }
+
+    /// Runs `work` on the journal inside the authority's thread, after
+    /// the calls before it (M5, owner B: the facade's token rows and
+    /// reads, the inspect read). With `create`, a journal is made when
+    /// there is none, as a first `CreateJob` makes it; without it, an
+    /// absent journal is `UnknownJob` for the job the work names, or
+    /// unavailable for work that names none.
+    pub(crate) async fn with_journal<T: Send + 'static>(
+        &self,
+        create: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        self.journal_call(create, false, work).await
+    }
+
+    /// As [`Authority::with_journal`], for work that writes (a token
+    /// minted or revoked): the commit counter moves after it, so a watch
+    /// sees the write.
+    pub(crate) async fn write_journal<T: Send + 'static>(
+        &self,
+        create: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        self.journal_call(create, true, work).await
+    }
+
+    /// Runs `run` on the authority's thread with the journal, after the
+    /// calls queued before it, and returns what it returns; with no
+    /// journal it runs with `None` and starts no thread. `gc` reads
+    /// residuals and records cleanups through it, so the journal keeps
+    /// one writer (ADR 0030).
+    pub(crate) async fn with_journal_or_none<T, F>(&self, run: F) -> Result<T, AuthorityError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Option<&mut Journal>) -> Result<T, CommitError> + Send + 'static,
+    {
+        if self.idle() {
+            return Ok(run(None)?);
+        }
+        self.call(move |reply: Reply<T>| {
+            Call::Run(Box::new(move |journal| {
+                let _ = reply.send(match journal {
+                    Ok(journal) => run(journal).map_err(AuthorityError::from),
+                    Err(reason) => Err(AuthorityError::Unavailable(reason)),
+                });
+            }))
+        })
+        .await
+    }
+
+    async fn journal_call<T: Send + 'static>(
+        &self,
+        create: bool,
+        writes: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        self.call(|reply: Reply<T>| Call::With {
+            create,
+            writes,
+            work: Box::new(move |journal| {
+                let _ = reply.send(journal.and_then(work));
+            }),
+        })
+        .await
     }
 
     /// Whether no thread runs: no journal at start and no command since,
@@ -273,11 +413,31 @@ impl Authority {
         self.call(|reply| Call::Submit(envelope, reply)).await
     }
 
+    /// Applies a command whose body `derive` makes from `job`'s state (a
+    /// checkpoint names the live attempt, a continue its task) once per
+    /// request: `request` is the digest of what the caller asked
+    /// ([`request_digest`]), and it, not the derived body, decides
+    /// sameness under `key`. The same request again answers the stored
+    /// answer as a replay without deriving, however the job moved since;
+    /// another request under the key is `OperationConflict`. The check,
+    /// the derivation and the commit run as one call on the authority's
+    /// thread, so nothing interleaves.
+    pub(crate) async fn submit_derived<E: Send + 'static>(
+        &self,
+        key: OperationKey,
+        request: [u8; 32],
+        job: JobId,
+        derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E> + Send + 'static,
+    ) -> Result<Result<Answer, E>, AuthorityError> {
+        self.call(|reply: Reply<Result<Answer, E>>| {
+            Call::Derived(Box::new(move |place, holder| {
+                let _ = reply.send(derived(place, holder, &key, &request, job, derive));
+            }))
+        })
+        .await
+    }
+
     /// Records what an executor reports about an attempt or an operation.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 reports through it")
-    )]
     pub(crate) async fn observe(
         &self,
         job: JobId,
@@ -287,11 +447,8 @@ impl Authority {
             .await
     }
 
-    /// Marks an operation, `Dispatched` right before its effect is asked for.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
-    )]
+    /// Marks an operation, `Dispatched` right before its effect is asked
+    /// for, then its outcome when the answer settles it (the dispatch).
     pub(crate) async fn mark(
         &self,
         job: JobId,
@@ -318,28 +475,15 @@ impl Authority {
         self.call(Call::List).await
     }
 
-    /// Runs `run` on the authority's thread with the journal, after the
-    /// calls queued before it, and returns what it returns; with no
-    /// journal it runs with `None` and starts no thread. `gc` reads
-    /// residuals and records cleanups through it, so the journal keeps
-    /// one writer (ADR 0030).
-    pub(crate) async fn with_journal<T, F>(&self, run: F) -> Result<T, AuthorityError>
-    where
-        T: Send + 'static,
-        F: FnOnce(Option<&mut Journal>) -> Result<T, CommitError> + Send + 'static,
-    {
+    /// Every accepted operation whose effect was not asked for yet, oldest
+    /// job first: what the node's dispatch loop takes next, after a
+    /// restart as during a run. Each is dispatched once, after
+    /// `mark(Dispatched)` or, for a create or a continue, by its `Placed`.
+    pub(crate) async fn pending(&self) -> Result<Vec<PendingEffect>, AuthorityError> {
         if self.idle() {
-            return Ok(run(None)?);
+            return Ok(Vec::new());
         }
-        self.call(move |reply: Reply<T>| {
-            Call::Run(Box::new(move |journal| {
-                let _ = reply.send(match journal {
-                    Ok(journal) => run(journal).map_err(AuthorityError::from),
-                    Err(reason) => Err(AuthorityError::Unavailable(reason)),
-                });
-            }))
-        })
-        .await
+        self.call(Call::Pending).await
     }
 }
 
@@ -436,12 +580,56 @@ fn stopped(e: &dyn std::fmt::Display) -> Holder {
 }
 
 /// The authority's thread: recovery first, then one call at a time.
-fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids>) {
+fn serve(
+    place: &Place,
+    mut queue: mpsc::Receiver<Call>,
+    ids: &watch::Sender<Ids>,
+    committed: &watch::Sender<u64>,
+) {
     let mut holder = open_existing(place, ids);
+    let tick = || committed.send_modify(|n| *n = n.wrapping_add(1));
     while let Some(call) = queue.blocking_recv() {
         match call {
+            Call::With {
+                create,
+                writes,
+                work,
+            } => {
+                if create && matches!(holder, Holder::Absent) {
+                    match self::create(place) {
+                        Ok(journal) => holder = Holder::Open(journal),
+                        Err(e) => {
+                            work(Err(e));
+                            continue;
+                        }
+                    }
+                }
+                work(match &mut holder {
+                    Holder::Open(journal) => Ok(journal),
+                    Holder::Absent => {
+                        Err(AuthorityError::Unavailable("no managed journal yet".into()))
+                    }
+                    Holder::Stopped(reason) => Err(AuthorityError::Unavailable(reason.clone())),
+                });
+                if writes {
+                    tick();
+                }
+            }
+            Call::Derived(work) => {
+                work(place, &mut holder);
+                tick();
+            }
+            Call::Run(run) => {
+                match &mut holder {
+                    Holder::Absent => run(Ok(None)),
+                    Holder::Open(journal) => run(Ok(Some(journal))),
+                    Holder::Stopped(reason) => run(Err(reason.clone())),
+                }
+                tick();
+            }
             Call::Submit(envelope, reply) => {
                 let answer = submit(place, &mut holder, &envelope);
+                tick();
                 // Published before the answer, so no caller that saw the
                 // job made can look its id up and miss it.
                 if let Ok(Answer {
@@ -462,12 +650,14 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                     open(&mut holder, job)
                         .and_then(|j| Ok(j.observe(job, &observation, now_ms())?)),
                 );
+                tick();
             }
             Call::Mark(job, operation, mark, reply) => {
                 let _ = reply.send(
                     open(&mut holder, job)
                         .and_then(|j| Ok(j.mark(job, operation, mark, now_ms())?)),
                 );
+                tick();
             }
             Call::Job(job, reply) => {
                 let _ = reply.send(match &holder {
@@ -479,13 +669,33 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
             Call::List(reply) => {
                 let _ = reply.send(list(&holder));
             }
-            Call::Run(run) => match &mut holder {
-                Holder::Absent => run(Ok(None)),
-                Holder::Open(journal) => run(Ok(Some(journal))),
-                Holder::Stopped(reason) => run(Err(reason.clone())),
-            },
+            Call::Pending(reply) => {
+                let _ = reply.send(list(&holder).map(|jobs| pending(&jobs)));
+            }
         }
     }
+}
+
+/// The accepted effects of `jobs`: grants that may still be dispatched
+/// and M5 commands still `accepted`.
+fn pending(jobs: &[ManagedState]) -> Vec<PendingEffect> {
+    let mut out = Vec::new();
+    for state in jobs {
+        for op in &state.operations {
+            let waits = match op.kind {
+                CommandKind::StartAttempt => state.grant_may_dispatch(op.id),
+                _ => op.status == OperationStatus::Accepted,
+            };
+            if waits {
+                out.push(PendingEffect {
+                    job: state.job.id,
+                    operation: op.id,
+                    kind: op.kind,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The open journal; with none yet, `job` is a job the authority does not have.
@@ -515,6 +725,54 @@ fn list(holder: &Holder) -> Result<Vec<ManagedState>, AuthorityError> {
 
 fn ulid() -> [u8; 16] {
     Ulid::generate().to_bytes()
+}
+
+/// The body of [`Authority::submit_derived`] on the authority's thread.
+fn derived<E>(
+    place: &Place,
+    holder: &mut Holder,
+    key: &OperationKey,
+    request: &[u8; 32],
+    job: JobId,
+    derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E>,
+) -> Result<Result<Answer, E>, AuthorityError> {
+    let unknown = || -> AuthorityError {
+        if place.standalone(job) {
+            AuthorityError::Standalone(job)
+        } else {
+            CommitError::Domain(DomainError::UnknownJob { job }).into()
+        }
+    };
+    let journal = match holder {
+        Holder::Open(journal) => journal,
+        Holder::Absent => return Err(unknown()),
+        Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
+    };
+    match journal.keyed_request(key, request)? {
+        KeyedRequest::Other => {
+            return Err(
+                CommitError::Domain(DomainError::OperationConflict { key: key.clone() }).into(),
+            );
+        }
+        KeyedRequest::Same => {
+            if let Some(answer) = journal.stored_answer(key)? {
+                return Ok(Ok(answer));
+            }
+        }
+        KeyedRequest::New => {}
+    }
+    let Some(state) = journal.job(job)? else {
+        return Err(unknown());
+    };
+    let envelope = match derive(&state) {
+        Ok(envelope) => envelope,
+        Err(e) => return Ok(Err(e)),
+    };
+    if envelope.key != *key || envelope.job != Some(job) {
+        return Err(CommitError::Domain(DomainError::BadEnvelope).into());
+    }
+    journal.record_request(key, request)?;
+    Ok(Ok(submit(place, holder, &envelope)?))
 }
 
 fn submit(

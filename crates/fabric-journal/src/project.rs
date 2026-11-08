@@ -7,12 +7,13 @@
 //! the projection is never anything but the replay of the events written
 //! beside it.
 
-use fabric_core::id::{JobId, SnapshotId};
+use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
-    Attempt, AttemptId, AttemptStatus, CommandKind, EventDigest, EventFrame, Generation, JobState,
-    ManagedEvent, ManagedJob, ManagedState, OperationId, OperationKey, OperationProgress,
-    OperationStatus, RequestDigest, RestartPolicy, StoredPart, Task, TaskId, TaskKind, TaskState,
-    Transition, WorkRevision, apply_batch,
+    Attempt, AttemptId, AttemptStatus, CommandKind, CutDigest, EffectRequest, EventDigest,
+    EventFrame, Generation, JobState, ManagedEvent, ManagedJob, ManagedState, OperationId,
+    OperationKey, OperationProgress, OperationStatus, Program, RequestDigest, RestartPolicy,
+    StoredPart, Task, TaskClass, TaskId, TaskKind, TaskState, Transition, WorkRevision,
+    apply_batch,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -113,17 +114,6 @@ pub(crate) fn attempt_status_name(status: &AttemptStatus) -> &'static str {
     }
 }
 
-pub(crate) fn command_kind(name: &str) -> Option<CommandKind> {
-    Some(match name {
-        "create_job" => CommandKind::CreateJob,
-        "start_attempt" => CommandKind::StartAttempt,
-        "register_task" => CommandKind::RegisterTask,
-        "finish_task" => CommandKind::FinishTask,
-        "cancel_job" => CommandKind::CancelJob,
-        _ => return None,
-    })
-}
-
 /// The status of an accepted operation from its column; `None` for `rejected`, which has no progress.
 fn progress_status(name: &str) -> Option<OperationStatus> {
     Some(match name {
@@ -180,13 +170,59 @@ pub(crate) fn load_state(
         tasks: load_tasks(conn, job)?,
         attempts: load_attempts(conn, job)?,
         operations: load_operations(conn, job)?,
+        requests: load_requests(conn, job)?,
+        cuts: load_cuts(conn, job)?,
     }))
+}
+
+/// The job's checkpoint cuts, read from their events: one per
+/// `checkpoint_cut_recorded`, in order, as the replay folds them.
+fn load_cuts(
+    conn: &Connection,
+    job: JobId,
+) -> Result<Vec<(fabric_core::managed::AttemptId, fabric_core::id::SnapshotId)>, CommitError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT body FROM events WHERE job_id = ?1 AND kind = 'checkpoint_cut_recorded' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([job.to_bytes()], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let frame = EventFrame::decode(&row?).map_err(|e| corrupt(job, e))?;
+        if let ManagedEvent::CheckpointCutRecorded {
+            attempt, snapshot, ..
+        } = frame.event
+        {
+            out.push((attempt, snapshot));
+        }
+    }
+    Ok(out)
+}
+
+/// The effects the job's M5 commands asked for, read from their events:
+/// one row per `effect_requested`, in order, the same whichever way the
+/// state is built.
+fn load_requests(
+    conn: &Connection,
+    job: JobId,
+) -> Result<Vec<(OperationId, EffectRequest)>, CommitError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT body FROM events WHERE job_id = ?1 AND kind = 'effect_requested' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([job.to_bytes()], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let frame = EventFrame::decode(&row?).map_err(|e| corrupt(job, e))?;
+        if let ManagedEvent::EffectRequested { operation, request } = frame.event {
+            out.push((operation, request));
+        }
+    }
+    Ok(out)
 }
 
 fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
     let id = job.to_bytes();
     let mut stmt = conn.prepare_cached(
-        "SELECT task_id, parent_id, kind_body, restart, state FROM tasks
+        "SELECT task_id, parent_id, kind_body, restart, state, class, program FROM tasks
          WHERE job_id = ?1 ORDER BY created_rev, rowid",
     )?;
     let rows = stmt.query_map([id], |r| {
@@ -196,11 +232,13 @@ fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
             r.get::<_, Vec<u8>>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<Vec<u8>>>(6)?,
         ))
     })?;
     let mut tasks = Vec::new();
     for row in rows {
-        let (task, parent, kind, restart_name, state) = row?;
+        let (task, parent, kind, restart_name, state, class, program) = row?;
         tasks.push(Task {
             id: TaskId::from_bytes(task),
             job,
@@ -209,6 +247,11 @@ fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
             restart: restart(&restart_name)
                 .ok_or_else(|| corrupt(job, format!("restart {restart_name}")))?,
             state: task_state(&state).ok_or_else(|| corrupt(job, format!("task state {state}")))?,
+            class: TaskClass::from_name(&class)
+                .ok_or_else(|| corrupt(job, format!("task class {class}")))?,
+            program: program
+                .map(|bytes| part::<Program>(job, &bytes, "task program"))
+                .transpose()?,
         });
     }
 
@@ -273,7 +316,8 @@ fn load_operations(conn: &Connection, job: JobId) -> Result<Vec<OperationProgres
             id: OperationId::from_bytes(op),
             key: OperationKey::parse(&key).map_err(|e| corrupt(job, e))?,
             digest: RequestDigest::from_bytes(digest),
-            kind: command_kind(&kind).ok_or_else(|| corrupt(job, format!("kind {kind}")))?,
+            kind: CommandKind::from_name(&kind)
+                .ok_or_else(|| corrupt(job, format!("kind {kind}")))?,
             revision,
             status: progress_status(&status)
                 .ok_or_else(|| corrupt(job, format!("operation status {status}")))?,
@@ -401,11 +445,10 @@ pub(crate) fn write_transition(
         )?;
         last_seq = conn.last_insert_rowid();
         first_seq.get_or_insert(last_seq);
-        if let ManagedEvent::AttemptObserved {
-            attempt, status, ..
-        } = event
-        {
-            write_evidence(
+        match event {
+            ManagedEvent::AttemptObserved {
+                attempt, status, ..
+            } => write_evidence(
                 conn,
                 job,
                 *attempt,
@@ -413,7 +456,56 @@ pub(crate) fn write_transition(
                 status,
                 digest,
                 last_seq,
-            )?;
+            )?,
+            ManagedEvent::CheckpointCutRecorded {
+                attempt,
+                snapshot,
+                cut,
+                ..
+            } => write_cut_evidence(
+                conn,
+                job,
+                *attempt,
+                transition.revision,
+                *snapshot,
+                *cut,
+                digest,
+                last_seq,
+            )?,
+            ManagedEvent::PlacementDecided { task, decision } => {
+                conn.execute(
+                    "INSERT INTO placements (seq, job_id, task_id, kind, chosen, decided_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        last_seq,
+                        id,
+                        task.to_bytes(),
+                        decision.kind.name(),
+                        decision.chosen.map(NodeId::to_bytes),
+                        sql_u64(decision.decided_at_ms)?,
+                    ],
+                )?;
+            }
+            ManagedEvent::ContinuationRecorded {
+                attempt,
+                from,
+                achieved,
+                package,
+                ..
+            } => {
+                conn.execute(
+                    "INSERT INTO continuations (attempt_id, from_attempt, achieved, package, seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        attempt.to_bytes(),
+                        from.to_bytes(),
+                        achieved.name(),
+                        package.map(|p| p.0),
+                        last_seq,
+                    ],
+                )?;
+            }
+            _ => {}
         }
         prev = Some(digest);
     }
@@ -437,8 +529,8 @@ pub(crate) fn write_transition(
             continue;
         }
         conn.execute(
-            "INSERT INTO tasks (task_id, job_id, parent_id, kind, kind_body, restart, state, created_rev)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO tasks (task_id, job_id, parent_id, kind, kind_body, restart, state, created_rev, class, program)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT (task_id) DO UPDATE SET state = ?7",
             params![
                 task.id.to_bytes(),
@@ -452,6 +544,8 @@ pub(crate) fn write_transition(
                 restart_name(task.restart),
                 task_state_name(task.state),
                 sql_u64(transition.revision.get())?,
+                task.class.name(),
+                task.program.as_ref().map(stored).transpose()?,
             ],
         )?;
     }
@@ -538,6 +632,40 @@ fn write_evidence(
             kind,
             reference,
             digest,
+            seq,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Records a checkpoint cut as evidence: the snapshot by name, the cut's
+/// digest as the evidence digest (ADR 0023).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one write with the columns of the evidence row"
+)]
+fn write_cut_evidence(
+    conn: &Connection,
+    job: JobId,
+    attempt: AttemptId,
+    revision: WorkRevision,
+    snapshot: SnapshotId,
+    cut: CutDigest,
+    event: EventDigest,
+    seq: i64,
+) -> Result<(), CommitError> {
+    let mut evidence_id = [0u8; 16];
+    evidence_id.copy_from_slice(&event.to_bytes()[..16]);
+    conn.execute(
+        "INSERT INTO evidence (evidence_id, job_id, attempt_id, revision, kind, ref, digest, seq)
+         VALUES (?1, ?2, ?3, ?4, 'checkpoint', ?5, ?6, ?7)",
+        params![
+            evidence_id,
+            job.to_bytes(),
+            attempt.to_bytes(),
+            sql_u64(revision.get())?,
+            snapshot.to_string(),
+            cut.0,
             seq,
         ],
     )?;

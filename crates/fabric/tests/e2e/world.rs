@@ -173,12 +173,23 @@ impl Env {
     /// rollout under `~/.codex/sessions/`, whose first line records the
     /// Codex that created it, as Codex records no version on a resume,
     /// starting `CODEX_THREAD`, or the thread `exec resume`
-    /// names, and prints the events `codex exec --json` prints for one turn. After `thread.started` it waits up to five
+    /// names, and prints the events `codex exec --json` prints for one turn.
+    /// A resume continues the thread's rollout wherever under `sessions/`
+    /// a restore placed it, and first writes the thread's first prompt, as
+    /// it reads it there, to `codex-recalled`: the answer a resumed session
+    /// gives about its first turn, empty when no rollout of the thread is
+    /// on the node. With `FAKE_CODEX_HOLD` set it then keeps the rollout
+    /// open until it is stopped, as a Codex that has the thread loaded
+    /// does, so the adapter refuses to capture it while it runs. Otherwise,
+    /// after `thread.started` it waits up to five
     /// seconds for the node's session record of the job and writes `yes`
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
     /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
-    /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
-    /// to `codex-signal` before it exits with 130. With
+    /// starts one `sleep` child it holds for the whole turn (a child in
+    /// its group that no node registered: an escaped child, present at
+    /// every moment a quiescence may look), touches `codex-waiting` and
+    /// runs until a `SIGINT`, which it writes to `codex-signal` before it
+    /// ends the child and exits with 130. With
     /// `FAKE_CODEX_PROBE_WAIT` set, `--version` touches `codex-probing`
     /// and answers three seconds later. With `FAKE_CODEX_LATE_STDERR` set
     /// it leaves a process behind that writes `codex: late diagnostics` to
@@ -200,24 +211,35 @@ impl Env {
                  env > \"$HOME/codex-env\"\n\
                  [ \"$1\" = exec ] || exit 0\n\
                  thread={thread}\n\
-                 if [ \"$2\" = resume ]; then thread=\"$3\"; fi\n\
+                 resume=\n\
+                 if [ \"$2\" = resume ]; then thread=\"$3\"; resume=1; fi\n\
                  prompt=\n\
                  while [ $# -gt 0 ]; do if [ \"$1\" = -- ]; then prompt=\"$2\"; fi; shift; done\n\
                  dir=\"$HOME/.codex/sessions/2026/10/21\"\n\
                  mkdir -p \"$dir\"\n\
                  file=\"$dir/rollout-2026-10-21T10-00-00-$thread.jsonl\"\n\
+                 if [ -n \"$resume\" ] && [ ! -f \"$file\" ]; then\n\
+                   found=$(find \"$HOME/.codex/sessions\" -name \"rollout-*-$thread.jsonl\" 2>/dev/null | head -n 1)\n\
+                   [ -z \"$found\" ] || file=\"$found\"\n\
+                 fi\n\
+                 if [ -n \"$resume\" ]; then\n\
+                   sed -n 's/.*\"input_text\",\"text\":\"\\([^\"]*\\)\".*/\\1/p' \"$file\" 2>/dev/null | head -n 1 > \"$HOME/codex-recalled\"\n\
+                 fi\n\
                  [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\",\"cli_version\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" \"$version\" > \"$file\"\n\
                  printf '{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-sol\",\"effort\":\"xhigh\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\\n' >> \"$file\"\n\
                  printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
                  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
+                 [ -z \"$FAKE_CODEX_HOLD\" ] || {{ exec 3>>\"$file\"; exec sleep 3600; }}\n\
                  record=\"$FABRIC_HOME/jobs/$(basename \"$(dirname \"$(pwd -P)\")\")/session\"\n\
                  tries=0\n\
                  while [ ! -f \"$record\" ] && [ $tries -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
                  if [ -f \"$record\" ]; then echo yes > \"$HOME/codex-saw-session\"; else echo no > \"$HOME/codex-saw-session\"; fi\n\
                  if [ -n \"$FAKE_CODEX_WAIT\" ]; then\n\
-                   trap 'echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
+                   sleep 3600 &\n\
+                   child=$!\n\
+                   trap 'kill \"$child\" 2>/dev/null; echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
                    touch \"$HOME/codex-waiting\"\n\
-                   while :; do sleep 0.1; done\n\
+                   wait \"$child\"\n\
                  fi\n\
                  if [ -n \"$FAKE_CODEX_LATE_STDERR\" ]; then\n\
                    ( exec >/dev/null; sleep 0.5; echo 'codex: late diagnostics' >&2 ) &\n\

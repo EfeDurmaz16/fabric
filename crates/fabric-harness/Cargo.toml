@@ -1,6 +1,6 @@
 [package]
 name = "fabric-harness"
-version = "0.1.0"
+version.workspace = true
 description = "Harness adapters: capture, restore and launch a Claude Code, Codex, OpenCode, pi, Gemini CLI, Cursor Agent or ACP agent session"
 edition.workspace = true
 license.workspace = true

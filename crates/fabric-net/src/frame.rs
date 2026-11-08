@@ -34,6 +34,12 @@ pub(crate) const ENVELOPE_ALLOWANCE: usize = 1024;
 /// is as long as the ledger allows, always fits with its envelope.
 pub const MAX_CONTROL_FRAME: usize = crate::wire::MAX_RECORD_PAGE + ENVELOPE_ALLOWANCE;
 
+/// The most bytes a frame that carries a facade answer may take: the
+/// answer's bound (ADR 0027) plus its envelope. Only the answer to
+/// `RequestBody::Facade` is read under it; every other control message
+/// keeps `MAX_CONTROL_FRAME`.
+pub const MAX_FACADE_FRAME: usize = crate::wire::MAX_FACADE_ANSWER + ENVELOPE_ALLOWANCE;
+
 /// The most bytes one stored chunk may take: zstd's worst case for `MAX_CHUNK_LEN`.
 pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_LEN + (MAX_CHUNK_LEN >> 8);
 
@@ -90,6 +96,7 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     let mut header = [0u8; LENGTH_LEN + 1];
     header[..LENGTH_LEN].copy_from_slice(&length.to_le_bytes());
     header[LENGTH_LEN] = FRAME_VERSION;
+    crate::tap::record(payload);
     writer.write_all(&header).await.map_err(FrameError::Io)?;
     writer.write_all(payload).await.map_err(FrameError::Io)?;
     writer.flush().await.map_err(FrameError::Io)

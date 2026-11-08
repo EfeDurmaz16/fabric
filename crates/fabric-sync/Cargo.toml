@@ -2,12 +2,25 @@
 # The product name is not final. A rename changes this name, the binary's
 # name below and `NAME` in src/lib.rs, and nothing else in the code.
 name = "fabric-sync"
-version = "0.1.0"
+version.workspace = true
 description = "Push and pull a working tree, with its uncommitted work and its caches, to a directory or over SSH"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# A crate cargo-dist ships (dist-workspace.toml), in its own archives, with
+# its one binary; the formula has the binary's name.
+[package.metadata.dist]
+dist = true
+formula = "fabric-sync"
+
+[package.metadata.dist.binaries]
+aarch64-apple-darwin = ["fabric-sync"]
+x86_64-apple-darwin = ["fabric-sync"]
+x86_64-unknown-linux-gnu = ["fabric-sync"]
 
 [features]
 # Named fault points, for the crate's own crash tests only.

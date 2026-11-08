@@ -1,0 +1,34 @@
+{
+  "case": "report_handoff_blocked",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "report",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "observation": {
+      "kind": "handoff_blocked",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1",
+      "blockers": [
+        {
+          "escaped_child": {
+            "pid": 4242,
+            "group": 4200
+          }
+        },
+        {
+          "uncontrolled_writer": {
+            "pid": 4300,
+            "path": "notes/plan.md"
+          }
+        }
+      ]
+    }
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

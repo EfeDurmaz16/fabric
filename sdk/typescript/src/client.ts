@@ -29,6 +29,7 @@ import {
   UnsupportedFieldError,
   UntrustedError,
 } from "./errors.ts";
+import { type ClientMessage, type FacadeAnswer, readAnswer, writeClientMessage, type Submit } from "./facade.ts";
 import { createFrameDecoder, decodeJson, encodeFrame } from "./frame.ts";
 import {
   API_VERSION,
@@ -45,14 +46,24 @@ import {
   isReplyTo,
   type JobCreated,
   type JobId,
+  type TaskId,
   type JobList,
   type JobLog,
   type JobStatus,
   type KnownEvent,
   type Lease,
+  type Fidelity,
+  type Imported,
+  type JobScope,
+  type ManagedInspection,
   type ManagedJobs,
   type ManagedOperation,
   type ManagedStatus,
+  type Minted,
+  type Note,
+  type Program,
+  type ResourceScope,
+  type Revoked,
   type Repaired,
   type Exported,
   type PsfExported,
@@ -355,6 +366,100 @@ export class FabricClient {
   /** Every managed job. */
   managedList(options?: CallOptions): Promise<ManagedJobs> {
     return this.call({ op: "managed_list" }, options);
+  }
+
+  /** Makes a managed job from a source that is not a repository on the node (M5); the key as for `managedCreate`. */
+  managedSubmit(operation_key: OperationKey, submit: Submit, options?: CallOptions): Promise<ManagedOperation> {
+    const { goal, harness, source, policy } = submit;
+    const acceptance = submit.acceptance.length === 0 ? undefined : submit.acceptance;
+    return this.call({ op: "managed_submit", operation_key, goal, harness, acceptance, source, policy }, options);
+  }
+
+  /** Records a note on a managed job (M5); the key as for `managedCreate`. */
+  managedNote(
+    operation_key: OperationKey,
+    job: JobId,
+    note: Note,
+    expectedRevision?: Counter,
+    options?: CallOptions,
+  ): Promise<ManagedOperation> {
+    const expected_revision = expectedRevision;
+    return this.call({ op: "managed_note", operation_key, job, expected_revision, note }, options);
+  }
+
+  /**
+   * Registers a build or test task with the program it runs under `parent`
+   * (the launch path); the key as for `managedCreate`. With a live attempt
+   * of the parent its node is asked to spawn the task.
+   */
+  managedRegister(
+    operation_key: OperationKey,
+    job: JobId,
+    registration: { parent: TaskId; label: string; class: "build" | "test"; program: Program },
+    expectedRevision?: Counter,
+    options?: CallOptions,
+  ): Promise<ManagedOperation> {
+    const expected_revision = expectedRevision;
+    const { parent, label, class: taskClass, program } = registration;
+    return this.call(
+      { op: "managed_register", operation_key, job, expected_revision, parent, label, class: taskClass, program },
+      options,
+    );
+  }
+
+  /** Takes a checkpoint cut of a managed job's live attempt (M5). */
+  managedCheckpoint(
+    operation_key: OperationKey,
+    job: JobId,
+    expectedRevision?: Counter,
+    options?: CallOptions,
+  ): Promise<ManagedOperation> {
+    const expected_revision = expectedRevision;
+    return this.call({ op: "managed_checkpoint", operation_key, job, expected_revision }, options);
+  }
+
+  /** Continues a managed job on a newly placed attempt (M5). */
+  managedContinue(
+    operation_key: OperationKey,
+    job: JobId,
+    choice: { expectedRevision?: Counter; fidelity?: Fidelity[]; pin?: NodeId } = {},
+    options?: CallOptions,
+  ): Promise<ManagedOperation> {
+    const { expectedRevision: expected_revision, fidelity, pin } = choice;
+    return this.call({ op: "managed_continue", operation_key, job, expected_revision, fidelity, pin }, options);
+  }
+
+  /** Everything the journal holds about one managed job (M5). */
+  managedInspect(job: JobId, options?: CallOptions): Promise<ManagedInspection> {
+    return this.call({ op: "managed_inspect", job }, options);
+  }
+
+  /** Captures a directory on the node into a snapshot (M5). */
+  managedImport(path: SystemPath, exportAllowlist: string[] = [], options?: CallOptions): Promise<Imported> {
+    const export_allowlist = exportAllowlist.length === 0 ? undefined : exportAllowlist;
+    return this.call({ op: "managed_import", path, export_allowlist }, options);
+  }
+
+  /** Mints a facade token on the node's authority (ADR 0027); the bearer is shown once. */
+  facadeMint(
+    actor: string,
+    jobs: JobScope,
+    resources: ResourceScope,
+    expiresMs: number,
+    options?: CallOptions,
+  ): Promise<Minted> {
+    return this.call({ op: "facade_mint", actor, jobs, resources, expires_ms: expiresMs }, options);
+  }
+
+  /** Revokes a facade token. */
+  facadeRevoke(tokenId: string, options?: CallOptions): Promise<Revoked> {
+    return this.call({ op: "facade_revoke", token_id: tokenId }, options);
+  }
+
+  /** Sends one facade message to `authority` through the node and reads the authority's answer. */
+  async facadeCall(authority: NodeId, message: ClientMessage, options?: CallOptions): Promise<FacadeAnswer> {
+    const reply = await this.call({ op: "facade_call", authority, message: writeClientMessage(message) }, options);
+    return readAnswer(reply.message);
   }
 
   /**

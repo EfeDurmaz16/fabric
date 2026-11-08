@@ -138,15 +138,20 @@ fn is_leaf(path: &[String]) -> bool {
 fn sample(id: &str, sandbox: &Sandbox) -> String {
     match id {
         "job" | "JOB" => JOB.to_owned(),
-        "node" | "to" | "on" | "peer" | "NODE" => node(),
-        "repo" | "path" | "PATH" => sandbox.path("repo").display().to_string(),
-        "goal" | "prompt" | "reason" | "note" | "TEXT" => "demo".to_owned(),
+        "node" | "to" | "on" | "peer" | "NODE" | "authority" => node(),
+        "repo" | "path" | "PATH" | "dir" => sandbox.path("repo").display().to_string(),
+        "goal" | "prompt" | "reason" | "note" | "TEXT" | "label" | "question" => "demo".to_owned(),
         "addr" | "HOST:PORT" => "127.0.0.1:7777".to_owned(),
         "KEY" => "retry-1".to_owned(),
         "REVISION" => "3".to_owned(),
-        "psf" | "container" | "dir" | "DIR" | "CONTAINER" => {
-            sandbox.path("psf").display().to_string()
-        }
+        "token" | "BEARER" => "ab".repeat(32),
+        "actor" | "ACTOR" => "e2e".to_owned(),
+        "token_id" | "TOKEN_ID" => "01JABCDEFGHJKMNPQRSTVWXYZ1".to_owned(),
+        "parent" | "TASK" => "01JABCDEFGHJKMNPQRSTVWXYZ2".to_owned(),
+        "class" => "build".to_owned(),
+        "argv" => "true".to_owned(),
+        "ttl_ms" => "60000".to_owned(),
+        "psf" | "container" | "DIR" | "CONTAINER" => sandbox.path("psf").display().to_string(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
 }
@@ -170,16 +175,47 @@ fn filled(path: &[String], sandbox: &Sandbox) -> Option<Vec<String>> {
     Some(args)
 }
 
+/// Adds `option` to `args`, before a `--` that ends the options if there is one.
+fn add_option(args: &mut Vec<String>, option: &str) {
+    let at = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    args.insert(at, option.to_owned());
+}
+
+/// Takes `option` back out of `args`.
+fn remove_option(args: &mut Vec<String>, option: &str) {
+    if let Some(at) = args.iter().position(|arg| arg == option) {
+        args.remove(at);
+    }
+}
+
 /// `path` with every required argument given a sample value.
 fn runnable(path: &[String], sandbox: &Sandbox) -> Vec<String> {
     let cmd = find(path);
     let mut args = path.to_vec();
-    for arg in cmd.get_arguments().filter(|arg| arg.is_required_set()) {
+    // A required group, such as a create's source, is given by its first member.
+    let firsts: Vec<&clap::Arg> = cmd
+        .get_groups()
+        .filter(|group| group.is_required_set())
+        .filter_map(|group| group.get_args().next())
+        .filter_map(|id| cmd.get_arguments().find(|arg| arg.get_id() == id))
+        .collect();
+    for arg in cmd
+        .get_arguments()
+        .filter(|arg| arg.is_required_set())
+        .chain(firsts)
+    {
         let id = arg.get_id().as_str();
         if let Some(long) = arg.get_long() {
             args.push(format!("--{long}"));
+        } else if arg.is_last_set() {
+            args.push("--".to_owned());
         }
-        args.push(sample(id, sandbox));
+        if arg.get_action().takes_values() {
+            args.push(sample(id, sandbox));
+        }
     }
     args
 }
@@ -425,7 +461,7 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
             .any(|arg| arg.get_id() == "operation_key");
 
         // A relative state directory fails every command before it does anything.
-        args.push("--json".to_owned());
+        add_option(&mut args, "--json");
         let output = sandbox
             .command(&args)
             .env("FABRIC_HOME", "state")
@@ -478,7 +514,7 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
             "{name}: {doc}"
         );
 
-        args.pop();
+        remove_option(&mut args, "--json");
         let output = sandbox.run(&args);
         let err = stderr(&output);
         assert_eq!(stdout(&output), "", "{name}: stdout is not empty");
@@ -527,7 +563,7 @@ fn no_color_removes_every_escape_sequence() {
             .unwrap();
         assert!(!escapes(&off), "{name}: NO_COLOR left an escape sequence");
         let mut flagged = args.clone();
-        flagged.push("--no-color".to_owned());
+        add_option(&mut flagged, "--no-color");
         let off = sandbox
             .command(&flagged)
             .env("FORCE_COLOR", "1")

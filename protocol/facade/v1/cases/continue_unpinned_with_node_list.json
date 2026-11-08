@@ -1,0 +1,45 @@
+{
+  "case": "continue_unpinned_with_node_list",
+  "direction": "client_to_authority",
+  "given": {
+    "now_ms": 1762128000000,
+    "tokens": [
+      {
+        "token_id": "01K8W3A0000000000000000K02",
+        "bearer": "2222222222222222222222222222222222222222222222222222222222222222",
+        "actor": "efe-laptop",
+        "jobs": [
+          "01K8W3A00000000000000000J1"
+        ],
+        "resources": [
+          "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+        ],
+        "expires_ms": 1762131600000,
+        "revoked_ms": null
+      }
+    ],
+    "jobs": [
+      {
+        "job": "01K8W3A00000000000000000J1",
+        "revision": "6",
+        "state": "active",
+        "live_attempt": true
+      }
+    ],
+    "operations": []
+  },
+  "message": {
+    "type": "continue",
+    "facade": 1,
+    "token": "2222222222222222222222222222222222222222222222222222222222222222",
+    "key": "key-cont-5",
+    "job": "01K8W3A00000000000000000J1",
+    "expected_revision": null,
+    "pin": null
+  },
+  "expect": {
+    "outcome": "reject",
+    "code": "scope",
+    "reason": "resource"
+  }
+}

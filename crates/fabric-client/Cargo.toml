@@ -1,6 +1,6 @@
 [package]
 name = "fabric-client"
-version = "0.1.0"
+version.workspace = true
 description = "The client API of a Fabric node: typed requests, replies, events and refusals over the control socket, and a client"
 edition.workspace = true
 license.workspace = true

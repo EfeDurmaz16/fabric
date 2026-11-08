@@ -1,0 +1,64 @@
+{
+  "case": "submit_expired_token",
+  "direction": "client_to_authority",
+  "given": {
+    "now_ms": 1762128000000,
+    "tokens": [
+      {
+        "token_id": "01K8W3A0000000000000000K03",
+        "bearer": "3333333333333333333333333333333333333333333333333333333333333333",
+        "actor": "efe-laptop",
+        "jobs": "any",
+        "resources": "any",
+        "expires_ms": 1762127999999,
+        "revoked_ms": null
+      }
+    ],
+    "jobs": [],
+    "operations": []
+  },
+  "message": {
+    "type": "submit",
+    "facade": 1,
+    "token": "3333333333333333333333333333333333333333333333333333333333333333",
+    "key": "key-submit-1",
+    "intent": {
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "acceptance": [
+        "cargo test passes"
+      ]
+    },
+    "source": {
+      "kind": "git",
+      "uri": "https://example.com/org/repo.git",
+      "commit": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "policy": {
+      "drain_budget_ms": 30000,
+      "allowed_fidelity": [
+        "native_session",
+        "new_native_session_with_package"
+      ],
+      "secrets": [
+        {
+          "name": "API_TOKEN",
+          "attempt": "any",
+          "resource_kinds": [
+            "node"
+          ]
+        }
+      ],
+      "export_allowlist": [],
+      "disk_bytes": 2147483648,
+      "pin": null
+    }
+  },
+  "expect": {
+    "outcome": "reject",
+    "code": "unauthorized",
+    "reason": "expired"
+  }
+}

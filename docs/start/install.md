@@ -1,6 +1,6 @@
 # Install
 
-There is no release, no Homebrew formula and no package yet. You build the binary from source. A release train with unsigned binaries for three platforms and a Homebrew tap is on the [roadmap](../roadmap.md) (PRs 3 and 14).
+There is no release yet. From the first tag on, `brew install EfeDurmaz16/tap/fabric-node` and unsigned binaries for three platforms on GitHub Releases are the quick way in; the [README](https://github.com/EfeDurmaz16/fabric#install) has both and the macOS Gatekeeper note, and [Releases](../release.md) says what a release holds. This page builds from source, which works today.
 
 ## Needs
 

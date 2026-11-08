@@ -66,6 +66,80 @@ named, instead of misreading a request. Version 4 added the question a push
 asks its target for the facts of the job's harness (ADR 0013, amended
 2026-10-27), so a node updated past it pairs only with nodes updated too.
 
+Version 4 has not shipped, and M5 adds two more messages to it (ADR 0026,
+ADR 0027). `Advertise` asks a peer what it offers for the placement of one
+managed job and is answered with `Advert`: platform, harnesses with versions,
+path layout, load and free disk, warmth for the job, the time measured, and
+the job's secrets the peer cannot resolve. `Facade` carries one facade
+message, JSON of at most 1 MiB that the link does not read, to the peer's
+managed authority, and is answered with `Facade`, the authority's answer of at
+most 16 MiB, unchanged (docs/facade-protocol.md). A facade message runs under
+the per-peer job work cap like a per-job message, so a watch holds one slot
+for at most its wait, and its answer alone is read under the facade's own
+frame bound; every other control message keeps the control frame's. A peer
+that serves neither answers a fault, which the asking node records as that
+peer's exclusion or answers its client as `unavailable`.
+
+The launch path (docs/managed-jobs.md, "Launch path (M5, as built)") adds
+four more messages to version 4, still unshipped. `Launch` carries a grant
+from a job's authority to the node it chose: the token (job, attempt,
+generation), the intent, the source, the policy, the checkpoint to start
+from and the node whose store holds it, the build and test tasks with
+their programs, and for a planned handoff the continuation and its work
+package; the node answers `Accepted` or `Refused` at once and runs the
+attempt after. `Instruct` asks the node that runs an attempt to spawn a
+task, to quiesce and cut (then resume or end), or to stop. `Report`
+carries one observation of an attempt back to the authority under the
+grant's token and is answered `Recorded` with the job's revision, or
+`Refused`; a token whose generation is not the job's is refused
+`StaleGeneration` and the node stops the attempt. `Heartbeat` names every
+grant a node runs, every two seconds while it runs one, and is answered
+with a verdict per grant (`Live`, `Stale`, `Unknown`); it writes nothing.
+All four fit the control frame (a launch's package is at most 256 KiB)
+and run under the per-peer job work cap. The shapes are
+`fabric_core::managed::launch`; the receiving side checks every bound
+again after it decodes.
+
+## Launch path fixtures
+
+[`protocol/net/v4`](../protocol/net/v4) holds one case per message form
+and a manifest, as the facade's fixtures do (docs/facade-protocol.md,
+"Fixtures"). A case is `{ "case", "direction", "message", "expect" }`:
+`direction` is `authority_to_node` or `node_to_authority`; `message` is
+the message's fields in the client API's text forms (ids as text,
+counters as decimal strings, a `type` naming the request); `expect` is
+`{ "outcome": "accept" }` or `{ "outcome": "reject", "reason": ... }`.
+The pin test, `crates/fabric-net/tests/launch_fixtures.rs`, checks every
+file against `manifest.sha256`, that none is missing or extra, and that
+the manifest's own sha256 is the one pinned there; then it builds each
+accepted case's message with the Rust constructors, encodes it as a
+request in a control frame, decodes it and compares, and checks that each
+rejected case is refused by the check its `reason` names
+(`Program::check`, `Report::check`, the list bounds). The manifest's
+sha256 as of this contract's commit is
+`972ed115913ac8cd4ca7aeb6e48923c5e0e82dcbcaa3839d502c5be55882b7aa`; the
+pin test carries the same constant, and it moves only with the fixtures,
+in the same commit.
+
+As built: the four messages are `RequestBody::{Launch, Instruct, Report,
+Heartbeat}`, answered by the `ResponseBody` of the same name, and served
+under the per-peer job work cap like a facade message: the work runs to
+its end, only the answer races the budget. The list bounds
+(`MAX_TASK_LAUNCHES` tasks in a launch, `MAX_HEARTBEAT_ATTEMPTS` grants in
+a heartbeat) are `RequestBody::check_bounds`, run when a request is
+parsed (`Request::from_control_payload`) and before `Session::launch` or
+`Session::heartbeat` sends one. The checks that answer a refusal rather
+than a fault are the receiver's: `LaunchRequest::check` (programs,
+`snapshot_at` with a checkpoint, a package exactly with a continuation,
+the package's job and size) and `Report::check`. `Service::{launch,
+instruct, report, heartbeat}` refuse by default with `Fault::BadRequest`.
+
+```sh
+cd protocol/net/v4
+find . -type f ! -name manifest.sha256 | sed 's|^\./||' | LC_ALL=C sort | xargs shasum -a 256 > manifest.sha256
+shasum -a 256 manifest.sha256
+```
+
 ## Wires
 
 Both transports listen on one port, and the node holds them as one

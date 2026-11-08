@@ -59,6 +59,8 @@ use std::time::{Duration, Instant};
 
 use crate::world::{Env, Fallible, Node, Wire, edit, pair};
 
+mod new_paths;
+
 /// The harness of each job shape, by its name in the report.
 const SHAPES: [(&str, &str); 3] = [
     ("acp", crate::AGENT),
