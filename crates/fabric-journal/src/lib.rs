@@ -762,7 +762,11 @@ impl Journal {
                 return Ok(Err(verdict));
             }
             // The same refusal again: refused, not recorded again.
-            if self.refused.get(&(token.attempt, path)) == Some(&verdict) {
+            if self
+                .refused
+                .get(&(token.attempt, path))
+                .is_some_and(|seen| same_refusal(seen, &verdict))
+            {
                 return Ok(Err(verdict));
             }
             let event = match verdict {
@@ -1264,5 +1268,21 @@ impl Journal {
     }
 }
 
+/// Whether `verdict` repeats the refusal `seen` for one attempt and path.
+/// A wrong node is one refusal whichever node sent it: the sender is not
+/// part of the job's state, so two peers taking turns would otherwise grow
+/// the history at wire speed (ADR 0028). Every other verdict changes only
+/// as the job does.
+fn same_refusal(seen: &FenceVerdict, verdict: &FenceVerdict) -> bool {
+    match (seen, verdict) {
+        (
+            FenceVerdict::WrongNode { granted: a, .. },
+            FenceVerdict::WrongNode { granted: b, .. },
+        ) => a == b,
+        _ => seen == verdict,
+    }
+}
+
 #[cfg(test)]
 mod tests;
+

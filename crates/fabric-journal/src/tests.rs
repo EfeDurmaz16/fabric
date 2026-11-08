@@ -868,6 +868,30 @@ fn a_refused_covered_write_changes_nothing_else() {
 /// without a record, and a different verdict for the same attempt is
 /// recorded again.
 #[test]
+fn two_wrong_nodes_alternating_are_recorded_once() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    let x = NodeId::from_bytes([0x77; 32]);
+    let y = NodeId::from_bytes([0x78; 32]);
+    let revision = |f: &Fixture| f.journal.job(job).unwrap().unwrap().job.revision.get();
+    let before = revision(&f);
+    for i in 0..6 {
+        let from = if i % 2 == 0 { x } else { y };
+        let verdict = f
+            .journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(from), 3_000 + i)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(verdict, FenceVerdict::WrongNode { .. }));
+    }
+    assert_eq!(
+        revision(&f),
+        before + 1,
+        "a wrong node is one refusal whichever peer sent it"
+    );
+}
+
+#[test]
 fn a_repeated_refusal_is_recorded_once_and_a_made_up_attempt_never() {
     let mut f = Fixture::new();
     let (job, token) = running(&mut f);
