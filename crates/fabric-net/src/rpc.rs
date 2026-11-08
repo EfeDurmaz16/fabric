@@ -1075,6 +1075,7 @@ impl VerifiedChunk {
             Err(_) => return None,
         };
         let bytes = zstd::bulk::decompress(&stored, capacity).ok()?;
+        crate::tap::record(&bytes);
         (ChunkId::of(&bytes) == id).then_some(Self { id, stored, bytes })
     }
 

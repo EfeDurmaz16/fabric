@@ -27,6 +27,7 @@ pub mod peers;
 mod pipe;
 pub mod quic;
 pub mod rpc;
+mod tap;
 pub mod tcp;
 pub mod tls;
 pub mod transport;

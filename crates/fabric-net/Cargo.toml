@@ -7,6 +7,11 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# The plaintext capture the end-to-end test reads through FABRIC_NET_TAP;
+# off in every build that is not a test.
+tap = []
+
 [dependencies]
 fabric-core = { path = "../fabric-core" }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
