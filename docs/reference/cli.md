@@ -18,6 +18,7 @@ Commands:
   node     This node's identity and its paired nodes
   job      Make, run, suspend, move and resume jobs
   managed  Make, cancel and read managed jobs (ADR 0019)
+  psf      Read Portable Session Format containers (ADR 0029)
   doctor   Print this node's facts, or compare them with a paired node's before a move
   help     Print this message or the help of the given subcommand(s)
 
@@ -142,7 +143,8 @@ Commands:
   approve  Record an approval in the ledger
   reject   Record a rejection in the ledger
   repair   Settle a job frozen after a fork by the fork rule: take the peer's chain when it wins, keeping this node's ledger and its snapshots
-  export   Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot
+  export   Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot; with --psf, write the job's latest snapshot as a Portable Session Format container instead
+  import   Check a Portable Session Format container against the job it names on this node, and say what this node can continue
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -332,7 +334,7 @@ Options:
 #### `fabric job export`
 
 ```text
-Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot
+Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot; with --psf, write the job's latest snapshot as a Portable Session Format container instead
 
 Usage: fabric job export [OPTIONS] <JOB>
 
@@ -341,7 +343,20 @@ Arguments:
 
 Options:
       --path <PATH>  A workspace a restore set aside under orphan/ beside the job's root; the workspace at the root when left out
+      --psf <PSF>    The container directory to write, which must not exist (ADR 0029)
   -h, --help         Print help
+```
+
+#### `fabric job import`
+
+```text
+Check a Portable Session Format container against the job it names on this node, and say what this node can continue
+
+Usage: fabric job import --psf <PSF>
+
+Options:
+      --psf <PSF>  The container directory
+  -h, --help       Print help
 ```
 
 ### `fabric managed`
@@ -418,6 +433,35 @@ Options:
 Every managed job this node's authority holds
 
 Usage: fabric managed ls
+
+Options:
+  -h, --help  Print help
+```
+
+### `fabric psf`
+
+```text
+Read Portable Session Format containers (ADR 0029)
+
+Usage: fabric psf <COMMAND>
+
+Commands:
+  inspect  Check a container or a manifest and print its digest, the fidelity it offers and the attachments it lacks
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric psf inspect`
+
+```text
+Check a container or a manifest and print its digest, the fidelity it offers and the attachments it lacks
+
+Usage: fabric psf inspect <PATH>
+
+Arguments:
+  <PATH>  A container directory, or a `manifest.json`
 
 Options:
   -h, --help  Print help

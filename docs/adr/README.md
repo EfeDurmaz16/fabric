@@ -4,7 +4,7 @@
 
 Every architecture decision record on `main`, with the status line the ADR itself carries. An ADR that says `proposed` and `as built on main` records code that is on `main` while the decision is still open for amendment; the status line says which parts.
 
-No ADR on `main` has the number 0017.
+No ADR on `main` has the number 0017, 0023, 0024, 0025, 0026, 0027, 0028.
 
 How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions).
 
@@ -31,3 +31,4 @@ How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions
 | [0020](0020-managed-authority-journal.md) | The managed authority, its journal and fencing eligibility | proposed, 2026-10-27; as built on `main` since 2026-11-03 (PR #31, schema version 2 in PR #32). Amended 2026-10-29: schema version 2 adds the `provider_operations` table of ADR 0021, which Efe approved that day; version 2 has not shipped in any release. |
 | [0021](0021-capsule-provider-bridge.md) | Versioned provider bridge to a Capsule worker | proposed, 2026-10-27; the bridge client and protocol v1 are on `main` since 2026-11-03 (PR #32). The `provider_operations` journal table (schema version 2) was approved by Efe on 2026-10-29; the rest of this ADR stays proposed. |
 | [0022](0022-reconciliation-and-cleanup-authorization.md) | Reconciliation of provider operations and cleanup authorization | proposed, 2026-10-29; as built on `main` since 2026-11-08 (PR #36). |
+| [0029](0029-portable-session-format.md) | The Portable Session Format v1 | proposed 2026-11-08 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 4 of the 2026-11-08 roadmap. |

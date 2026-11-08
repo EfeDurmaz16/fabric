@@ -63,6 +63,7 @@
   - [ADR 0020: The managed authority, its journal and fencing eligibility](adr/0020-managed-authority-journal.md)
   - [ADR 0021: Versioned provider bridge to a Capsule worker](adr/0021-capsule-provider-bridge.md)
   - [ADR 0022: Reconciliation of provider operations and cleanup authorization](adr/0022-reconciliation-and-cleanup-authorization.md)
+  - [ADR 0029: The Portable Session Format v1](adr/0029-portable-session-format.md)
 <!-- adr:end -->
 
 # Project
