@@ -224,7 +224,23 @@ pub(crate) fn create_command(submit: &Submit, source: SourceBinding) -> Result<C
     })
 }
 
-/// The allowance a `continue` names, or the job's own.
+/// The allowance a facade `continue` asks for: what it names, cut to what
+/// the job's policy allows, or the policy's own when it names none. A
+/// token holder never widens the allowance (ADR 0024: the owner does);
+/// when nothing is left the domain refuses the continue as `fidelity`.
+pub(crate) fn facade_allowance(names: Option<&[FidelityName]>, job: &JobPolicy) -> AllowedFidelity {
+    let named = allowance(names, job);
+    let policy = job.allowed_fidelity;
+    AllowedFidelity {
+        native_session: named.native_session && policy.native_session,
+        new_native_session_with_package: named.new_native_session_with_package
+            && policy.new_native_session_with_package,
+        workspace_only: named.workspace_only && policy.workspace_only,
+    }
+}
+
+/// The allowance a `continue` names, or the job's own; the owner's
+/// socket passes it as named, since the owner may widen it.
 pub(crate) fn allowance(names: Option<&[FidelityName]>, job: &JobPolicy) -> AllowedFidelity {
     names.map_or(job.allowed_fidelity, |names| AllowedFidelity {
         native_session: names.contains(&FidelityName::NativeSession),
@@ -411,7 +427,7 @@ impl Node {
                 let task = state.live_attempt().map_or(state.job.primary, |a| a.task);
                 let command = Command::Continue {
                     task,
-                    fidelity: allowance(fidelity.as_deref(), &state.job.policy),
+                    fidelity: facade_allowance(fidelity.as_deref(), &state.job.policy),
                     pin,
                 };
                 self.facade_command(record, &key, Some(job), expected_revision, command)
@@ -1543,6 +1559,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, all);
+    }
+
+    /// A facade `continue` cannot widen the job's fidelity allowance: what
+    /// it names is cut to what the policy allows, and nothing left is a
+    /// refusal, never a lower fidelity. Only the owner widens it.
+    #[tokio::test]
+    async fn a_continue_cannot_widen_the_jobs_fidelity_allowance() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let mut create = submit_json(&hex_of(1), "k1", "g");
+        create["policy"] = json!({ "allowed_fidelity": ["native_session"], "pin": null });
+        let (job, _) = accepted(&node.facade_answer(&create, NOW).await);
+        let widen = json!({ "type": "continue", "facade": 1, "token": hex_of(1),
+            "key": "k-cont", "job": job.to_string(), "expected_revision": null,
+            "pin": null, "fidelity": ["workspace_only"] });
+        refused_as(
+            &node.facade_answer(&widen, NOW).await,
+            RefusalCode::Refused,
+            "fidelity",
+        );
+        let both = json!({ "type": "continue", "facade": 1, "token": hex_of(1),
+            "key": "k-cont-2", "job": job.to_string(), "expected_revision": null,
+            "pin": null, "fidelity": ["workspace_only", "native_session"] });
+        accepted(&node.facade_answer(&both, NOW).await);
+        let state = node.authority.job(job).await.unwrap().unwrap();
+        let requested = state.requests.iter().find_map(|(_, r)| match r {
+            fabric_core::managed::EffectRequest::Continue { fidelity, .. } => Some(*fidelity),
+            _ => None,
+        });
+        assert_eq!(
+            requested,
+            Some(AllowedFidelity {
+                native_session: true,
+                new_native_session_with_package: false,
+                workspace_only: false,
+            })
+        );
     }
 
     /// An ACP harness whose arguments carry a secret is refused before the

@@ -102,7 +102,7 @@ Answered with `accepted`. Refused with reason `not_live` when no attempt of the 
   "fidelity": ["native_session", "new_native_session_with_package"], "pin": null }
 ```
 
-`fidelity` is optional and defaults to the job's allowance; empty is `bad_request`/`empty_fidelity`. `pin` is required and nullable; a pin outside the token's resource scope, or no pin under a token limited to listed nodes, is `refused`/`scope`/`resource`. Answered with `accepted`.
+`fidelity` is optional and defaults to the job's allowance; a named list is cut to the job's allowance (a token holder never widens it; the owner does, on the socket), and nothing left is `refused`/`fidelity`; empty is `bad_request`/`empty_fidelity`. `pin` is required and nullable; a pin outside the token's resource scope, or no pin under a token limited to listed nodes, is `refused`/`scope`/`resource`. Answered with `accepted`.
 
 ## Messages from the authority
 
