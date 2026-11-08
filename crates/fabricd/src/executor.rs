@@ -944,6 +944,10 @@ mod tests {
         }
     }
 
+    /// A task that runs `script` under `sh -c`. A shell may fork its last
+    /// command instead of replacing itself (dash on Ubuntu does), and the
+    /// forked child is then an escaped child of the task's group (ADR
+    /// 0023), so a task meant to be one process says `exec`.
     fn sh(script: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg(script);
@@ -978,7 +982,7 @@ mod tests {
     async fn an_interrupted_test_is_recorded_interrupted_never_passed() {
         let b = bench(Ok(SnapshotId::of(b"x"))).await;
         b.executor
-            .spawn(b.attempt, task(1), TaskClass::Test, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Test, sh("exec sleep 30"))
             .await
             .unwrap();
         let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
@@ -1011,7 +1015,7 @@ mod tests {
         let b = bench(Ok(SnapshotId::of(b"x"))).await;
         let spawned = b
             .executor
-            .spawn(b.attempt, task(1), TaskClass::Build, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Build, sh("exec sleep 30"))
             .await
             .unwrap();
         let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
@@ -1034,7 +1038,7 @@ mod tests {
         let b = bench(Ok(snapshot)).await;
         let spawned = b
             .executor
-            .spawn(b.attempt, task(1), TaskClass::Harness, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Harness, sh("exec sleep 30"))
             .await
             .unwrap();
         let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
@@ -1062,7 +1066,7 @@ mod tests {
     async fn a_failed_harness_checkpoint_blocks_the_handoff() {
         let b = bench(Err("the transcript is locked".into())).await;
         b.executor
-            .spawn(b.attempt, task(1), TaskClass::Harness, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Harness, sh("exec sleep 30"))
             .await
             .unwrap();
         let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
@@ -1086,7 +1090,7 @@ mod tests {
     async fn an_opaque_task_blocks() {
         let b = bench(Ok(SnapshotId::of(b"x"))).await;
         b.executor
-            .spawn(b.attempt, task(1), TaskClass::Opaque, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Opaque, sh("exec sleep 30"))
             .await
             .unwrap();
         let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
@@ -1173,7 +1177,7 @@ mod tests {
         let b = bench(Ok(SnapshotId::of(b"x"))).await;
         // The parent is spawned first, the leaf after; the leaf settles first.
         b.executor
-            .spawn(b.attempt, task(1), TaskClass::Build, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Build, sh("exec sleep 30"))
             .await
             .unwrap();
         b.executor
@@ -1192,7 +1196,7 @@ mod tests {
         let b = bench(Ok(SnapshotId::of(b"x"))).await;
         let spawned = b
             .executor
-            .spawn(b.attempt, task(1), TaskClass::Opaque, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Opaque, sh("exec sleep 30"))
             .await
             .unwrap();
         let started = tokio::time::Instant::now();
@@ -1206,7 +1210,7 @@ mod tests {
         let b2 = bench(Ok(SnapshotId::of(b"x"))).await;
         let spawned2 = b2
             .executor
-            .spawn(b2.attempt, task(1), TaskClass::Test, sh("sleep 30"))
+            .spawn(b2.attempt, task(1), TaskClass::Test, sh("exec sleep 30"))
             .await
             .unwrap();
         let started = tokio::time::Instant::now();
@@ -1317,7 +1321,7 @@ mod tests {
             )
             .await;
         b.executor
-            .spawn(b.attempt, task(1), TaskClass::Test, sh("sleep 30"))
+            .spawn(b.attempt, task(1), TaskClass::Test, sh("exec sleep 30"))
             .await
             .unwrap();
         let executor = Arc::new(b.executor);
@@ -1515,7 +1519,7 @@ mod tests {
                 )
                 .await;
             let spawned = executor
-                .spawn(attempt, task(2), TaskClass::Test, sh("sleep 30"))
+                .spawn(attempt, task(2), TaskClass::Test, sh("exec sleep 30"))
                 .await
                 .unwrap();
             assert!(alive(spawned.pid));
