@@ -512,6 +512,38 @@ async fn presence_marks_overdue_on_the_authority_clock_and_writes_no_heartbeat()
     assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
 }
 
+#[tokio::test]
+async fn a_heartbeat_or_a_tick_that_writes_nothing_wakes_no_watch() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (_job, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let mut commits = authority.commits().unwrap();
+    commits.borrow_and_update();
+    let now = mono_ms();
+    assert!(authority.tick(now).await.unwrap().is_empty());
+    authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    authority.heartbeat(OTHER, beat(token)).await.unwrap();
+    assert!(
+        !commits.has_changed().unwrap(),
+        "nothing was written, so no watch wakes"
+    );
+    // A tick that makes the attempt unknown writes, and moves the counter.
+    assert_eq!(
+        authority
+            .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(commits.has_changed().unwrap());
+    commits.borrow_and_update();
+    // The heartbeat that brings it back writes too.
+    authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert!(commits.has_changed().unwrap());
+}
+
 /// The runner captures a checkpoint and the authority acknowledges it
 /// after its own fetch (the fetch is M5's executor path; the
 /// acknowledgement is what recovery reads).

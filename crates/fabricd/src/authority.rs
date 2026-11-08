@@ -804,13 +804,28 @@ fn serve(
                 );
                 bump();
             }
+            // A heartbeat or a tick moves the counter only when it wrote,
+            // so an idle authority wakes no facade watch (ADR 0028).
             Call::Heartbeat(from, beat, reply) => {
-                let _ = reply.send(heartbeat(place, &mut holder, &mut presence, from, &beat));
-                bump();
+                let mut wrote = false;
+                let _ = reply.send(heartbeat(
+                    place,
+                    &mut holder,
+                    &mut presence,
+                    from,
+                    &beat,
+                    &mut wrote,
+                ));
+                if wrote {
+                    bump();
+                }
             }
             Call::Tick(now, reply) => {
-                let _ = reply.send(tick(place, &mut holder, &mut presence, now));
-                bump();
+                let mut wrote = false;
+                let _ = reply.send(tick(place, &mut holder, &mut presence, now, &mut wrote));
+                if wrote {
+                    bump();
+                }
             }
             Call::Job(job, reply) => {
                 let _ = reply.send(match &holder {
@@ -941,56 +956,62 @@ fn note(place: &Place, presence: &mut Presence, job: JobId, events: &[ManagedEve
 /// did not see (one made while the journal was stopped) is tracked from
 /// here. A write from this node is never presence: nothing on this node
 /// heartbeats. Writes nothing else; a failed observation is logged and
-/// the fence then answers as the journal stands.
+/// the fence then answers as the journal stands. Returns whether it
+/// committed the observation.
 fn presence_of(
     place: &Place,
     journal: &mut Journal,
     presence: &mut Presence,
     from: NodeId,
     token: &GrantToken,
-) {
+) -> bool {
     if from == place.node {
-        return;
+        return false;
     }
     let (now, wall) = (mono_ms(), now_ms());
     if presence.seen(from, token, now, wall) {
-        return;
+        return false;
     }
     // Not tracked, or unavailable: the journal decides.
     let state = match journal.job(token.job) {
         Ok(Some(state)) => state,
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(e) => {
             tracing::warn!(job = %token.job, error = %e, "a write's presence was not read");
-            return;
+            return false;
         }
     };
     let Some(attempt) = state.attempt(token.attempt) else {
-        return;
+        return false;
     };
     let ResourceRef::Node { node } = attempt.resource;
     if node != from
         || attempt.generation != token.generation
         || attempt.generation != state.job.generation
     {
-        return;
+        return false;
     }
+    let mut wrote = false;
     match attempt.status {
         AttemptStatus::Unknown if attempt.unavailable_since_ms.is_some() => {
             let back = Observation::ResourceReachable {
                 attempt: token.attempt,
                 generation: token.generation,
             };
-            if let Err(e) = journal.observe_authority(token.job, &back, wall) {
-                tracing::warn!(job = %token.job, attempt = %token.attempt, error = %e, "a returned attempt was not recorded");
-                return;
+            match journal.observe_authority(token.job, &back, wall) {
+                Ok(t) => wrote = !t.events.is_empty(),
+                Err(e) => {
+                    tracing::warn!(job = %token.job, attempt = %token.attempt, error = %e, "a returned attempt was not recorded");
+                    return false;
+                }
             }
         }
         AttemptStatus::Granted | AttemptStatus::Running => {}
-        _ => return,
+        _ => return false,
     }
     presence.track(token.job, token.attempt, token.generation, from, now);
     presence.returned(token.attempt, now, wall);
+    wrote
 }
 
 /// Answers a heartbeat: each token from the node its attempt was granted
@@ -1002,6 +1023,7 @@ fn heartbeat(
     presence: &mut Presence,
     from: NodeId,
     beat: &Heartbeat,
+    wrote: &mut bool,
 ) -> Result<HeartbeatAnswer, AuthorityError> {
     let journal = match holder {
         Holder::Open(journal) => journal,
@@ -1017,7 +1039,7 @@ fn heartbeat(
     };
     let mut verdicts = Vec::with_capacity(beat.attempts().len());
     for token in beat.attempts() {
-        presence_of(place, journal, presence, from, token);
+        *wrote |= presence_of(place, journal, presence, from, token);
         let state = journal.job(token.job)?;
         verdicts.push((token.attempt, fence(state.as_ref(), token, Some(from))));
     }
@@ -1027,12 +1049,13 @@ fn heartbeat(
 /// One tick at `now` on the monotonic clock: every overdue attempt is
 /// observed `ResourceUnavailable` (the record carries the wall clock), and
 /// the recovery policy runs for each attempt that has been unavailable for
-/// `UNAVAILABLE_AFTER_MS`.
+/// `UNAVAILABLE_AFTER_MS`. `wrote` says whether anything was committed.
 fn tick(
     place: &Place,
     holder: &mut Holder,
     presence: &mut Presence,
     now: u64,
+    wrote: &mut bool,
 ) -> Result<Vec<Overdue>, AuthorityError> {
     let journal = match holder {
         Holder::Open(journal) => journal,
@@ -1049,7 +1072,8 @@ fn tick(
             at_ms: wall,
         };
         match journal.observe_authority(o.job, &unavailable, wall) {
-            Ok(_) => {
+            Ok(t) => {
+                *wrote |= !t.events.is_empty();
                 presence.mark_unavailable(o.attempt, now);
                 out.push(o);
             }
@@ -1058,7 +1082,7 @@ fn tick(
         }
     }
     for o in presence.unavailable(now) {
-        recover(place, journal, presence, &o, now, wall)?;
+        recover(place, journal, presence, &o, now, wall, wrote)?;
     }
     Ok(out)
 }
@@ -1095,6 +1119,7 @@ fn recover(
     o: &Overdue,
     now: u64,
     wall: u64,
+    wrote: &mut bool,
 ) -> Result<(), AuthorityError> {
     let Some(state) = journal.job(o.job)? else {
         presence.forget(o.attempt);
@@ -1137,7 +1162,9 @@ fn recover(
                 operation: OperationId::from_bytes(ulid()),
                 at_ms: wall,
             };
-            match journal.submit(&envelope, ids)?.result {
+            let answer = journal.submit(&envelope, ids)?;
+            *wrote |= !answer.replayed;
+            match answer.result {
                 StoredResult::Accepted(accepted) => {
                     tracing::info!(job = %o.job, attempt = %o.attempt, operation = %accepted.operation, "recovered an unavailable attempt from its acknowledged checkpoint");
                     presence.forget(o.attempt);
@@ -1160,6 +1187,7 @@ fn recover(
     };
     if presence.block_changed(o.attempt, &reason) {
         journal.recovery_blocked(o.job, o.attempt, reason, wall)?;
+        *wrote = true;
     }
     Ok(())
 }
