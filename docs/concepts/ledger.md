@@ -19,6 +19,7 @@ The target writes one decision per move id and answers every later question abou
 - `after_import_receipt`: The target made `MoveImported` durable and did not answer yet; on the source, the answer just arrived.
 - `before_harness_record`: A CLI asked to record the harness it launched, and the node has written nothing for it yet.
 - `before_placement`: An accepted managed create is about to be placed, and no decision is recorded yet.
+- `before_launch`: A grant is committed and its launch is not sent yet.
 - `while_stopping`: `fabric serve` was told to stop and still holds the state directory.
 <!-- faults:end -->
 

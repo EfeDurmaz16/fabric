@@ -4,7 +4,7 @@
 
 Every architecture decision record on `main`, with the status line the ADR itself carries. An ADR that says `proposed` and `as built on main` records code that is on `main` while the decision is still open for amendment; the status line says which parts.
 
-No ADR on `main` has the number 0017, 0023, 0024, 0025, 0026, 0027, 0028.
+No ADR on `main` has the number 0017, 0028.
 
 How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions).
 
