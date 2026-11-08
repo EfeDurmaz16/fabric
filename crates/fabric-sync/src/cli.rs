@@ -271,6 +271,9 @@ fn after_help(path: &[&str], root: bool) -> String {
 )]
 struct Modes {
     json: bool,
+    /// A prompt may appear: none of `--json`, `--non-interactive` and a
+    /// nonempty `CI`, and standard input and standard error are terminals.
+    interactive: bool,
     rich: bool,
     color: bool,
     help_color: bool,
@@ -293,12 +296,19 @@ fn color(no_color: bool, detected: bool) -> bool {
 }
 
 impl Modes {
-    fn resolve(json: bool, no_color: bool) -> Modes {
+    fn resolve(seen: &Seen) -> Modes {
+        let (json, no_color) = (seen.json, seen.no_color);
         let dumb = env_set("TERM").is_some_and(|t| t == "dumb");
+        let ci = env_set("CI").is_some_and(|ci| !ci.is_empty());
         let stderr_tty = std::io::stderr().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
         Modes {
             json,
+            interactive: !json
+                && !seen.non_interactive
+                && !ci
+                && std::io::stdin().is_terminal()
+                && stderr_tty,
             rich: stderr_tty && !dumb,
             color: color(no_color, stderr_tty && !dumb),
             help_color: color(no_color, stdout_tty && !dumb),
@@ -308,17 +318,31 @@ impl Modes {
 }
 
 /// The global flags a lenient parse saw, and the command path it reached.
-fn lenient(cmd: &Command, argv: &[OsString]) -> (bool, bool, bool, String) {
+#[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is one global flag, read on its own"
+)]
+struct Seen {
+    json: bool,
+    no_color: bool,
+    non_interactive: bool,
+    version: bool,
+    reached: String,
+}
+
+fn lenient(cmd: &Command, argv: &[OsString]) -> Seen {
     let parsed = cmd.clone().ignore_errors(true).try_get_matches_from(argv);
     let mut path = vec![NAME.to_owned()];
-    let (mut json, mut no_color, mut version) = (false, false, false);
+    let mut seen = Seen::default();
     if let Ok(matches) = &parsed {
         let mut at = Some(matches);
         while let Some(m) = at {
             let flag = |id: &str| m.try_get_one::<bool>(id).ok().flatten() == Some(&true);
-            json |= flag("json");
-            no_color |= flag("no_color");
-            version |= flag("version");
+            seen.json |= flag("json");
+            seen.no_color |= flag("no_color");
+            seen.non_interactive |= flag("non_interactive");
+            seen.version |= flag("version");
             at = m.subcommand().map(|(name, sub)| {
                 path.push(name.to_owned());
                 sub
@@ -326,10 +350,12 @@ fn lenient(cmd: &Command, argv: &[OsString]) -> (bool, bool, bool, String) {
         }
     }
     for arg in argv.iter().skip(1).take_while(|arg| *arg != "--") {
-        json |= arg == "--json";
-        no_color |= arg == "--no-color";
+        seen.json |= arg == "--json";
+        seen.no_color |= arg == "--no-color";
+        seen.non_interactive |= arg == "--non-interactive";
     }
-    (json, no_color, version, path.join(" "))
+    seen.reached = path.join(" ");
+    seen
 }
 
 /// Runs the command line and returns its exit code.
@@ -337,8 +363,9 @@ fn lenient(cmd: &Command, argv: &[OsString]) -> (bool, bool, bool, String) {
 pub fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let mut cmd = command();
-    let (json, no_color, version, reached) = lenient(&cmd, &argv);
-    let modes = Modes::resolve(json, no_color);
+    let seen = lenient(&cmd, &argv);
+    let modes = Modes::resolve(&seen);
+    let (no_color, version, reached) = (seen.no_color, seen.version, seen.reached);
     if no_color || env_set("NO_COLOR").is_some_and(|v| !v.is_empty()) {
         cmd = cmd.color(ColorChoice::Never);
     }
@@ -876,6 +903,7 @@ fn run(cli: Cli, modes: Modes) -> Result<ExitCode, SyncError> {
                     target: target.clone(),
                     name,
                     force,
+                    interactive: modes.interactive,
                 },
             )?;
             Ok(answer(&report, &target, modes))
@@ -893,6 +921,7 @@ fn run(cli: Cli, modes: Modes) -> Result<ExitCode, SyncError> {
                     target: target.clone(),
                     name,
                     replace,
+                    interactive: modes.interactive,
                 },
             )?;
             Ok(answer(&report, &target, modes))

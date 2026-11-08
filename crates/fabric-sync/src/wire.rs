@@ -347,16 +347,23 @@ impl SshRemote {
     /// The program is `<NAME>_SSH` when set, else `ssh`, and the command it
     /// runs there is `<NAME>_REMOTE` when set, else `NAME`, found on the
     /// remote `PATH`. The host follows `--`, so no host is read as an option.
+    /// Unless `interactive`, `ssh` runs with `BatchMode=yes`: it reads a
+    /// password or a host key answer from the terminal whatever its
+    /// standard input is, so this is the only way it never prompts.
     pub(crate) fn connect(
         host: &str,
         port: Option<u16>,
         path: &str,
         create: bool,
+        interactive: bool,
     ) -> Result<SshRemote, SyncError> {
         let program = std::env::var_os(crate::env_var("SSH")).unwrap_or_else(|| "ssh".into());
         let remote = std::env::var(crate::env_var("REMOTE")).unwrap_or_else(|_| NAME.to_owned());
         let mut command = Command::new(&program);
         command.arg("-T");
+        if !interactive {
+            command.arg("-o").arg("BatchMode=yes");
+        }
         if let Some(port) = port {
             command.arg("-p").arg(port.to_string());
         }

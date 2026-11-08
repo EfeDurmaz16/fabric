@@ -188,6 +188,7 @@ fn counters() -> Fallible {
                 target: target.clone(),
                 name: None,
                 force: false,
+                interactive: false,
             },
         )?)
     };
@@ -199,6 +200,7 @@ fn counters() -> Fallible {
                 target: target.clone(),
                 name: None,
                 replace,
+                interactive: false,
             },
         )?)
     };

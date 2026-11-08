@@ -557,3 +557,24 @@ fn a_busy_store_over_ssh_is_store_busy_and_retryable() {
     assert_eq!(doc["reason"], "store_busy", "{doc}");
     assert_eq!(doc["retryable"], true, "{doc}");
 }
+
+#[test]
+fn ssh_never_prompts_unless_the_run_may() {
+    let world = World::new();
+    let a = world.path("a/app");
+    dirty_tree(&a);
+    let seen = world.path("ssh-args");
+    let ssh = world.path("bin/ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift 2\nexec /bin/sh -c \"$*\"\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    let target = format!("box:{}", world.path("target").display());
+    world.ok("home-a", &["push", &target, "--tree", a.to_str().unwrap()]);
+    let args = fs::read_to_string(&seen).unwrap();
+    assert!(args.starts_with("-T -o BatchMode=yes "), "{args}");
+}

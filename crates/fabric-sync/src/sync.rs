@@ -204,6 +204,8 @@ pub struct PushRequest {
     pub name: Option<TreeName>,
     /// Move the target's head even when this tree has not pulled it.
     pub force: bool,
+    /// May `ssh` prompt for a password or a host key; off, it fails instead.
+    pub interactive: bool,
 }
 
 /// What to pull.
@@ -217,13 +219,15 @@ pub struct PullRequest {
     pub name: Option<TreeName>,
     /// Replace a tree with content, keeping it beside the new one.
     pub replace: bool,
+    /// May `ssh` prompt for a password or a host key; off, it fails instead.
+    pub interactive: bool,
 }
 
-fn connect(target: &Target, create: bool) -> Result<Box<dyn Remote>, SyncError> {
+fn connect(target: &Target, create: bool, interactive: bool) -> Result<Box<dyn Remote>, SyncError> {
     Ok(match target {
         Target::Dir(dir) => Box::new(DirTarget::open(dir, create)?),
         Target::Ssh { host, port, path } => {
-            Box::new(SshRemote::connect(host, *port, path, create)?)
+            Box::new(SshRemote::connect(host, *port, path, create, interactive)?)
         }
     })
 }
@@ -360,7 +364,7 @@ pub fn push(home: &Home, req: &PushRequest) -> Result<SyncReport, SyncError> {
         Some(state) if has_snapshot(&store, state.snapshot)? => Some(state),
         _ => None,
     };
-    let mut remote = connect(&req.target, true)?;
+    let mut remote = connect(&req.target, true, req.interactive)?;
     let head = remote.head(&name)?;
     if let Some(head) = head
         && !req.force
@@ -449,7 +453,7 @@ pub fn pull(home: &Home, req: &PullRequest) -> Result<SyncReport, SyncError> {
     home.recover(&tree)?;
     let name = name_of(&tree, req.name.as_ref())?;
     let mut store = home.open_store()?;
-    let mut remote = connect(&req.target, false)?;
+    let mut remote = connect(&req.target, false, req.interactive)?;
     let head = remote.head(&name)?.ok_or_else(|| SyncError::NothingThere {
         name: name.to_string(),
     })?;

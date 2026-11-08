@@ -24,6 +24,8 @@ cp target/release/fabric-sync /usr/local/bin/      # any directory on the PATH
 
 For an SSH target, the same binary must be on the remote machine's `PATH` (or named by `FABRIC_SYNC_REMOTE`): `ssh` starts `fabric-sync serve` there for each sync and it exits after it. There is no daemon.
 
+`ssh` runs with `-o BatchMode=yes` unless the run may prompt (no `--json`, no `--non-interactive`, no nonempty `CI`, and standard input and standard error are terminals), so a host key to accept or a password fails the sync with exit 83 instead of waiting on a prompt. Add the host to `known_hosts` and use a key for scripts.
+
 ## A first sync
 
 On the first machine, from the top of the tree:
