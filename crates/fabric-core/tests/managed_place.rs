@@ -434,3 +434,29 @@ fn the_rank_keys_on_the_probed_node_not_the_advertised_one() {
     let decision = place(&input(&job, None, vec![five, three]));
     assert_eq!(decision.chosen, Some(node(3)));
 }
+
+/// A failover never chooses the node of the attempt it replaces, however
+/// well that node answers and ranks: the attempt may still run there
+/// (ADR 0028). Any other placement kind keeps the M5 rank.
+#[test]
+fn a_failover_excludes_the_unavailable_node_whatever_it_offers() {
+    let job = job(PlacementPolicy::DEFAULT);
+    let lost = CurrentPlacement {
+        node: node(1),
+        healthy: false,
+    };
+    let best = probe(advert(1, 10, 1 << 40, WARM));
+    let other = probe(advert(2, 9_000, 1 << 40, COLD));
+    let mut failover = input(&job, Some(lost), vec![best.clone(), other.clone()]);
+    failover.kind = PlacementKind::Failover;
+    let decision = place(&failover);
+    assert_eq!(decision.chosen, Some(node(2)));
+    assert_eq!(reasons(&decision, 1), vec![Exclusion::Unavailable]);
+    // Alone, the lost node parks the failover.
+    failover.candidates = vec![best.clone()];
+    assert_eq!(place(&failover).chosen, None);
+    // A planned handoff from the same node may stay there.
+    let mut handoff = input(&job, Some(lost), vec![best, other]);
+    handoff.kind = PlacementKind::PlannedHandoff;
+    assert_eq!(place(&handoff).chosen, Some(node(1)));
+}

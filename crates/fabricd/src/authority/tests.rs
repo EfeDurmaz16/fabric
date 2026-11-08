@@ -593,8 +593,7 @@ async fn acknowledged(authority: &Authority, job: JobId, token: GrantToken) -> S
 async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_runner() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
-    // This node runs managed attempts, so the placement may name it.
-    let authority = Authority::start_with_executor(&state, NODE).unwrap();
+    let authority = Authority::start(&state, NODE).unwrap();
     let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
     let now = mono_ms();
     // Silent: unknown after the threshold; the policy waits as long again.
@@ -655,6 +654,30 @@ async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_ru
         "a tick inside the dwell writes nothing"
     );
     authority.tick(later + UNAVAILABLE_AFTER_MS).await.unwrap();
+    // The recover takes the grant at once; its failover is placed by the
+    // dispatch, which never chooses the runner's node.
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation, Generation::FIRST);
+    assert_eq!(s.attempts[0].status, AttemptStatus::Superseded { by: None });
+    let recover = recover_of(&s);
+    assert_eq!(
+        s.request(recover),
+        Some(&fabric_core::managed::EffectRequest::Recover {
+            task: s.attempts[0].task,
+            from: snapshot,
+            lost: RUNNER,
+        })
+    );
+    assert!(
+        authority
+            .pending()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.operation == recover),
+        "the failover waits for the dispatch"
+    );
+    failover(&authority, job, recover, NODE).await;
     let s = authority.job(job).await.unwrap().unwrap();
     assert_eq!(s.job.generation.get(), 2);
     assert_eq!(
@@ -728,19 +751,17 @@ async fn restart_from_acknowledged_recovers_onto_this_node_and_fences_the_old_ru
     // A restart replays the authority's recover under its derived key
     // rather than granting again.
     drop(authority);
-    let authority = Authority::start_with_executor(&state, NODE).unwrap();
+    let authority = Authority::start(&state, NODE).unwrap();
     let s = authority.job(job).await.unwrap().unwrap();
     assert_eq!(s.attempts.len(), 2);
     assert_eq!(s.job.generation.get(), 2);
 }
 
-/// On this base no node runs managed attempts, so the authority's own
-/// `Recover` finds no eligible node: the job falls back to `block` with
-/// `NoEligibleNode` recorded once per silence, the old grant is kept, and
-/// the runner that returns is live again. Nothing is granted onto a node
-/// that could not run it.
+/// A failover placement that chooses the runner's own node is refused by
+/// the domain: the attempt it replaces may still run there. Nothing is
+/// granted and the old grant stays taken.
 #[tokio::test]
-async fn without_an_executor_the_automatic_restart_is_blocked_and_the_grant_kept() {
+async fn a_failover_onto_the_unavailable_node_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let authority = Authority::start(&state, NODE).unwrap();
@@ -748,29 +769,80 @@ async fn without_an_executor_the_automatic_restart_is_blocked_and_the_grant_kept
     acknowledged(&authority, job, token).await;
     let now = mono_ms();
     authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
-    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
-    let unknown_at = revision(&authority, job).await;
     authority
         .tick(now + 2 * UNAVAILABLE_AFTER_MS)
         .await
         .unwrap();
     let s = authority.job(job).await.unwrap().unwrap();
-    assert_eq!(s.job.generation, Generation::FIRST, "nothing was granted");
-    assert_eq!(s.attempts.len(), 1);
-    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    let recover = recover_of(&s);
+    let task = s.attempts[0].task;
+    let refused = authority
+        .observe_authority(
+            job,
+            Observation::Placed {
+                operation: recover,
+                task,
+                decision: fabric_core::managed::PlacementDecision {
+                    kind: fabric_core::managed::PlacementKind::Failover,
+                    decided_at_ms: 1,
+                    candidates: Vec::new(),
+                    chosen: Some(RUNNER),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
     assert_eq!(
-        s.job.revision.get(),
-        unknown_at + 1,
-        "the block is recorded"
+        refused.domain(),
+        Some(&fabric_core::managed::DomainError::FailoverToLostNode { node: RUNNER })
     );
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.attempts.len(), 1, "nothing was granted");
+    assert_eq!(s.attempts[0].status, AttemptStatus::Superseded { by: None });
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(
+        answer.verdicts,
+        vec![(token.attempt, FenceVerdict::Superseded { by: None })]
+    );
+}
+
+/// The job's open recover.
+fn recover_of(s: &ManagedState) -> fabric_core::managed::OperationId {
+    s.operations
+        .iter()
+        .rev()
+        .find(|o| o.kind == fabric_core::managed::CommandKind::Recover)
+        .expect("a recover")
+        .id
+}
+
+/// The dispatch's failover placement of `recover`, choosing `node`.
+async fn failover(
+    authority: &Authority,
+    job: fabric_core::id::JobId,
+    recover: fabric_core::managed::OperationId,
+    node: NodeId,
+) {
+    let s = authority.job(job).await.unwrap().unwrap();
+    let Some(fabric_core::managed::EffectRequest::Recover { task, .. }) = s.request(recover) else {
+        panic!("not a recover");
+    };
     authority
-        .tick(now + 3 * UNAVAILABLE_AFTER_MS)
+        .observe_authority(
+            job,
+            Observation::Placed {
+                operation: recover,
+                task: *task,
+                decision: fabric_core::managed::PlacementDecision {
+                    kind: fabric_core::managed::PlacementKind::Failover,
+                    decided_at_ms: 1,
+                    candidates: Vec::new(),
+                    chosen: Some(node),
+                },
+            },
+        )
         .await
         .unwrap();
-    assert_eq!(revision(&authority, job).await, unknown_at + 1);
-    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
-    assert_eq!(answer.verdicts, vec![(token.attempt, FenceVerdict::Live)]);
-    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
 }
 
 /// An attempt that was `unknown` when the authority restarted is not
@@ -813,7 +885,7 @@ async fn an_attempt_unknown_at_a_restart_comes_back_on_its_heartbeat_and_still_r
     // the attempt dwells from the restart and is then recovered.
     let dir = tempfile::tempdir().unwrap();
     let state = self::state(dir.path());
-    let authority = Authority::start_with_executor(&state, NODE).unwrap();
+    let authority = Authority::start(&state, NODE).unwrap();
     let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
     acknowledged(&authority, job, token).await;
     authority
@@ -822,7 +894,7 @@ async fn an_attempt_unknown_at_a_restart_comes_back_on_its_heartbeat_and_still_r
         .unwrap();
     assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
     drop(authority);
-    let authority = Authority::start_with_executor(&state, NODE).unwrap();
+    let authority = Authority::start(&state, NODE).unwrap();
     // The start scan runs on the thread before its first answer; the
     // dwell counts from then.
     assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
@@ -832,7 +904,14 @@ async fn an_attempt_unknown_at_a_restart_comes_back_on_its_heartbeat_and_still_r
     assert_eq!(s.job.generation, Generation::FIRST, "the dwell runs again");
     authority.tick(at + UNAVAILABLE_AFTER_MS).await.unwrap();
     let s = authority.job(job).await.unwrap().unwrap();
-    assert_eq!(s.job.generation.get(), 2, "recovered after the restart");
+    assert_eq!(
+        s.attempts[0].status,
+        AttemptStatus::Superseded { by: None },
+        "recovered after the restart"
+    );
+    failover(&authority, job, recover_of(&s), NODE).await;
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.job.generation.get(), 2);
     assert_eq!(s.attempts[1].resource, ResourceRef::Node { node: NODE });
 }
 

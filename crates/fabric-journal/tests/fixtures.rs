@@ -562,12 +562,7 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .recovery_blocked(
             FIFTH,
             token1.attempt,
-            RecoveryBlock::NoEligibleNode {
-                exclusions: vec![fabric_core::managed::RecoveryExclusion {
-                    node: RUNNER,
-                    reason: "unavailable".into(),
-                }],
-            },
+            RecoveryBlock::NoAcknowledgedCheckpoint,
             at + 15_001,
         )
         .unwrap();
@@ -577,7 +572,6 @@ fn m6_job(journal: &mut Journal, at: u64) {
         Some(FIFTH),
         Command::Recover {
             attempt: token1.attempt,
-            resource: ResourceRef::Node { node: NODE },
             from: snapshot,
             reason: "the fixture's runner went silent".into(),
         },
@@ -596,25 +590,38 @@ fn m6_job(journal: &mut Journal, at: u64) {
             at + 15_002,
         )
         .unwrap();
-    assert!(matches!(
-        late,
-        Err(FenceVerdict::Superseded { by: Some(_) })
-    ));
-    // The recovered attempt runs, goes silent and is superseded by hand.
-    let g2 = g1.next().unwrap();
-    let token2 = GrantToken {
-        job: FIFTH,
-        attempt: AttemptId::from_bytes([82; 16]),
-        generation: g2,
-    };
+    assert!(matches!(late, Err(FenceVerdict::Superseded { by: None })));
+    // The recover's failover placement grants on the authority's node,
+    // never the runner's; the recovered attempt runs, goes silent and is
+    // superseded by hand.
     journal
-        .mark_authority(
+        .observe_authority(
             FIFTH,
-            OperationId::from_bytes([82; 16]),
-            OperationMark::Dispatched,
+            &Observation::Placed {
+                operation: OperationId::from_bytes([82; 16]),
+                task: primary,
+                decision: PlacementDecision {
+                    kind: PlacementKind::Failover,
+                    decided_at_ms: at + 15_003,
+                    candidates: vec![Candidate {
+                        node: RUNNER,
+                        verdict: Verdict::Excluded {
+                            reasons: vec![Exclusion::NoAnswer { within_ms: 2_000 }],
+                        },
+                    }],
+                    chosen: Some(NODE),
+                },
+            },
             at + 15_003,
         )
         .unwrap();
+    let g2 = g1.next().unwrap();
+    let recovered = journal.job(FIFTH).unwrap().unwrap();
+    let token2 = GrantToken {
+        job: FIFTH,
+        attempt: recovered.attempts.last().unwrap().id,
+        generation: g2,
+    };
     journal
         .observe(
             &token2,

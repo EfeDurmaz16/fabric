@@ -1044,17 +1044,15 @@ fn an_automatic_recover_replays_under_its_derived_key() {
         .acknowledge(job, &ack(&token, snapshot, cut), 3_000)
         .unwrap();
     silent(&mut f, &token, 20_000);
-    let here = NodeId::from_bytes([0x11; 32]);
     let decided = fabric_core::managed::recovery_decision(
         &f.journal.job(job).unwrap().unwrap(),
         token.attempt,
         fabric_core::managed::OutcomePolicy::Checkpoint,
         &[],
-        Ok(ResourceRef::Node { node: here }),
     )
     .unwrap();
     // The key is derived from (job, attempt, generation): the same decision
-    // after a restart replays the same operation and grants nothing twice.
+    // after a restart replays the same operation and takes nothing twice.
     let key = format!("recover.{job}.{}.{}", token.attempt, token.generation.get());
     let first = f.submit(&key, Some(job), decided.clone());
     assert!(!first.replayed);
@@ -1062,14 +1060,33 @@ fn an_automatic_recover_replays_under_its_derived_key() {
     assert!(again.replayed);
     assert_eq!(again.bytes, first.bytes);
     let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(s.attempts.len(), 1, "the grant follows the placement");
+    assert_eq!(s.attempts[0].status, AttemptStatus::Superseded { by: None });
+    // The failover placement grants once, from the acknowledged checkpoint.
+    let StoredResult::Accepted(accepted) = &first.result else {
+        panic!("not accepted: {:?}", first.result);
+    };
+    let here = NodeId::from_bytes([0x11; 32]);
+    f.journal
+        .observe_authority(
+            job,
+            &Observation::Placed {
+                operation: accepted.operation,
+                task: s.attempts[0].task,
+                decision: fabric_core::managed::PlacementDecision {
+                    kind: fabric_core::managed::PlacementKind::Failover,
+                    decided_at_ms: 21_000,
+                    candidates: Vec::new(),
+                    chosen: Some(here),
+                },
+            },
+            21_000,
+        )
+        .unwrap();
+    let s = f.journal.job(job).unwrap().unwrap();
     assert_eq!(s.attempts.len(), 2);
     assert_eq!(s.job.generation.get(), 2);
-    assert_eq!(
-        s.attempts[0].status,
-        AttemptStatus::Superseded {
-            by: Some(s.attempts[1].generation)
-        }
-    );
+    assert_eq!(s.attempts[1].resource, ResourceRef::Node { node: here });
     assert_eq!(s.attempts[1].initial_checkpoint, Some(snapshot));
     assert_eq!(
         rows(

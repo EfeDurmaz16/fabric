@@ -31,7 +31,7 @@ use fabric_core::id::{JobId, SnapshotId};
 use fabric_core::managed::launch::{
     AfterCut, InstructAnswer, InstructRefusal, Instruction, LaunchAnswer, LaunchRefusal, TaskLaunch,
 };
-use fabric_core::managed::placement::PlacementKind;
+use fabric_core::managed::placement::{CurrentPlacement, PlacementKind};
 use fabric_core::managed::{
     Attempt, AttemptId, AttemptStatus, CommandKind, EffectRequest, ExitOutcome, ManagedState,
     Observation, OperationId, OperationMark, OperationStatus, ReceiptStatus, ResourceRef,
@@ -105,11 +105,15 @@ pub(crate) async fn pass(authority: &Authority, link: &dyn Link, seen: &mut Seen
         Ok(effects) => {
             for effect in effects {
                 let outcome = match effect.kind {
-                    CommandKind::CreateJob => {
+                    CommandKind::CreateJob | CommandKind::Recover => {
                         if seen.failed.contains(&(effect.job, effect.operation)) {
                             continue;
                         }
-                        let placed = place_create(authority, link, &effect).await;
+                        let placed = if effect.kind == CommandKind::Recover {
+                            place_failover(authority, link, &effect).await
+                        } else {
+                            place_create(authority, link, &effect).await
+                        };
                         if placed.is_err() {
                             seen.failed.insert((effect.job, effect.operation));
                         }
@@ -160,6 +164,50 @@ async fn place_create(
     crate::faults::hit(crate::faults::Point::BeforePlacement).await;
     let decision = link.place(&state.job, &ask).await;
     tracing::info!(job = %effect.job, chosen = ?decision.chosen.map(|n| n.to_string()), "placed");
+    authority
+        .observe_authority(
+            effect.job,
+            Observation::Placed {
+                operation: effect.operation,
+                task,
+                decision,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Places `effect`'s recover once as a failover (ADR 0028) and records the
+/// decision: the M5 placement with the superseded attempt's node named as
+/// the current placement, not healthy, so it is excluded whatever it
+/// answers, and the acknowledged checkpoint as the snapshot to start
+/// from. The domain grants from that checkpoint, or the job parks with
+/// every exclusion recorded; the grant is then launched like any other.
+async fn place_failover(
+    authority: &Authority,
+    link: &dyn Link,
+    effect: &PendingEffect,
+) -> Result<(), AuthorityError> {
+    let Some(state) = authority.job(effect.job).await? else {
+        return Ok(());
+    };
+    let Some(EffectRequest::Recover { task, from, lost }) =
+        state.request(effect.operation).cloned()
+    else {
+        return Ok(());
+    };
+    let ask = PlacementAsk {
+        task,
+        kind: PlacementKind::Failover,
+        required_layout: None,
+        current: Some(CurrentPlacement {
+            node: lost,
+            healthy: false,
+        }),
+        snapshot: Some(from),
+    };
+    let decision = link.place(&state.job, &ask).await;
+    tracing::info!(job = %effect.job, lost = %lost, chosen = ?decision.chosen.map(|n| n.to_string()), "failover placed");
     authority
         .observe_authority(
             effect.job,
@@ -301,6 +349,9 @@ fn instruction_for(
         EffectRequest::CancelTask { task, reason } => {
             live_of(state, *task).map(|a| (a.id, stop(reason)))
         }
+        // A recover is placed, never instructed: its old attempt's grant
+        // is already taken (`place_failover`).
+        EffectRequest::Recover { .. } => None,
         EffectRequest::Spawn { task } => {
             let child = state.task(*task)?;
             let program = child.program.clone()?;
@@ -577,7 +628,8 @@ fn cancel_pending(state: &ManagedState, task: TaskId) -> bool {
 }
 
 /// Every grant a placement made that may still be launched: granted, at
-/// the job's generation, made by a create or a continue, with no cancel
+/// the job's generation, made by a create, a continue or a recover's
+/// failover, with no cancel
 /// of it pending (its stop ends it unlaunched).
 fn grants(state: &ManagedState) -> Vec<AttemptId> {
     state
@@ -588,7 +640,10 @@ fn grants(state: &ManagedState) -> Vec<AttemptId> {
                 && a.generation == state.job.generation
                 && !cancel_pending(state, a.task)
                 && state.operation(a.granted_by).is_some_and(|op| {
-                    matches!(op.kind, CommandKind::CreateJob | CommandKind::Continue)
+                    matches!(
+                        op.kind,
+                        CommandKind::CreateJob | CommandKind::Continue | CommandKind::Recover
+                    )
                 })
         })
         .map(|a| a.id)
@@ -719,7 +774,7 @@ mod tests {
     use fabric_core::managed::{AllowedFidelity, Command, JobState, TaskState};
 
     use super::*;
-    use crate::launch::fixture::{Asked, FakeLink, OTHER, REMOTE, World};
+    use crate::launch::fixture::{Asked, FakeLink, OTHER, OWN, REMOTE, World};
 
     /// `observation`, reported by `from` as its node would.
     async fn report(
@@ -1157,6 +1212,105 @@ mod tests {
 
     /// A stop its node answers `NotRunning` (the node restarted, or the
     /// launch never reached it) ends the attempt cancelled, which cancels
+    /// A recover is placed by the M5 placement as a failover, with the
+    /// superseded attempt's node named as the current placement, not
+    /// healthy, and its grant is launched like any other: from the
+    /// acknowledged checkpoint, held by this authority (ADR 0028).
+    #[tokio::test]
+    async fn a_recover_is_placed_as_a_failover_and_launched_like_any_grant() {
+        let world = World::new();
+        let link = FakeLink::new();
+        let job = world.created("create").await;
+        let first = world.granted(job, REMOTE).await;
+        world.started(job, first).await;
+        let state = world.state(job).await;
+        let generation = state.attempt(first).unwrap().generation;
+        let snapshot = fabric_core::id::SnapshotId::of(b"acknowledged");
+        let cut = fabric_core::managed::CutDigest::from_bytes([4; 32]);
+        world
+            .authority
+            .observe_authority(
+                job,
+                Observation::Captured {
+                    attempt: first,
+                    generation,
+                    snapshot,
+                    cut,
+                },
+            )
+            .await
+            .unwrap();
+        world
+            .authority
+            .acknowledge(
+                job,
+                fabric_core::managed::CheckpointAck {
+                    attempt: first,
+                    generation,
+                    snapshot,
+                    cut,
+                    manifests: 1,
+                    chunks: 1,
+                    bytes: 1,
+                    fetched_from: REMOTE,
+                },
+            )
+            .await
+            .unwrap();
+        world
+            .authority
+            .observe_authority(
+                job,
+                Observation::ResourceUnavailable {
+                    attempt: first,
+                    generation,
+                    last_heartbeat_ms: None,
+                    at_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let recover = world
+            .submit(
+                job,
+                "recover",
+                Command::Recover {
+                    attempt: first,
+                    from: snapshot,
+                    reason: "silent".into(),
+                },
+            )
+            .await
+            .unwrap();
+        *link.place_on.lock().unwrap() = Some(OTHER);
+        let mut seen = Seen::default();
+        pass(&world.authority, &link, &mut seen).await;
+        let asked = link.asked.lock().unwrap().clone();
+        assert!(
+            asked.contains(&Asked::Place(PlacementKind::Failover)),
+            "{asked:?}"
+        );
+        let state = world.state(job).await;
+        let next = state.attempts.last().unwrap();
+        assert_eq!(next.granted_by, recover);
+        assert_eq!(next.resource, ResourceRef::Node { node: OTHER });
+        assert_eq!(next.initial_checkpoint, Some(snapshot));
+        let launched = asked.iter().find_map(|a| match a {
+            Asked::Launch(node, request) if request.token.attempt == next.id => {
+                Some((*node, request.clone()))
+            }
+            _ => None,
+        });
+        let (node, request) = launched.expect("the recover's grant was launched");
+        assert_eq!(node, OTHER);
+        assert_eq!(request.initial_checkpoint, Some(snapshot));
+        assert_eq!(
+            request.snapshot_at,
+            Some(OWN),
+            "the authority holds the bytes"
+        );
+    }
+
     /// the job; a grant with a cancel pending is never launched.
     #[tokio::test]
     async fn a_stop_its_node_does_not_run_ends_the_attempt_and_the_job() {

@@ -913,6 +913,32 @@ fn ack_of(kept: &Kept, n: u8) -> CheckpointAck {
     }
 }
 
+/// The open recover's failover placement chooses `node`.
+fn failover(kept: &mut Kept, node: NodeId) -> Result<Transition, DomainError> {
+    let s = kept.state();
+    let op = s
+        .operations
+        .iter()
+        .rev()
+        .find(|o| o.kind == CommandKind::Recover && o.status == OperationStatus::Accepted)
+        .expect("an open recover")
+        .id;
+    let task = match s.request(op) {
+        Some(EffectRequest::Recover { task, .. }) => *task,
+        other => panic!("not a recover: {other:?}"),
+    };
+    kept.observe(&Observation::Placed {
+        operation: op,
+        task,
+        decision: fabric_core::managed::placement::PlacementDecision {
+            kind: fabric_core::managed::placement::PlacementKind::Failover,
+            decided_at_ms: 60,
+            candidates: Vec::new(),
+            chosen: Some(node),
+        },
+    })
+}
+
 /// The running attempt goes silent: `unknown` by `ResourceUnavailable`.
 fn gone_silent(kept: &mut Kept) -> Attempt {
     let a = kept.state().live_attempt().unwrap().clone();
@@ -972,20 +998,13 @@ fn a_captured_checkpoint_restarts_nothing_until_acknowledged() {
             "recover-1",
             Command::Recover {
                 attempt: a.id,
-                resource: ResourceRef::Node { node: OTHER_NODE },
                 from: snapshot(1),
                 reason: "test".into(),
             }
         ),
         Err(DomainError::NotAcknowledged { .. })
     ));
-    let decision = recovery_decision(
-        kept.state(),
-        a.id,
-        OutcomePolicy::Checkpoint,
-        &[],
-        Ok(ResourceRef::Node { node: OTHER_NODE }),
-    );
+    let decision = recovery_decision(kept.state(), a.id, OutcomePolicy::Checkpoint, &[]);
     assert_eq!(decision, Err(RecoveryBlock::NoAcknowledgedCheckpoint));
     // Acknowledged, and it is one.
     kept.acknowledge(&ack_of(&kept, 1)).unwrap();
@@ -997,7 +1016,6 @@ fn a_captured_checkpoint_restarts_nothing_until_acknowledged() {
             a.id,
             OutcomePolicy::Checkpoint,
             &[],
-            Ok(ResourceRef::Node { node: OTHER_NODE }),
         ),
         Ok(Command::Recover { from, .. }) if from == snapshot(1)
     ));
@@ -1210,14 +1228,13 @@ fn supersede_needs_an_unknown_attempt() {
 }
 
 #[test]
-fn recover_grants_the_next_generation_from_an_acknowledged_checkpoint_in_one_batch() {
+fn recover_supersedes_then_its_failover_grants_the_next_generation_elsewhere() {
     let mut kept = running();
     capture(&mut kept, 1).unwrap();
     kept.acknowledge(&ack_of(&kept, 1)).unwrap();
     let a = kept.state().attempts[0].clone();
     let recover = Command::Recover {
         attempt: a.id,
-        resource: ResourceRef::Node { node: OTHER_NODE },
         from: snapshot(1),
         reason: "the laptop lid".into(),
     };
@@ -1227,7 +1244,6 @@ fn recover_grants_the_next_generation_from_an_acknowledged_checkpoint_in_one_bat
     ));
     gone_silent(&mut kept);
     let t = kept.submit("r-1", recover).unwrap();
-    assert_eq!(t.events.len(), 3);
     assert!(matches!(
         t.events.as_slice(),
         [
@@ -1235,52 +1251,34 @@ fn recover_grants_the_next_generation_from_an_acknowledged_checkpoint_in_one_bat
                 kind: CommandKind::Recover,
                 ..
             },
-            ManagedEvent::GrantSuperseded { by: Some(_), .. },
-            ManagedEvent::AttemptGranted {
-                initial_checkpoint: Some(_),
+            ManagedEvent::GrantSuperseded { by: None, .. },
+            ManagedEvent::EffectRequested {
+                request: EffectRequest::Recover { lost: NODE, .. },
                 ..
             }
         ]
     ));
+    // The grant is taken at once; nothing is granted until the placement.
+    let s = kept.state();
+    assert_eq!(s.job.generation.get(), 1);
+    assert_eq!(s.live_attempt(), None);
+    assert_eq!(
+        s.attempt(a.id).unwrap().status,
+        AttemptStatus::Superseded { by: None }
+    );
+    // A failover onto the node whose attempt it replaces is refused.
+    assert_eq!(
+        failover(&mut kept, NODE),
+        Err(DomainError::FailoverToLostNode { node: NODE })
+    );
+    failover(&mut kept, OTHER_NODE).unwrap();
     let s = kept.state();
     let next = s.attempts[1].clone();
     assert_eq!(next.generation.get(), 2);
     assert_eq!(s.job.generation, next.generation);
     assert_eq!(next.initial_checkpoint, Some(snapshot(1)));
     assert_eq!(next.resource, ResourceRef::Node { node: OTHER_NODE });
-    assert_eq!(
-        s.attempt(a.id).unwrap().status,
-        AttemptStatus::Superseded {
-            by: Some(next.generation)
-        }
-    );
     assert_eq!(s.live_attempt().map(|l| l.id), Some(next.id));
-    // The recover is a grant: it waits for its one dispatch.
-    assert!(s.grant_may_dispatch(next.granted_by));
-    assert_eq!(
-        s.operation(next.granted_by).unwrap().status,
-        OperationStatus::Accepted
-    );
-    kept.mark(next.granted_by, OperationMark::Dispatched)
-        .unwrap();
-    // The old attempt's late report is stale and recorded as such.
-    let late = kept
-        .observe(&Observation::Exited {
-            attempt: a.id,
-            generation: a.generation,
-            outcome: ExitOutcome::Succeeded,
-        })
-        .unwrap();
-    assert!(matches!(
-        late.events.as_slice(),
-        [ManagedEvent::StaleObservationRefused { .. }]
-    ));
-    assert_eq!(
-        fence(Some(kept.state()), &token(&a), Some(NODE)),
-        FenceVerdict::Superseded {
-            by: Some(next.generation)
-        }
-    );
     kept.replays();
 }
 
@@ -1478,74 +1476,39 @@ fn recovery_decision_falls_back_to_block_with_the_failed_condition() {
     capture(&mut kept, 1).unwrap();
     kept.acknowledge(&ack_of(&kept, 1)).unwrap();
     let a = gone_silent(&mut kept);
-    let here = Ok(ResourceRef::Node { node: OTHER_NODE });
     assert_eq!(
-        recovery_decision(kept.state(), a.id, OutcomePolicy::Block, &[], here.clone()),
+        recovery_decision(kept.state(), a.id, OutcomePolicy::Block, &[]),
         Err(RecoveryBlock::OutcomeBlocks {
             kind: "block".into()
         })
     );
     let blocker = OperationId::from_bytes([0xbb; 16]);
     assert_eq!(
-        recovery_decision(
-            kept.state(),
-            a.id,
-            OutcomePolicy::Checkpoint,
-            &[blocker],
-            here.clone()
-        ),
+        recovery_decision(kept.state(), a.id, OutcomePolicy::Checkpoint, &[blocker],),
         Err(RecoveryBlock::ReplacementBlocked {
             blockers: vec![blocker]
         })
     );
-    let exclusion = RecoveryExclusion {
-        node: NODE,
-        reason: "unavailable".into(),
-    };
-    assert_eq!(
-        recovery_decision(
-            kept.state(),
-            a.id,
-            OutcomePolicy::Checkpoint,
-            &[],
-            Err(vec![exclusion.clone()])
-        ),
-        Err(RecoveryBlock::NoEligibleNode {
-            exclusions: vec![exclusion]
-        })
-    );
-    let decided = recovery_decision(
-        kept.state(),
-        a.id,
-        OutcomePolicy::Checkpoint,
-        &[],
-        here.clone(),
-    )
-    .unwrap();
+    let decided = recovery_decision(kept.state(), a.id, OutcomePolicy::Checkpoint, &[]).unwrap();
     assert!(matches!(
         &decided,
-        Command::Recover { attempt, from, resource, .. }
-            if *attempt == a.id && *from == snapshot(1) && *resource == ResourceRef::Node { node: OTHER_NODE }
+        Command::Recover { attempt, from, .. } if *attempt == a.id && *from == snapshot(1)
     ));
-    // The decision is a command the rules accept as is.
+    // The decision is a command the rules accept as is; its grant is the
+    // failover placement's.
     kept.submit("auto-recover", decided).unwrap();
+    failover(&mut kept, OTHER_NODE).unwrap();
     assert_eq!(kept.state().job.generation.get(), 2);
     // A cancel-and-restart task takes the job's newest acknowledged
     // checkpoint, which another attempt may have made; a checkpoint task
     // takes only its own.
     let b = gone_silent(&mut kept);
     assert_eq!(
-        recovery_decision(
-            kept.state(),
-            b.id,
-            OutcomePolicy::Checkpoint,
-            &[],
-            here.clone()
-        ),
+        recovery_decision(kept.state(), b.id, OutcomePolicy::Checkpoint, &[],),
         Err(RecoveryBlock::NoAcknowledgedCheckpoint)
     );
     assert!(matches!(
-        recovery_decision(kept.state(), b.id, OutcomePolicy::CancelAndRestart, &[], here),
+        recovery_decision(kept.state(), b.id, OutcomePolicy::CancelAndRestart, &[]),
         Ok(Command::Recover { from, .. }) if from == snapshot(1)
     ));
     kept.replays();
@@ -1673,15 +1636,8 @@ fn an_attempt_is_judged_by_its_own_task_not_the_primary() {
     assert_eq!(OutcomePolicy::of_task(&child_task), OutcomePolicy::Block);
     // Judged by its own task, the child's attempt is blocked although the
     // job holds an acknowledged checkpoint the primary's policy would use.
-    let here = Ok(ResourceRef::Node { node: OTHER_NODE });
     assert_eq!(
-        recovery_decision(
-            kept.state(),
-            b.id,
-            OutcomePolicy::of_task(&child_task),
-            &[],
-            here.clone()
-        ),
+        recovery_decision(kept.state(), b.id, OutcomePolicy::of_task(&child_task), &[],),
         Err(RecoveryBlock::OutcomeBlocks {
             kind: "block".into()
         })
@@ -1694,7 +1650,6 @@ fn an_attempt_is_judged_by_its_own_task_not_the_primary() {
             b.id,
             OutcomePolicy::CancelAndRestart,
             &[],
-            here
         ),
         Ok(Command::Recover { from, .. }) if from == snapshot(1)
     ));
@@ -1720,7 +1675,6 @@ fn a_recover_fails_the_old_attempt_s_checkpoint_so_the_new_one_may_take_one() {
             "r-1",
             Command::Recover {
                 attempt: a.id,
-                resource: ResourceRef::Node { node: OTHER_NODE },
                 from: snapshot(1),
                 reason: "silent".into(),
             },
@@ -1735,6 +1689,7 @@ fn a_recover_fails_the_old_attempt_s_checkpoint_so_the_new_one_may_take_one() {
         OperationStatus::Failed
     );
     // The new attempt runs, and a checkpoint of it is not refused as in flight.
+    failover(&mut kept, OTHER_NODE).unwrap();
     let next = kept.state().attempts[1].clone();
     kept.mark(next.granted_by, OperationMark::Dispatched)
         .unwrap();
@@ -1772,7 +1727,6 @@ fn an_open_cancel_refuses_a_recover_and_a_supersede_completes_it() {
             "r-1",
             Command::Recover {
                 attempt: a.id,
-                resource: ResourceRef::Node { node: OTHER_NODE },
                 from: snapshot(1),
                 reason: "silent".into(),
             },
@@ -1809,12 +1763,17 @@ fn an_acknowledgement_that_lands_after_a_regrant_is_stale() {
         "r-1",
         Command::Recover {
             attempt: a.id,
-            resource: ResourceRef::Node { node: OTHER_NODE },
             from: snapshot(1),
             reason: "silent".into(),
         },
     )
     .unwrap();
+    // Superseded and not yet placed: the grant is taken all the same.
+    assert_eq!(
+        kept.acknowledge(&late),
+        Err(DomainError::NotLive { attempt: a.id })
+    );
+    failover(&mut kept, OTHER_NODE).unwrap();
     assert_eq!(
         kept.acknowledge(&late),
         Err(DomainError::StaleGeneration {

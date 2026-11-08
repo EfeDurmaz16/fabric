@@ -39,8 +39,8 @@ use fabric_core::managed::{
     AttemptId, AttemptStatus, CheckpointAck, Command, CommandKind, CoveredPath, DomainError,
     Envelope, FenceVerdict, GrantToken, HEARTBEAT_INTERVAL_MS, ManagedEvent, ManagedState, NewIds,
     Observation, OperationId, OperationKey, OperationMark, OperationStatus, OutcomePolicy,
-    RecoveryBlock, RecoveryExclusion, RecoveryPolicy, ResourceRef, StoredResult, TaskId,
-    Transition, fence, recovery_decision,
+    RecoveryBlock, RecoveryPolicy, ResourceRef, StoredResult, TaskId, Transition, fence,
+    recovery_decision,
 };
 use fabric_journal::{
     Answer, Blocker, CommitError, FILE_NAME, Journal, KeyedRequest, Liveness, OpenError,
@@ -223,9 +223,8 @@ pub(crate) struct Authority {
 enum Writer {
     /// No journal at start and no managed command since: no thread, no
     /// queue and no published ids, since there are none. Holds the state
-    /// directory the thread will work in, the node, and whether this node
-    /// runs managed attempts.
-    Idle(StateDir, NodeId, bool),
+    /// directory the thread will work in and the node.
+    Idle(StateDir, NodeId),
     /// The thread runs.
     Running {
         /// The queue it takes calls from. Declared before `thread`, so the
@@ -261,31 +260,15 @@ impl Drop for JoinOnDrop {
 impl Authority {
     /// The authority for `state`, on node `node`. Returns at once: with a
     /// journal, its thread starts now and recovers it before any call;
-    /// without one, no thread starts until a managed command. No node runs
-    /// managed attempts on this base (the M5 executor does), so the
-    /// authority's own automatic `Recover` finds no eligible node and
-    /// records `RecoveryBlocked` instead of granting onto this node.
+    /// without one, no thread starts until a managed command. The
+    /// authority's own automatic `Recover` takes the grant; the dispatch
+    /// places its failover with the M5 placement (`dispatch::pass`).
     pub(crate) fn start(state: &StateDir, node: NodeId) -> std::io::Result<Authority> {
-        Authority::start_with(state, node, false)
-    }
-
-    /// `start` for a node that runs managed attempts, so the automatic
-    /// `Recover` may place the next attempt on this node: the shape the
-    /// M5 placement takes at the restack, for the tests of that path.
-    #[cfg(test)]
-    pub(crate) fn start_with_executor(
-        state: &StateDir,
-        node: NodeId,
-    ) -> std::io::Result<Authority> {
-        Authority::start_with(state, node, true)
-    }
-
-    fn start_with(state: &StateDir, node: NodeId, executor: bool) -> std::io::Result<Authority> {
         // A journal whose presence cannot be read is left to the thread,
         // which fails closed on it.
         let journal = !matches!(managed_dir(state).join(FILE_NAME).try_exists(), Ok(false));
         let authority = Authority {
-            writer: Arc::new(Mutex::new(Writer::Idle(state.clone(), node, executor))),
+            writer: Arc::new(Mutex::new(Writer::Idle(state.clone(), node))),
             started: Arc::new(watch::channel(None).0),
             #[cfg(test)]
             spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -307,11 +290,10 @@ impl Authority {
         let mut writer = crate::node::lock(&self.writer);
         let place = match &*writer {
             Writer::Running { calls, ids, .. } => return Ok((calls.clone(), ids.clone())),
-            Writer::Idle(state, node, executor) => Place {
+            Writer::Idle(state, node) => Place {
                 dir: managed_dir(state),
                 jobs: state.jobs(),
                 node: *node,
-                executor: *executor,
             },
         };
         let (calls, queue) = mpsc::channel(QUEUE);
@@ -658,27 +640,6 @@ struct Place {
     dir: PathBuf,
     jobs: PathBuf,
     node: NodeId,
-    /// Whether this node runs managed attempts, so the automatic `Recover`
-    /// may place one here. No node does on this base; the M5 placement
-    /// replaces this at the restack.
-    executor: bool,
-}
-
-impl Place {
-    /// The placement of the automatic `Recover` (ADR 0028): this node when
-    /// it runs managed attempts, and otherwise no eligible node, with this
-    /// node's exclusion named, so the job falls back to `block` with the
-    /// reason recorded and the old grant is kept.
-    fn placement(&self) -> Result<ResourceRef, Vec<RecoveryExclusion>> {
-        if self.executor {
-            Ok(ResourceRef::Node { node: self.node })
-        } else {
-            Err(vec![RecoveryExclusion {
-                node: self.node,
-                reason: "no executor: this node runs no managed attempt".to_owned(),
-            }])
-        }
-    }
 }
 
 impl Place {
@@ -1193,10 +1154,10 @@ fn unreachable_key() -> OperationKey {
 /// the threshold (ADR 0028): under `Block` nothing; under
 /// `RestartFromAcknowledged` the pure decision, judged by the attempt's
 /// own task, then the `Recover` it names under its derived key, or the
-/// reason it did not restart, recorded once per silence and reason.
-/// Placement is `Place::placement`: no eligible node on this base, this
-/// node when it runs managed attempts, the M5 placement at the restack.
-/// `now` is the monotonic clock, `wall` the time the records carry.
+/// reason it did not restart, recorded once per silence and reason. The
+/// `Recover` takes the grant; its failover is placed by the dispatch with
+/// the M5 placement, the unavailable node excluded, and granted like a
+/// continue (`dispatch::place_failover`). `now` is the monotonic clock, `wall` the time the records carry.
 fn recover(
     place: &Place,
     journal: &mut Journal,
@@ -1231,7 +1192,7 @@ fn recover(
         .iter()
         .map(Blocker::operation)
         .collect();
-    let decided = recovery_decision(&state, o.attempt, outcome, &blockers, place.placement());
+    let decided = recovery_decision(&state, o.attempt, outcome, &blockers);
     let reason = match decided {
         Ok(command) => {
             let envelope = Envelope {

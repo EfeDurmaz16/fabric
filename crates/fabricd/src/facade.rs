@@ -1008,6 +1008,7 @@ fn exclusion_wire(reason: &Exclusion) -> ExclusionWire {
             detailed(json!({ "disk": { "need": need, "free": free } }))
         }
         Exclusion::Pin { pinned } => detailed(json!({ "pin": { "pinned": pinned.to_string() } })),
+        Exclusion::Unavailable => ExclusionWire::Named("unavailable".into()),
     }
 }
 
@@ -1054,12 +1055,6 @@ fn recovery_block_json(reason: &fabric_core::managed::RecoveryBlock) -> Value {
         RecoveryBlock::NoAcknowledgedCheckpoint => json!("no_acknowledged_checkpoint"),
         RecoveryBlock::ReplacementBlocked { blockers } => json!({ "replacement_blocked": {
             "blockers": blockers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        } }),
-        RecoveryBlock::NoEligibleNode { exclusions } => json!({ "no_eligible_node": {
-            "exclusions": exclusions
-                .iter()
-                .map(|e| json!({ "node": e.node.to_string(), "reason": e.reason }))
-                .collect::<Vec<_>>(),
         } }),
     }
 }
@@ -1424,6 +1419,11 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
                     "pin": pin.map(|n| n.to_string()),
                 } }),
                 EffectRequest::Spawn { task } => json!({ "spawn": { "task": task.to_string() } }),
+                EffectRequest::Recover { task, from, lost } => json!({ "recover": {
+                    "task": task.to_string(),
+                    "from": from.to_string(),
+                    "lost": lost.to_string(),
+                } }),
             },
         }),
     };
@@ -2545,7 +2545,7 @@ mod tests {
         use fabric_core::id::{JobId, NodeId, SnapshotId};
         use fabric_core::managed::{
             AttemptId, CheckpointAck, CoveredPath, CutDigest, FenceVerdict, Generation,
-            RecoveryBlock, RecoveryExclusion, WorkRevision,
+            RecoveryBlock, WorkRevision,
         };
         let attempt = AttemptId::from_bytes([1; 16]);
         let g1 = Generation::FIRST;
@@ -2597,12 +2597,7 @@ mod tests {
             ManagedEvent::RecoveryBlocked {
                 attempt,
                 generation: g1,
-                reason: RecoveryBlock::NoEligibleNode {
-                    exclusions: vec![RecoveryExclusion {
-                        node,
-                        reason: "unavailable".into(),
-                    }],
-                },
+                reason: RecoveryBlock::NoAcknowledgedCheckpoint,
             },
         ];
         let rendered: Vec<_> = events
@@ -2644,9 +2639,6 @@ mod tests {
         assert_eq!(rendered[3]["since_ms"], "7");
         assert!(rendered[3].get("last_heartbeat_ms").is_none());
         assert_eq!(rendered[5]["by"], "2");
-        assert_eq!(
-            rendered[6]["reason"]["no_eligible_node"]["exclusions"][0]["reason"],
-            "unavailable"
-        );
+        assert_eq!(rendered[6]["reason"], "no_acknowledged_checkpoint");
     }
 }

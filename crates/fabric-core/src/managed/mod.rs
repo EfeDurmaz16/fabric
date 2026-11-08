@@ -116,9 +116,9 @@ pub use model::{
     Dedupe, DomainError, EffectRequest, Envelope, ExitOutcome, HEARTBEAT_INTERVAL_MS, Intent,
     JobMode, JobPolicy, JobState, MAX_EXPORT_ALLOWLIST, MAX_SECRETS, ManagedEvent, ManagedJob,
     ManagedState, NewIds, Note, Observation, Operation, OperationMark, OperationProgress,
-    OperationStatus, PlacementPolicy, RecoveryBlock, RecoveryExclusion, RecoveryPolicy,
-    ResourceRef, RestartPolicy, SourceBinding, StoredResult, Task, TaskKind, TaskOutcome,
-    TaskState, Transition, UNAVAILABLE_AFTER_MS,
+    OperationStatus, PlacementPolicy, RecoveryBlock, RecoveryPolicy, ResourceRef, RestartPolicy,
+    SourceBinding, StoredResult, Task, TaskKind, TaskOutcome, TaskState, Transition,
+    UNAVAILABLE_AFTER_MS,
 };
 pub use package::{
     AllowedFidelity, Fidelity, FidelityRefusal, PACKAGE_MAX_BYTES, PACKAGE_VERSION, PackageDigest,

@@ -14,8 +14,7 @@ use super::model::{
     Attempt, AttemptStatus, Checkpoint, CheckpointAck, Command, CommandKind, Dedupe, DomainError,
     EffectRequest, Envelope, ExitOutcome, JobState, ManagedEvent, ManagedJob, ManagedState, NewIds,
     Observation, Operation, OperationMark, OperationProgress, OperationStatus, RecoveryBlock,
-    RecoveryExclusion, RecoveryPolicy, ResourceRef, SourceBinding, Task, TaskKind, TaskOutcome,
-    TaskState, Transition,
+    RecoveryPolicy, ResourceRef, SourceBinding, Task, TaskKind, TaskOutcome, TaskState, Transition,
 };
 use super::package::{Fidelity, TEXT_MAX_BYTES};
 use crate::credential::looks_like_credential;
@@ -307,9 +306,9 @@ fn open_effects<'a>(
             let request = state.request(o.id)?;
             let mine = match request {
                 EffectRequest::Checkpoint { attempt } => *attempt == old.id,
-                EffectRequest::Continue { task, .. } | EffectRequest::CancelTask { task, .. } => {
-                    *task == old.task
-                }
+                EffectRequest::Continue { task, .. }
+                | EffectRequest::CancelTask { task, .. }
+                | EffectRequest::Recover { task, .. } => *task == old.task,
                 EffectRequest::CancelJob { .. } => true,
                 // A spawn under the attempt's task is the attempt's to run.
                 EffectRequest::Spawn { task } => open_tasks_of(state, old.task).contains(task),
@@ -334,7 +333,8 @@ fn settle_superseded(
         match request {
             EffectRequest::Checkpoint { .. }
             | EffectRequest::Continue { .. }
-            | EffectRequest::Spawn { .. } => {
+            | EffectRequest::Spawn { .. }
+            | EffectRequest::Recover { .. } => {
                 events.extend(settle(op, OperationMark::Failed));
             }
             EffectRequest::CancelJob { .. } | EffectRequest::CancelTask { .. } if regrant => {
@@ -399,7 +399,6 @@ fn command_events(
         }
         Command::Recover {
             attempt,
-            resource,
             from,
             reason,
         } => {
@@ -408,22 +407,25 @@ fn command_events(
                 return Err(DomainError::NotAcknowledged { snapshot: *from });
             }
             open_task(state, old.task)?;
+            let ResourceRef::Node { node: lost } = old.resource;
             let settled = settle_superseded(state, old, true)?;
-            let next = state.job.generation.next().ok_or(DomainError::Exhausted)?;
             let mut events = vec![ManagedEvent::GrantSuperseded {
                 attempt: old.id,
                 generation: old.generation,
-                by: Some(next),
+                by: None,
                 reason: reason.clone(),
             }];
             events.extend(settled);
-            events.push(ManagedEvent::AttemptGranted {
-                attempt: ids.attempt,
-                task: old.task,
-                resource: resource.clone(),
-                generation: next,
-                initial_checkpoint: Some(*from),
+            // The grant follows the failover placement, as a continue's
+            // does (`place`): the dispatch places the task with `lost`
+            // excluded and the domain grants from `from`.
+            events.push(ManagedEvent::EffectRequested {
                 operation: ids.operation,
+                request: EffectRequest::Recover {
+                    task: old.task,
+                    from: *from,
+                    lost,
+                },
             });
             return Ok((true, events));
         }
@@ -1022,12 +1024,13 @@ fn place(
     let op = job
         .operation(operation)
         .ok_or(DomainError::UnknownOperation { operation })?;
-    if !matches!(op.kind, CommandKind::CreateJob | CommandKind::Continue)
-        || !matches!(
-            op.status,
-            OperationStatus::Accepted | OperationStatus::Dispatched
-        )
-        || job.attempts.iter().any(|a| a.granted_by == operation)
+    if !matches!(
+        op.kind,
+        CommandKind::CreateJob | CommandKind::Continue | CommandKind::Recover
+    ) || !matches!(
+        op.status,
+        OperationStatus::Accepted | OperationStatus::Dispatched
+    ) || job.attempts.iter().any(|a| a.granted_by == operation)
     {
         return Err(DomainError::OperationState {
             operation,
@@ -1037,6 +1040,19 @@ fn place(
     open_task(job, task)?;
     if let Some(live) = job.live_attempt() {
         return Err(DomainError::AttemptStillLive { attempt: live.id });
+    }
+    let recover = match job.request(operation) {
+        Some(EffectRequest::Recover { from, lost, .. }) if op.kind == CommandKind::Recover => {
+            Some((*from, *lost))
+        }
+        _ => None,
+    };
+    if let (Some((_, lost)), Some(chosen)) = (recover, decision.chosen)
+        && chosen == lost
+    {
+        // A failover never goes back to the node whose attempt it
+        // replaces: that attempt may still run there (ADR 0028).
+        return Err(DomainError::FailoverToLostNode { node: lost });
     }
     let mut events = vec![ManagedEvent::PlacementDecided {
         task,
@@ -1050,8 +1066,9 @@ fn place(
     }
     match decision.chosen {
         Some(node) => {
-            let initial_checkpoint = match op.kind {
-                CommandKind::Continue => last_checkpoint(job, task),
+            let initial_checkpoint = match (op.kind, recover) {
+                (CommandKind::Recover, Some((from, _))) => Some(from),
+                (CommandKind::Continue, _) => last_checkpoint(job, task),
                 _ => match job.job.source {
                     SourceBinding::Snapshot { snapshot } => Some(snapshot),
                     _ => None,
@@ -1256,6 +1273,16 @@ pub fn acknowledge(job: &ManagedState, ack: &CheckpointAck) -> Result<Transition
     if known.ack.is_some() {
         return Ok(unchanged(job));
     }
+    if matches!(attempt.status, AttemptStatus::Superseded { .. })
+        && open_recover_of(job, attempt.task)
+    {
+        // A recover took its grant and its failover is still being
+        // placed: the job's generation does not say so yet, and the new
+        // lineage starts from the recover's own checkpoint.
+        return Err(DomainError::NotLive {
+            attempt: ack.attempt,
+        });
+    }
     if ack.generation != job.job.generation {
         return Err(DomainError::StaleGeneration {
             given: ack.generation,
@@ -1266,6 +1293,20 @@ pub fn acknowledge(job: &ManagedState, ack: &CheckpointAck) -> Result<Transition
         job,
         ManagedEvent::CheckpointAcknowledged { ack: ack.clone() },
     )
+}
+
+/// Whether a `Recover` of `task` is accepted or dispatched and has not
+/// granted yet.
+fn open_recover_of(job: &ManagedState, task: TaskId) -> bool {
+    job.operations.iter().any(|o| {
+        o.kind == CommandKind::Recover
+            && matches!(
+                o.status,
+                OperationStatus::Accepted | OperationStatus::Dispatched
+            )
+            && matches!(job.request(o.id), Some(EffectRequest::Recover { task: t, .. }) if *t == task)
+            && !job.attempts.iter().any(|a| a.granted_by == o.id)
+    })
 }
 
 /// The admission rule of `RestartFromAcknowledged`, pure (ADR 0028): given
@@ -1279,7 +1320,6 @@ pub fn recovery_decision(
     attempt: AttemptId,
     outcome: OutcomePolicy,
     blockers: &[OperationId],
-    placement: Result<ResourceRef, Vec<RecoveryExclusion>>,
 ) -> Result<Command, RecoveryBlock> {
     let from = match outcome {
         OutcomePolicy::Block => {
@@ -1300,10 +1340,8 @@ pub fn recovery_decision(
             blockers: blockers.to_vec(),
         });
     }
-    let resource = placement.map_err(|exclusions| RecoveryBlock::NoEligibleNode { exclusions })?;
     Ok(Command::Recover {
         attempt,
-        resource,
         from,
         reason: format!("automatic restart from acknowledged checkpoint {from}"),
     })
@@ -1611,6 +1649,20 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 )
             ) {
                 return Err(broken(format!("a grant by operation {operation}")));
+            }
+            // A recover's failover grant is the generation that took the
+            // superseded attempt's place: its `by` is named now.
+            if s.operation(*operation).map(|o| o.kind) == Some(CommandKind::Recover) {
+                let previous = s.job.generation;
+                for old in s.attempts.iter_mut().filter(|a| {
+                    a.task == *task
+                        && a.generation == previous
+                        && a.status == AttemptStatus::Superseded { by: None }
+                }) {
+                    old.status = AttemptStatus::Superseded {
+                        by: Some(*generation),
+                    };
+                }
             }
             s.attempts.push(Attempt {
                 id: *attempt,

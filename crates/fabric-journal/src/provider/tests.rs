@@ -4,7 +4,7 @@
 
 use fabric_core::id::SnapshotId;
 use fabric_core::managed::{
-    AttemptStatus, Command, Generation, Observation, OperationMark, ResourceRef, StoredResult,
+    AttemptStatus, Command, Generation, Observation, OperationMark, StoredResult,
 };
 
 use super::*;
@@ -1015,9 +1015,6 @@ fn a_recover_is_blocked_like_a_start_attempt() {
         .unwrap();
     let recover = Command::Recover {
         attempt: ATTEMPT,
-        resource: ResourceRef::Node {
-            node: crate::tests::NODE,
-        },
         from: snapshot,
         reason: "test".into(),
     };

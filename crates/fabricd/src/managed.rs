@@ -67,6 +67,7 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::UnknownCheckpoint { .. } => "unknown_checkpoint",
         DomainError::CutMismatch { .. } => "cut_mismatch",
         DomainError::NotAcknowledged { .. } => "not_acknowledged",
+        DomainError::FailoverToLostNode { .. } => "failover_to_lost_node",
         DomainError::AttemptReachable { .. } => "attempt_reachable",
         DomainError::RecoveryUnsupported { .. } => "recovery_unsupported",
         DomainError::MissingReceipt { .. } => "missing_receipt",

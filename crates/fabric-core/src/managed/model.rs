@@ -204,15 +204,6 @@ impl JobPolicy {
     }
 }
 
-/// Why the recovery decision found a node ineligible for the restart.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RecoveryExclusion {
-    /// The node.
-    pub node: NodeId,
-    /// Why it is not eligible.
-    pub reason: String,
-}
-
 /// Why an automatic restart did not happen; the job stays under `Block`
 /// with this recorded, never under a weaker restart.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -230,11 +221,6 @@ pub enum RecoveryBlock {
     ReplacementBlocked {
         /// The blocking provider operations, oldest first.
         blockers: Vec<OperationId>,
-    },
-    /// M5 placement found no eligible node with the unavailable node excluded.
-    NoEligibleNode {
-        /// Every candidate and why it was excluded.
-        exclusions: Vec<RecoveryExclusion>,
     },
 }
 
@@ -732,15 +718,15 @@ pub enum Command {
         /// Why, for the history.
         reason: String,
     },
-    /// `Supersede` and `StartAttempt` in one transaction: the next attempt
-    /// at the next generation, placed on `resource`, from the acknowledged
-    /// checkpoint `from` (ADR 0028).
+    /// `Supersede`, then a failover placement from the acknowledged
+    /// checkpoint `from` (ADR 0028): the grant is taken now, and the next
+    /// attempt is granted when the M5 placement chooses a node for it, as
+    /// a `Continue` is, with the unavailable attempt's node excluded. A
+    /// recover's grant is launched like any other.
     Recover {
         /// The `unknown` attempt whose grant is taken.
         attempt: AttemptId,
-        /// Where the next attempt runs.
-        resource: ResourceRef,
-        /// The acknowledged checkpoint it starts from.
+        /// The acknowledged checkpoint the next attempt starts from.
         from: SnapshotId,
         /// Why, for the history.
         reason: String,
@@ -855,6 +841,16 @@ pub enum EffectRequest {
     Spawn {
         /// The task.
         task: TaskId,
+    },
+    /// Place the task again as a failover from an acknowledged checkpoint
+    /// after its attempt on `lost` was superseded (ADR 0028, M6).
+    Recover {
+        /// The task.
+        task: TaskId,
+        /// The acknowledged checkpoint the next attempt starts from.
+        from: SnapshotId,
+        /// The node the superseded attempt ran on; never chosen.
+        lost: NodeId,
     },
 }
 
@@ -1459,6 +1455,14 @@ pub enum DomainError {
     NotAcknowledged {
         /// The snapshot.
         snapshot: SnapshotId,
+    },
+    /// A failover placement chose the node whose attempt it replaces: that
+    /// attempt may still run there, so the recover's grant goes elsewhere
+    /// or the job parks (ADR 0028).
+    #[error("a failover may not go back to node {node}, whose attempt it replaces")]
+    FailoverToLostNode {
+        /// The node.
+        node: NodeId,
     },
     /// `Supersede` or `Recover` on an attempt that is not `unknown`: a
     /// reachable attempt is handed over by the M5 planned handoff, never recovered.
