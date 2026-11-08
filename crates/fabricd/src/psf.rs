@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use fabric_client::api::PsfExported;
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{JobId, SnapshotId};
-use fabric_core::ledger::EventKind;
+use fabric_core::id::{JobId, RecordHash, SnapshotId};
+use fabric_core::ledger::{EventKind, Ledger};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, GitHead, SnapshotManifest,
 };
@@ -26,6 +26,7 @@ use fabric_psf::{
 };
 
 use crate::error::NodeError;
+use crate::local::Liveness;
 use crate::node::Node;
 use crate::transfer::with_store;
 
@@ -41,10 +42,22 @@ impl Node {
     ) -> Result<PsfExported, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
+        // A running harness is ahead of the latest snapshot and may be
+        // rewriting the state the attachment would carry: the export
+        // names a revision at rest, as the orphan export does.
+        if let Some(record) = job.harness_record()?
+            && record.liveness().await != Liveness::Gone
+        {
+            return Err(NodeError::AlreadyRunningHarness {
+                job: id,
+                pid: record.pid,
+            });
+        }
         let latest = job.latest().ok_or(NodeError::NoSnapshot(id))?;
         let snapshot = with_store(&self.store, move |store| Ok(store.manifest(latest)?)).await?;
         let chain = self.bundle_chain(latest).await?;
         let ledger = job.ledger();
+        let (ledger_head, epoch) = revision_record(ledger, latest);
         let created_by = ledger
             .records()
             .iter()
@@ -81,8 +94,8 @@ impl Node {
             workspace: Workspace {
                 root: snapshot.root.to_string(),
                 bundle_head: latest.to_string(),
-                ledger_head: ledger.head().to_string(),
-                epoch: ledger.lease().epoch().get(),
+                ledger_head: ledger_head.to_string(),
+                epoch,
                 os: snapshot.platform.os.clone(),
                 arch: snapshot.platform.arch.clone(),
             },
@@ -289,6 +302,29 @@ fn carry_key(key: &CarryKey) -> Vec<(String, String)> {
     pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
 }
 
+/// The revision `latest` is (section 5.2): the hash of the record at
+/// which it became the job's state, the last `SnapshotPublished` or
+/// `Suspended` that names it, and the epoch that record was written in.
+/// Records after it, a `Resumed` or a note, do not change the revision.
+fn revision_record(ledger: &Ledger, latest: SnapshotId) -> (RecordHash, u64) {
+    ledger
+        .records()
+        .iter()
+        .rev()
+        .find(|r| match &r.event().kind {
+            EventKind::SnapshotPublished { snapshot, .. } | EventKind::Suspended { snapshot } => {
+                *snapshot == latest
+            }
+            _ => false,
+        })
+        .map_or_else(
+            // The latest snapshot is set by its SnapshotPublished, so a
+            // ledger always holds one; the head is the safe answer if not.
+            || (ledger.head(), ledger.lease().epoch().get()),
+            |r| (r.hash(), r.event().epoch.get()),
+        )
+}
+
 /// True when `uri` names a repository another node can fetch: a URL of a
 /// network scheme, or git's `[user@]host:path`, on a host that is not
 /// this one. A local path in any spelling, a `file:` URL, a relative or
@@ -329,7 +365,61 @@ fn fetchable_elsewhere(uri: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::fetchable_elsewhere;
+    use fabric_core::harness::HarnessKind;
+    use fabric_core::id::{EventId, JobId, NodeId, SnapshotId};
+    use fabric_core::ledger::{EventKind, Ledger};
+
+    use super::{fetchable_elsewhere, revision_record};
+    use crate::job::Job;
+    use crate::paths::StateDir;
+
+    /// Two exports of one revision name the same ledger head, whatever
+    /// was written after it: a resume, a note, a later suspend of the
+    /// same snapshot moves it to that suspend.
+    #[test]
+    fn the_ledger_head_is_the_record_that_made_the_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let (id, me) = (JobId::from_bytes([1; 16]), NodeId::from_bytes([3; 32]));
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            me,
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let mut job = Job::create(id, state.job(id), &created).unwrap();
+        let s1 = SnapshotId::from_bytes([7; 32]);
+        job.append(
+            me,
+            EventKind::SnapshotPublished {
+                snapshot: s1,
+                parent: None,
+            },
+        )
+        .unwrap();
+        let suspended = job.append(me, EventKind::Suspended { snapshot: s1 }).unwrap();
+        let want = (suspended.hash(), suspended.event().epoch.get());
+        assert_eq!(revision_record(job.ledger(), s1), want);
+        job.append(
+            me,
+            EventKind::Resumed {
+                node: me,
+                snapshot: Some(s1),
+                harness: HarnessKind::Codex,
+            },
+        )
+        .unwrap();
+        job.append(me, EventKind::Note { text: "n".into() }).unwrap();
+        assert_eq!(revision_record(job.ledger(), s1), want);
+        let again = job.append(me, EventKind::Suspended { snapshot: s1 }).unwrap();
+        assert_eq!(
+            revision_record(job.ledger(), s1),
+            (again.hash(), again.event().epoch.get())
+        );
+    }
 
     #[test]
     fn only_a_network_remote_on_another_host_is_a_source() {

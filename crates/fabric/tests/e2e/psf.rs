@@ -6,7 +6,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::world::{Fallible, Wire, text};
+use crate::GIVE_UP;
+use crate::world::{Fallible, Wire, finish, text};
 
 /// Every file under `dir`, with its bytes.
 fn files(dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Fallible {
@@ -86,5 +87,16 @@ fn e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back() -> Falli
         "an export over an existing directory: {}",
         text(&again)
     );
+
+    // A running harness is past the latest snapshot: no export names it.
+    let (running, _pid) = p.a.run_lingering(&job)?;
+    let live = p.env.root.join("live.psf");
+    let live_text = live.to_str().ok_or("the test directory is not UTF-8")?;
+    let refused = p.a.run(&["job", "export", &job, "--psf", live_text])?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let _ = finish(running, GIVE_UP)?;
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(text(&refused).contains("already runs as pid"), "{}", text(&refused));
+    assert!(!live.exists(), "a refused export wrote {}", live.display());
     Ok(())
 }
