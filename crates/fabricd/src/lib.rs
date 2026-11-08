@@ -12,6 +12,7 @@
 //! command finishes or refuses with the command that resolves it.
 
 mod authority;
+mod capturer;
 mod carry;
 mod catchup;
 pub mod clock;
@@ -37,6 +38,7 @@ mod package;
 pub mod paths;
 mod placement;
 mod report;
+mod runner;
 pub mod secrets;
 mod service;
 pub mod sources;

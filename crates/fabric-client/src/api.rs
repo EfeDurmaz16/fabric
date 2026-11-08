@@ -157,11 +157,13 @@ pub enum Op {
     FacadeRevoke,
     /// [`Request::FacadeCall`].
     FacadeCall,
+    /// [`Request::ManagedRegister`].
+    ManagedRegister,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 34] = [
+    pub const ALL: [Op; 35] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -196,6 +198,7 @@ impl Op {
         Op::FacadeMint,
         Op::FacadeRevoke,
         Op::FacadeCall,
+        Op::ManagedRegister,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -236,6 +239,7 @@ impl Op {
             Op::FacadeMint => "facade_mint",
             Op::FacadeRevoke => "facade_revoke",
             Op::FacadeCall => "facade_call",
+            Op::ManagedRegister => "managed_register",
         }
     }
 }
@@ -723,6 +727,33 @@ pub enum Request {
         /// The note.
         note: NoteWire,
     },
+    /// Registers a build or test task under a task of a managed job, with
+    /// the program it runs (M5, the launch path). With a live attempt of
+    /// the parent the node that runs it is asked to spawn the task; with
+    /// none the task rides in the parent's next launch.
+    ManagedRegister {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+        /// The task it is registered under.
+        #[serde(with = "text")]
+        parent: TaskId,
+        /// The caller's label for it.
+        label: String,
+        /// `build` or `test`.
+        class: RegisterClass,
+        /// What it runs.
+        program: ProgramWire,
+    },
     /// Takes a checkpoint cut of the job's live attempt (M5); the attempt
     /// goes on afterwards.
     ManagedCheckpoint {
@@ -929,6 +960,7 @@ impl Request {
             | Request::ManagedList
             | Request::ManagedSubmit { .. }
             | Request::ManagedNote { .. }
+            | Request::ManagedRegister { .. }
             | Request::ManagedCheckpoint { .. }
             | Request::ManagedContinue { .. }
             | Request::ManagedInspect { .. }
@@ -978,6 +1010,7 @@ impl Request {
             Request::FacadeMint { .. } => Op::FacadeMint,
             Request::FacadeRevoke { .. } => Op::FacadeRevoke,
             Request::FacadeCall { .. } => Op::FacadeCall,
+            Request::ManagedRegister { .. } => Op::ManagedRegister,
         }
     }
 }
@@ -1365,6 +1398,8 @@ pub enum Reply {
     FacadeRevoke(Revoked),
     /// For [`Request::FacadeCall`].
     FacadeCall(FacadeEnvelope),
+    /// For [`Request::ManagedRegister`].
+    ManagedRegister(Box<ManagedOperation>),
 }
 
 impl Reply {
@@ -1406,6 +1441,7 @@ impl Reply {
             Reply::FacadeMint(_) => Op::FacadeMint,
             Reply::FacadeRevoke(_) => Op::FacadeRevoke,
             Reply::FacadeCall(_) => Op::FacadeCall,
+            Reply::ManagedRegister(_) => Op::ManagedRegister,
         }
     }
 }
@@ -1515,6 +1551,72 @@ pub struct ManagedTask {
     /// The task's last receipt (M5), when an executor reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<ReceiptWire>,
+    /// What a build or test task runs (M5, the launch path); absent for
+    /// a harness task, which runs through its adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<ProgramWire>,
+}
+
+/// The class of a task a client registers: a build or a test (M5, the
+/// launch path). A harness task is the job's own, and an opaque one is
+/// never registered by a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegisterClass {
+    /// A build: an interrupted one is restarted, never resumed.
+    Build,
+    /// A test: an interrupted one is recorded interrupted, never passed.
+    Test,
+}
+
+impl From<RegisterClass> for fabric_core::managed::TaskClass {
+    fn from(class: RegisterClass) -> Self {
+        match class {
+            RegisterClass::Build => fabric_core::managed::TaskClass::Build,
+            RegisterClass::Test => fabric_core::managed::TaskClass::Test,
+        }
+    }
+}
+
+/// What a build or test task runs, as the client API writes it
+/// (docs/facade-protocol.md, "Launch path"): the command and its
+/// arguments, the directory under the attempt's root, and the variables
+/// of the node's environment it may see. The node checks it again
+/// (`Program::check`) before anything is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramWire {
+    /// The command and its arguments; never empty.
+    pub argv: Vec<String>,
+    /// Where it runs, relative to the attempt's root; the root when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<fabric_core::path::RelPath>,
+    /// The variables of the node's environment it may see.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "null_as_default"
+    )]
+    pub env_allowlist: Vec<fabric_core::env::EnvVarName>,
+}
+
+impl From<ProgramWire> for fabric_core::managed::Program {
+    fn from(wire: ProgramWire) -> Self {
+        fabric_core::managed::Program {
+            argv: wire.argv,
+            cwd: wire.cwd,
+            env_allowlist: wire.env_allowlist,
+        }
+    }
+}
+
+impl From<&fabric_core::managed::Program> for ProgramWire {
+    fn from(program: &fabric_core::managed::Program) -> Self {
+        ProgramWire {
+            argv: program.argv.clone(),
+            cwd: program.cwd.clone(),
+            env_allowlist: program.env_allowlist.clone(),
+        }
+    }
 }
 
 /// One attempt of a managed job.
@@ -1921,6 +2023,19 @@ pub struct ProviderOperationWire {
         with = "text::option"
     )]
     pub cleans: Option<OperationId>,
+    /// `effect` or `cleanup` (M5, the provider read surface); absent from
+    /// a node before it, which a reader takes as `effect` unless `cleans` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// The resource Fabric sent the action to, as the bridge names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The scope its last absent answer searched, as canonical JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched: Option<String>,
+    /// Why the owner abandoned it; set exactly when it is `abandoned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandon_reason: Option<String>,
 }
 
 /// One reason no replacement attempt may be granted (ADR 0022).
@@ -1946,6 +2061,9 @@ pub struct ResidualWire {
     /// Where the resource is, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<String>,
+    /// The scope the create's last absent attach searched, when it has no locator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched: Option<String>,
 }
 
 /// Everything the journal holds about one managed job (M5): the body of
@@ -2063,6 +2181,7 @@ impl From<&ManagedState> for ManagedJob {
                     .to_owned(),
                     class: None,
                     receipt: None,
+                    program: task.program.as_ref().map(ProgramWire::from),
                 })
                 .collect(),
             attempts: state

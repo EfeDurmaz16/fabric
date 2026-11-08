@@ -483,6 +483,23 @@ pub fn managed_job(job: &ManagedJob) -> Vec<String> {
             Some(label) => format!("task {} ({label}): {}", task.task, task.state),
             None => format!("task {} (primary): {}", task.task, task.state),
         });
+        if let Some(program) = &task.program {
+            // Each argument as JSON text, so a space or a quote in one reads
+            // as what it is.
+            let argv: Vec<String> = program
+                .argv
+                .iter()
+                .map(|arg| serde_json::to_string(arg).unwrap_or_default())
+                .collect();
+            lines.push(format!(
+                "  runs {}{}",
+                argv.join(" "),
+                program
+                    .cwd
+                    .as_ref()
+                    .map_or(String::new(), |cwd| format!(" in {}", cwd.as_str()))
+            ));
+        }
     }
     for attempt in &job.attempts {
         lines.push(format!(

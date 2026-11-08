@@ -184,6 +184,7 @@ impl Node {
             | Request::ManagedCancel { .. }
             | Request::ManagedSubmit { .. }
             | Request::ManagedNote { .. }
+            | Request::ManagedRegister { .. }
             | Request::ManagedCheckpoint { .. }
             | Request::ManagedContinue { .. }
             | Request::ManagedInspect { .. }

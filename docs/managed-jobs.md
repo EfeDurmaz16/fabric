@@ -1735,6 +1735,23 @@ The client surfaces (owner B): the client API gains `managed_register` (api 1, a
 
 The provider read-surface row, carried from M4, closes in this step on owner B's side: `fabricd::facade::tests::an_inspection_lists_every_provider_status` over a journal seeded with one provider operation per status and the blockers and residuals they make, and `managed::e2e_the_cli_inspects_provider_operations_blockers_and_residuals` in the e2e suite for `fabric managed inspect`.
 
+#### As built (owner B)
+
+Where the code differs from the shapes above, or adds to them:
+
+- The runner is `runner::Runner`, held by the node beside its executor: `Runner::launch(from, request)` and `Runner::instruct(from, token, instruction)`. There is no `Node::runner_launch` or `Node::runner_instruct`; the four `Service` methods are the entry, and each maps the node's own id to `None`, so a grant from this node's authority, sent through `NodeLink` with its own id, takes the same path as one from a peer. An instruction from another authority than the one that launched the attempt is answered `NotRunning`.
+- The node's effects (the root, the harness, the task command, the report and heartbeat links, the capturer's attempt) are the `runner::Host` trait; `NodeHost` is the node's, and `runner::tests` runs the loop against a fake host and a real executor.
+- A launch taken is recorded in `runs/taken/<attempt>.json` before it is answered `Accepted`, so a launch sent again, after either side restarted, is `AlreadyLaunched`. The executor's launch records are under `runs/records`, and the node stops what they name at start-up (`Executor::recover`) before anything new is launched.
+- The root is prepared (step 2) before `Executor::begin` (step 1): a failed preparation begins nothing. A root a previous attempt of the job left on this node is set aside as `<root>.before-<attempt>`, never removed.
+- A heartbeat names one grant: each attempt runs its own heartbeat loop. A `Live` answer, or one that names nothing of the grant, lets a waiting report go again.
+- No native session is offered: the launch restores the workspace from the cut and not the harness's own state, so `offered_fidelity` is asked with the layout never the same. `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout` is ignored with that reason.
+- The harness runs with the daemon's environment less every `FABRIC_SECRET_*` variable, plus the job's secrets under their names, as a CLI run passes the user's environment; its output is read for the session (`read_headless_line`, or an ACP agent's turn feed) and dropped. A build or test task gets `PATH`, `HOME` and its allowlist only, the job's secrets from the executor, and no terminal.
+- `NodeCapturer` captures the harness's state through its adapter once its session is known, and the workspace alone before that; the facts a cut records are measured at its capture. `Executor::adopt` refuses a pid that leads no group (`NotAGroupLeader`).
+- The executor marks a task it signalled, so a test a checkpoint interrupted is still `Interrupted` at the next cut (`an_interrupted_test_stays_interrupted_at_the_next_cut`), not read as exited.
+- `managed_register` registers with the `explicit_only` restart. A program in a request or a reply skips a field it does not know, like any object outside a run plan; the node checks it again. The provider read surface adds `purpose`, `target`, `searched` and `abandon_reason` to a provider operation and `searched` to a residual, each optional; the fixtures are `reply/managed_inspect_provider_operations.json` and `hello_answer/welcome_with_the_launch_path.json`.
+- The e2e fake codex gains `FAKE_CODEX_HOLD`, one process that holds its turn open: its `FAKE_CODEX_WAIT` loop forks a `sleep` per tick, an escaped child that rightly blocks a strong handoff. The continuity test runs the fake codex, not the fake ACP agent, and follows the handoff's placement: a continue's `pin` does not reach `dispatch::place_handoff`, which places with the job's policy (open, owner A).
+- Counters: launches taken, reports sent, reports refused, heartbeats answered, stale verdicts obeyed (`Runner::counters`).
+
 #### Acceptance mapped to tests, the launch path
 
 Each test is written first and fails on this contract's commit.

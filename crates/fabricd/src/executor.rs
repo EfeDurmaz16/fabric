@@ -74,6 +74,13 @@ pub enum ExecutorError {
     /// The durable record of a launch could not be written or read.
     #[error(transparent)]
     Record(#[from] local::LocalError),
+    /// A process offered for adoption does not lead a process group of
+    /// its own, so a stop of its group would reach what is not the task's.
+    #[error("pid {pid} does not lead a process group of its own")]
+    NotAGroupLeader {
+        /// The pid.
+        pid: u32,
+    },
 }
 
 /// What a spawn made.
@@ -140,15 +147,30 @@ pub struct LaunchRecord {
     pub started: Option<String>,
 }
 
+/// How the executor holds a task's process.
+enum Handle {
+    /// A process the executor spawned and reaps.
+    Child(tokio::process::Child),
+    /// A harness process its adapter spawned (`Executor::adopt`): its
+    /// parent, the runner, reaps it, so the executor learns it ended when
+    /// nothing of its group is left.
+    Adopted,
+}
+
 /// One running task.
 struct Running {
     task: TaskId,
     class: TaskClass,
     pid: NonZeroU32,
     started: Option<String>,
-    child: tokio::process::Child,
+    handle: Handle,
     /// The exit status, once reaped.
     exit: Option<std::process::ExitStatus>,
+    /// True once the task is known to have ended, its status known or not.
+    gone: bool,
+    /// True once a quiescence or a stop signalled it: it ended interrupted,
+    /// whatever its status says, and every later receipt says so.
+    interrupted: bool,
 }
 
 /// One attempt this node runs.
@@ -299,6 +321,57 @@ impl Executor {
         Ok(())
     }
 
+    /// The job's secrets for a process of `attempt`, by name; a secret
+    /// scoped to the current attempt only while `is_current`.
+    fn resolve_secrets(
+        &self,
+        run: &AttemptRun,
+        attempt: AttemptId,
+        is_current: bool,
+    ) -> Result<Vec<(String, String)>, ExecutorError> {
+        let mut env = Vec::new();
+        for secret in &run.secrets {
+            if secret.scope.attempt == AttemptScope::Current && !is_current {
+                continue;
+            }
+            let value = self.resolver.resolve(run.job, attempt, secret)?;
+            env.push((
+                secret.name.as_str().to_owned(),
+                String::from_utf8_lossy(value.expose()).into_owned(),
+            ));
+        }
+        Ok(env)
+    }
+
+    /// The secrets a process of `attempt` that its adapter spawns gets in
+    /// its environment, under their names, resolved now, as
+    /// [`Executor::spawn`] resolves them: the harness task's (the launch
+    /// path, step 4). The caller hands them to the adapter and keeps none.
+    pub async fn secret_env(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<Vec<(String, String)>, ExecutorError> {
+        let run = self.run(attempt).await?;
+        let run = run.lock().await;
+        let is_current = self
+            .current
+            .lock()
+            .await
+            .get(&run.job)
+            .is_none_or(|current| *current <= run.generation);
+        self.resolve_secrets(&run, attempt, is_current)
+    }
+
+    /// The job's current generation as this node knows it, if it knows one.
+    pub async fn current(&self, job: JobId) -> Option<Generation> {
+        self.current.lock().await.get(&job).copied()
+    }
+
+    /// The secrets of `refs` that do not resolve on this node.
+    pub fn unresolved(&self, refs: &[SecretRef]) -> Vec<fabric_core::managed::SecretName> {
+        self.resolver.unresolved(refs)
+    }
+
     fn record_path(&self, attempt: AttemptId, task: TaskId) -> PathBuf {
         self.records
             .join(attempt.to_string())
@@ -333,17 +406,7 @@ impl Executor {
             .is_none_or(|current| *current <= run.generation);
         // Secrets are resolved now, never earlier and never kept: a
         // missing one refuses the launch before any process exists.
-        let mut env = Vec::new();
-        for secret in &run.secrets {
-            if secret.scope.attempt == AttemptScope::Current && !is_current {
-                continue;
-            }
-            let value = self.resolver.resolve(run.job, attempt, secret)?;
-            env.push((
-                secret.name.as_str().to_owned(),
-                String::from_utf8_lossy(value.expose()).into_owned(),
-            ));
-        }
+        let env = self.resolve_secrets(&run, attempt, is_current)?;
         let path = self.record_path(attempt, task);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| local::LocalError::Io {
@@ -362,7 +425,12 @@ impl Executor {
         // is durable and no process exists; a crash here leaves a record
         // with no pid, which recovery clears.
         local::write(&path, &record)?;
-        command.process_group(0).current_dir(run.root.as_str());
+        // A program names its directory under the root (the launch path);
+        // every other task runs in the root.
+        if command.get_current_dir().is_none() {
+            command.current_dir(run.root.as_str());
+        }
+        command.process_group(0);
         scrub_secrets(&mut command);
         for (key, value) in &env {
             command.env(key, value);
@@ -402,8 +470,74 @@ impl Executor {
             class,
             pid,
             started,
-            child,
+            handle: Handle::Child(child),
             exit: None,
+            gone: false,
+            interrupted: false,
+        });
+        Ok(Spawned {
+            pid: pid.get(),
+            group: pid.get(),
+            task,
+        })
+    }
+
+    /// Registers a harness process its adapter spawned, in a group it
+    /// leads, as the attempt's task `task` of class `Harness`: the launch
+    /// record is written as for [`Executor::spawn`], so a restart stops
+    /// it, and a quiescence checkpoints it through the suspend path, never
+    /// kills it. `started` is its start time as `ps` prints it; read now
+    /// when `None`. Refused while the attempt is frozen, and for a pid
+    /// that leads no group of its own. The caller, which holds the
+    /// process, reaps it; the executor sees it ended when its group is gone.
+    pub async fn adopt(
+        &self,
+        attempt: AttemptId,
+        task: TaskId,
+        pid: u32,
+        started: Option<String>,
+    ) -> Result<Spawned, ExecutorError> {
+        let run = self.run(attempt).await?;
+        let mut run = run.lock().await;
+        if run.frozen {
+            return Err(ExecutorError::Frozen { attempt });
+        }
+        let leader = NonZeroU32::new(pid)
+            .and_then(pid_of)
+            .ok_or(ExecutorError::NotAGroupLeader { pid })?;
+        match rustix::process::getpgid(Some(leader)) {
+            Ok(group) if group == leader => {}
+            _ => return Err(ExecutorError::NotAGroupLeader { pid }),
+        }
+        let pid = NonZeroU32::new(pid).ok_or(ExecutorError::NotAGroupLeader { pid })?;
+        let started = match started {
+            Some(started) => Some(started),
+            None => local::process_started(pid).await,
+        };
+        let path = self.record_path(attempt, task);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| local::LocalError::Io {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        let record = LaunchRecord {
+            attempt,
+            task,
+            class: TaskClass::Harness,
+            pid: Some(pid.get()),
+            started: started.clone(),
+        };
+        local::write(&path, &record)?;
+        run.tasks.push(Running {
+            task,
+            class: TaskClass::Harness,
+            pid,
+            started,
+            handle: Handle::Adopted,
+            exit: None,
+            gone: false,
+            interrupted: false,
         });
         Ok(Spawned {
             pid: pid.get(),
@@ -494,7 +628,7 @@ impl Executor {
                     settle_or_interrupt(running, budget, &self.signals).await
                 }
                 OutcomePolicy::Checkpoint => {
-                    if reap(running).is_some() {
+                    if reap(running).await {
                         exited(running)
                     } else {
                         self.captures.fetch_add(1, Ordering::Relaxed);
@@ -530,7 +664,7 @@ impl Executor {
                     }
                 }
                 OutcomePolicy::Block => {
-                    if reap(running).is_some() {
+                    if reap(running).await {
                         exited(running)
                     } else {
                         blockers.push(HandoffBlocker::Opaque { task: running.task });
@@ -570,7 +704,7 @@ impl Executor {
         run.frozen = true;
         let mut receipts = Vec::new();
         for running in &mut run.tasks {
-            let exited_before = reap(running).is_some();
+            let exited_before = reap(running).await;
             interrupt(running, budget, &self.signals).await;
             receipts.push(if exited_before {
                 exited(running)
@@ -671,17 +805,39 @@ fn receipt_digest(receipt: &TaskReceipt) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Reaps the task if it exited; its status, once known, is kept.
-fn reap(running: &mut Running) -> Option<std::process::ExitStatus> {
-    if running.exit.is_none()
-        && let Ok(Some(status)) = running.child.try_wait()
-    {
-        running.exit = Some(status);
+/// Whether the task ended: a spawned one is reaped and its status kept;
+/// an adopted one ended once nothing of its group is left alive.
+async fn reap(running: &mut Running) -> bool {
+    if running.gone {
+        return true;
     }
-    running.exit
+    match &mut running.handle {
+        Handle::Child(child) => {
+            if let Ok(Some(status)) = child.try_wait() {
+                running.exit = Some(status);
+                running.gone = true;
+            }
+        }
+        Handle::Adopted => {
+            if group_members(running.pid.get()).await.is_empty() {
+                running.gone = true;
+            }
+        }
+    }
+    running.gone
 }
 
 fn exited(running: &Running) -> TaskReceipt {
+    if running.interrupted {
+        return TaskReceipt {
+            task: running.task,
+            class: running.class,
+            status: ReceiptStatus::Interrupted,
+            exit: None,
+            interrupted: true,
+            workspace: None,
+        };
+    }
     TaskReceipt {
         task: running.task,
         class: running.class,
@@ -701,7 +857,7 @@ async fn settle_or_interrupt(
 ) -> TaskReceipt {
     let deadline = tokio::time::Instant::now() + budget.duration();
     loop {
-        if reap(running).is_some() {
+        if reap(running).await {
             return exited(running);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -733,27 +889,39 @@ async fn interrupt(running: &mut Running, grace: DrainBudget, signals: &AtomicU6
         return;
     };
     if group_members(running.pid.get()).await.is_empty() {
-        let _ = running
-            .child
-            .try_wait()
-            .map(|s| running.exit = s.or(running.exit));
+        if let Handle::Child(child) = &mut running.handle
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            running.exit = Some(status);
+        }
+        running.gone = true;
         return;
     }
-    if running.exit.is_none()
+    let leader_exited = match &mut running.handle {
+        Handle::Child(child) => child.try_wait().ok().flatten().is_some(),
+        Handle::Adopted => false,
+    };
+    if !running.gone
         && let Some(started) = &running.started
         && local::process_started(running.pid).await.as_ref() != Some(started)
-        && running.child.try_wait().ok().flatten().is_none()
+        && !leader_exited
     {
         return;
     }
     signals.fetch_add(1, Ordering::Relaxed);
+    running.interrupted = !running.gone;
     signal_group(group, Signal::TERM);
     if !wait_group_gone(group, grace.duration()).await {
         signals.fetch_add(1, Ordering::Relaxed);
         signal_group(group, Signal::KILL);
         wait_group_gone(group, KILL_WAIT).await;
     }
-    let _ = running.child.wait().await.map(|s| running.exit = Some(s));
+    if let Handle::Child(child) = &mut running.handle
+        && let Ok(status) = child.wait().await
+    {
+        running.exit = Some(status);
+    }
+    running.gone = true;
 }
 
 fn signal_group(group: Pid, signal: Signal) {
@@ -1560,5 +1728,105 @@ mod tests {
         .unwrap();
         Executor::recover(&records, budget(1_000)).await.unwrap();
         assert!(walkdir(&records).is_empty());
+    }
+
+    /// A harness process its adapter spawned is registered as the
+    /// attempt's harness task (the launch path, step 4): it must lead a
+    /// group of its own, its launch record names its pid and start time
+    /// so a restart stops it, a quiescence checkpoints it through the
+    /// suspend path and never signals it, a frozen attempt adopts nothing,
+    /// and a stop ends its group.
+    #[tokio::test]
+    async fn an_adopted_harness_process_is_in_its_own_group_and_recorded() {
+        let snapshot = SnapshotId::of(b"adopted");
+        let b = bench(Ok(snapshot)).await;
+        // Not a group leader: a process in the test's own group.
+        let mut stray = sh("exec sleep 30");
+        let mut stray = stray.spawn().unwrap();
+        assert!(matches!(
+            b.executor.adopt(b.attempt, task(1), stray.id(), None).await,
+            Err(ExecutorError::NotAGroupLeader { .. })
+        ));
+        stray.kill().unwrap();
+        stray.wait().unwrap();
+
+        let mut harness = sh("exec sleep 30");
+        harness.process_group(0);
+        let mut harness = harness.spawn().unwrap();
+        let pid = harness.id();
+        let adopted = b
+            .executor
+            .adopt(b.attempt, task(1), pid, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (adopted.pid, adopted.group, adopted.task),
+            (pid, pid, task(1))
+        );
+        assert_eq!(b.executor.pids(b.attempt).await, vec![pid]);
+        let record: LaunchRecord = local::read(
+            &b.dir
+                .path()
+                .join("records")
+                .join(b.attempt.to_string())
+                .join(format!("{}.json", task(1))),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.class, TaskClass::Harness);
+        assert_eq!(record.pid, Some(pid));
+        assert!(
+            record.started.is_some(),
+            "the start time tells a reused pid"
+        );
+        assert_eq!(
+            b.executor.counters().spawns,
+            0,
+            "nothing was spawned by the executor"
+        );
+
+        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(
+            q.receipts[0].status,
+            ReceiptStatus::Checkpointed { snapshot }
+        );
+        assert_eq!(*b.capturer.asked.lock().unwrap(), vec![task(1)]);
+        assert!(alive(pid), "a quiescence never kills the harness");
+        assert_eq!(b.executor.counters().signals, 0);
+        assert!(matches!(
+            b.executor.adopt(b.attempt, task(2), pid, None).await,
+            Err(ExecutorError::Frozen { .. })
+        ));
+
+        let stopped = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(stopped[0].status, ReceiptStatus::Interrupted);
+        // The caller holds the process and reaps it.
+        harness.wait().unwrap();
+        assert!(!alive(pid), "the stop ended the harness's group");
+    }
+
+    /// A test a checkpoint's quiescence interrupted is still interrupted at
+    /// the next cut of the same attempt, never read as exited: its group
+    /// is gone by then, and the signal that ended it was the executor's.
+    #[tokio::test]
+    async fn an_interrupted_test_stays_interrupted_at_the_next_cut() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        b.executor
+            .spawn(b.attempt, task(1), TaskClass::Test, sh("exec sleep 30"))
+            .await
+            .unwrap();
+        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(q.receipts[0].status, ReceiptStatus::Interrupted);
+        b.executor.resume(b.attempt).await.unwrap();
+        let again = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(
+            again.receipts[0].status,
+            ReceiptStatus::Interrupted,
+            "{again:?}"
+        );
+        assert!(again.receipts[0].interrupted);
+        assert!(!again.receipts[0].passed());
+        let stopped = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(stopped[0].status, ReceiptStatus::Interrupted);
     }
 }

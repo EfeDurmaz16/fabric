@@ -18,13 +18,15 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use fabric_client::Client;
 use fabric_client::api::{
-    AnyWord, FidelityName, JobScopeWire, ManagedPolicy, ManagedSource, NoteWire, Reply, Request,
-    ResourceScopeWire, SecretRefWire,
+    AnyWord, FidelityName, JobScopeWire, ManagedPolicy, ManagedSource, NoteWire, ProgramWire,
+    RegisterClass, Reply, Request, ResourceScopeWire, SecretRefWire,
 };
 use fabric_client::facade::{Bearer, ClientMessage, Submit};
+use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{EventSeq, OperationKey, TaskId, WorkRevision};
+use fabric_core::path::RelPath;
 
 use crate::{Notes, ask, harness_arg, repository, system_path};
 
@@ -171,6 +173,35 @@ pub(crate) enum ManagedCommand {
         /// The command's key.
         #[arg(long, value_parser = operation_key_arg)]
         operation_key: Option<OperationKey>,
+    },
+    /// Register a build or test task with the program it runs under a task of a job.
+    Register {
+        /// The job.
+        job: JobId,
+        /// The task it is registered under.
+        #[arg(long)]
+        parent: TaskId,
+        /// Your label for it.
+        #[arg(long)]
+        label: String,
+        /// build or test.
+        #[arg(long, value_parser = class_arg)]
+        class: RegisterClass,
+        /// Where it runs, relative to the attempt's root; the root without it.
+        #[arg(long, value_parser = rel_path_arg)]
+        cwd: Option<RelPath>,
+        /// A variable of the node's environment it may see, by name; repeatable.
+        #[arg(long = "env", value_parser = env_name_arg)]
+        env: Vec<EnvVarName>,
+        /// Refuse unless the job is at this revision.
+        #[arg(long, value_parser = revision_arg)]
+        expected_revision: Option<WorkRevision>,
+        /// The command's key.
+        #[arg(long, value_parser = operation_key_arg)]
+        operation_key: Option<OperationKey>,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true, num_args = 1..)]
+        argv: Vec<String>,
     },
     /// Take a checkpoint cut of the job's live attempt; the attempt goes on.
     Checkpoint {
@@ -366,6 +397,22 @@ fn revision_arg(text: &str) -> Result<WorkRevision, String> {
         .ok_or_else(|| format!("a revision is a whole number of at least 1, not {text:?}"))
 }
 
+fn class_arg(text: &str) -> Result<RegisterClass, String> {
+    match text {
+        "build" => Ok(RegisterClass::Build),
+        "test" => Ok(RegisterClass::Test),
+        other => Err(format!("a registered task is build or test, not {other:?}")),
+    }
+}
+
+fn rel_path_arg(text: &str) -> Result<RelPath, String> {
+    RelPath::parse(text).map_err(|e| format!("{text:?}: {e}"))
+}
+
+fn env_name_arg(text: &str) -> Result<EnvVarName, String> {
+    EnvVarName::parse(text).map_err(|e| format!("{text:?}: {e}"))
+}
+
 fn seq_arg(text: &str) -> Result<EventSeq, String> {
     text.parse::<u64>()
         .ok()
@@ -460,6 +507,10 @@ fn note_of(
 }
 
 /// The request `command` sends.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per command, so the whole mapping reads in one place"
+)]
 fn request(command: ManagedCommand) -> Result<Request> {
     Ok(match command {
         ManagedCommand::Create {
@@ -518,6 +569,29 @@ fn request(command: ManagedCommand) -> Result<Request> {
             job,
             expected_revision,
             note: note_of(decision, reason, question, answer, text)?,
+        },
+        ManagedCommand::Register {
+            job,
+            parent,
+            label,
+            class,
+            cwd,
+            env,
+            expected_revision,
+            operation_key,
+            argv,
+        } => Request::ManagedRegister {
+            operation_key: key_for(operation_key)?,
+            job,
+            expected_revision,
+            parent,
+            label,
+            class,
+            program: ProgramWire {
+                argv,
+                cwd,
+                env_allowlist: env,
+            },
         },
         ManagedCommand::Checkpoint {
             job,

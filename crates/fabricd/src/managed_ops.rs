@@ -21,7 +21,9 @@ use fabric_client::facade::{Refusal, RefusalCode, Submit};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::JobId;
 use fabric_core::managed::facade::{JobScope, ResourceScope};
-use fabric_core::managed::{Command, Envelope, Note, OperationKey, SourceBinding, TaskId};
+use fabric_core::managed::{
+    Command, Envelope, Note, OperationKey, RestartPolicy, SourceBinding, TaskId, TaskKind,
+};
 use fabric_core::path::AbsPath;
 
 use crate::authority::request_digest;
@@ -170,6 +172,34 @@ impl Node {
                     })
                     .await?;
                 Ok(Reply::ManagedNote(Box::new(operation)))
+            }
+            Request::ManagedRegister {
+                operation_key,
+                job,
+                expected_revision,
+                parent,
+                label,
+                class,
+                program,
+            } => {
+                // The authority checks the program and the class (owner A's
+                // rules); a build or test the parent's live attempt runs is
+                // spawned by the dispatch, otherwise it rides in the next launch.
+                let operation = self
+                    .managed_submit(Envelope {
+                        key: operation_key,
+                        job: Some(job),
+                        expected: expected_revision,
+                        body: Command::RegisterTask {
+                            parent,
+                            kind: TaskKind::Child { label },
+                            restart: RestartPolicy::ExplicitOnly,
+                            class: class.into(),
+                            program: Some(program.into()),
+                        },
+                    })
+                    .await?;
+                Ok(Reply::ManagedRegister(Box::new(operation)))
             }
             Request::ManagedCheckpoint {
                 operation_key,
