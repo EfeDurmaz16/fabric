@@ -197,7 +197,16 @@ cp "$candidate_bin" "$scratch/candidate/fabric"
 
 counters=
 if [ -n "$can_count" ]; then
-  cc -dynamiclib -O2 -Wall -Wextra -Werror -o "$scratch/libcounters.dylib" scripts/perf-ab/counters.c
+  # Both arm64 slices: with SIP off, as on GitHub's macOS runners, the
+  # library reaches the system's own programs too (git, sh), which are
+  # arm64e, and dyld ends a process whose inserted library has no slice
+  # for it. Those programs map nothing and count nothing.
+  arches=
+  if [ "$(uname -m)" = arm64 ]; then
+    arches="-arch arm64 -arch arm64e"
+  fi
+  # shellcheck disable=SC2086 # $arches is a list of flags.
+  cc -dynamiclib $arches -O2 -Wall -Wextra -Werror -o "$scratch/libcounters.dylib" scripts/perf-ab/counters.c
   counters=$scratch/libcounters.dylib
 else
   echo "bench-ab: the counters need macOS and cc; no counted phase" >&2
@@ -217,6 +226,9 @@ size() { wc -c <"$1" | tr -d ' '; }
     echo "cpu: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || true) $(sysctl -n hw.ncpu 2>/dev/null || true) cores"
   fi
   echo "rustc: $(rustc -V)"
+  if command -v csrutil >/dev/null 2>&1; then
+    echo "sip: $(csrutil status 2>/dev/null | sed 's/.*status: //')"
+  fi
   echo "start: $(date -u +%Y-%m-%dT%H:%M:%SZ), load: $(uptime | sed 's/.*load average[s]*: //')"
 } >"$out/machine.txt"
 
