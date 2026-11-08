@@ -22,9 +22,11 @@ fi
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 
-# Prints the subcommands a --help output lists under "Commands:".
+# Prints the subcommands a --help output lists: the rows under "Commands:"
+# or under one of the root's workflow headings ("Work on jobs:"), never
+# the rows under an options heading or "Examples:".
 subcommands() {
-  awk '/^Commands:/ { on = 1; next } on && /^$/ { exit } on && /^  [a-z]/ { print $1 }' | grep -v '^help$' || true
+  awk '/^[A-Z][^:]*:$/ { on = ($0 !~ /Options:$/ && $0 != "Examples:"); next } /^$/ { on = 0; next } on && /^  [a-z]/ { print $1 }' || true
 }
 
 # Writes one section for the command named by the arguments, then one for
@@ -52,10 +54,15 @@ cat > "$tmp" <<HEADER
 
 Every command of \`$CLI_BIN\` on \`main\`, as its own \`--help\` prints it. CI regenerates this page and fails when it differs, so it says what the binary does today.
 
-Exit codes (ADR 0016, Exit codes): 0 for success, the harness's own code when it exits, 128 plus the signal when a signal stopped it, 80 when no node answers on the control socket, 81 not the owner, 82 frozen, 83 a peer unreachable, 84 refused without \`--force\` or \`--yes\`, 85 the job's state stops the command, 2 a usage error, and 1 any other failure. See [ADR 0016](../adr/0016-node-and-cli-as-built.md) for each one.
+Exit codes (ADR 0016, Exit codes): 0 for success, the harness's own code when it exits, 128 plus the signal when a signal stopped it, 80 when no node answers on the control socket, 81 not the owner, 82 frozen, 83 a peer unreachable, 84 refused without \`--force\` or \`--yes\`, 85 the job's state stops the command, 2 a usage error, and 1 any other failure. See [ADR 0016](../adr/0016-node-and-cli-as-built.md) for each one, and [the CLI contract](../cli-contract.md) for the rules every command keeps: streams, \`--json\`, errors, help and prompts.
 
 HEADER
 section
+# `help` is a command of its own when it has its own --help; the root's
+# listing leaves it out, so it gets its section here.
+if "$bin" help --help > /dev/null 2>&1; then
+  section help
+fi
 
 if [ "${1:-}" = "--check" ]; then
   if ! diff -u "$out" "$tmp"; then

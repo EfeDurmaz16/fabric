@@ -5,8 +5,11 @@
 //! caller's name for the command: the node answers a key it has seen with
 //! the answer it gave the first time and never runs the command twice, so a
 //! script that lost an answer runs the same command again with the same
-//! key. Without `--operation-key` the CLI makes a fresh ULID and prints the
-//! key it used, for such a retry.
+//! key. Without `--operation-key` the CLI makes a fresh ULID and names the
+//! key it used, for such a retry: before the request in words, in the
+//! answer's operation under `--json`, and in every failure's
+//! `data.operation_key`, with the retry as the `next` command when the
+//! answer was lost (`contract::Keyed`).
 
 use std::path::PathBuf;
 
@@ -18,7 +21,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::JobId;
 use fabric_core::managed::{OperationKey, WorkRevision};
 
-use crate::{Notes, ask, harness_arg, repository};
+use crate::{Notes, ask, contract, harness_arg, repository};
 
 /// Make, cancel and read managed jobs.
 #[derive(Debug, Subcommand)]
@@ -26,16 +29,16 @@ pub(crate) enum ManagedCommand {
     /// Make a managed job from a repository.
     Create {
         /// The repository to clone into the job's workspace.
-        #[arg(long)]
+        #[arg(long, value_name = "PATH")]
         repo: PathBuf,
         /// The goal in your words.
-        #[arg(long)]
+        #[arg(long, value_name = "TEXT")]
         goal: String,
         /// The harness: claude, codex or acp:<program>.
-        #[arg(long, default_value = "claude", value_parser = harness_arg)]
+        #[arg(long, default_value = "claude", value_parser = harness_arg, value_name = "HARNESS")]
         harness: HarnessKind,
         /// The command's key; the same key and arguments again give the same job.
-        #[arg(long, value_parser = operation_key_arg)]
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
         operation_key: Option<OperationKey>,
     },
     /// Cancel a managed job none of whose attempts may still run.
@@ -43,13 +46,13 @@ pub(crate) enum ManagedCommand {
         /// The job.
         job: JobId,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
         /// Why, for the journal.
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", value_name = "TEXT")]
         reason: String,
         /// The command's key; the same key and arguments again give the same answer.
-        #[arg(long, value_parser = operation_key_arg)]
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
         operation_key: Option<OperationKey>,
     },
     /// One managed job: its revision, state, tasks and attempts.
@@ -74,29 +77,36 @@ fn revision_arg(text: &str) -> Result<WorkRevision, String> {
 }
 
 /// The key a changing command runs under: the caller's, or a fresh one,
-/// printed so a retry can name it.
-fn key_for(given: Option<OperationKey>) -> Result<OperationKey> {
+/// printed so a retry can name it and kept in `minted` for its failure.
+fn key_for(
+    given: Option<OperationKey>,
+    notes: Notes,
+    minted: &mut Option<OperationKey>,
+) -> Result<OperationKey> {
     if let Some(key) = given {
         return Ok(key);
     }
     let key = fabricd::clock::operation_key()
         .map_err(|e| anyhow!("no operation key could be made: {e}"))?;
-    Notes::Stderr.print(&[format!(
+    // Under `--json` the key is in the answer's operation, or in the failure's data.
+    notes.print(&[format!(
         "operation key {key}; run the command again with --operation-key {key} after a lost answer"
     )])?;
+    *minted = Some(key.clone());
     Ok(key)
 }
 
-/// The request `command` sends.
-fn request(command: ManagedCommand) -> Result<Request> {
-    Ok(match command {
+/// The request `command` sends, and the key the CLI made for it, if it made one.
+fn request(command: ManagedCommand, notes: Notes) -> Result<(Request, Option<OperationKey>)> {
+    let mut minted = None;
+    let request = match command {
         ManagedCommand::Create {
             repo,
             goal,
             harness,
             operation_key,
         } => Request::ManagedCreate {
-            operation_key: key_for(operation_key)?,
+            operation_key: key_for(operation_key, notes, &mut minted)?,
             repo: repository(&repo)?,
             goal,
             harness,
@@ -107,19 +117,34 @@ fn request(command: ManagedCommand) -> Result<Request> {
             reason,
             operation_key,
         } => Request::ManagedCancel {
-            operation_key: key_for(operation_key)?,
+            operation_key: key_for(operation_key, notes, &mut minted)?,
             job,
             expected_revision,
             reason,
         },
         ManagedCommand::Status { job } => Request::ManagedStatus { job },
         ManagedCommand::Ls => Request::ManagedList,
-    })
+    };
+    Ok((request, minted))
 }
 
-/// Runs `command` against the node `client` speaks to and prints its answer.
-pub(crate) async fn run(client: &Client, command: ManagedCommand) -> Result<Reply> {
-    ask(client, &request(command)?, Notes::Stdout).await
+/// Runs `command` against the node `client` speaks to and returns its answer.
+pub(crate) async fn run(
+    client: &Client,
+    command: ManagedCommand,
+    run: &contract::Run,
+) -> Result<Reply> {
+    let (request, minted) = request(command, run.notes())?;
+    ask(client, &request, run.notes())
+        .await
+        .map_err(|error| match minted {
+            Some(key) => contract::Keyed {
+                key: key.as_str().to_owned(),
+                error,
+            }
+            .into(),
+            None => error,
+        })
 }
 
 #[cfg(test)]
@@ -154,7 +179,7 @@ mod tests {
             operation_key,
             expected_revision,
             ..
-        } = request(given).unwrap()
+        } = request(given, Notes::Silent).unwrap().0
         else {
             panic!("not a cancel");
         };
@@ -163,8 +188,11 @@ mod tests {
 
         let fresh = || {
             let command = parsed(&["fabric", "managed", "cancel", "01JABCDEFGHJKMNPQRSTVWXYZ0"]);
-            match request(command).unwrap() {
-                Request::ManagedCancel { operation_key, .. } => operation_key,
+            match request(command, Notes::Silent).unwrap() {
+                (Request::ManagedCancel { operation_key, .. }, Some(minted)) => {
+                    assert_eq!(operation_key, minted, "the key sent is the key kept");
+                    operation_key
+                }
                 other => panic!("{other:?}"),
             }
         };

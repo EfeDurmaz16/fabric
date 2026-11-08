@@ -38,8 +38,10 @@ while [ "$round" -lt "$rounds" ]; do
     label=${spec%%=*}
     bin=${spec#*=}
     dir=$root/$label
-    job=$(HOME=$dir/h FABRIC_HOME=$dir/s "$bin" job new --repo "$root/repo" --goal g --harness codex 2>&1 |
-      sed -n '1s/^job //p' | awk '{print $1}')
+    # The id is the first word of stdout's first line, after an older
+    # build's `job ` prefix; the CLI contract prints the bare id alone.
+    job=$(HOME=$dir/h FABRIC_HOME=$dir/s "$bin" job new --repo "$root/repo" --goal g --harness codex 2>/dev/null |
+      head -n 1 | sed 's/^job //' | awk '{print $1}')
     HOME=$dir/h FABRIC_HOME=$dir/s "$bin" job suspend "$job" >/dev/null 2>&1
     rm -rf "$dir/h/fabric/jobs/$job/work"
     HOME=$dir/h FABRIC_HOME=$dir/s "$bin" job resume "$job" >/dev/null 2>&1
