@@ -88,7 +88,10 @@ pub(crate) async fn accept(
 /// One verdict per token of `beat`, in its order, at most
 /// `MAX_HEARTBEAT_ATTEMPTS`: `Live` for the job's live grant on the
 /// sender, `Stale` when the job moved to a later generation, `Unknown`
-/// otherwise. Writes nothing.
+/// for a job or attempt the journal does not hold as the sender's live
+/// grant. A token whose job cannot be read (the journal is closed,
+/// refused or unreadable) gets no verdict, which says nothing of it: a
+/// journal that failed to open is not a cancel. Writes nothing.
 pub(crate) async fn heartbeat(
     authority: &Authority,
     own: NodeId,
@@ -96,13 +99,22 @@ pub(crate) async fn heartbeat(
     beat: &Heartbeat,
 ) -> HeartbeatAnswer {
     let sender = from.unwrap_or(own);
-    let mut jobs: BTreeMap<JobId, Option<ManagedState>> = BTreeMap::new();
+    let mut jobs: BTreeMap<JobId, Result<Option<ManagedState>, ()>> = BTreeMap::new();
     let mut verdicts = Vec::new();
     for token in beat.attempts.iter().take(MAX_HEARTBEAT_ATTEMPTS) {
         if let std::collections::btree_map::Entry::Vacant(slot) = jobs.entry(token.job) {
-            slot.insert(authority.job(token.job).await.ok().flatten());
+            slot.insert(match authority.job(token.job).await {
+                Ok(state) => Ok(state),
+                Err(AuthorityError::Commit(CommitError::Domain(DomainError::UnknownJob {
+                    ..
+                }))) => Ok(None),
+                Err(_) => Err(()),
+            });
         }
-        let verdict = match jobs.get(&token.job).and_then(Option::as_ref) {
+        let Some(Ok(state)) = jobs.get(&token.job) else {
+            continue;
+        };
+        let verdict = match state.as_ref() {
             None => GrantVerdict::Unknown,
             Some(state) if state.job.generation > token.generation => GrantVerdict::Stale {
                 current: state.job.generation,
@@ -382,5 +394,39 @@ mod tests {
             revision,
             "a heartbeat wrote"
         );
+    }
+
+    /// An authority whose journal it cannot open answers a heartbeat with
+    /// no verdict for the tokens it cannot read, never `Unknown`: a node
+    /// obeys `Unknown` by stopping the attempt, and a journal that failed
+    /// to open is not a cancel.
+    #[tokio::test]
+    async fn a_heartbeat_to_an_authority_that_cannot_read_its_journal_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::paths::StateDir::resolve(
+            Some(dir.path().as_os_str()),
+            std::path::Path::new("/"),
+        )
+        .unwrap();
+        let managed = crate::authority::managed_dir(&state);
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join(fabric_journal::FILE_NAME), b"not a journal").unwrap();
+        let authority = Authority::start(&state, OWN).unwrap();
+        let token = GrantToken {
+            job: JobId::from_bytes([7; 16]),
+            attempt: fabric_core::managed::AttemptId::from_bytes([8; 16]),
+            generation: fabric_core::managed::Generation::FIRST,
+        };
+        assert!(authority.job(token.job).await.is_err(), "the journal is refused");
+        let answer = heartbeat(
+            &authority,
+            OWN,
+            Some(REMOTE),
+            &Heartbeat {
+                attempts: vec![token],
+            },
+        )
+        .await;
+        assert_eq!(answer.verdicts, Vec::new());
     }
 }
