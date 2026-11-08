@@ -9,6 +9,14 @@
 //! anything starts, and refuses when it is older than the newest version
 //! the session records, or when its version cannot be read.
 
+#![cfg_attr(
+    not(any(feature = "claude", feature = "codex")),
+    allow(
+        dead_code,
+        reason = "without Claude or Codex only the resume guard is used, by OpenCode and Gemini"
+    )
+)]
+
 pub(crate) use fabric_core::version::HarnessVersion;
 
 /// True when `version` is at least `floor` by the same order as the
@@ -16,7 +24,12 @@ pub(crate) use fabric_core::version::HarnessVersion;
 /// parse, so a caller that cannot tell takes the cautious path. Serves
 /// the floors an adapter was checked on, such as the Codex version whose
 /// writer lock it takes.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 pub(crate) fn at_least(version: &str, floor: &str) -> bool {
     match (HarnessVersion::parse(version), HarnessVersion::parse(floor)) {
         (Ok(version), Ok(floor)) => version >= floor,
@@ -31,7 +44,12 @@ pub(crate) fn at_least(version: &str, floor: &str) -> bool {
 /// launch starts it in, with the launch environment minus the
 /// parent-session markers, as the launch itself would run, or takes the
 /// answer of `ahead` when it asked exactly that.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 pub(crate) async fn refuse_older(
     program: &str,
     (binary, cwd, env): (
@@ -78,11 +96,21 @@ pub(crate) async fn refuse_older(
 /// Otherwise it asks again, so nothing is decided on what another binary
 /// or another shim answered. A probe nobody takes is stopped when the
 /// last copy of this handle goes.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 #[derive(Debug, Clone)]
 pub struct VersionAhead(std::sync::Arc<Ahead>);
 
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 #[derive(Debug)]
 pub(crate) struct Ahead {
     question: Question,
@@ -90,7 +118,12 @@ pub(crate) struct Ahead {
 }
 
 /// What a probe asked ahead was asked.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Question {
     /// The installed version, as `process::installed_version` asks it:
@@ -109,17 +142,32 @@ enum Question {
 }
 
 /// The probe's answer: its output, or why it failed, in words.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 type Reply = Result<Option<String>, String>;
 
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 #[derive(Debug)]
 enum Answer {
     Running(tokio::task::JoinHandle<Reply>),
     Done(Reply),
 }
 
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 impl Drop for Ahead {
     fn drop(&mut self) {
         if let Answer::Running(task) = self.answer.get_mut() {
@@ -128,7 +176,12 @@ impl Drop for Ahead {
     }
 }
 
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 impl VersionAhead {
     fn start(question: Question, probe: impl Future<Output = Reply> + Send + 'static) -> Self {
         Self(std::sync::Arc::new(Ahead {
@@ -194,7 +247,12 @@ impl VersionAhead {
 
 /// `process::installed_version(binary, path_var, program)`, answered by
 /// `ahead` when it asked exactly that.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 pub(crate) async fn installed_version(
     ahead: Option<&VersionAhead>,
     binary: Option<std::path::PathBuf>,
@@ -215,7 +273,12 @@ pub(crate) async fn installed_version(
 
 /// `process::reported_version(binary, cwd, env)`, answered by `ahead`
 /// when it asked exactly that.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "gemini",
+    feature = "opencode"
+))]
 async fn reported_version(
     ahead: Option<&VersionAhead>,
     binary: &std::path::Path,
@@ -237,7 +300,15 @@ async fn reported_version(
         .map_err(|e| e.to_string())
 }
 
-#[cfg(all(test, any(feature = "claude", feature = "codex")))]
+#[cfg(all(
+    test,
+    any(
+        feature = "claude",
+        feature = "codex",
+        feature = "gemini",
+        feature = "opencode"
+    )
+))]
 mod tests {
     use super::*;
 

@@ -41,7 +41,7 @@ use crate::denylist;
 use crate::departure::{Departure, Records};
 use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
-use crate::harness::Restored;
+use crate::harness::{Fidelity, Restored};
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
 use crate::place::{self, Placement, Seen};
 use crate::redact::RedactionCounts;
@@ -342,7 +342,16 @@ where
     let dropped = dropped_files(&placements, held, &departure)?;
     let placed = place::place_all(&placements, &|dest| departure.unchanged(dest))?;
     remove_dropped(&dropped)?;
-    Ok(Restored { manifest, placed })
+    // The pipeline places the session's own files, which the harness reads
+    // as its own; an adapter that then hands them to the harness and gets
+    // another id back lowers both fields itself.
+    let session = manifest.session().clone();
+    Ok(Restored {
+        manifest,
+        placed,
+        session,
+        fidelity: Fidelity::NativeSession,
+    })
 }
 
 /// A file of the session the job dropped, and what it was when restore

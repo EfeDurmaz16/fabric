@@ -45,6 +45,10 @@ use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome, VersionAhead};
 use fabric_harness::codex::Codex;
+use fabric_harness::cursor::CursorAgent;
+use fabric_harness::gemini::GeminiCli;
+use fabric_harness::opencode::OpenCode;
+use fabric_harness::pi::Pi;
 use fabric_harness::{
     Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnEvent, TurnFeed,
     TurnReport,
@@ -149,7 +153,7 @@ enum JobCommand {
         /// The goal in your words.
         #[arg(long, value_name = "TEXT")]
         goal: String,
-        /// The harness: claude, codex or acp:<program>.
+        /// The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
         #[arg(long, default_value = "claude", value_parser = harness_arg, value_name = "HARNESS")]
         harness: HarnessKind,
     },
@@ -179,7 +183,7 @@ enum JobCommand {
         /// The node that holds the job, when this node has never seen it.
         #[arg(long, value_name = "NODE")]
         on: Option<NodeId>,
-        /// Continue under another harness: claude, codex or acp:<program>.
+        /// Continue under another harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
         #[arg(long, value_parser = harness_arg, value_name = "HARNESS")]
         harness: Option<HarnessKind>,
         /// The first message to send.
@@ -737,7 +741,12 @@ impl GuardAhead {
             HarnessKind::Codex => {
                 Codex::new(env.home, env.path_var).ask_guard_ahead(root, &launch_env)
             }
-            HarnessKind::Acp { .. } => return,
+            // No resume guard asks ahead for these yet (docs/harness-adapters.md).
+            HarnessKind::Acp { .. }
+            | HarnessKind::OpenCode
+            | HarnessKind::Pi
+            | HarnessKind::GeminiCli
+            | HarnessKind::CursorAgent => return,
         };
         // A probe that cannot start, as without the binary, is left to
         // the guard, which reports it in its own words.
@@ -961,6 +970,20 @@ const DRAIN: Duration = Duration::from_secs(2);
 /// Reads one line a headless harness printed into a report; true when it named a new session.
 type ReadLine = fn(&mut TurnReport, &str) -> bool;
 
+/// What reads the lines a headless run of `harness` prints; `None` for a
+/// terminal run, and for an ACP agent, whose output its protocol client holds.
+fn headless_reader(mode: &Mode, harness: &HarnessKind) -> Option<ReadLine> {
+    match (mode, harness) {
+        (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
+        (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
+        (Mode::Headless(_), HarnessKind::OpenCode) => Some(OpenCode::read_headless_line),
+        (Mode::Headless(_), HarnessKind::Pi) => Some(Pi::read_headless_line),
+        (Mode::Headless(_), HarnessKind::GeminiCli) => Some(GeminiCli::read_headless_line),
+        (Mode::Headless(_), HarnessKind::CursorAgent) => Some(CursorAgent::read_headless_line),
+        _ => None,
+    }
+}
+
 /// Runs the plan's setup steps, launches the harness, registers it, and waits for it.
 async fn launch(
     state: &StateDir,
@@ -971,12 +994,7 @@ async fn launch(
     approval: &Approval<'_>,
 ) -> Result<ExitCode> {
     let notes = mode.notes();
-    let read_line: Option<ReadLine> = match (&mode, &plan.harness) {
-        (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
-        (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
-        // The protocol client holds an ACP agent's output.
-        _ => None,
-    };
+    let read_line = headless_reader(&mode, &plan.harness);
     let (tree, setup_ran) = prepare(state, home, client, plan, notes, approval).await?;
     // A setup step may have installed or switched the harness, so the
     // guard asks it again rather than take an answer from before.
@@ -1162,6 +1180,34 @@ async fn adapter_for(
             };
             (Box::new(agent), launch)
         }
+        HarnessKind::OpenCode => (
+            Box::new(
+                OpenCode::new(harness_env.home.clone(), harness_env.path_var.clone())
+                    .with_known_writer(plan.known_writer.clone()),
+            ),
+            launch,
+        ),
+        HarnessKind::Pi => (
+            Box::new(Pi::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
+        HarnessKind::GeminiCli => (
+            Box::new(
+                GeminiCli::new(harness_env.home.clone(), harness_env.path_var.clone())
+                    .with_known_writer(plan.known_writer.clone()),
+            ),
+            launch,
+        ),
+        HarnessKind::CursorAgent => (
+            Box::new(CursorAgent::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
     })
 }
 

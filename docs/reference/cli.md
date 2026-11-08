@@ -213,7 +213,7 @@ Make a job from a repository, rooted at ~/fabric/jobs/<id>/work
 
 Options:
       --goal <TEXT>        The goal in your words
-      --harness <HARNESS>  The harness: claude, codex or acp:<program> [default: claude]
+      --harness <HARNESS>  The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program> [default: claude]
       --repo <PATH>        The repository to clone into the job's root
 
 Global Options: See `fabric --help`
@@ -283,7 +283,7 @@ Arguments:
 
 Options:
       --force              Waive the preflight refusals that can be waived when pulling
-      --harness <HARNESS>  Continue under another harness: claude, codex or acp:<program>
+      --harness <HARNESS>  Continue under another harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>
       --headless           Run one turn without a terminal, print the answer and the session, and exit
       --on <NODE>          The node that holds the job, when this node has never seen it
       --prompt <TEXT>      The first message to send
@@ -567,7 +567,7 @@ Make a managed job from a repository
 
 Options:
       --goal <TEXT>          The goal in your words
-      --harness <HARNESS>    The harness: claude, codex or acp:<program> [default: claude]
+      --harness <HARNESS>    The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program> [default: claude]
       --operation-key <KEY>  The command's key; the same key and arguments again give the same job
       --repo <PATH>          The repository to clone into the job's workspace
 
