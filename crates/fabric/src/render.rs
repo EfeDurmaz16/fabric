@@ -212,6 +212,25 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                 chain.join(" <- ")
             )]
         }
+        Reply::JobExportPsf(exported) => {
+            let mut lines = vec![format!(
+                "wrote {} as a portable session: snapshot {}, offered fidelity {}, document digest {}",
+                exported.dir.display(),
+                exported.snapshot,
+                exported.fidelity,
+                exported.digest
+            )];
+            if !exported.attachments.is_empty() {
+                lines.push(format!("attachments: {}", exported.attachments.join(", ")));
+            }
+            if !exported.left_behind.is_empty() {
+                lines.push(format!(
+                    "left behind on this node, recreate them where it is read: {}",
+                    exported.left_behind.join(", ")
+                ));
+            }
+            lines
+        }
         Reply::JobRun(_)
         | Reply::JobResume(_)
         | Reply::JobSuspend(_)
@@ -623,6 +642,10 @@ pub(crate) fn answer(reply: &Reply, job: Option<JobId>) -> Answer {
             notes: lines,
             ..id(exported.snapshot.to_string())
         },
+        Reply::JobExportPsf(exported) => Answer {
+            notes: lines,
+            ..id(exported.digest.clone())
+        },
         Reply::JobSuspend(_)
         | Reply::JobMove(_)
         | Reply::JobSteal(_)
@@ -689,6 +712,7 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         Reply::JobDecide(_) => json!({ "job": with_job(fields), "outcome": "recorded" }),
         Reply::JobRepair(_) => json!({ "job": with_job(fields), "outcome": "repaired" }),
         Reply::JobExport(_) => json!({ "snapshot": with_job(fields), "outcome": "exported" }),
+        Reply::JobExportPsf(_) => json!({ "container": with_job(fields), "outcome": "exported" }),
         Reply::ManagedCreate(operation) | Reply::ManagedCancel(operation) => {
             let outcome = match (reply, operation.replayed) {
                 (_, true) => "unchanged",

@@ -401,6 +401,11 @@ hello_answer/welcome_with_managed_jobs.json /capabilities
 hello_answer/welcome_with_managed_jobs.json /node
 hello_answer/welcome_with_managed_jobs.json /node_version
 hello_answer/welcome_with_managed_jobs.json /type
+hello_answer/welcome_with_psf_export.json /api
+hello_answer/welcome_with_psf_export.json /capabilities
+hello_answer/welcome_with_psf_export.json /node
+hello_answer/welcome_with_psf_export.json /node_version
+hello_answer/welcome_with_psf_export.json /type
 hello_answer/welcome_with_repair_and_export.json /api
 hello_answer/welcome_with_repair_and_export.json /capabilities
 hello_answer/welcome_with_repair_and_export.json /node
@@ -832,6 +837,13 @@ reply/job_export.json /chain
 reply/job_export.json /kind
 reply/job_export.json /root
 reply/job_export.json /snapshot
+reply/job_export_psf.json /attachments
+reply/job_export_psf.json /digest
+reply/job_export_psf.json /dir
+reply/job_export_psf.json /fidelity
+reply/job_export_psf.json /kind
+reply/job_export_psf.json /left_behind
+reply/job_export_psf.json /snapshot
 reply/job_list.json /closed
 reply/job_list.json /closed/0/error
 reply/job_list.json /closed/0/job
@@ -1491,6 +1503,9 @@ request/job_decide_reject.json /note
 request/job_decide_reject.json /op
 request/job_export.json /job
 request/job_export.json /op
+request/job_export_psf.json /dir
+request/job_export_psf.json /job
+request/job_export_psf.json /op
 request/job_export_set_aside.json /env/path
 request/job_export_set_aside.json /job
 request/job_export_set_aside.json /op

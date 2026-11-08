@@ -35,6 +35,18 @@ const ELSEWHERE: &[(&str, &str)] = &[
         "job repair",
         "main.rs: e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork",
     ),
+    (
+        "job import",
+        "psf.rs: e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back",
+    ),
+    (
+        "psf inspect",
+        "psf.rs: e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back",
+    ),
+    (
+        "psf verdicts",
+        "sdk/typescript/test/psf.test.ts: the verdict lines every reader prints",
+    ),
 ];
 
 /// The commands this run asked, by command path, such as `job new`.

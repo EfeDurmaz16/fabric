@@ -61,7 +61,7 @@ const GLOBALS: &[(&str, &str, Option<char>, &str)] = &[
 /// How the root help groups the commands: in the order a user meets them.
 const GROUPS: &[(&str, &[&str])] = &[
     ("Set up a node", &["serve", "node", "doctor"]),
-    ("Work on jobs", &["job"]),
+    ("Work on jobs", &["job", "psf"]),
     ("Managed jobs", &["managed"]),
 ];
 
@@ -226,7 +226,32 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
                 "Keep an orphan workspace",
                 "fabric job export <JOB> --path <PATH>",
             ),
+            (
+                "Write the job as a portable session and keep its digest",
+                "fabric job export <JOB> --psf <DIR>",
+            ),
         ],
+    ),
+    (
+        "job import",
+        &[(
+            "Check a portable session against this node",
+            "fabric job import --psf <DIR>",
+        )],
+    ),
+    (
+        "psf inspect",
+        &[(
+            "Read a portable session's digest and fidelity",
+            "fabric psf inspect <CONTAINER>",
+        )],
+    ),
+    (
+        "psf verdicts",
+        &[(
+            "Print the verdicts of the format's fixture set",
+            "fabric psf verdicts <DIR>",
+        )],
     ),
     (
         "managed create",

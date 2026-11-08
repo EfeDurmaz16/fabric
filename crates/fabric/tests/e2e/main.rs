@@ -26,6 +26,7 @@ mod headless;
 mod legacy;
 mod managed;
 mod preflight;
+mod psf;
 mod streams;
 mod terminal;
 mod world;

@@ -60,6 +60,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub mod contract;
 mod managed;
+mod psf;
 mod render;
 mod terminal;
 
@@ -84,6 +85,9 @@ enum Command {
     /// Make, cancel and read managed jobs (experimental).
     #[command(subcommand)]
     Managed(managed::ManagedCommand),
+    /// Read Portable Session Format containers.
+    #[command(subcommand)]
+    Psf(psf::PsfCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
     Doctor {
         /// The node to compare with.
@@ -248,14 +252,25 @@ enum JobCommand {
         job: JobId,
     },
     /// Snapshot an orphan workspace of the job without making it the job's
-    /// head, and keep the snapshot.
+    /// head, and keep the snapshot; with --psf, write the job's latest
+    /// snapshot as a Portable Session Format container instead.
     Export {
         /// The job.
         job: JobId,
         /// A workspace a restore set aside under orphan/ beside the job's
         /// root; the workspace at the root when left out.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "psf")]
         path: Option<PathBuf>,
+        /// The container directory to write, which must not exist.
+        #[arg(long, value_name = "DIR")]
+        psf: Option<PathBuf>,
+    },
+    /// Check a Portable Session Format container against the job it names
+    /// on this node, and say what this node can continue.
+    Import {
+        /// The container directory.
+        #[arg(long, value_name = "DIR")]
+        psf: PathBuf,
     },
 }
 
@@ -601,6 +616,7 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
             answer(run, &reply, None)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Psf(command) => psf::run(command, run),
     }
 }
 
@@ -653,6 +669,9 @@ async fn job(
     run: &contract::Run,
 ) -> Result<ExitCode> {
     let client = client(state);
+    if let JobCommand::Import { psf } = &command {
+        return psf::import(&client, home, psf, run).await;
+    }
     let (request, mode, yes) = job_request(command)?;
     let job = request_job(&request);
     let mut ahead = GuardAhead::default();
@@ -824,12 +843,9 @@ fn job_request(command: JobCommand) -> Result<(Request, Mode, bool)> {
             false,
         ),
         JobCommand::Repair { job } => (Request::JobRepair { job }, Mode::Interactive(None), false),
-        JobCommand::Export { job, path } => (
-            Request::JobExport {
-                job,
-                path: path.as_deref().map(system_path).transpose()?,
-                env: env()?,
-            },
+        JobCommand::Import { .. } => bail!("job import runs without a node request"),
+        JobCommand::Export { job, path, psf } => (
+            export_request(job, path.as_deref(), psf.as_deref())?,
             Mode::Interactive(None),
             false,
         ),
@@ -846,7 +862,8 @@ fn request_job(request: &Request) -> Option<JobId> {
         | Request::JobRepair { job }
         | Request::JobStatus { job }
         | Request::JobLog { job }
-        | Request::JobExport { job, .. } => Some(*job),
+        | Request::JobExport { job, .. }
+        | Request::JobExportPsf { job, .. } => Some(*job),
         _ => None,
     }
 }
@@ -854,6 +871,43 @@ fn request_job(request: &Request) -> Option<JobId> {
 /// The repository `fabric job new` names, as the absolute path the client API carries.
 fn repository(repo: &Path) -> Result<SystemPath> {
     system_path(repo).with_context(|| format!("repository {}", repo.display()))
+}
+
+/// `job export`: an orphan snapshot, or with `psf` a container at that path.
+fn export_request(job: JobId, path: Option<&Path>, psf: Option<&Path>) -> Result<Request> {
+    Ok(match psf {
+        Some(dir) => Request::JobExportPsf {
+            job,
+            dir: new_system_path(dir)?,
+        },
+        None => Request::JobExport {
+            job,
+            path: path.map(system_path).transpose()?,
+            env: Some(ClientEnv::current()?),
+        },
+    })
+}
+
+/// A path that does not exist yet, under its parent's physical path, as
+/// the client API carries it.
+fn new_system_path(path: &Path) -> Result<SystemPath> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} names no directory to create", path.display()))?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let parent = std::fs::canonicalize(parent).with_context(|| parent.display().to_string())?;
+    let full = parent.join(name);
+    full.to_str()
+        .and_then(|text| SystemPath::parse(text).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} is not a UTF-8 path, which the client API cannot carry",
+                full.display()
+            )
+        })
 }
 
 /// `path`, resolved to its physical path, as the client API carries it.
