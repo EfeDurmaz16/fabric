@@ -8,7 +8,18 @@ The ledger is what keeps exactly one live copy of a standalone job ([ADR 0003](.
 2. The owner appends `MoveStarted`. From here it is not runnable.
 3. The target appends its one decision for that move id, `MoveImported` or `MoveAborted`, and the owner appends the same.
 
-The target writes one decision per move id and answers every later question about that move with the same record, so a lost or repeated answer, or `kill -9` of either node at any step, cannot leave two runnable copies. The end-to-end test breaks the move at five named points to prove it.
+The target writes one decision per move id and answers every later question about that move with the same record, so a lost or repeated answer, or `kill -9` of either node at any step, cannot leave two runnable copies. To prove it, the end-to-end test arms each fault point below (`crates/fabricd/src/faults.rs`): the node stops there and the test kills it or its peer with `SIGKILL`, or the node drops or repeats the answer it was about to send. The list is generated from that file and the tests that arm the points:
+
+<!-- faults:begin -->
+- `after_quiesce`: The source stopped the harness and has written nothing yet.
+- `after_snapshot_publish`: The snapshot is published in the store and the ledger does not name it yet.
+- `after_departing_write`: `MoveStarted` is durable and no offer was sent.
+- `mid_transfer`: The target stored some of a snapshot's chunks and not all.
+- `before_import`: A pulling node holds the owner's `MoveStarted` toward it and has not imported yet.
+- `after_import_receipt`: The target made `MoveImported` durable and did not answer yet; on the source, the answer just arrived.
+- `before_harness_record`: A CLI asked to record the harness it launched, and the node has written nothing for it yet.
+- `while_stopping`: `fabric serve` was told to stop and still holds the state directory.
+<!-- faults:end -->
 
 Each `MoveImported` or `Stolen` record raises the job's **epoch** by one. Anything that carries an older epoch is stale and is refused; see [fence](fence.md).
 

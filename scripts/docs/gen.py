@@ -6,6 +6,9 @@
 - docs/reference/evidence.md, the evidence index, from docs/evidence.
 - The "what moves" matrix in README.md and docs/README.md, copied from
   docs/start/what-moves.md, where it is written once.
+- The fault points in docs/concepts/ledger.md, from the node's fault
+  module and the end-to-end tests that arm them, so the page never counts
+  them by hand.
 
 Usage: scripts/docs/gen.py [--check]
 With --check nothing is written, and the script fails when a generated
@@ -20,6 +23,10 @@ import sys
 ROOT = subprocess.run(
     ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
 ).stdout.strip()
+
+# Where the fault points are defined and where the end-to-end test arms them.
+FAULTS = "crates/fabricd/src/faults.rs"
+E2E = "crates/fabric/tests/e2e"
 
 GENERATED = "<!-- This page is written by scripts/docs/gen.py. Do not edit it; run the script. -->"
 
@@ -135,6 +142,36 @@ def evidence_index():
     return "\n".join(lines) + "\n"
 
 
+def fault_points():
+    """A Markdown list of every fault point the end-to-end test arms, in
+    the order the node defines them, each with its doc comment."""
+    text = read(FAULTS)
+    enum = re.search(r"pub enum Point \{(.*?)\n\}", text, re.S)
+    names = dict(re.findall(r'Point::(\w+) => "(\w+)"', text))
+    if not enum or not names:
+        sys.exit("error: %s: no `pub enum Point` or no name for its variants" % FAULTS)
+    armed = set()
+    base = os.path.join(ROOT, E2E)
+    for name in sorted(os.listdir(base)):
+        if name.endswith(".rs"):
+            armed |= set(re.findall(r'"(\w+)(?::\w+)?"', read(E2E + "/" + name)))
+    lines, doc = [], []
+    for line in enum.group(1).split("\n"):
+        line = line.strip()
+        if line.startswith("///"):
+            doc.append(line[3:].strip())
+        elif re.match(r"^\w+,$", line):
+            variant = line[:-1]
+            if variant not in names:
+                sys.exit("error: %s: Point::%s has no name" % (FAULTS, variant))
+            if names[variant] in armed:
+                lines.append("- `%s`: %s" % (names[variant], " ".join(doc)))
+            doc = []
+    if not lines:
+        sys.exit("error: no fault point of %s is armed in %s" % (FAULTS, E2E))
+    return "\n" + "\n".join(lines) + "\n"
+
+
 def main():
     check = sys.argv[1:] == ["--check"]
     if sys.argv[1:] not in ([], ["--check"]):
@@ -147,6 +184,9 @@ def main():
         "docs/reference/evidence.md": evidence_index(),
         "README.md": replace_block(read("README.md"), "matrix", matrix, "README.md"),
         "docs/README.md": replace_block(read("docs/README.md"), "matrix", matrix, "docs/README.md"),
+        "docs/concepts/ledger.md": replace_block(
+            read("docs/concepts/ledger.md"), "faults", fault_points(), "docs/concepts/ledger.md"
+        ),
     }
     stale = []
     for rel, text in wanted.items():

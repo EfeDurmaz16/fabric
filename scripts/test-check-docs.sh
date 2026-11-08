@@ -66,6 +66,11 @@ sed 's/| Stay on the source |/| Moves |/' "$work/repo/README.md" > "$work/repo/x
 expect fail 'the README matrix edited by hand' python3 scripts/docs/gen.py --check
 
 fresh
+sed '/^- `while_stopping`/d' "$work/repo/docs/concepts/ledger.md" > "$work/repo/x" \
+  && mv "$work/repo/x" "$work/repo/docs/concepts/ledger.md"
+expect fail 'a fault point dropped from the ledger page' python3 scripts/docs/gen.py --check
+
+fresh
 mkdir -p "$work/repo/docs/evidence/zz-new"
 printf '# A new run\n' > "$work/repo/docs/evidence/zz-new/README.md"
 expect fail 'new evidence missing from its index' python3 scripts/docs/gen.py --check
