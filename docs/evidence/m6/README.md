@@ -4,6 +4,10 @@ Recorded first on 2026-11-03 on `m6/loss-recovery` at the M6 implementation comm
 
 What this is: two `fabricd` processes on one host, each with its own state root (`FABRIC_HOME`), paired over a real QUIC link that runs through a small userspace relay the test owns (`fabric-relay`, `crates/fabric/fixtures/relay.rs`, std only). Pausing the relay drops every datagram between the two in both directions and holds every TCP byte (the relay stops reading, so flow control holds the sender and the bytes arrive in order after resume) while the sockets stay open; resuming forwards again. This is a two-process partition on one host, not two hosts. No firewall rule and no system setting was touched; the relay is an ordinary process on two loopback ports, started and stopped by the test. Every process the runs started was gone when they ended (`pgrep -x fabricd` and `pgrep -x fabric-relay` found none after each run).
 
+## On the M5 base again, 2026-11-08 (`f09cc8d`)
+
+After the second merge with M5 (merge `f000963`), the same script with `--all` at `496f358`: `runs/20261108T164203Z/`. Result: the relay test, the partition primitive and scenario (4) passed (3 passed, 39.59 s); the three ignored stubs failed with their reason, as designed. Scenario (4): `unknown` 11.2 s after the pause, 7 events, relay while paused `udp_forwarded [20, 14]`, `udp_dropped [19, 17]`, TCP 0. No `fabricd` or `fabric-relay` process was left. The blocked scenarios and their questions below still stand: `f09cc8d` carries the launch path contract and its shared types, not the node that launches a grant.
+
 ## On the M5 base, 2026-11-08
 
 ```

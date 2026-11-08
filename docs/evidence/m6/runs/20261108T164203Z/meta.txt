@@ -1,0 +1,7 @@
+host: Darwin 25.6.0 arm64
+commit: 496f35865ef3d263c1a313188f0f08586c405d22
+started: 2026-11-08T16:42:03Z
+note: two fabricd processes on one host through a userspace relay; no firewall or system setting touched
+load before: 9.95 13.91 13.98
+fabricd and fabric-relay processes after: 0 and 0 (any process on the host by those names)
+finished: 2026-11-08T16:43:11Z
