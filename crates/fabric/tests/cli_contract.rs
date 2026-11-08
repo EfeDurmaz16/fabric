@@ -542,17 +542,23 @@ fn the_version_prints_alone_at_any_depth() {
     }
 }
 
-/// docs/reference/cli.md is the help of every command as it is now.
+/// docs/reference/cli.md is the help of every command as it is now. One
+/// writer makes the page, scripts/docs/cli-reference.sh, and CI runs it
+/// too; this runs it against the binary under test so `cargo test` holds it.
 #[test]
 fn the_command_reference_is_up_to_date() {
-    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli.md");
-    let made = contract::reference();
-    if std::env::var_os("FABRIC_BLESS").is_some() {
-        std::fs::write(&file, &made).unwrap();
-    }
-    let kept = std::fs::read_to_string(&file).unwrap_or_default();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = std::process::Command::new("sh")
+        .arg(root.join("scripts/docs/cli-reference.sh"))
+        .arg("--check")
+        .current_dir(&root)
+        .env("DOCS_CLI", env!("CARGO_BIN_EXE_fabric"))
+        .output()
+        .unwrap();
     assert!(
-        kept == made,
-        "docs/reference/cli.md is out of date; run FABRIC_BLESS=1 cargo test -p fabric --test cli_contract"
+        output.status.success(),
+        "docs/reference/cli.md is out of date; run scripts/docs/cli-reference.sh\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

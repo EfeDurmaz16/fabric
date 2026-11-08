@@ -295,26 +295,6 @@ pub fn help(path: &[String]) -> String {
     }
 }
 
-/// docs/reference/cli.md: the help of every command, as `--help` prints it.
-#[must_use]
-pub fn reference() -> String {
-    let mut text = String::from(
-        "# Command reference\n\nGenerated from `fabric <command> --help`; do not edit. The contract every command keeps is in [../cli-contract.md](../cli-contract.md). Regenerate with `FABRIC_BLESS=1 cargo test -p fabric --test cli_contract`.\n",
-    );
-    for path in paths() {
-        let title = std::iter::once("fabric")
-            .chain(path.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let _ = write!(
-            text,
-            "\n## {title}\n\n```text\n{}\n```\n",
-            help(&path).trim_end()
-        );
-    }
-    text
-}
-
 /// Applies the help layout to `cmd`, at `path` below the root, and to every command under it.
 fn decorate(cmd: Command, path: &[&str]) -> Command {
     let root = path.is_empty();

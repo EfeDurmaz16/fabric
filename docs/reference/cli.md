@@ -1,8 +1,12 @@
-# Command reference
+<!-- This page is written by scripts/docs/cli-reference.sh from `fabric --help`. Do not edit it; run the script. -->
 
-Generated from `fabric <command> --help`; do not edit. The contract every command keeps is in [../cli-contract.md](../cli-contract.md). Regenerate with `FABRIC_BLESS=1 cargo test -p fabric --test cli_contract`.
+# CLI reference
 
-## fabric
+Every command of `fabric` on `main`, as its own `--help` prints it. CI regenerates this page and fails when it differs, so it says what the binary does today.
+
+Exit codes (ADR 0016, Exit codes): 0 for success, the harness's own code when it exits, 128 plus the signal when a signal stopped it, 80 when no node answers on the control socket, 81 not the owner, 82 frozen, 83 a peer unreachable, 84 refused without `--force` or `--yes`, 85 the job's state stops the command, 2 a usage error, and 1 any other failure. See [ADR 0016](../adr/0016-node-and-cli-as-built.md) for each one, and [the CLI contract](../cli-contract.md) for the rules every command keeps: streams, `--json`, errors, help and prompts.
+
+## `fabric`
 
 ```text
 Usage: fabric [OPTIONS] <COMMAND>
@@ -41,7 +45,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md
 ```
 
-## fabric serve
+### `fabric serve`
 
 ```text
 Usage: fabric serve [OPTIONS]
@@ -60,7 +64,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-serve
 ```
 
-## fabric node
+### `fabric node`
 
 ```text
 Usage: fabric node <COMMAND>
@@ -77,7 +81,7 @@ Global Options: See `fabric --help`
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-node
 ```
 
-## fabric node id
+#### `fabric node id`
 
 ```text
 Usage: fabric node id
@@ -94,7 +98,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-node-id
 ```
 
-## fabric node add
+#### `fabric node add`
 
 ```text
 Usage: fabric node add <NODE> [ADDR]
@@ -116,7 +120,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-node-add
 ```
 
-## fabric node ls
+#### `fabric node ls`
 
 ```text
 Usage: fabric node ls
@@ -133,7 +137,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-node-ls
 ```
 
-## fabric node ping
+#### `fabric node ping`
 
 ```text
 Usage: fabric node ping <NODE>
@@ -151,7 +155,29 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-node-ping
 ```
 
-## fabric job
+### `fabric doctor`
+
+```text
+Usage: fabric doctor [OPTIONS]
+Print this node's facts, or compare them with a paired node's before a move
+
+Options:
+      --job <JOB>    The job a move would carry; only with --peer
+      --peer <NODE>  The node to compare with
+
+Global Options: See `fabric --help`
+
+Examples:
+  Print this node's facts
+    fabric doctor
+
+  Check a move before making it
+    fabric doctor --peer <NODE> --job <JOB>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-doctor
+```
+
+### `fabric job`
 
 ```text
 Usage: fabric job <COMMAND>
@@ -177,7 +203,7 @@ Global Options: See `fabric --help`
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job
 ```
 
-## fabric job new
+#### `fabric job new`
 
 ```text
 Usage: fabric job new [OPTIONS] --repo <PATH> --goal <TEXT>
@@ -200,7 +226,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-new
 ```
 
-## fabric job run
+#### `fabric job run`
 
 ```text
 Usage: fabric job run [OPTIONS] <JOB>
@@ -226,7 +252,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-run
 ```
 
-## fabric job suspend
+#### `fabric job suspend`
 
 ```text
 Usage: fabric job suspend <JOB>
@@ -244,7 +270,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-suspend
 ```
 
-## fabric job resume
+#### `fabric job resume`
 
 ```text
 Usage: fabric job resume [OPTIONS] <JOB>
@@ -273,7 +299,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-resume
 ```
 
-## fabric job move
+#### `fabric job move`
 
 ```text
 Usage: fabric job move [OPTIONS] --to <NODE> <JOB>
@@ -298,7 +324,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-move
 ```
 
-## fabric job steal
+#### `fabric job steal`
 
 ```text
 Usage: fabric job steal [OPTIONS] <JOB>
@@ -323,7 +349,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-steal
 ```
 
-## fabric job status
+#### `fabric job status`
 
 ```text
 Usage: fabric job status <JOB>
@@ -341,7 +367,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-status
 ```
 
-## fabric job ls
+#### `fabric job ls`
 
 ```text
 Usage: fabric job ls
@@ -358,7 +384,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-ls
 ```
 
-## fabric job log
+#### `fabric job log`
 
 ```text
 Usage: fabric job log <JOB>
@@ -376,7 +402,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-log
 ```
 
-## fabric job approve
+#### `fabric job approve`
 
 ```text
 Usage: fabric job approve [OPTIONS] <JOB>
@@ -397,7 +423,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-approve
 ```
 
-## fabric job reject
+#### `fabric job reject`
 
 ```text
 Usage: fabric job reject [OPTIONS] <JOB>
@@ -418,7 +444,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-reject
 ```
 
-## fabric job repair
+#### `fabric job repair`
 
 ```text
 Usage: fabric job repair <JOB>
@@ -436,7 +462,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-repair
 ```
 
-## fabric job export
+#### `fabric job export`
 
 ```text
 Usage: fabric job export [OPTIONS] <JOB>
@@ -460,7 +486,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-export
 ```
 
-## fabric managed
+### `fabric managed`
 
 ```text
 Usage: fabric managed <COMMAND>
@@ -477,7 +503,7 @@ Global Options: See `fabric --help`
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed
 ```
 
-## fabric managed create
+#### `fabric managed create`
 
 ```text
 Usage: fabric managed create [OPTIONS] --repo <PATH> --goal <TEXT>
@@ -498,7 +524,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-create
 ```
 
-## fabric managed cancel
+#### `fabric managed cancel`
 
 ```text
 Usage: fabric managed cancel [OPTIONS] <JOB>
@@ -521,7 +547,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-cancel
 ```
 
-## fabric managed status
+#### `fabric managed status`
 
 ```text
 Usage: fabric managed status <JOB>
@@ -539,7 +565,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-status
 ```
 
-## fabric managed ls
+#### `fabric managed ls`
 
 ```text
 Usage: fabric managed ls
@@ -556,29 +582,7 @@ Examples:
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-ls
 ```
 
-## fabric doctor
-
-```text
-Usage: fabric doctor [OPTIONS]
-Print this node's facts, or compare them with a paired node's before a move
-
-Options:
-      --job <JOB>    The job a move would carry; only with --peer
-      --peer <NODE>  The node to compare with
-
-Global Options: See `fabric --help`
-
-Examples:
-  Print this node's facts
-    fabric doctor
-
-  Check a move before making it
-    fabric doctor --peer <NODE> --job <JOB>
-
-Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-doctor
-```
-
-## fabric help
+### `fabric help`
 
 ```text
 Usage: fabric help [COMMAND]...
@@ -595,3 +599,4 @@ Examples:
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-help
 ```
+
