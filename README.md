@@ -56,6 +56,7 @@ That run found that the resumed agent used the other Mac's model setting instead
 | `crates/fabric-env` | `EnvSpec` detection from the files a workspace already has and from `.fabric/env.toml`, and the materializer that runs setup steps only when a cache is missing or torn, with a dry run. Tested against fixture workspaces, real setup processes and `SIGKILL`. |
 | `crates/fabric-journal` | The managed journal (ADR 0020, [docs/managed-jobs.md](docs/managed-jobs.md)): one SQLite file under `<state>/managed/`, made by the first managed command, holding every managed job's events, the operations with the bytes each key was answered with (so a repeated key gets the same answer and a changed body under the same key is refused), attempts, and since schema version 2 the provider operations of the bridge. Replay equals the projection after every test; crash-tested with `SIGKILL` at each fault point; a frozen schema fixture per version. `fabric managed create`, `status`, `cancel` and `ls` are its commands. |
 | `crates/fabricd` | The node: one process per state directory holding the store, one ledger file per job, the network service and the control socket. Suspend, the push move, the pull resume, the steal behind `--force`, doctor, and recovery after a restart. See [ADR 0016](docs/adr/0016-node-and-cli-as-built.md). |
+| `crates/fabric-sync` | The `fabric-sync` command: push and pull a working tree to a directory or over SSH with the store's capture and restore, no node. Only missing objects are sent, a head moves by compare and swap, and a pull is crash-tested with `SIGKILL` while copying, before and between its renames. See [docs/guides/sync-alone.md](docs/guides/sync-alone.md). |
 | `crates/fabric-client` | The client API of a node (ADR 0018): typed requests, replies, progress events and refusals as length-prefixed JSON on the control socket after a version handshake, and a Rust client. `protocol/fixtures` holds one example of every message; the Rust and TypeScript clients both test against it. |
 | `sdk/typescript` | The TypeScript client of the same API for Node 22 and Bun, built to JavaScript with declarations in `dist/`: zod schemas at the boundary, the same trust checks and handshake as the Rust client, and the same contract test against `protocol/fixtures`, plus an end-to-end test against a real node and a test that imports the packed package with plain Node from `node_modules`. |
 | `crates/fabric-psf` | The Portable Session Format v1 (ADR 0029, [docs/portable-session-format.md](docs/portable-session-format.md)): reads, checks and writes the canonical manifest and its container of blobs, and packs the harness state attachment. `protocol/psf/v1` holds the pinned fixtures; the crate, a standard-library Python reader (`scripts/psf_check.py`) and the TypeScript SDK reader must give the same verdict on every fixture and on generated documents. |
@@ -210,6 +211,17 @@ How faithfully a job's conversation continues on the other machine, per harness,
 | GitHub Copilot CLI | not declared | `session-state/<id>/`, or the id alone where the account sync holds | `~/.copilot` config and tokens | docs only, 2026-11-08 | Left out of PR 5: not installed on the owner's Mac, and an id-only resume through the account sync cannot be shown without two signed-in nodes. A contributor task after PR 13. |
 | Aider | `new_native_session_with_package` (planned) | Nothing beyond the workspace snapshot: `.aider.chat.history.md` is inside it and replayed with `--restore-chat-history` | `.env`, API keys | docs, 2026-11-08 | After PR 5. |
 | Warp agent | `unsupported` | Nothing | Everything: no documented local session | 2026-11-08 | Not planned. |
+
+## Sync alone
+
+`fabric-sync` is the store on its own: no node, no pairing, no job. It pushes a working tree, with its staged and unstaged changes, its untracked files and its caches such as `node_modules`, to a directory or over SSH, and pulls it onto another machine. `.env` and every other secret-shaped untracked or ignored file stays behind, by the same policy a suspend uses, `.fabric/env.toml`'s secret patterns and declared caches included.
+
+```sh
+fabric-sync push box:sync                                  # on the first machine, in the tree
+fabric-sync pull box:sync --name app --tree ~/code/app     # on the second
+```
+
+A second push sends only the objects the target lacks: in the bench tree, 2 of 2,012 objects after ten files changed. A push over a head this tree has not seen is refused, a pull never writes over a tree with content without `--replace` (the old tree is kept beside it), and a pull killed at any point leaves the old tree or the whole new one. v1 has directory and SSH targets only, not the node link. See [docs/guides/sync-alone.md](docs/guides/sync-alone.md).
 
 ## Known limits
 
