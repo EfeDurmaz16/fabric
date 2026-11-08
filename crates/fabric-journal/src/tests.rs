@@ -563,3 +563,29 @@ fn events_page_in_order() {
     assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
     assert_eq!(all[0].frame.prev, None);
 }
+
+/// The receipts read of one job never scans the events table: it searches
+/// `events_by_job` for that job alone, whatever other jobs hold.
+#[test]
+fn the_receipts_read_searches_one_jobs_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::create(&dir.path().join(FILE_NAME), NODE, 1).unwrap();
+    let plan: Vec<String> = journal
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {RECEIPTS_SQL}"))
+        .unwrap()
+        .query_map([JobId::from_bytes([1; 16]).to_bytes()], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter().any(|step| step.contains("events_by_job")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.starts_with("SCAN events")),
+        "{plan:?}"
+    );
+}

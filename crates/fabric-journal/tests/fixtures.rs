@@ -853,7 +853,7 @@ fn check_v3(journal: &mut Journal) {
     // The in-place checkpoint's receipts said the test was interrupted;
     // the handoff cut's say the harness was checkpointed, and the last cut wins.
     assert_eq!(
-        journal.receipts(fourth.attempts[0].id).unwrap(),
+        journal.receipts(FOURTH, fourth.attempts[0].id).unwrap(),
         vec![handoff_harness(
             fourth.job.primary,
             SnapshotId::of(b"fixture handoff cut")

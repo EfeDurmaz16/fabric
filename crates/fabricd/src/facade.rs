@@ -739,7 +739,7 @@ fn read_inspection(journal: &Journal, state: &ManagedState) -> Result<Inspection
     // The last receipt of each task: the newest attempt's receipts first.
     let mut receipts: Vec<(fabric_core::managed::TaskId, TaskReceipt)> = Vec::new();
     for attempt in state.attempts.iter().rev() {
-        for receipt in journal.receipts(attempt.id)? {
+        for receipt in journal.receipts(state.job.id, attempt.id)? {
             if !receipts.iter().any(|(task, _)| *task == receipt.task) {
                 receipts.push((receipt.task, receipt));
             }

@@ -372,7 +372,7 @@ fn a_continue_killed_after_its_cut_is_retried_from_the_cut() {
         state.attempts[0].status,
         AttemptStatus::Checkpointed { snapshot }
     );
-    let receipts = journal.receipts(state.attempts[0].id).unwrap();
+    let receipts = journal.receipts(job, state.attempts[0].id).unwrap();
     assert_eq!(receipts.len(), 1, "the cut's one receipt, for the harness");
     assert_eq!(receipts[0].task, state.attempts[0].task);
     // The owner's retry under a new key converges: nothing is live, nothing
