@@ -750,6 +750,13 @@ impl Runner {
             }
         };
         tracing::debug!(%attempt, snapshot = %cut.snapshot, "cut");
+        // A cut that ends the attempt stops what still runs before it is
+        // reported: the authority places the replacement as soon as the
+        // cut is recorded, so nothing of this attempt may run by then.
+        let stopped = match then {
+            AfterCut::End => Some(self.executor.stop(attempt, budget).await.unwrap_or_default()),
+            AfterCut::Resume => None,
+        };
         let answer = reporter
             .send(Observation::Checkpointed {
                 attempt,
@@ -758,8 +765,26 @@ impl Runner {
                 cut,
             })
             .await?;
-        if let (ReportAnswer::Recorded { .. }, AfterCut::End) = (answer, then) {
-            let _ = self.executor.stop(attempt, budget).await;
+        if let Some(receipts) = stopped {
+            if !matches!(answer, ReportAnswer::Recorded { .. }) {
+                // The cut was refused and nothing runs any more: the
+                // attempt's end is reported as a failure, so its task is
+                // free for another continue.
+                reporter
+                    .send(Observation::Receipts {
+                        attempt,
+                        generation: token.generation,
+                        receipts,
+                    })
+                    .await?;
+                reporter
+                    .send(Observation::Exited {
+                        attempt,
+                        generation: token.generation,
+                        outcome: ExitOutcome::Failed { code: None },
+                    })
+                    .await?;
+            }
             return Ok(true);
         }
         // Resumed, or refused for another reason than a stale grant: the
@@ -1360,6 +1385,8 @@ mod tests {
         /// What happened, in order: `report`, `link-fail`, `heartbeat`.
         log: StdMutex<Vec<&'static str>>,
         harness_pids: StdMutex<Vec<u32>>,
+        /// Whether the last harness ran when each cut was reported.
+        alive_at_cut: StdMutex<Vec<bool>>,
         dir: PathBuf,
     }
 
@@ -1425,6 +1452,13 @@ mod tests {
                     return Err("the link is down".into());
                 }
                 self.log.lock().unwrap().push("report");
+                if matches!(report.observation, Observation::Checkpointed { .. }) {
+                    let harness = self.harness_pids.lock().unwrap().last().copied();
+                    self.alive_at_cut
+                        .lock()
+                        .unwrap()
+                        .push(harness.is_some_and(alive));
+                }
                 self.reports.lock().unwrap().push(report.observation);
                 if script.refuse_stale {
                     return Ok(ReportAnswer::Refused {
@@ -1765,6 +1799,11 @@ mod tests {
             vec!["started", "checkpointed", "checkpointed"]
         );
         assert!(!alive(harness), "an end stops what still runs");
+        assert_eq!(
+            *b.host.alive_at_cut.lock().unwrap(),
+            vec![true, false],
+            "an end's cut is reported only once the harness is stopped"
+        );
     }
 
     #[tokio::test]
