@@ -49,6 +49,10 @@ printf '\nSee [the page](no-such-page.md).\n' >> "$work/repo/docs/start/install.
 expect fail 'a broken relative link' python3 scripts/docs/check-links.py
 
 fresh
+printf '\nSee [CONTRIBUTING](../contributing.md).\n' >> "$work/repo/docs/start/install.md"
+expect fail 'a link to an include stub' python3 scripts/docs/check-links.py
+
+fresh
 printf '# ADR 9999: A test\n\nStatus: proposed, 2026-11-08\n' > "$work/repo/docs/adr/9999-a-test.md"
 expect fail 'a new ADR missing from the index' python3 scripts/docs/gen.py --check
 

@@ -84,7 +84,7 @@ def adr_index(entries):
     if missing:
         lines += ["No ADR on `main` has the number %s." % ", ".join(missing), ""]
     lines += [
-        "How to write one is in [CONTRIBUTING, Decisions](../contributing.md).",
+        "How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions).",
         "",
         "| ADR | Title | Status |",
         "|---|---|---|",

@@ -8,7 +8,10 @@ Markdown file that is not a chapter) becomes a link to that path on the
 repository's main branch, so the same Markdown reads right on GitHub and
 on the site. A line that is only {{#include <file>}} of a file outside
 docs/ is inlined here, with its links rebased on the included file, so
-CONTRIBUTING.md is one file and still reads right on both.
+CONTRIBUTING.md is one file and still reads right on both. A link to such
+an included file goes to the chapter that includes it, and the lines
+between <!-- github-only:begin --> and <!-- github-only:end --> (a pointer
+for readers of the stub on GitHub) leave the site.
 
 The repository URL comes from scripts/docs/names.env. Standard library only.
 """
@@ -23,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import links  # noqa: E402
 
 INCLUDE = re.compile(r"^\{\{#include\s+(\S+)\s*\}\}$")
+GITHUB_ONLY = re.compile(r"<!-- github-only:begin -->.*?<!-- github-only:end -->\n?", re.S)
 
 
 def names(root):
@@ -55,6 +59,16 @@ def main():
     repo = names(root)["REPO_URL"].rstrip("/")
     every = chapters(book.get("items", book.get("sections", [])), [])
     pages = {os.path.normpath(os.path.join(src, c["source_path"])) for c in every}
+    # An outside file a chapter includes whole is read on the site as that chapter.
+    included_by = {}
+    for chapter in every:
+        chapter_dir = os.path.dirname(os.path.join(src, chapter["source_path"]))
+        for line in chapter["content"].split("\n"):
+            m = INCLUDE.match(line.strip())
+            if m:
+                path = os.path.normpath(os.path.join(chapter_dir, m.group(1)))
+                if os.path.commonpath([path, src]) != src:
+                    included_by[path] = os.path.normpath(os.path.join(src, chapter["source_path"]))
 
     def fixer(base, chapter_dir):
         def fix(target):
@@ -65,6 +79,7 @@ def main():
             if not name:
                 return target
             path = os.path.normpath(os.path.join(base, name))
+            path = included_by.get(path, path)
             if path in pages:
                 rel = os.path.relpath(path, chapter_dir)
                 # mdBook renders a README.md chapter as index.html.
@@ -81,7 +96,7 @@ def main():
     for chapter in every:
         chapter_dir = os.path.dirname(os.path.join(src, chapter["source_path"]))
         lines = []
-        for line in chapter["content"].split("\n"):
+        for line in GITHUB_ONLY.sub("", chapter["content"]).split("\n"):
             m = INCLUDE.match(line.strip())
             included = os.path.normpath(os.path.join(chapter_dir, m.group(1))) if m else None
             if included and os.path.commonpath([included, src]) != src and os.path.isfile(included):

@@ -6,7 +6,7 @@ Every architecture decision record on `main`, with the status line the ADR itsel
 
 No ADR on `main` has the number 0017.
 
-How to write one is in [CONTRIBUTING, Decisions](../contributing.md).
+How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions).
 
 | ADR | Title | Status |
 |---|---|---|

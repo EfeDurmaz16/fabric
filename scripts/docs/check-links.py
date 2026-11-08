@@ -8,6 +8,10 @@ Usage: scripts/docs/check-links.py [file ...]
 Without files, every tracked *.md outside docs/evidence is checked. With
 --site, every relative href in the built site's pages must name a file of
 the site; a link that starts with / is the site URL and is skipped.
+A link to a page that only includes a file from outside docs/ (such as
+docs/contributing.md) fails too: on GitHub it lands on the stub, so link
+the included file instead, which the site maps to the chapter. Only
+docs/SUMMARY.md, the site's table of contents, names such a page.
 """
 
 import os
@@ -19,6 +23,16 @@ from urllib.parse import unquote
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import links  # noqa: E402
+
+INCLUDE = re.compile(r"^\{\{#include\s+\.\./\S+\s*\}\}$", re.M)
+
+
+def is_stub(path):
+    """A page under docs/ whose content is an include of an outside file."""
+    if not path.endswith(".md") or not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        return bool(INCLUDE.search(f.read()))
 
 
 def check_site(site):
@@ -67,6 +81,10 @@ def main():
             resolved = os.path.normpath(os.path.join(os.path.dirname(path), name))
             if not os.path.exists(resolved):
                 print("%s: broken link %s" % (os.path.relpath(path, root), target))
+                broken += 1
+            elif os.path.basename(path) != "SUMMARY.md" and is_stub(resolved):
+                print("%s: link %s lands on an include stub on GitHub; link the file it includes"
+                      % (os.path.relpath(path, root), target))
                 broken += 1
     if broken:
         sys.exit("error: %d broken relative link(s)" % broken)
