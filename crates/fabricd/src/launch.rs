@@ -614,6 +614,8 @@ pub(crate) mod fixture {
         pub(crate) launch_answer: Mutex<LaunchAnswer>,
         /// The answer to an instruction.
         pub(crate) instruct_answer: Mutex<InstructAnswer>,
+        /// How many instructions fail on the link before one is answered.
+        pub(crate) instruct_failures: Mutex<u32>,
         /// Where a placement lands.
         pub(crate) place_on: Mutex<Option<NodeId>>,
         /// The pin of the job each placement was asked with, in order.
@@ -627,6 +629,7 @@ pub(crate) mod fixture {
                 launched: Mutex::new(HashSet::new()),
                 launch_answer: Mutex::new(LaunchAnswer::Accepted),
                 instruct_answer: Mutex::new(InstructAnswer::Accepted),
+                instruct_failures: Mutex::new(0),
                 place_on: Mutex::new(None),
                 placed_pins: Mutex::new(Vec::new()),
             }
@@ -697,6 +700,17 @@ pub(crate) mod fixture {
                 .lock()
                 .unwrap()
                 .push(Asked::Instruct(target, token, instruction));
+            let mut failures = self.instruct_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Box::pin(async move {
+                    Err(NodeError::Io {
+                        path: std::path::PathBuf::from("link"),
+                        source: std::io::Error::other("the link is down"),
+                    })
+                });
+            }
+            drop(failures);
             let answer = self.instruct_answer.lock().unwrap().clone();
             Box::pin(async move { Ok(answer) })
         }

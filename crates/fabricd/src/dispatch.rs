@@ -9,7 +9,12 @@
 //! command is marked `Dispatched` before its instruction is sent, so a
 //! crash after the mark never sends it again; a spawn is settled by the
 //! node's answer, a checkpoint, a continue's cut and a cancel by the
-//! node's report. A grant is launched by sending its plan again after a
+//! node's report. Two instructions are safe to send again and are: a
+//! cancel's stop that did not reach its node or found it busy (a node
+//! takes one stop per attempt, and a restart sends each unsettled stop
+//! once more), and a spawn its node answered busy or frozen. A stop its
+//! node answers `NotRunning` ends the attempt cancelled, since nothing of
+//! it runs there, and a grant with a cancel pending is never launched. A grant is launched by sending its plan again after a
 //! restart: the node answers a launch of an attempt it already runs
 //! `AlreadyLaunched`, so nothing runs twice and the authority keeps no
 //! "launch sent" fact. A launch the node refuses for any other reason
@@ -24,7 +29,8 @@ use std::time::Duration;
 
 use fabric_core::id::{JobId, SnapshotId};
 use fabric_core::managed::launch::{
-    AfterCut, InstructAnswer, Instruction, LaunchAnswer, LaunchRefusal, TaskLaunch,
+    AfterCut, InstructAnswer, InstructRefusal, Instruction, LaunchAnswer, LaunchRefusal,
+    TaskLaunch,
 };
 use fabric_core::managed::placement::PlacementKind;
 use fabric_core::managed::{
@@ -52,6 +58,10 @@ pub(crate) struct Seen {
     placed: HashSet<(JobId, OperationId)>,
     /// Grants sent and taken, or refused for good.
     launched: HashSet<AttemptId>,
+    /// Cancels whose stop its node took, or answered for good.
+    stopped: HashSet<(JobId, OperationId)>,
+    /// Spawns their node answered busy or frozen, sent again later.
+    respawn: HashSet<(JobId, OperationId)>,
     /// Whether a launch failed at the link and is worth another try.
     retry: bool,
 }
@@ -86,6 +96,7 @@ pub(crate) async fn run(node: Arc<Node>) {
 /// placed, and the grants those made are launched.
 pub(crate) async fn pass(authority: &Authority, link: &dyn Link, seen: &mut Seen) {
     launch_grants(authority, link, seen).await;
+    resend(authority, link, seen).await;
     match authority.pending().await {
         Ok(effects) => {
             for effect in effects {
@@ -345,29 +356,188 @@ async fn dispatch_effect(
         return Ok(());
     };
     let ResourceRef::Node { node: target } = found.resource;
-    let spawn = matches!(request, EffectRequest::Spawn { .. });
     authority
         .mark(effect.job, effect.operation, OperationMark::Dispatched)
         .await?;
+    instruct(
+        authority,
+        link,
+        seen,
+        (effect.job, effect.operation),
+        &request,
+        (target, token),
+        instruction,
+    )
+    .await
+}
+
+/// Sends `instruction` for the dispatched operation `key` and acts on the
+/// answer. A spawn is settled by it, except a node that is preparing the
+/// root or quiescing (`Busy`, `Frozen`): it is sent again later. A stop
+/// is settled by the attempt's end; one that did not reach its node, or
+/// that its node answered `Busy`, is sent again, which is safe since a
+/// node takes one stop per attempt; one its node answers `NotRunning`
+/// ends the attempt cancelled here, since nothing of it runs there. Any
+/// other refusal fails the command, and a checkpoint that did not reach
+/// its node is `Unknown`, since the node may have taken it.
+async fn instruct(
+    authority: &Authority,
+    link: &dyn Link,
+    seen: &mut Seen,
+    key: (JobId, OperationId),
+    request: &EffectRequest,
+    (target, token): (fabric_core::id::NodeId, fabric_core::managed::launch::GrantToken),
+    instruction: Instruction,
+) -> Result<(), AuthorityError> {
+    let (job, operation) = key;
+    let spawn = matches!(request, EffectRequest::Spawn { .. });
+    let stop = matches!(
+        request,
+        EffectRequest::CancelJob { .. } | EffectRequest::CancelTask { .. }
+    );
     let mark = match link.instruct(target, token, instruction).await {
-        Ok(InstructAnswer::Accepted) => spawn.then_some(OperationMark::Succeeded),
+        Ok(InstructAnswer::Accepted) => {
+            seen.respawn.remove(&key);
+            if stop {
+                seen.stopped.insert(key);
+            }
+            spawn.then_some(OperationMark::Succeeded)
+        }
+        Ok(InstructAnswer::Refused {
+            reason: InstructRefusal::NotRunning,
+        }) if stop => {
+            seen.stopped.insert(key);
+            tracing::info!(%job, %operation, attempt = %token.attempt, "the node runs nothing of the attempt; it ends cancelled");
+            let ended = authority
+                .observe(
+                    job,
+                    Observation::Exited {
+                        attempt: token.attempt,
+                        generation: token.generation,
+                        outcome: ExitOutcome::Cancelled,
+                    },
+                )
+                .await;
+            if let Err(e) = ended {
+                // The attempt ended by another way since; its end settled
+                // the cancel.
+                tracing::info!(%job, %operation, error = %e, "the attempt was not ended here");
+            }
+            None
+        }
+        Ok(InstructAnswer::Refused {
+            reason: InstructRefusal::Busy { .. },
+        }) if stop => {
+            seen.retry = true;
+            None
+        }
+        Ok(InstructAnswer::Refused {
+            reason: InstructRefusal::Busy { .. } | InstructRefusal::Frozen,
+        }) if spawn => {
+            seen.respawn.insert(key);
+            seen.retry = true;
+            None
+        }
         Ok(InstructAnswer::Refused { reason }) => {
-            tracing::info!(job = %effect.job, operation = %effect.operation, %reason, "the node refused the instruction");
+            tracing::info!(%job, %operation, %reason, "the node refused the instruction");
+            seen.respawn.remove(&key);
+            if stop {
+                seen.stopped.insert(key);
+            }
             Some(OperationMark::Failed)
         }
+        Err(e) if stop => {
+            tracing::warn!(%job, %operation, error = %e, "the stop did not reach its node; it is sent again");
+            seen.retry = true;
+            None
+        }
         Err(e) => {
-            tracing::warn!(job = %effect.job, operation = %effect.operation, error = %e, "the instruction did not reach its node");
+            tracing::warn!(%job, %operation, error = %e, "the instruction did not reach its node");
+            seen.respawn.remove(&key);
             Some(OperationMark::Unknown)
         }
     };
     if let Some(mark) = mark {
-        authority.mark(effect.job, effect.operation, mark).await?;
+        authority.mark(job, operation, mark).await?;
     }
     Ok(())
 }
 
+/// Sends again every stop of a cancel in flight its node has not taken
+/// in this process (a restart sends each once more), and every spawn its
+/// node answered busy or frozen; a spawn whose attempt has ended since
+/// fails, so its task rides in the next launch.
+async fn resend(authority: &Authority, link: &dyn Link, seen: &mut Seen) {
+    let jobs = match authority.list().await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::warn!(error = %e, "the jobs could not be read");
+            return;
+        }
+    };
+    for state in jobs {
+        for op in &state.operations {
+            let key = (state.job.id, op.id);
+            let again = match op.kind {
+                CommandKind::CancelJob | CommandKind::CancelTask => {
+                    matches!(
+                        op.status,
+                        OperationStatus::Dispatched | OperationStatus::Unknown
+                    ) && !seen.stopped.contains(&key)
+                }
+                CommandKind::RegisterTask => {
+                    op.status == OperationStatus::Dispatched && seen.respawn.contains(&key)
+                }
+                _ => false,
+            };
+            if !again {
+                continue;
+            }
+            let Some(request) = state.request(op.id) else {
+                continue;
+            };
+            let target = instruction_for(&state, request).and_then(|(attempt, instruction)| {
+                let token = token_of(&state, attempt)?;
+                let ResourceRef::Node { node } = state.attempt(attempt)?.resource;
+                Some((node, token, instruction))
+            });
+            let outcome = match target {
+                Some((node, token, instruction)) => {
+                    instruct(authority, link, seen, key, request, (node, token), instruction).await
+                }
+                None if op.kind == CommandKind::RegisterTask => {
+                    seen.respawn.remove(&key);
+                    authority
+                        .mark(state.job.id, op.id, OperationMark::Failed)
+                        .await
+                        .map(|_| ())
+                }
+                None => Ok(()),
+            };
+            if let Err(e) = outcome {
+                tracing::warn!(job = %state.job.id, operation = %op.id, error = %e, "an instruction was not sent again");
+            }
+        }
+    }
+}
+
+/// Whether a cancel of the job, or of `task`, is accepted and not settled.
+fn cancel_pending(state: &ManagedState, task: TaskId) -> bool {
+    state.operations.iter().any(|op| {
+        matches!(
+            op.status,
+            OperationStatus::Accepted | OperationStatus::Dispatched | OperationStatus::Unknown
+        ) && match state.request(op.id) {
+            Some(EffectRequest::CancelJob { .. }) => true,
+            Some(EffectRequest::CancelTask { task: of, .. }) => *of == task,
+            _ => false,
+        }
+    })
+}
+
 /// Every grant a placement made that may still be launched: granted, at
-/// the job's generation, made by a create or a continue.
+/// the job's generation, made by a create or a continue, with no cancel
+/// of it pending (its stop ends it unlaunched).
 fn grants(state: &ManagedState) -> Vec<AttemptId> {
     state
         .attempts
@@ -375,6 +545,7 @@ fn grants(state: &ManagedState) -> Vec<AttemptId> {
         .filter(|a| {
             a.status == AttemptStatus::Granted
                 && a.generation == state.job.generation
+                && !cancel_pending(state, a.task)
                 && state.operation(a.granted_by).is_some_and(|op| {
                     matches!(op.kind, CommandKind::CreateJob | CommandKind::Continue)
                 })
@@ -503,7 +674,7 @@ async fn fail_attempt(
 
 #[cfg(test)]
 mod tests {
-    use fabric_core::managed::launch::{GrantToken, InstructRefusal, Report, ReportAnswer};
+    use fabric_core::managed::launch::{GrantToken, Report, ReportAnswer};
     use fabric_core::managed::{AllowedFidelity, Command, JobState, TaskState};
 
     use super::*;
@@ -845,7 +1016,8 @@ mod tests {
 
     /// A program registered while its parent's attempt runs is a `Spawn`
     /// to that attempt's node, succeeded when the node takes it and failed
-    /// when it refuses.
+    /// when it refuses for good; one refused while the node prepares the
+    /// root or quiesces (`Busy`, `Frozen`) is sent again on a later pass.
     #[tokio::test]
     async fn a_spawn_is_instructed_and_settled_by_the_answer() {
         let world = World::new();
@@ -882,8 +1054,129 @@ mod tests {
             .await;
         pass(&world.authority, &link, &mut seen).await;
         let state = world.state(job).await;
-        assert_eq!(spawned(&state, test), Some(OperationStatus::Failed));
-        assert_eq!(state.task(test).unwrap().state, TaskState::Open);
+        assert_eq!(spawned(&state, test), Some(OperationStatus::Dispatched));
+        assert!(seen.retry, "a frozen spawn asks for another pass");
+        *link.instruct_answer.lock().unwrap() = InstructAnswer::Accepted;
+        pass(&world.authority, &link, &mut seen).await;
+        let state = world.state(job).await;
+        assert_eq!(spawned(&state, test), Some(OperationStatus::Succeeded));
+        assert_eq!(
+            link.instructions().len(),
+            3,
+            "the frozen spawn was sent again once"
+        );
+        *link.instruct_answer.lock().unwrap() = InstructAnswer::Refused {
+            reason: InstructRefusal::Internal {
+                reason: "no".into(),
+            },
+        };
+        let lint = world
+            .register(job, "lint", TaskClass::Test, &["cargo", "clippy"])
+            .await;
+        pass(&world.authority, &link, &mut seen).await;
+        let state = world.state(job).await;
+        assert_eq!(spawned(&state, lint), Some(OperationStatus::Failed));
+        assert_eq!(state.task(lint).unwrap().state, TaskState::Open);
+    }
+
+    /// A cancel whose stop did not reach the node stays dispatched and its
+    /// stop is sent again on the next pass, so the attempt does not run on
+    /// while the heartbeat keeps saying `Live`.
+    #[tokio::test]
+    async fn a_stop_that_did_not_reach_its_node_is_sent_again() {
+        let world = World::new();
+        let link = FakeLink::new();
+        let job = world.created("create").await;
+        let first = world.granted(job, REMOTE).await;
+        world.started(job, first).await;
+        let mut seen = Seen::default();
+        pass(&world.authority, &link, &mut seen).await;
+        *link.instruct_failures.lock().unwrap() = 1;
+        let cancel = world
+            .submit(
+                job,
+                "cancel",
+                Command::CancelJob {
+                    reason: "operator".into(),
+                },
+            )
+            .await
+            .unwrap();
+        pass(&world.authority, &link, &mut seen).await;
+        assert_eq!(
+            world.state(job).await.operation(cancel).unwrap().status,
+            OperationStatus::Dispatched
+        );
+        assert!(seen.retry, "an unreached stop asks for another pass");
+        pass(&world.authority, &link, &mut seen).await;
+        pass(&world.authority, &link, &mut seen).await;
+        let stops = link
+            .instructions()
+            .into_iter()
+            .filter(|(_, _, i)| matches!(i, Instruction::Stop { .. }))
+            .count();
+        assert_eq!(stops, 2, "sent again once, then taken");
+    }
+
+    /// A stop its node answers `NotRunning` (the node restarted, or the
+    /// launch never reached it) ends the attempt cancelled, which cancels
+    /// the job; a grant with a cancel pending is never launched.
+    #[tokio::test]
+    async fn a_stop_its_node_does_not_run_ends_the_attempt_and_the_job() {
+        let world = World::new();
+        let link = FakeLink::new();
+        let job = world.created("create").await;
+        let first = world.granted(job, REMOTE).await;
+        world.started(job, first).await;
+        *link.instruct_answer.lock().unwrap() = InstructAnswer::Refused {
+            reason: InstructRefusal::NotRunning,
+        };
+        let cancel = world
+            .submit(
+                job,
+                "cancel",
+                Command::CancelJob {
+                    reason: "operator".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut seen = Seen::default();
+        pass(&world.authority, &link, &mut seen).await;
+        let state = world.state(job).await;
+        assert_eq!(state.attempt(first).unwrap().status, AttemptStatus::Cancelled);
+        assert_eq!(state.job.state, JobState::Cancelled);
+        assert_eq!(
+            state.operation(cancel).unwrap().status,
+            OperationStatus::Succeeded
+        );
+
+        // A grant not launched yet when the cancel comes is not launched.
+        let world = World::new();
+        let job = world.created("create").await;
+        let granted = world.granted(job, REMOTE).await;
+        world
+            .submit(
+                job,
+                "cancel",
+                Command::CancelJob {
+                    reason: "operator".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let link = FakeLink::new();
+        *link.instruct_answer.lock().unwrap() = InstructAnswer::Refused {
+            reason: InstructRefusal::NotRunning,
+        };
+        pass(&world.authority, &link, &mut Seen::default()).await;
+        let state = world.state(job).await;
+        assert!(link.launches().is_empty(), "a cancelled grant was launched");
+        assert_eq!(
+            state.attempt(granted).unwrap().status,
+            AttemptStatus::Cancelled
+        );
+        assert_eq!(state.job.state, JobState::Cancelled);
     }
 }
 
