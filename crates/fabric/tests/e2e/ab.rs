@@ -1411,12 +1411,23 @@ fn counted_size_pairs(samples: &[Sample], metric: &str) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// The memory rows of the gate: each daemon's sizes after the timed runs,
-/// and the CLI's peak sizes per counted op. The daemons' sizes after the
-/// counted ops stay in the report only: each side has one daemon per node,
-/// read again after every op, so those pairs are not independent, and two
-/// equal builds read 0.971 to 1.075 there on the runner (perf-ab README,
-/// CI section).
+/// The daemons whose sizes after the timed runs the gate judges: daemon a
+/// restarts in every timed run (`restart`), so each of its pairs is two
+/// fresh processes. Daemon b lives through the whole timed phase, so its
+/// 15 readings per side are one process read 15 times: a constant offset
+/// between the two processes (heap layout, start order) gives an interval
+/// about 1% wide away from 1, and two equal builds failed it in a run and
+/// in its confirmation on the runner (perf-ab README, CI section). Its
+/// sizes stay in the report.
+const GATED_DAEMONS: [&str; 1] = ["daemon a"];
+
+/// The memory rows of the gate: the sizes after the timed runs of each
+/// daemon in [`GATED_DAEMONS`], and the CLI's peak sizes per counted op,
+/// a fresh process each. The daemons' sizes after the counted ops stay in
+/// the report only: each side has one daemon per node, read again after
+/// every op, so those pairs are not independent either, and two equal
+/// builds read 0.971 to 1.075 there on the runner (perf-ab README, CI
+/// section).
 fn memory_series(samples: &[Sample]) -> Vec<Series> {
     let mut memory: Vec<Series> = Vec::new();
     for (metric, _, title, _) in DAEMON_SIZES {
@@ -1424,6 +1435,7 @@ fn memory_series(samples: &[Sample]) -> Vec<Series> {
             .iter()
             .filter(|sample| sample.phase == "timed" && sample.metric == metric)
             .map(|sample| sample.op.as_str())
+            .filter(|daemon| GATED_DAEMONS.contains(daemon))
             .collect();
         for daemon in daemons {
             let found = pairs(samples, "timed", daemon, metric);
@@ -1464,7 +1476,7 @@ fn counter_checks(samples: &[Sample], out: &mut String) -> Vec<Check> {
         out.push_str("---|\n");
         for op in &counted {
             let _ = write!(out, "| {op} |");
-            let mut over = Vec::new();
+            let mut fails = false;
             for (title, metrics) in GATED_COUNTERS {
                 let mut sum = [0.0, 0.0];
                 for metric in metrics {
@@ -1472,17 +1484,19 @@ fn counter_checks(samples: &[Sample], out: &mut String) -> Vec<Check> {
                     sum[0] += anchor;
                     sum[1] += candidate;
                 }
-                if sum[1] > sum[0] {
-                    over.push(title);
-                }
+                // One check per op and counter, named the same whatever
+                // the other counters did, so a confirmation matches an op
+                // that starts more processes in both runs even when its
+                // flushes differ between them.
+                let over = sum[1] > sum[0];
+                fails |= over;
+                checks.push(Check {
+                    row: format!("{op}: more {title}"),
+                    fails: over,
+                });
                 let _ = write!(out, " {:.0} -> {:.0} |", sum[0], sum[1]);
             }
-            let fails = !over.is_empty();
             let _ = writeln!(out, " {} |", if fails { "**fail**" } else { "pass" });
-            checks.push(Check {
-                row: format!("{op}: more {}", over.join(", ")),
-                fails,
-            });
         }
     }
 
@@ -1491,12 +1505,15 @@ fn counter_checks(samples: &[Sample], out: &mut String) -> Vec<Check> {
 
 /// The verdict of a run against the performance rule, as markdown, and
 /// the rows that break it. Times: no op's family interval above 1, the 95%
-/// interval across all timed ops at once, so that two equal builds fail
-/// one run in 20 at most however many ops there are. Memory: no daemon's
-/// resident size or physical footprint and no CLI's peak resident size or
+/// interval across all timed ops at once (Bonferroni). That bounds the
+/// false failures of independent, alike samples at one run in 20; a shared
+/// runner's are neither, and 6 of 15 single A/A runs failed a check there,
+/// so CI confirms a failing run ([`confirmed_verdict`]). Memory: no gated
+/// daemon's resident size or physical footprint and no CLI's peak resident size or
 /// physical footprint with a family interval above 1, across the memory
 /// rows. Counters: no op with more process starts or more full or
-/// barrier flushes than the anchor, medians over the counted runs.
+/// barrier flushes than the anchor, medians over the counted runs, one
+/// check per op and counter.
 fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
     let samples = parse_samples(text)?;
     let mut out = String::new();
@@ -1819,6 +1836,13 @@ fn gate_samples(slower: f64, larger: f64, extra: u64) -> String {
                 text,
                 "timed\t{run}\tdaemon a\t{side}\tanchor\tfootprint_kib\t{footprint:.0}"
             );
+            // Daemon b is one process per side for the whole timed phase:
+            // the candidate's reads a constant 2% above the anchor's.
+            let b = if side == "anchor" { 9000.0 } else { 9180.0 };
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tdaemon b\t{side}\tanchor\tfootprint_kib\t{b:.0}"
+            );
         }
     }
     for run in 1..=3 {
@@ -1860,6 +1884,20 @@ fn the_gate_fails_a_slower_op_a_larger_daemon_and_one_more_process() -> Fallible
     Ok(())
 }
 
+/// Daemon b's timed readings are one process per side read again and
+/// again, so a constant offset between the two is not a regression: the
+/// report shows it, the gate does not judge it.
+#[test]
+fn the_gate_leaves_out_the_long_lived_daemon() -> Fallible {
+    let samples = gate_samples(1.0, 1.0, 0);
+    let (verdict, failed) = judge_run(&samples)?;
+    assert!(failed.is_empty(), "{verdict}");
+    assert!(!verdict.contains("daemon b"), "{verdict}");
+    let report = report(&samples)?;
+    assert!(report.contains("| daemon b | 9000 |"), "{report}");
+    Ok(())
+}
+
 /// With a confirmation run, a check fails only when it fails in both runs.
 #[test]
 fn a_confirmed_gate_fails_only_what_fails_twice() -> Fallible {
@@ -1871,5 +1909,30 @@ fn a_confirmed_gate_fails_only_what_fails_twice() -> Fallible {
     assert!(verdict.contains("### First run: fail"), "{verdict}");
     let (verdict, failed) = confirmed_verdict(&noisy, Some(&noisy))?;
     assert_eq!(failed, ["cli ls"], "{verdict}");
+    Ok(())
+}
+
+/// A confirmation matches each counter of an op on its own: an op that
+/// starts one more process in both runs fails although only the first run
+/// also made one more flush.
+#[test]
+fn a_confirmed_gate_matches_each_counter_of_an_op() -> Fallible {
+    let spawn = gate_samples(1.0, 1.0, 1);
+    let spawn_and_flush = spawn.replace(
+        "acp new\tcandidate\tanchor\tfullfsync\t3",
+        "acp new\tcandidate\tanchor\tfullfsync\t4",
+    );
+    let (verdict, failed) = judge_run(&spawn_and_flush)?;
+    assert_eq!(
+        failed,
+        [
+            "acp new: more process starts",
+            "acp new: more full and barrier flushes"
+        ],
+        "{verdict}"
+    );
+    let (verdict, failed) = confirmed_verdict(&spawn_and_flush, Some(&spawn))?;
+    assert_eq!(failed, ["acp new: more process starts"], "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: fail"), "{verdict}");
     Ok(())
 }

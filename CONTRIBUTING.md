@@ -97,13 +97,19 @@ and runs `scripts/bench-ab.sh --release --pairs 15 --counted 5`, then
 
 - an op whose time ratio, candidate over anchor, has a family interval
   above 1: the 95% bootstrap interval across all timed ops at once
-  (Bonferroni), so that two equal builds fail at most one run in 20
-  however many ops there are;
-- a daemon's resident size or physical footprint after the timed runs,
+  (Bonferroni). For independent, alike samples that is at most one false
+  failure in 20 runs however many ops there are; a shared runner's
+  samples are neither, which is why a failing run is confirmed (below);
+- daemon a's resident size or physical footprint after the timed runs,
   or the CLI's peak resident size or physical footprint over the counted
-  ops, whose ratio has a family interval above 1 across the memory rows;
+  ops, whose ratio has a family interval above 1 across the memory rows.
+  Daemon a restarts in every timed run, so its pairs are fresh processes;
+  daemon b lives through the whole timed phase, so its readings are one
+  process per side read again and again, and its sizes are reported, not
+  gated;
 - an op that starts more processes, or makes more full or barrier
-  flushes, than the anchor, medians over the counted runs. These do not
+  flushes, than the anchor, medians over the counted runs, each counter
+  of each op a check of its own. These do not
   depend on the runner's load, so they hold where a shared runner's times
   are too noisy to: `new`, `launch`, `cold start` and the approvals, whose
   family intervals span about 0.6 to 1.9 on the runner.
