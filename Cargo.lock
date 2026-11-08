@@ -467,6 +467,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-psf"
+version = "0.1.0"
+dependencies = [
+ "fabric-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "fabric-store"
 version = "0.1.0"
 dependencies = [
