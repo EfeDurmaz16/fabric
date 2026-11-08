@@ -901,10 +901,16 @@ async fn interrupt(running: &mut Running, grace: DrainBudget, signals: &AtomicU6
         Handle::Child(child) => child.try_wait().ok().flatten().is_some(),
         Handle::Adopted => false,
     };
+    // A leader pid that another process now has (it starts at another
+    // time) names a group that is not this task's. A leader that is gone
+    // while its group still has members (an adopted harness the runner
+    // reaped, which left a child behind) is this task's group: a pid is
+    // not reused while a group of that id lives.
     if !running.gone
-        && let Some(started) = &running.started
-        && local::process_started(running.pid).await.as_ref() != Some(started)
         && !leader_exited
+        && let Some(started) = &running.started
+        && let Some(now) = local::process_started(running.pid).await
+        && &now != started
     {
         return;
     }
@@ -1828,5 +1834,46 @@ mod tests {
         assert!(!again.receipts[0].passed());
         let stopped = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
         assert_eq!(stopped[0].status, ReceiptStatus::Interrupted);
+    }
+
+    /// An adopted harness that exited on its own (the runner reaped it,
+    /// step 8) and left a child in its group: a stop of the attempt ends
+    /// that group too, so nothing of the attempt outlives its report.
+    #[tokio::test]
+    async fn a_stop_ends_the_group_an_exited_adopted_harness_left() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-pid");
+        let mut harness = sh(&format!(
+            "sleep 30 & echo $! > {}; exit 0",
+            marker.display()
+        ));
+        harness.process_group(0);
+        let mut harness = harness.spawn().unwrap();
+        let pid = harness.id();
+        b.executor
+            .adopt(b.attempt, task(1), pid, None)
+            .await
+            .unwrap();
+        harness.wait().unwrap();
+        let child: u32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && let Ok(p) = text.trim().parse()
+            {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(alive(child), "the background child runs");
+        let receipts = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let still = alive(child);
+        if still {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child).unwrap()).unwrap(),
+                rustix::process::Signal::KILL,
+            );
+        }
+        assert!(!still, "the harness's child outlived the stop: {receipts:?}");
     }
 }
