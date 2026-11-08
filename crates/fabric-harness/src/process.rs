@@ -256,7 +256,7 @@ fn is_executable(path: &Path) -> bool {
 /// a launch env can hold, with `PATH` set to `path_var`: the binary was
 /// found on that value, and a shim such as `#!/usr/bin/env node` must find
 /// its interpreter there too, as it will at launch.
-fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
+pub(crate) fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
     let mut env: Vec<(EnvVarName, String)> = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = EnvVarName::parse(name.to_str()?).ok()?;
@@ -1069,6 +1069,28 @@ pub(crate) async fn running_pids(
     Ok(pids)
 }
 
+/// Process ids of running processes whose command line holds `binary` as
+/// one whole word, as the path it was found at or as its physical path:
+/// a harness without a name of its own, such as pi, which runs as `node`
+/// with its script's path as an argument. Matching the whole word keeps
+/// `/usr/bin/pi` from matching `/usr/bin/pip`.
+#[cfg(feature = "pi")]
+pub(crate) async fn running_binary(binary: &Path) -> Result<Vec<u32>, HarnessError> {
+    let physical = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+    let mut pids = Vec::new();
+    for path in [binary, physical.as_path()] {
+        let mut pattern = std::ffi::OsString::from("(^|[[:space:]])");
+        pattern.push(ere_literal(path.as_os_str()));
+        pattern.push("([[:space:]]|$)");
+        pids.extend(pgrep(&[OsStr::new("-f"), &pattern]).await?);
+    }
+    let own = std::process::id();
+    pids.retain(|pid| *pid != own);
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
 /// True when a process with this id exists, asked of `ps`. `ps` exits 0
 /// and prints the pid for a live process, and exits 1 with no output for
 /// none; any other answer is an error, never "dead".
@@ -1292,7 +1314,13 @@ mod tests {
 
     /// The hold, through the launch handle that ends it, which only a
     /// build with an adapter has.
-    #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "acp",
+        feature = "claude",
+        feature = "codex",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     mod hold {
         use super::*;
 

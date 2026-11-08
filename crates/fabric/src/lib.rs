@@ -796,6 +796,18 @@ const DRAIN: Duration = Duration::from_secs(2);
 /// Reads one line a headless harness printed into a report; true when it named a new session.
 type ReadLine = fn(&mut TurnReport, &str) -> bool;
 
+/// What reads the lines a headless run of `harness` prints; `None` for a
+/// terminal run, and for an ACP agent, whose output its protocol client holds.
+fn headless_reader(mode: &Mode, harness: &HarnessKind) -> Option<ReadLine> {
+    match (mode, harness) {
+        (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
+        (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
+        (Mode::Headless(_), HarnessKind::OpenCode) => Some(OpenCode::read_headless_line),
+        (Mode::Headless(_), HarnessKind::Pi) => Some(Pi::read_headless_line),
+        _ => None,
+    }
+}
+
 /// Runs the plan's setup steps, launches the harness, registers it, and waits for it.
 async fn launch(
     state: &StateDir,
@@ -806,12 +818,7 @@ async fn launch(
     approval: &Approval<'_>,
 ) -> Result<ExitCode> {
     let notes = mode.notes();
-    let read_line: Option<ReadLine> = match (&mode, &plan.harness) {
-        (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
-        (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
-        // The protocol client holds an ACP agent's output.
-        _ => None,
-    };
+    let read_line = headless_reader(&mode, &plan.harness);
     let (tree, setup_ran) = prepare(state, home, client, plan, notes, approval).await?;
     // A setup step may have installed or switched the harness, so the
     // guard asks it again rather than take an answer from before.

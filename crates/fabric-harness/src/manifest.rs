@@ -256,7 +256,14 @@ impl TryFrom<String> for RuleName {
 impl StateManifest {
     /// Builds the manifest of one capture, sorting `files` by path and
     /// checking the rules of this module.
-    #[cfg(any(test, feature = "acp", feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        test,
+        feature = "acp",
+        feature = "claude",
+        feature = "codex",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     pub(crate) fn new(
         kind: HarnessKind,
         session: SessionId,
@@ -366,7 +373,13 @@ impl StateManifest {
 
     /// The `BLAKE3` digest of the manifest's JSON form, which names one
     /// capture: equal manifests, read back or kept in memory, share it.
-    #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "acp",
+        feature = "claude",
+        feature = "codex",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     pub(crate) fn digest(&self) -> Result<Digest, HarnessError> {
         let bytes = serde_json::to_vec(self).map_err(|e| HarnessError::Malformed {
             what: Input::Manifest,
