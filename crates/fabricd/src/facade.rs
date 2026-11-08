@@ -1923,4 +1923,116 @@ mod tests {
         }
         assert!(checked >= 30, "{checked} cases");
     }
+
+    /// Every M6 event kind renders with its kind and its fields as text
+    /// (ADR 0028), so a facade watch shows a loss and its handling.
+    #[test]
+    fn the_m6_event_kinds_render_with_their_fields() {
+        use fabric_core::id::{JobId, NodeId, SnapshotId};
+        use fabric_core::managed::{
+            AttemptId, CheckpointAck, CoveredPath, CutDigest, FenceVerdict, Generation,
+            RecoveryBlock, RecoveryExclusion, WorkRevision,
+        };
+        let attempt = AttemptId::from_bytes([1; 16]);
+        let g1 = Generation::FIRST;
+        let g2 = g1.next().unwrap();
+        let snapshot = SnapshotId::from_bytes([2; 32]);
+        let cut = CutDigest::from_bytes([3; 32]);
+        let node = NodeId::from_bytes([4; 32]);
+        let events = [
+            ManagedEvent::CheckpointCaptured {
+                attempt,
+                generation: g1,
+                snapshot,
+                cut,
+            },
+            ManagedEvent::CheckpointAcknowledged {
+                ack: CheckpointAck {
+                    attempt,
+                    generation: g1,
+                    snapshot,
+                    cut,
+                    manifests: 1,
+                    chunks: 2,
+                    bytes: 3,
+                    fetched_from: node,
+                },
+            },
+            ManagedEvent::CoveredWriteRefused {
+                path: CoveredPath::LedgerAppend,
+                attempt,
+                generation: g1,
+                verdict: FenceVerdict::Superseded { by: Some(g2) },
+            },
+            ManagedEvent::AttemptUnavailable {
+                attempt,
+                generation: g1,
+                last_heartbeat_ms: None,
+                since_ms: 7,
+            },
+            ManagedEvent::AttemptReachable {
+                attempt,
+                generation: g1,
+            },
+            ManagedEvent::GrantSuperseded {
+                attempt,
+                generation: g1,
+                by: Some(g2),
+                reason: "lost".into(),
+            },
+            ManagedEvent::RecoveryBlocked {
+                attempt,
+                generation: g1,
+                reason: RecoveryBlock::NoEligibleNode {
+                    exclusions: vec![RecoveryExclusion {
+                        node,
+                        reason: "unavailable".into(),
+                    }],
+                },
+            },
+        ];
+        let rendered: Vec<_> = events
+            .into_iter()
+            .map(|event| {
+                event_json(&EventFrame {
+                    job: JobId::from_bytes([5; 16]),
+                    revision: WorkRevision::FIRST,
+                    operation: None,
+                    prev: None,
+                    at_ms: NOW,
+                    event,
+                })
+            })
+            .collect();
+        let kinds: Vec<_> = rendered.iter().map(|m| m["kind"].clone()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "checkpoint_captured",
+                "checkpoint_acknowledged",
+                "covered_write_refused",
+                "attempt_unavailable",
+                "attempt_reachable",
+                "grant_superseded",
+                "recovery_blocked",
+            ]
+        );
+        for map in &rendered {
+            assert_eq!(map["attempt"], attempt.to_string(), "{map:?}");
+            assert_eq!(map["generation"], "1", "{map:?}");
+        }
+        assert_eq!(rendered[0]["cut"], hex(&[3; 32]));
+        assert_eq!(rendered[1]["fetched_from"], node.to_string());
+        assert_eq!(rendered[1]["chunks"], "2");
+        assert_eq!(rendered[2]["path"], "ledger_append");
+        assert_eq!(rendered[2]["verdict"]["verdict"], "superseded");
+        assert_eq!(rendered[2]["verdict"]["by"], "2");
+        assert_eq!(rendered[3]["since_ms"], "7");
+        assert!(rendered[3].get("last_heartbeat_ms").is_none());
+        assert_eq!(rendered[5]["by"], "2");
+        assert_eq!(
+            rendered[6]["reason"]["no_eligible_node"]["exclusions"][0]["reason"],
+            "unavailable"
+        );
+    }
 }
