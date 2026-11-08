@@ -564,6 +564,44 @@ fn a_first_pull_whose_restore_fails_records_nothing() {
 }
 
 #[test]
+fn a_replacing_pull_keeps_the_old_tree_until_the_new_one_is_written() {
+    let world = World::new();
+    let a = world.path("a/app");
+    dirty_tree(&a);
+    let target = world.path("target");
+    let (t, ta) = (target.to_str().unwrap(), a.to_str().unwrap());
+    world.ok("home-a", &["push", t, "--tree", ta]);
+    let b = world.path("b/app");
+    let tb = b.to_str().unwrap();
+    world.ok("home-b", &["pull", t, "--tree", tb]);
+    write(&b.join(".env"), "MINE=b\n");
+    write(&a.join("src/index.js"), "console.log(5);\n");
+    world.ok("home-a", &["push", t, "--tree", ta]);
+    let pulled = world.ok("home-b", &["pull", t, "--tree", tb, "--replace"]);
+    let previous = b.with_extension("fabric-sync-previous");
+    let warnings = pulled["sync"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains(".env")),
+        "the pull did not say .env is now only beside the tree: {warnings:?}"
+    );
+    write(&a.join("src/index.js"), "console.log(6);\n");
+    world.ok("home-a", &["push", t, "--tree", ta]);
+    let output = world.run(
+        "home-b",
+        &["pull", t, "--tree", tb, "--replace"],
+        Some("pull.before_restore"),
+    );
+    assert_eq!(output.status.code(), None, "the pull did not die");
+    assert_eq!(
+        fs::read_to_string(previous.join(".env")).unwrap(),
+        "MINE=b\n",
+        "the kept tree went before the new one was written"
+    );
+}
+
+#[test]
 fn a_busy_store_over_ssh_is_store_busy_and_retryable() {
     let world = World::new();
     let a = world.path("a/app");

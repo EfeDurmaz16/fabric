@@ -11,6 +11,8 @@
 const POINTS: &[&str] = &[
     // Some objects of a snapshot are copied and the snapshot is not published.
     "copy.mid_objects",
+    // The snapshot is copied and nothing of the new tree is written.
+    "pull.before_restore",
     // The new tree is restored beside the old one and nothing is renamed.
     "pull.before_swap",
     // The old tree is renamed aside and the new one is not in place.

@@ -1,12 +1,13 @@
 //! Push and pull.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_core::id::{ChunkId, JobId, NodeId, SnapshotId};
+use fabric_core::path::RelPath;
 use fabric_core::snapshot::{EntryKind, SnapshotManifest};
 use fabric_store::capture::{CaptureRequest, UnmeasuredKeys, capture};
 use fabric_store::objects::ChunkParams;
@@ -246,6 +247,50 @@ fn policy_for(tree: &Path) -> Result<IgnorePolicy, SyncError> {
         policy.add_declared_cache(*class, path);
     }
     Ok(policy)
+}
+
+/// The secret-shaped paths of the tree at `old` that `new` lacks, outside
+/// `.git` and the cache directories in `caches`: what only the old tree
+/// holds, since no snapshot carries them. Best effort: a directory that
+/// does not read is skipped.
+fn secrets_only_in(
+    old: &Path,
+    new: &Path,
+    policy: &IgnorePolicy,
+    caches: &HashSet<&str>,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut dirs = vec![String::new()];
+    while let Some(rel) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(old.join(&rel)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let path = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if path == ".git" || caches.contains(path.as_str()) {
+                continue;
+            }
+            let Ok(parsed) = RelPath::parse(&path) else {
+                continue;
+            };
+            if policy.is_secret(&parsed) {
+                if fs::symlink_metadata(new.join(&path)).is_err() {
+                    found.push(path);
+                }
+            } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                dirs.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 fn name_of(tree: &Path, given: Option<&TreeName>) -> Result<TreeName, SyncError> {
@@ -490,9 +535,9 @@ pub fn pull(home: &Home, req: &PullRequest) -> Result<SyncReport, SyncError> {
         home.set_pending(&tree, head)?;
         tree.clone()
     } else {
-        tree::remove_tree(&beside.previous)?;
         beside.incoming.clone()
     };
+    faults::hit("pull.before_restore");
     let restored = restore(
         &store,
         &RestoreRequest {
@@ -514,14 +559,21 @@ pub fn pull(home: &Home, req: &PullRequest) -> Result<SyncReport, SyncError> {
         }
         return Err(e.into());
     }
+    let mut kept = Vec::new();
     if !empty {
+        let caches: HashSet<&str> = manifest.caches.iter().map(|c| c.path.as_str()).collect();
+        let policy = policy_for(&tree).unwrap_or_default();
+        kept = secrets_only_in(&tree, &beside.incoming, &policy, &caches);
+        // The tree the last replacing pull kept goes only now, with the
+        // new one whole beside the tree path.
+        tree::remove_tree(&beside.previous)?;
         home.set_pending(&tree, head)?;
         tree::swap_in(&tree, &beside)?;
     }
     home.save(&tree, head)?;
     home.clear_pending(&tree)?;
     let (files, snapshot_bytes) = sizes(&store, &manifest)?;
-    Ok(report(
+    let mut pulled = report(
         Outcome::Pulled,
         name,
         head.snapshot,
@@ -529,7 +581,15 @@ pub fn pull(home: &Home, req: &PullRequest) -> Result<SyncReport, SyncError> {
         snapshot_bytes,
         counters,
         &manifest,
-    ))
+    );
+    if !kept.is_empty() {
+        pulled.warnings.push(format!(
+            "{} holds {}, which no snapshot carries; the next replacing pull removes it",
+            beside.previous.display(),
+            kept.join(", ")
+        ));
+    }
+    Ok(pulled)
 }
 
 fn report(
