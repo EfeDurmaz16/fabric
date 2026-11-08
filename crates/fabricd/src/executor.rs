@@ -74,6 +74,13 @@ pub enum ExecutorError {
     /// The durable record of a launch could not be written or read.
     #[error(transparent)]
     Record(#[from] local::LocalError),
+    /// A process offered for adoption does not lead a process group of
+    /// its own, so a stop of its group would reach what is not the task's.
+    #[error("pid {pid} does not lead a process group of its own")]
+    NotAGroupLeader {
+        /// The pid.
+        pid: u32,
+    },
 }
 
 /// What a spawn made.
@@ -140,15 +147,27 @@ pub struct LaunchRecord {
     pub started: Option<String>,
 }
 
+/// How the executor holds a task's process.
+enum Handle {
+    /// A process the executor spawned and reaps.
+    Child(tokio::process::Child),
+    /// A harness process its adapter spawned (`Executor::adopt`): its
+    /// parent, the runner, reaps it, so the executor learns it ended when
+    /// nothing of its group is left.
+    Adopted,
+}
+
 /// One running task.
 struct Running {
     task: TaskId,
     class: TaskClass,
     pid: NonZeroU32,
     started: Option<String>,
-    child: tokio::process::Child,
+    handle: Handle,
     /// The exit status, once reaped.
     exit: Option<std::process::ExitStatus>,
+    /// True once the task is known to have ended, its status known or not.
+    gone: bool,
 }
 
 /// One attempt this node runs.
@@ -402,8 +421,72 @@ impl Executor {
             class,
             pid,
             started,
-            child,
+            handle: Handle::Child(child),
             exit: None,
+            gone: false,
+        });
+        Ok(Spawned {
+            pid: pid.get(),
+            group: pid.get(),
+            task,
+        })
+    }
+
+    /// Registers a harness process its adapter spawned, in a group it
+    /// leads, as the attempt's task `task` of class `Harness`: the launch
+    /// record is written as for [`Executor::spawn`], so a restart stops
+    /// it, and a quiescence checkpoints it through the suspend path, never
+    /// kills it. `started` is its start time as `ps` prints it; read now
+    /// when `None`. Refused while the attempt is frozen, and for a pid
+    /// that leads no group of its own. The caller, which holds the
+    /// process, reaps it; the executor sees it ended when its group is gone.
+    pub async fn adopt(
+        &self,
+        attempt: AttemptId,
+        task: TaskId,
+        pid: u32,
+        started: Option<String>,
+    ) -> Result<Spawned, ExecutorError> {
+        let run = self.run(attempt).await?;
+        let mut run = run.lock().await;
+        if run.frozen {
+            return Err(ExecutorError::Frozen { attempt });
+        }
+        let leader = NonZeroU32::new(pid)
+            .and_then(pid_of)
+            .ok_or(ExecutorError::NotAGroupLeader { pid })?;
+        match rustix::process::getpgid(Some(leader)) {
+            Ok(group) if group == leader => {}
+            _ => return Err(ExecutorError::NotAGroupLeader { pid }),
+        }
+        let pid = NonZeroU32::new(pid).ok_or(ExecutorError::NotAGroupLeader { pid })?;
+        let started = match started {
+            Some(started) => Some(started),
+            None => local::process_started(pid).await,
+        };
+        let path = self.record_path(attempt, task);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| local::LocalError::Io {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        let record = LaunchRecord {
+            attempt,
+            task,
+            class: TaskClass::Harness,
+            pid: Some(pid.get()),
+            started: started.clone(),
+        };
+        local::write(&path, &record)?;
+        run.tasks.push(Running {
+            task,
+            class: TaskClass::Harness,
+            pid,
+            started,
+            handle: Handle::Adopted,
+            exit: None,
+            gone: false,
         });
         Ok(Spawned {
             pid: pid.get(),
@@ -494,7 +577,7 @@ impl Executor {
                     settle_or_interrupt(running, budget, &self.signals).await
                 }
                 OutcomePolicy::Checkpoint => {
-                    if reap(running).is_some() {
+                    if reap(running).await {
                         exited(running)
                     } else {
                         self.captures.fetch_add(1, Ordering::Relaxed);
@@ -530,7 +613,7 @@ impl Executor {
                     }
                 }
                 OutcomePolicy::Block => {
-                    if reap(running).is_some() {
+                    if reap(running).await {
                         exited(running)
                     } else {
                         blockers.push(HandoffBlocker::Opaque { task: running.task });
@@ -570,7 +653,7 @@ impl Executor {
         run.frozen = true;
         let mut receipts = Vec::new();
         for running in &mut run.tasks {
-            let exited_before = reap(running).is_some();
+            let exited_before = reap(running).await;
             interrupt(running, budget, &self.signals).await;
             receipts.push(if exited_before {
                 exited(running)
@@ -671,14 +754,26 @@ fn receipt_digest(receipt: &TaskReceipt) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Reaps the task if it exited; its status, once known, is kept.
-fn reap(running: &mut Running) -> Option<std::process::ExitStatus> {
-    if running.exit.is_none()
-        && let Ok(Some(status)) = running.child.try_wait()
-    {
-        running.exit = Some(status);
+/// Whether the task ended: a spawned one is reaped and its status kept;
+/// an adopted one ended once nothing of its group is left alive.
+async fn reap(running: &mut Running) -> bool {
+    if running.gone {
+        return true;
     }
-    running.exit
+    match &mut running.handle {
+        Handle::Child(child) => {
+            if let Ok(Some(status)) = child.try_wait() {
+                running.exit = Some(status);
+                running.gone = true;
+            }
+        }
+        Handle::Adopted => {
+            if group_members(running.pid.get()).await.is_empty() {
+                running.gone = true;
+            }
+        }
+    }
+    running.gone
 }
 
 fn exited(running: &Running) -> TaskReceipt {
@@ -701,7 +796,7 @@ async fn settle_or_interrupt(
 ) -> TaskReceipt {
     let deadline = tokio::time::Instant::now() + budget.duration();
     loop {
-        if reap(running).is_some() {
+        if reap(running).await {
             return exited(running);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -733,16 +828,22 @@ async fn interrupt(running: &mut Running, grace: DrainBudget, signals: &AtomicU6
         return;
     };
     if group_members(running.pid.get()).await.is_empty() {
-        let _ = running
-            .child
-            .try_wait()
-            .map(|s| running.exit = s.or(running.exit));
+        if let Handle::Child(child) = &mut running.handle
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            running.exit = Some(status);
+        }
+        running.gone = true;
         return;
     }
-    if running.exit.is_none()
+    let leader_exited = match &mut running.handle {
+        Handle::Child(child) => child.try_wait().ok().flatten().is_some(),
+        Handle::Adopted => false,
+    };
+    if !running.gone
         && let Some(started) = &running.started
         && local::process_started(running.pid).await.as_ref() != Some(started)
-        && running.child.try_wait().ok().flatten().is_none()
+        && !leader_exited
     {
         return;
     }
@@ -753,7 +854,12 @@ async fn interrupt(running: &mut Running, grace: DrainBudget, signals: &AtomicU6
         signal_group(group, Signal::KILL);
         wait_group_gone(group, KILL_WAIT).await;
     }
-    let _ = running.child.wait().await.map(|s| running.exit = Some(s));
+    if let Handle::Child(child) = &mut running.handle
+        && let Ok(status) = child.wait().await
+    {
+        running.exit = Some(status);
+    }
+    running.gone = true;
 }
 
 fn signal_group(group: Pid, signal: Signal) {
@@ -1560,5 +1666,80 @@ mod tests {
         .unwrap();
         Executor::recover(&records, budget(1_000)).await.unwrap();
         assert!(walkdir(&records).is_empty());
+    }
+
+    /// A harness process its adapter spawned is registered as the
+    /// attempt's harness task (the launch path, step 4): it must lead a
+    /// group of its own, its launch record names its pid and start time
+    /// so a restart stops it, a quiescence checkpoints it through the
+    /// suspend path and never signals it, a frozen attempt adopts nothing,
+    /// and a stop ends its group.
+    #[tokio::test]
+    async fn an_adopted_harness_process_is_in_its_own_group_and_recorded() {
+        let snapshot = SnapshotId::of(b"adopted");
+        let b = bench(Ok(snapshot)).await;
+        // Not a group leader: a process in the test's own group.
+        let mut stray = sh("exec sleep 30");
+        let mut stray = stray.spawn().unwrap();
+        assert!(matches!(
+            b.executor.adopt(b.attempt, task(1), stray.id(), None).await,
+            Err(ExecutorError::NotAGroupLeader { .. })
+        ));
+        stray.kill().unwrap();
+        stray.wait().unwrap();
+
+        let mut harness = sh("exec sleep 30");
+        harness.process_group(0);
+        let mut harness = harness.spawn().unwrap();
+        let pid = harness.id();
+        let adopted = b
+            .executor
+            .adopt(b.attempt, task(1), pid, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (adopted.pid, adopted.group, adopted.task),
+            (pid, pid, task(1))
+        );
+        assert_eq!(b.executor.pids(b.attempt).await, vec![pid]);
+        let record: LaunchRecord = local::read(
+            &b.dir
+                .path()
+                .join("records")
+                .join(b.attempt.to_string())
+                .join(format!("{}.json", task(1))),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.class, TaskClass::Harness);
+        assert_eq!(record.pid, Some(pid));
+        assert!(
+            record.started.is_some(),
+            "the start time tells a reused pid"
+        );
+        assert_eq!(
+            b.executor.counters().spawns,
+            0,
+            "nothing was spawned by the executor"
+        );
+
+        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(
+            q.receipts[0].status,
+            ReceiptStatus::Checkpointed { snapshot }
+        );
+        assert_eq!(*b.capturer.asked.lock().unwrap(), vec![task(1)]);
+        assert!(alive(pid), "a quiescence never kills the harness");
+        assert_eq!(b.executor.counters().signals, 0);
+        assert!(matches!(
+            b.executor.adopt(b.attempt, task(2), pid, None).await,
+            Err(ExecutorError::Frozen { .. })
+        ));
+
+        let stopped = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(stopped[0].status, ReceiptStatus::Interrupted);
+        // The caller holds the process and reaps it.
+        harness.wait().unwrap();
+        assert!(!alive(pid), "the stop ended the harness's group");
     }
 }
