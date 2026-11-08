@@ -74,7 +74,9 @@ jobs:
         id: anchor
         run: echo "toolchain=$(git show "$ANCHOR:rust-toolchain.toml" | shasum -a 256 | cut -c1-16)" >>"$GITHUB_OUTPUT"
 
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore the anchor's build
+        id: anchor-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/fabric-ab
           key: perf-anchor-${{ env.ANCHOR }}-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.anchor.outputs.toolchain }}
@@ -86,6 +88,17 @@ jobs:
         run: |
           scripts/bench-ab.sh --release --pairs 15 --counted 5 \
             ${CANDIDATE:+--candidate "$CANDIDATE"} "$RUNNER_TEMP/perf"
+
+      # Saved even when the A/B or the gate fails, so a failing pull
+      # request does not build the anchor again on every push.
+      - name: Keep the anchor's build
+        if: always() && steps.anchor-cache.outputs.cache-hit != 'true'
+        # Nothing to save when the run stopped before the anchor was built.
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/fabric-ab
+          key: ${{ steps.anchor-cache.outputs.cache-primary-key }}
 
       - name: Gate
         run: scripts/bench-ab.sh --release --gate "$RUNNER_TEMP/perf"
