@@ -168,7 +168,13 @@ macro_rules! stored_part {
     )*};
 }
 
-stored_part!(SourceBinding, TaskKind, ResourceRef, AttemptStatus);
+stored_part!(
+    SourceBinding,
+    TaskKind,
+    ResourceRef,
+    AttemptStatus,
+    super::launch::Program
+);
 
 impl sealed::Sealed for Intent {}
 impl StoredPart for Intent {

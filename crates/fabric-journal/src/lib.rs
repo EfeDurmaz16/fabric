@@ -380,6 +380,12 @@ impl Journal {
         if conn.prepare(schema::V2_COMPLETE).is_err() {
             return Err(OpenError::DraftSchema { version: 2 });
         }
+        // Version 3 was amended in place before any release (the launch
+        // path's `tasks.program`): a journal an unreleased build made
+        // lacks the column, and is refused as M6 refuses its own draft.
+        if conn.prepare(schema::V3_COMPLETE).is_err() {
+            return Err(OpenError::DraftSchema { version: 3 });
+        }
         Ok(Journal {
             conn,
             path: path.to_owned(),
