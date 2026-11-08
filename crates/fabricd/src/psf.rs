@@ -10,7 +10,7 @@
 //! carry, a goal or a remote URL, is refused by the format's own check
 //! before anything is written.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use fabric_client::api::PsfExported;
 use fabric_core::harness::HarnessKind;
@@ -189,7 +189,8 @@ fn harness_of(kind: &HarnessKind) -> Harness {
 
 /// Where the workspace came from: the remote `origin` and the commit
 /// `HEAD` named when the snapshot was taken, or the first snapshot of
-/// the bundle chain when the repository has no remote to name.
+/// the bundle chain when the repository has no remote another node can
+/// fetch.
 fn source(snapshot: &SnapshotManifest, chain: &[SnapshotId]) -> Source {
     let from_git = snapshot.git.as_ref().and_then(|git| {
         let uri = git
@@ -197,7 +198,7 @@ fn source(snapshot: &SnapshotManifest, chain: &[SnapshotId]) -> Source {
             .iter()
             .find(|(key, _)| key.to_string() == "remote.origin.url")
             .map(|(_, value)| value.as_str().to_owned())
-            .filter(|uri| !Path::new(uri).is_absolute())?;
+            .filter(|uri| fetchable_elsewhere(uri))?;
         let commit = match &git.head {
             GitHead::Detached(oid) => oid.as_str().to_owned(),
             GitHead::Branch(branch) => {
@@ -286,4 +287,87 @@ fn carry_key(key: &CarryKey) -> Vec<(String, String)> {
         CarryKey::Unmeasured => vec![("kind", "unmeasured".to_owned())],
     };
     pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+}
+
+/// True when `uri` names a repository another node can fetch: a URL of a
+/// network scheme, or git's `[user@]host:path`, on a host that is not
+/// this one. A local path in any spelling, a `file:` URL, a relative or
+/// `~` path, or `localhost` names nothing elsewhere (section 5.2).
+fn fetchable_elsewhere(uri: &str) -> bool {
+    // `<transport>::<address>` runs a remote helper, never a fetch elsewhere.
+    if uri.contains("::") || uri.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let host = if let Some((scheme, rest)) = uri.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        if !["https", "http", "ssh", "git", "git+ssh", "ssh+git"].contains(&scheme.as_str()) {
+            return false;
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+        host.split(':').next().unwrap_or_default()
+    } else {
+        // git's scp form: a colon with no slash before it. One letter
+        // before the colon is a drive, not a host.
+        let Some((before, _)) = uri.split_once(':') else {
+            return false;
+        };
+        let host = before.rsplit_once('@').map_or(before, |(_, host)| host);
+        if before.contains('/') || host.len() < 2 {
+            return false;
+        }
+        host
+    };
+    let host = host.to_ascii_lowercase();
+    !(host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.starts_with("127.")
+        || host == "0.0.0.0"
+        || host.starts_with('['))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetchable_elsewhere;
+
+    #[test]
+    fn only_a_network_remote_on_another_host_is_a_source() {
+        for uri in [
+            "https://github.com/example/repo.git",
+            "http://git.example.com/repo",
+            "ssh://git@github.com/example/repo.git",
+            "ssh://git@github.com:22/example/repo.git",
+            "git://git.example.com/repo.git",
+            "git+ssh://git@example.com/repo",
+            "git@github.com:example/repo.git",
+            "github.com:example/repo.git",
+        ] {
+            assert!(fetchable_elsewhere(uri), "{uri}");
+        }
+        for uri in [
+            "/Users/me/repos/x",
+            "file:///Users/me/repos/x",
+            "file://localhost/Users/me/repos/x",
+            "FILE:///x",
+            "../sibling",
+            "./x",
+            "x",
+            "~/repos/x",
+            "~me/repos/x",
+            "C:/repos/x",
+            "./a:b",
+            "a/b:c",
+            "ssh://localhost/repo",
+            "https://127.0.0.1/repo",
+            "ssh://[::1]/repo",
+            "git@localhost:repo",
+            "https:///repo",
+            "ext::sh -c touch% /tmp/x",
+            ":repo",
+            "",
+        ] {
+            assert!(!fetchable_elsewhere(uri), "{uri}");
+        }
+    }
 }
