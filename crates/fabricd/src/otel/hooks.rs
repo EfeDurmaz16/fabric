@@ -95,7 +95,13 @@ pub(crate) fn command_end(span: &mut OpSpan, answer: Result<&Answer, &AuthorityE
     match answer {
         Ok(answer) => match &answer.result {
             StoredResult::Accepted(accepted) => {
-                span.context = operation_context(accepted.operation);
+                // The first answer is the operation's span; a replay is a
+                // child of it, so no two spans share the derived ids.
+                if answer.replayed {
+                    span.child_of(operation_context(accepted.operation));
+                } else {
+                    span.context = operation_context(accepted.operation);
+                }
                 span.operation = Some(accepted.operation);
                 span.job = Some(accepted.job);
                 span.revision = Some(accepted.revision.get());
@@ -302,10 +308,18 @@ pub(crate) fn launch_begin(
     span
 }
 
-/// Ends a span with a refusal enum's variant as its code, or done.
+/// Ends a span with a refusal enum's variant as its code, or done. Only
+/// the accepted launch is the attempt's root: a refused one (the plan sent
+/// again after a restart) is a child of it, so no two spans share its ids.
 pub(crate) fn answer_end<R: std::fmt::Debug>(span: &mut OpSpan, refusal: Option<&R>) {
     match refusal {
-        Some(reason) => span.refused(&snake(type_name(reason).as_str())),
+        Some(reason) => {
+            if span.op == SpanOp::PEER_LAUNCH && span.parent.is_none() {
+                let root = span.context;
+                span.child_of(root);
+            }
+            span.refused(&snake(type_name(reason).as_str()));
+        }
         None => span.end(SpanResult::Done),
     }
 }

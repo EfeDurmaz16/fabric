@@ -322,6 +322,11 @@ async fn no_secret_raw_key_argv_path_or_message_reaches_a_span() {
         attr(&spans[3], "fabric.result").unwrap()["stringValue"],
         "replayed"
     );
+    // The replay is a child in the operation's trace, never a second span
+    // with the original's ids.
+    assert_eq!(spans[3]["traceId"], spans[0]["traceId"]);
+    assert_ne!(spans[3]["spanId"], spans[0]["spanId"]);
+    assert_eq!(spans[3]["parentSpanId"], spans[0]["spanId"]);
     assert_eq!(
         attr(&spans[4], "fabric.result").unwrap()["stringValue"],
         "refused"
@@ -389,4 +394,27 @@ fn a_body_names_the_service_its_version_and_the_node() {
         keys,
         ["service.name", "service.version", "service.instance.id"]
     );
+}
+
+#[test]
+fn only_the_accepted_launch_is_the_attempt_root() {
+    use fabric_core::managed::launch::{GrantToken, LaunchRefusal};
+    use fabric_core::managed::{AttemptId, Generation};
+    let token = GrantToken {
+        job: fabric_core::id::JobId::from_bytes([3; 16]),
+        attempt: AttemptId::from_bytes([4; 16]),
+        generation: Generation::FIRST,
+    };
+    let root = super::span::attempt_context(token.attempt);
+    let mut accepted = hooks::launch_begin(SpanOp::PEER_LAUNCH, &token, None);
+    hooks::answer_end::<LaunchRefusal>(&mut accepted, None);
+    assert_eq!(accepted.context, root);
+    assert_eq!(accepted.parent, None);
+    // The same plan sent again after a restart is refused: a child of the
+    // root with its own id, never a second root.
+    let mut again = hooks::launch_begin(SpanOp::PEER_LAUNCH, &token, None);
+    hooks::answer_end(&mut again, Some(&LaunchRefusal::AlreadyLaunched));
+    assert_eq!(again.context.trace, root.trace);
+    assert_ne!(again.context.span, root.span);
+    assert_eq!(again.parent, Some(root.span));
 }
