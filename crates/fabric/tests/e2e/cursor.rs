@@ -22,7 +22,9 @@ fn chat(n: u32) -> String {
 /// chat it makes takes the next id from `~/cursor-chats`. A first turn
 /// leaves `NOTES.md` in the workspace; a question about the first turn is
 /// answered from that file, since no chat travels. With
-/// `FAKE_CURSOR_HOLD` set it holds the chat's store open and waits.
+/// `FAKE_CURSOR_HOLD` set it holds the chat's store open and waits; its
+/// `sleep` closes that descriptor, so the store is held by the fake alone
+/// and is free once [`Holder`] has killed and reaped it.
 const FAKE: &str = r#"#!/bin/sh
 if [ "$1" = --version ]; then echo 2026.10.01-e373342; exit 0; fi
 printf '%s\n' "$@" > "$HOME/cursor-agent-args"
@@ -52,7 +54,7 @@ printf '{"schemaVersion":1,"cwd":"%s","hasConversation":true}\n' "$root" > "$sto
 if [ -n "$FAKE_CURSOR_HOLD" ]; then
   exec 3<"$store/store.db"
   : > "$HOME/cursor-holding"
-  while :; do sleep 0.1; done
+  while :; do sleep 0.1 3<&-; done
 fi
 case "$prompt" in
   *"first turn"*)
