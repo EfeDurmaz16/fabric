@@ -21,8 +21,8 @@ use tokio::net::UnixStream;
 use crate::api::{
     API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Exported, Hello, HelloAnswer,
     JobCreated, JobList, JobLog, JobStatus, Lease, ManagedJob, ManagedJobs, ManagedOperation,
-    NodeIdentity, Op, Paired, PeerList, Pong, Refusal, Registered, Repaired, Reply, Request,
-    RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
+    NodeIdentity, Op, Paired, PeerList, Pong, PsfExported, Refusal, Registered, Repaired, Reply,
+    Request, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
 };
 use crate::frame::{self, FrameError};
 
@@ -418,6 +418,23 @@ impl Client {
         {
             Reply::JobExport(reply) => Ok(reply),
             other => Err(unexpected(Op::JobExport, &other)),
+        }
+    }
+
+    /// Writes the job's latest snapshot as a Portable Session Format
+    /// container at `dir`, which must not exist (ADR 0029).
+    pub async fn job_export_psf(
+        &self,
+        job: JobId,
+        dir: SystemPath,
+        on_event: impl FnMut(Event),
+    ) -> Result<PsfExported, ClientError> {
+        match self
+            .call(&Request::JobExportPsf { job, dir }, on_event)
+            .await?
+        {
+            Reply::JobExportPsf(reply) => Ok(reply),
+            other => Err(unexpected(Op::JobExportPsf, &other)),
         }
     }
 

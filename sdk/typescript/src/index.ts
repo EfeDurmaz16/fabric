@@ -111,6 +111,7 @@ export {
   type ManagedStatus,
   type Repaired,
   type Exported,
+  type PsfExported,
   type RepairOutcome,
   REPAIR_OUTCOME_KINDS,
   ManagedTask,

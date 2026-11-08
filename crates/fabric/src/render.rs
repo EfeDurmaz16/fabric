@@ -210,6 +210,25 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                 chain.join(" <- ")
             )]
         }
+        Reply::JobExportPsf(exported) => {
+            let mut lines = vec![format!(
+                "wrote {} as a portable session: snapshot {}, offered fidelity {}, document digest {}",
+                exported.dir.display(),
+                exported.snapshot,
+                exported.fidelity,
+                exported.digest
+            )];
+            if !exported.attachments.is_empty() {
+                lines.push(format!("attachments: {}", exported.attachments.join(", ")));
+            }
+            if !exported.left_behind.is_empty() {
+                lines.push(format!(
+                    "left behind on this node, recreate them where it is read: {}",
+                    exported.left_behind.join(", ")
+                ));
+            }
+            lines
+        }
         Reply::JobRun(_)
         | Reply::JobResume(_)
         | Reply::JobSuspend(_)
