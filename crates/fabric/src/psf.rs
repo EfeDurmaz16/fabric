@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use fabric_client::api::{DoctorReport, RefusalKind, Reply, Request};
+use fabric_client::api::{DoctorReport, JobStatus, Op, RefusalKind, Reply, Request};
 use fabric_client::{Client, ClientError};
 use fabric_core::id::JobId;
 use fabric_core::version::HarnessVersion;
@@ -169,45 +169,8 @@ pub(crate) async fn import(
         )
     })?;
     let by = &parts.produced.by;
-    let status = match client.call(&Request::JobStatus { job }, |_| {}).await {
-        Ok(Reply::JobStatus(status)) => status,
-        Ok(other) => {
-            return Err(ClientError::Unexpected {
-                op: fabric_client::api::Op::JobStatus,
-                got: other.op(),
-            }
-            .into());
-        }
-        Err(ClientError::Refused(refusal)) => {
-            let mut refused = Refused::from_refusal(&refusal);
-            refused.message = format!(
-                "{} The document was written by {by}: pair it, then run `fabric job resume {job} --on {by}`.",
-                sentence(&refused.message)
-            );
-            return Err(refused.into());
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let head = status.snapshot.as_ref().map(|s| s.id.to_string());
     let named = parts.workspace.bundle_head.as_str();
-    if head.as_deref() != Some(named) {
-        let mut refused = Refused::local(
-            RefusalKind::JobState,
-            "stale_container",
-            format!(
-                "The document names snapshot {named} of job {job}, and this node's head for it is {}. \
-                 Resume the job where the document was written ({by}), then export it again.",
-                head.as_deref().unwrap_or("none"),
-            ),
-        );
-        refused.data = Some(json!({
-            "job": job.to_string(),
-            "snapshot": named,
-            "head": head,
-            "produced_by": by,
-        }));
-        return Err(refused.into());
-    }
+    let status = held(client, job, by, named).await?;
     let root = status.workspace.as_ref().map_or_else(
         || parts.workspace.root.clone(),
         |w| w.root.display().to_string(),
@@ -252,6 +215,52 @@ pub(crate) async fn import(
     write_lines(&mut std::io::stdout().lock(), &lines)?;
     run.notes().print(&[next])?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The job's status on this node, when this node's head for it is the
+/// snapshot `named` that the document written by `by` names. A refusal of
+/// the job keeps the node's reason and names the node to resume from; a
+/// head that differs is `stale_container`.
+async fn held(client: &Client, job: JobId, by: &str, named: &str) -> Result<Box<JobStatus>> {
+    let status = match client.call(&Request::JobStatus { job }, |_| {}).await {
+        Ok(Reply::JobStatus(status)) => status,
+        Ok(other) => {
+            return Err(ClientError::Unexpected {
+                op: Op::JobStatus,
+                got: other.op(),
+            }
+            .into());
+        }
+        Err(ClientError::Refused(refusal)) => {
+            let mut refused = Refused::from_refusal(&refusal);
+            refused.message = format!(
+                "{} The document was written by {by}: pair it, then run `fabric job resume {job} --on {by}`.",
+                sentence(&refused.message)
+            );
+            return Err(refused.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let head = status.snapshot.as_ref().map(|s| s.id.to_string());
+    if head.as_deref() == Some(named) {
+        return Ok(status);
+    }
+    let mut refused = Refused::local(
+        RefusalKind::JobState,
+        "stale_container",
+        format!(
+            "The document names snapshot {named} of job {job}, and this node's head for it is {}. \
+             Resume the job where the document was written ({by}), then export it again.",
+            head.as_deref().unwrap_or("none"),
+        ),
+    );
+    refused.data = Some(json!({
+        "job": job.to_string(),
+        "snapshot": named,
+        "head": head,
+        "produced_by": by,
+    }));
+    Err(refused.into())
 }
 
 /// `text` as a sentence that ends in a period, for another to follow it.
