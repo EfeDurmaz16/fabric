@@ -112,3 +112,5 @@ Not run here: a run on two hosts. Every test above is two processes on one host;
 ## Gates
 
 `gates/run-gates.sh` ran every gate once, serially, at the commit in `gates/commit.txt`; `gates/summary.txt` has each exit code, time and load, and each gate's log is beside it.
+
+The run at `b3eb72f`, the merge of `main` with the Portable Session Format (#42) and the PR 5 harness adapters (#44), base `origin/main`: every gate passed but two. `test` and `sdk` failed on one check, the welcome fixtures: no fixture listed the merged op list. `ab34b6e` adds `job_export_psf` to `welcome_with_the_launch_path.json`, a fixture main does not have; then `test`, `sdk`, `fixtures` and `hygiene` ran again and passed (`*-rerun.log`).

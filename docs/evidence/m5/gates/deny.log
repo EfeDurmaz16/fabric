@@ -1,8 +1,8 @@
 warning[duplicate]: found 2 duplicate entries for crate 'getrandom'
-   ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:49:1
+   ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:50:1
    │  
-49 │ ╭ getrandom 0.2.17 registry+https://github.com/rust-lang/crates.io-index
-50 │ │ getrandom 0.4.3 registry+https://github.com/rust-lang/crates.io-index
+50 │ ╭ getrandom 0.2.17 registry+https://github.com/rust-lang/crates.io-index
+51 │ │ getrandom 0.4.3 registry+https://github.com/rust-lang/crates.io-index
    │ ╰─────────────────────────────────────────────────────────────────────┘ lock entries
    │  
    ├ getrandom v0.2.17
@@ -54,6 +54,9 @@ warning[duplicate]: found 2 duplicate entries for crate 'getrandom'
      │       │   │   ├── fabric-net v0.1.0
      │       │   │   │   ├── fabric v0.1.0 (*)
      │       │   │   │   └── fabricd v0.1.0 (*)
+     │       │   │   ├── fabric-psf v0.1.0
+     │       │   │   │   ├── fabric v0.1.0 (*)
+     │       │   │   │   └── fabricd v0.1.0 (*)
      │       │   │   ├── fabric-store v0.1.0
      │       │   │   │   └── fabricd v0.1.0 (*)
      │       │   │   └── fabricd v0.1.0 (*)
@@ -84,7 +87,7 @@ warning[duplicate]: found 2 duplicate entries for crate 'getrandom'
      │       └── (build) zstd-sys v2.1.2+zstd.1.5.7
      │           └── zstd-safe v8.2.0
      │               └── zstd v0.14.3
-     │                   ├── (dev) fabric-harness v0.1.0 (*)
+     │                   ├── fabric-harness v0.1.0 (*)
      │                   ├── fabric-net v0.1.0 (*)
      │                   └── fabric-store v0.1.0 (*)
      ├── quinn-proto v0.11.19 (*)
@@ -107,16 +110,17 @@ warning[duplicate]: found 2 duplicate entries for crate 'getrandom'
      │   ├── (dev) fabric-harness v0.1.0 (*)
      │   ├── (dev) fabric-journal v0.1.0 (*)
      │   ├── (dev) fabric-net v0.1.0 (*)
+     │   ├── (dev) fabric-psf v0.1.0 (*)
      │   ├── (dev) fabric-store v0.1.0 (*)
      │   └── (dev) fabricd v0.1.0 (*)
      └── uuid v1.28.0
          └── fabric-harness v0.1.0 (*)
 
 warning[duplicate]: found 2 duplicate entries for crate 'hashbrown'
-   ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:51:1
+   ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:52:1
    │  
-51 │ ╭ hashbrown 0.16.1 registry+https://github.com/rust-lang/crates.io-index
-52 │ │ hashbrown 0.17.1 registry+https://github.com/rust-lang/crates.io-index
+52 │ ╭ hashbrown 0.16.1 registry+https://github.com/rust-lang/crates.io-index
+53 │ │ hashbrown 0.17.1 registry+https://github.com/rust-lang/crates.io-index
    │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
    │  
    ├ hashbrown v0.16.1
@@ -162,6 +166,9 @@ warning[duplicate]: found 2 duplicate entries for crate 'hashbrown'
          │   ├── (dev) fabric-net v0.1.0
          │   │   ├── fabric v0.1.0 (*)
          │   │   └── fabricd v0.1.0 (*)
+         │   ├── fabric-psf v0.1.0
+         │   │   ├── fabric v0.1.0 (*)
+         │   │   └── fabricd v0.1.0 (*)
          │   └── fabricd v0.1.0 (*)
          └── toml v1.1.8+spec-1.1.0
              ├── (dev) fabric v0.1.0 (*)
@@ -169,10 +176,10 @@ warning[duplicate]: found 2 duplicate entries for crate 'hashbrown'
              └── fabricd v0.1.0 (*)
 
 warning[duplicate]: found 2 duplicate entries for crate 'syn'
-    ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:114:1
+    ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:115:1
     │  
-114 │ ╭ syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index
-115 │ │ syn 3.0.9 registry+https://github.com/rust-lang/crates.io-index
+115 │ ╭ syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index
+116 │ │ syn 3.0.9 registry+https://github.com/rust-lang/crates.io-index
     │ ╰───────────────────────────────────────────────────────────────┘ lock entries
     │  
     ├ syn v2.0.119
@@ -229,6 +236,9 @@ warning[duplicate]: found 2 duplicate entries for crate 'syn'
       │       │   │   ├── fabric-bridge v0.1.0 (*)
       │       │   │   └── fabricd v0.1.0 (*)
       │       │   ├── fabric-net v0.1.0
+      │       │   │   ├── fabric v0.1.0 (*)
+      │       │   │   └── fabricd v0.1.0 (*)
+      │       │   ├── fabric-psf v0.1.0
       │       │   │   ├── fabric v0.1.0 (*)
       │       │   │   └── fabricd v0.1.0 (*)
       │       │   ├── fabric-store v0.1.0
@@ -305,7 +315,7 @@ warning[duplicate]: found 2 duplicate entries for crate 'syn'
                   │   │       └── (build) zstd-sys v2.1.2+zstd.1.5.7
                   │   │           └── zstd-safe v8.2.0
                   │   │               └── zstd v0.14.3
-                  │   │                   ├── (dev) fabric-harness v0.1.0 (*)
+                  │   │                   ├── fabric-harness v0.1.0 (*)
                   │   │                   ├── fabric-net v0.1.0 (*)
                   │   │                   └── fabric-store v0.1.0 (*)
                   │   ├── quinn-proto v0.11.19 (*)
@@ -328,6 +338,7 @@ warning[duplicate]: found 2 duplicate entries for crate 'syn'
                   │   │   ├── (dev) fabric-harness v0.1.0 (*)
                   │   │   ├── (dev) fabric-journal v0.1.0 (*)
                   │   │   ├── (dev) fabric-net v0.1.0 (*)
+                  │   │   ├── (dev) fabric-psf v0.1.0 (*)
                   │   │   ├── (dev) fabric-store v0.1.0 (*)
                   │   │   └── (dev) fabricd v0.1.0 (*)
                   │   └── uuid v1.28.0
@@ -349,10 +360,10 @@ warning[duplicate]: found 2 duplicate entries for crate 'syn'
                   └── web-time v1.1.0 (*)
 
 warning[duplicate]: found 2 duplicate entries for crate 'windows-sys'
-    ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:148:1
+    ┌─ /private/tmp/fabric-wt/m5/Cargo.lock:149:1
     │  
-148 │ ╭ windows-sys 0.52.0 registry+https://github.com/rust-lang/crates.io-index
-149 │ │ windows-sys 0.61.2 registry+https://github.com/rust-lang/crates.io-index
+149 │ ╭ windows-sys 0.52.0 registry+https://github.com/rust-lang/crates.io-index
+150 │ │ windows-sys 0.61.2 registry+https://github.com/rust-lang/crates.io-index
     │ ╰────────────────────────────────────────────────────────────────────────┘ lock entries
     │  
     ├ windows-sys v0.52.0
@@ -394,12 +405,16 @@ warning[duplicate]: found 2 duplicate entries for crate 'windows-sys'
       │   │       │   ├── fabric-net v0.1.0
       │   │       │   │   ├── fabric v0.1.0 (*)
       │   │       │   │   └── fabricd v0.1.0 (*)
+      │   │       │   ├── fabric-psf v0.1.0
+      │   │       │   │   ├── fabric v0.1.0 (*)
+      │   │       │   │   └── fabricd v0.1.0 (*)
       │   │       │   ├── fabric-store v0.1.0 (*)
       │   │       │   └── fabricd v0.1.0 (*)
       │   │       ├── (dev) fabric-env v0.1.0 (*)
       │   │       ├── (dev) fabric-harness v0.1.0 (*)
       │   │       ├── (dev) fabric-journal v0.1.0 (*)
       │   │       ├── (dev) fabric-net v0.1.0 (*)
+      │   │       ├── (dev) fabric-psf v0.1.0 (*)
       │   │       ├── (dev) fabric-store v0.1.0 (*)
       │   │       └── (dev) fabricd v0.1.0 (*)
       │   └── signal-hook-registry v1.4.8

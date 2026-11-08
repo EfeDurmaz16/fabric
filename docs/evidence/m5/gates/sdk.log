@@ -1,11 +1,83 @@
 bun install v1.3.14 (0d9b296a)
 
-Checked 6 installs across 7 packages (no changes) [26.00ms]
+Checked 6 installs across 7 packages (no changes) [28.00ms]
 $ tsc --noEmit
 $ tsc -p tsconfig.build.json
 bun test v1.3.14 (0d9b296a)
 
- 69 pass
- 0 fail
- 3158 expect() calls
-Ran 69 tests across 6 files. [2.60s]
+test/contract.test.ts:
+289 |       for (const name of listed) {
+290 |         next = names.indexOf(name, next) + 1;
+291 |         expect(next, `${name} in ${JSON.stringify(listed)}`).toBeGreaterThan(0);
+292 |       }
+293 |     }
+294 |     expect(welcomes).toContainEqual(names);
+                           ^
+error: expect(received).toContainEqual(expected)
+
+Expected to contain: [
+  "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+  "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+  "harness_session", "harness_exited", "launch_check", "managed_create", "managed_cancel", "managed_status",
+  "managed_list", "job_repair", "job_export", "managed_note", "managed_checkpoint", "managed_continue",
+  "managed_inspect", "managed_submit", "managed_import", "facade_mint", "facade_revoke", "facade_call",
+  "managed_register", "job_export_psf", "harness_started.planned", "harness_started.version",
+  "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home", "env.roots.xdg_data_home"
+]
+Received: [
+  [
+    "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+    "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+    "harness_session", "harness_exited", "env.roots.cargo_home", "env.roots.rustup_home",
+    "env.roots.pnpm_home", "env.roots.xdg_data_home"
+  ], [
+    "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+    "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+    "harness_session", "harness_exited", "launch_check", "harness_started.planned", "harness_started.version",
+    "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home", "env.roots.xdg_data_home"
+  ], [
+    "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+    "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+    "harness_session", "harness_exited", "launch_check", "managed_create", "managed_cancel",
+    "managed_status", "managed_list", "harness_started.planned", "harness_started.version",
+    "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home", "env.roots.xdg_data_home"
+  ], [
+    "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+    "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+    "harness_session", "harness_exited", "launch_check", "managed_create", "managed_cancel",
+    "managed_status", "managed_list", "job_repair", "job_export", "managed_note", "managed_checkpoint",
+    "managed_continue", "managed_inspect", "managed_submit", "managed_import", "facade_mint",
+    "facade_revoke", "facade_call", "harness_started.planned", "harness_started.version",
+    "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home", "env.roots.xdg_data_home"
+  ], [
+    "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+    "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+    "harness_session", "harness_exited", "launch_check", "managed_create", "managed_cancel",
+    "managed_status", "managed_list", "job_repair", "job_export", "job_export_psf", "harness_started.planned",
+    "harness_started.version", "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home",
+    "env.roots.xdg_data_home"
+  ], [
+    "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+    "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+    "harness_session", "harness_exited", "launch_check", "managed_create", "managed_cancel",
+    "managed_status", "managed_list", "job_repair", "job_export", "harness_started.planned",
+    "harness_started.version", "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home",
+    "env.roots.xdg_data_home"
+  ], [
+    "node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log",
+    "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started",
+    "harness_session", "harness_exited", "launch_check", "managed_create", "managed_cancel",
+    "managed_status", "managed_list", "job_repair", "job_export", "managed_note", "managed_checkpoint",
+    "managed_continue", "managed_inspect", "managed_submit", "managed_import", "facade_mint",
+    "facade_revoke", "facade_call", "managed_register", "harness_started.planned", "harness_started.version",
+    "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home", "env.roots.xdg_data_home"
+  ]
+]
+
+      at <anonymous> (/private/tmp/fabric-wt/m5/sdk/typescript/test/contract.test.ts:294:22)
+(fail) the shared fixtures > the welcome fixtures list every op, in order, then every field and every root [2.82ms]
+
+ 76 pass
+ 1 fail
+ 3319 expect() calls
+Ran 77 tests across 7 files. [12.68s]
