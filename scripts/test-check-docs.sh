@@ -71,6 +71,11 @@ printf '# A new run\n' > "$work/repo/docs/evidence/zz-new/README.md"
 expect fail 'new evidence missing from its index' python3 scripts/docs/gen.py --check
 
 fresh
+expect pass 'claims carry their qualifiers' python3 scripts/docs/check-claims.py
+printf '\nProved on two real Macs.\n' >> "$work/repo/docs/start/install.md"
+expect fail 'a two-Mac claim without its qualifier' python3 scripts/docs/check-claims.py
+
+fresh
 if [ -x "$bin" ]; then
   expect pass 'CLI reference matches the binary' env DOCS_CLI="$bin" scripts/docs/cli-reference.sh --check
   printf '#!/bin/sh\necho "Usage: %s <COMMAND>"\n' "$CLI_BIN" > "$work/fake-cli"

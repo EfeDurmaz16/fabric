@@ -1,6 +1,6 @@
 # Two Macs
 
-Move a job from one Mac to another and back, by hand. This is the walk the 2026-10-21 gate ran with a Codex job. The commands that check it again on today's `main` are in [the pending gate checks](../evidence/two-mac-gate-pending.md).
+Move a job from one Mac to another and back, by hand. This is the walk the 2026-10-21 gate ran with a Codex job, on the binary of that day, before M2 to M4 merged; it has not been run again on `main`. The commands that check it again on today's `main` are in [the pending gate checks](../evidence/two-mac-gate-pending.md).
 
 ## Before you start
 

@@ -4,7 +4,7 @@ There is no release, no Homebrew formula and no package yet. You build the binar
 
 ## Needs
 
-- macOS or Linux. Two real Macs are the only pair a move has been proved on; Linux runs in CI.
+- macOS or Linux. A move between machines has run on two real Macs once, on 2026-10-21, before M2 to M4 merged; Linux runs in CI.
 - A C compiler and `git`. On a Mac, the Xcode Command Line Tools give both: `xcode-select --install`. The store captures and restores git state with `git`, so it must be on the `PATH`.
 - `rustup`, which installs Rust. `rust-toolchain.toml` pins Rust 1.97.1, and `rustup` fetches that version on the first build. Without `rustup`, install it as [rustup.rs](https://rustup.rs) says, then open a new terminal so `cargo` is on the `PATH`:
 

@@ -15,7 +15,7 @@ This is the contract of a move on `main` today: what a suspend captures, what a 
 | Logins, keychains, `~/.ssh`, `~/.aws`, `auth.json`, `~/.claude.json`, `~/.fabric` | Stay on the source | A hard-coded denylist, checked before every copy |
 | A harness that is still running | Nothing moves | Capture refuses while the session may be written; suspend stops the harness first |
 
-Both nodes need the same user name and the same home path, and `git` on the `PATH`: nothing rewrites paths (ADR 0011). One harness moves to the same harness; Claude to Codex is not supported. Proved on two real Macs: a Codex job, on 2026-10-21. Claude Code across two Macs is not recorded in this repository's evidence (gate G2 is pending). The end-to-end test, two nodes on one machine with fake harnesses, moves a job with uncommitted work, `.env`, `dist` and `node_modules` and checks each of them; the crates' own tests cover the other rows against fixtures.
+Both nodes need the same user name and the same home path, and `git` on the `PATH`: nothing rewrites paths (ADR 0011). One harness moves to the same harness; Claude to Codex is not supported. A Codex job moved between two real Macs on 2026-10-21, on the binary of that day, before M2 to M4 merged. That run's log is not in this repository; the README keeps its timings, and it has not been run again on `main` (gate G1 is pending). Claude Code has never been moved between two machines (gate G2 is pending). The end-to-end test, two nodes on one machine with fake harnesses, moves a job with uncommitted work, `.env`, `dist` and `node_modules` and checks each of them; the crates' own tests cover the other rows against fixtures.
 <!-- matrix:end -->
 
 ## Each row in more detail
@@ -31,7 +31,7 @@ Both nodes need the same user name and the same home path, and `git` on the `PAT
 | Harness | What is captured | How it continues | Proof on `main` |
 |---|---|---|---|
 | Claude Code | `projects/*/<sid>.jsonl` and sidecars, project memory, filtered `file-history/<sid>/`, `tasks/` and `uploads/` for the session | `claude --resume <sid> --model <transcript model>`; refuses a Claude older than the one that wrote the session | Fixtures and fakes, end to end on one machine |
-| Codex | The thread's rollouts under `sessions/` and `archived_sessions/`, following its lineage | `codex resume` or `codex exec resume`, with the thread's settings; refuses a Codex older than the newest writer | Two real Macs, 2026-10-21; fakes end to end |
+| Codex | The thread's rollouts under `sessions/` and `archived_sessions/`, following its lineage | `codex resume` or `codex exec resume`, with the thread's settings; refuses a Codex older than the newest writer | Fakes end to end. Two real Macs on 2026-10-21, before M2 to M4 and with no log in this repository |
 | ACP agent | Files named for the session id in the state directory the job declares | `session/resume` when advertised, else `session/load`, else refused | A fake ACP agent, end to end |
 
 A session moves to the same harness only. A neutral text brief to start another harness is an experiment ADR 0006 names, not a feature.

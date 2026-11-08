@@ -17,7 +17,7 @@ Fabric moves a coding-agent job from one machine to another and lets you pick it
 | Logins, keychains, `~/.ssh`, `~/.aws`, `auth.json`, `~/.claude.json`, `~/.fabric` | Stay on the source | A hard-coded denylist, checked before every copy |
 | A harness that is still running | Nothing moves | Capture refuses while the session may be written; suspend stops the harness first |
 
-Both nodes need the same user name and the same home path, and `git` on the `PATH`: nothing rewrites paths (ADR 0011). One harness moves to the same harness; Claude to Codex is not supported. Proved on two real Macs: a Codex job, on 2026-10-21. Claude Code across two Macs is not recorded in this repository's evidence (gate G2 is pending). The end-to-end test, two nodes on one machine with fake harnesses, moves a job with uncommitted work, `.env`, `dist` and `node_modules` and checks each of them; the crates' own tests cover the other rows against fixtures.
+Both nodes need the same user name and the same home path, and `git` on the `PATH`: nothing rewrites paths (ADR 0011). One harness moves to the same harness; Claude to Codex is not supported. A Codex job moved between two real Macs on 2026-10-21, on the binary of that day, before M2 to M4 merged. That run's log is not in this repository; the README keeps its timings, and it has not been run again on `main` (gate G1 is pending). Claude Code has never been moved between two machines (gate G2 is pending). The end-to-end test, two nodes on one machine with fake harnesses, moves a job with uncommitted work, `.env`, `dist` and `node_modules` and checks each of them; the crates' own tests cover the other rows against fixtures.
 <!-- matrix:end -->
 
 Each row in detail is in [docs/start/what-moves.md](docs/start/what-moves.md). The docs, from install to the ADRs, start at [docs/README.md](docs/README.md) and are built into a site by `scripts/docs/build.sh`.
@@ -34,7 +34,7 @@ Fabric is a working name. It collides with Microsoft Fabric and others, and may 
 
 A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names.
 
-On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn.
+On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn. That ran on the binary of that day, before M2 to M4 merged; its log is not in this repository, and the walk has not been run again on `main` ([gate G1](docs/evidence/two-mac-gate-pending.md) is pending).
 
 | Step | Measured |
 |---|---|
