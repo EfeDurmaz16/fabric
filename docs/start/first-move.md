@@ -1,6 +1,6 @@
 # First move
 
-This is the walk a fresh checkout of `main` was taken through on one Mac on 2026-11-03 and again on 2026-11-08. [The evidence](../evidence/usable-from-main/walk.md) has every command and what it printed. It needs a node running (see [Install](install.md)) and Codex or Claude Code logged in; pick the harness `fabric doctor` says is logged in.
+This is the walk a fresh checkout of `main` was taken through with Codex on one Mac on 2026-11-03, a real turn and its resume. On 2026-11-08, after M4 merged, the same commands ran again under the fake `codex` of the end-to-end tests, so no real turn ran that day; it checked that the merge broke none of them. [The evidence](../evidence/usable-from-main/walk.md) has every command and what each run printed. It needs a node running (see [Install](install.md)) and Codex logged in, as `fabric doctor` shows. Claude Code takes the same commands with `--harness claude`; that walk is not recorded on `main`.
 
 ## On one Mac
 
