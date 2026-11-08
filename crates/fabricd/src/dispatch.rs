@@ -59,6 +59,11 @@ pub(crate) struct Seen {
     launched: HashSet<AttemptId>,
     /// Cancels whose stop its node took, or answered for good.
     stopped: HashSet<(JobId, OperationId)>,
+    /// Cancels whose stop did not reach its node or found it busy.
+    unreached: HashSet<(JobId, OperationId)>,
+    /// Whether this process swept the journal once for the stops a
+    /// previous one left unsettled.
+    swept: bool,
     /// Spawns their node answered busy or frozen, sent again later.
     respawn: HashSet<(JobId, OperationId)>,
     /// Whether a launch failed at the link and is worth another try.
@@ -400,6 +405,7 @@ async fn instruct(
     let mark = match link.instruct(target, token, instruction).await {
         Ok(InstructAnswer::Accepted) => {
             seen.respawn.remove(&key);
+            seen.unreached.remove(&key);
             if stop {
                 seen.stopped.insert(key);
             }
@@ -409,6 +415,7 @@ async fn instruct(
             reason: InstructRefusal::NotRunning,
         }) if stop => {
             seen.stopped.insert(key);
+            seen.unreached.remove(&key);
             tracing::info!(%job, %operation, attempt = %token.attempt, "the node runs nothing of the attempt; it ends cancelled");
             let ended = authority
                 .observe(
@@ -430,6 +437,7 @@ async fn instruct(
         Ok(InstructAnswer::Refused {
             reason: InstructRefusal::Busy { .. },
         }) if stop => {
+            seen.unreached.insert(key);
             seen.retry = true;
             None
         }
@@ -443,6 +451,7 @@ async fn instruct(
         Ok(InstructAnswer::Refused { reason }) => {
             tracing::info!(%job, %operation, %reason, "the node refused the instruction");
             seen.respawn.remove(&key);
+            seen.unreached.remove(&key);
             if stop {
                 seen.stopped.insert(key);
             }
@@ -450,6 +459,7 @@ async fn instruct(
         }
         Err(e) if stop => {
             tracing::warn!(%job, %operation, error = %e, "the stop did not reach its node; it is sent again");
+            seen.unreached.insert(key);
             seen.retry = true;
             None
         }
@@ -465,11 +475,18 @@ async fn instruct(
     Ok(())
 }
 
-/// Sends again every stop of a cancel in flight its node has not taken
-/// in this process (a restart sends each once more), and every spawn its
-/// node answered busy or frozen; a spawn whose attempt has ended since
-/// fails, so its task rides in the next launch.
+/// Sends again every stop of a cancel in flight that did not reach its
+/// node or found it busy, every unsettled stop once after a restart (the
+/// first pass of a process), and every spawn its node answered busy or
+/// frozen; a spawn whose attempt has ended since fails, so its task rides
+/// in the next launch. A pass with none of these reads nothing.
 async fn resend(authority: &Authority, link: &dyn Link, seen: &mut Seen) {
+    // Nothing to send again reads nothing: a pass after the first one
+    // costs no journal read unless a stop or a spawn waits.
+    let sweep = !std::mem::replace(&mut seen.swept, true);
+    if !sweep && seen.unreached.is_empty() && seen.respawn.is_empty() {
+        return;
+    }
     let jobs = match authority.list().await {
         Ok(jobs) => jobs,
         Err(e) => {
@@ -480,12 +497,22 @@ async fn resend(authority: &Authority, link: &dyn Link, seen: &mut Seen) {
     for state in jobs {
         for op in &state.operations {
             let key = (state.job.id, op.id);
+            if !matches!(
+                op.status,
+                OperationStatus::Dispatched | OperationStatus::Unknown
+            ) {
+                // Settled since: nothing waits on it any more.
+                seen.unreached.remove(&key);
+                seen.respawn.remove(&key);
+                continue;
+            }
             let again = match op.kind {
                 CommandKind::CancelJob | CommandKind::CancelTask => {
                     matches!(
                         op.status,
                         OperationStatus::Dispatched | OperationStatus::Unknown
                     ) && !seen.stopped.contains(&key)
+                        && (sweep || seen.unreached.contains(&key))
                 }
                 CommandKind::RegisterTask => {
                     op.status == OperationStatus::Dispatched && seen.respawn.contains(&key)
@@ -523,7 +550,10 @@ async fn resend(authority: &Authority, link: &dyn Link, seen: &mut Seen) {
                         .await
                         .map(|_| ())
                 }
-                None => Ok(()),
+                None => {
+                    seen.unreached.remove(&key);
+                    Ok(())
+                }
             };
             if let Err(e) = outcome {
                 tracing::warn!(job = %state.job.id, operation = %op.id, error = %e, "an instruction was not sent again");
