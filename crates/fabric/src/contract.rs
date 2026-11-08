@@ -249,6 +249,10 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
         "managed ls",
         &[("List the managed jobs", "fabric managed ls")],
     ),
+    (
+        "help",
+        &[("Print the help of a command", "fabric help job move")],
+    ),
 ];
 
 /// The full command tree with the contract's help layout, examples and
@@ -262,12 +266,12 @@ pub fn command() -> Command {
 }
 
 /// Every command path below the root, depth first in help order, the
-/// root as the empty path; `help` is clap's and is left out.
+/// root as the empty path; `help` is one of them, held to the same rules.
 #[must_use]
 pub fn paths() -> Vec<Vec<String>> {
     fn walk(cmd: &Command, at: &[String], out: &mut Vec<Vec<String>>) {
         out.push(at.to_vec());
-        for sub in cmd.get_subcommands().filter(|sub| sub.get_name() != "help") {
+        for sub in cmd.get_subcommands() {
             let mut below = at.to_vec();
             below.push(sub.get_name().to_owned());
             walk(sub, &below, out);
@@ -350,7 +354,9 @@ fn decorate(cmd: Command, path: &[&str]) -> Command {
         cmd = cmd.arg(arg);
     }
     if root {
-        // `fabric help <path>` prints exactly what `fabric <path> --help` does.
+        // `fabric help <path>` prints exactly what `fabric <path> --help`
+        // does. It is decorated below like every other command, so it takes
+        // the global options and `--help` too.
         cmd = cmd.subcommand(
             Command::new("help")
                 .about("Print the help of a command")
@@ -359,14 +365,12 @@ fn decorate(cmd: Command, path: &[&str]) -> Command {
                         .num_args(0..)
                         .value_name("COMMAND")
                         .help("The command, such as `job move`"),
-                )
-                .disable_help_flag(true),
+                ),
         );
     }
     let names: Vec<String> = cmd
         .get_subcommands()
         .map(|sub| sub.get_name().to_owned())
-        .filter(|name| name != "help")
         .collect();
     for name in names {
         let mut below: Vec<&str> = path.to_vec();
@@ -514,6 +518,9 @@ pub(crate) struct Modes {
     pub(crate) color: bool,
     /// Standard output is a terminal, so a JSON document is indented.
     pub(crate) stdout_tty: bool,
+    /// Help on standard output may carry color: the same precedence as
+    /// `color`, for standard output.
+    pub(crate) help_color: bool,
     /// `--debug`.
     pub(crate) debug: bool,
 }
@@ -533,6 +540,11 @@ impl Modes {
             rich: stderr_tty && !dumb,
             color: color(globals.no_color, env, stderr_tty && !dumb),
             stdout_tty: std::io::stdout().is_terminal(),
+            help_color: color(
+                globals.no_color,
+                env,
+                std::io::stdout().is_terminal() && !dumb,
+            ),
             debug: globals.debug,
         }
     }
@@ -589,7 +601,17 @@ pub(crate) fn parse(argv: &[OsString]) -> Parsed {
         |error: clap::Error| -> Parsed { Parsed::Exit(clap_exit(&error, modes, &reached)) };
     let matches = match cmd.clone().try_get_matches_from(argv) {
         Ok(matches) => matches,
-        Err(e) if early.version && !matches!(e.kind(), ErrorKind::DisplayHelp) => {
+        // `--version` stands in for the command's missing input, and for
+        // nothing else: an unknown option or an invalid value still fails.
+        Err(e)
+            if early.version
+                && matches!(
+                    e.kind(),
+                    ErrorKind::MissingRequiredArgument
+                        | ErrorKind::MissingSubcommand
+                        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) =>
+        {
             return Parsed::Exit(version(modes));
         }
         Err(e) => return failed(e),
@@ -640,10 +662,7 @@ fn help_of(path: &[String], modes: Modes) -> std::process::ExitCode {
     let mut argv: Vec<OsString> = vec!["fabric".into()];
     argv.extend(path.iter().map(OsString::from));
     argv.push("--help".into());
-    let mut cmd = command();
-    if !modes.stdout_tty {
-        cmd = cmd.color(ColorChoice::Never);
-    }
+    let cmd = command();
     let reached = std::iter::once("fabric")
         .chain(path.iter().map(String::as_str))
         .collect::<Vec<_>>()
@@ -666,12 +685,24 @@ fn version(modes: Modes) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Help on stdout with exit 0; any other parse failure as a usage error.
+/// Help on stdout with exit 0, a group without a command included; any
+/// other parse failure as a usage error.
 fn clap_exit(error: &clap::Error, modes: Modes, reached: &str) -> std::process::ExitCode {
     match error.kind() {
+        // A group with options and no command, such as `fabric job --json`,
+        // prints its help as a bare group does: an option never turns it
+        // into an error.
+        ErrorKind::MissingSubcommand => {
+            let group: Vec<String> = usage_path(error, reached)
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_owned)
+                .collect();
+            help_of(&group, modes)
+        }
         ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
             let help = error.render();
-            let text = if modes.stdout_tty {
+            let text = if modes.help_color {
                 help.ansi().to_string()
             } else {
                 help.to_string()
@@ -720,18 +751,23 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<String> {
 
 /// A parse failure as a usage error, with the one suggestion clap has and
 /// the help command to read.
-pub(crate) fn usage_failure(error: &clap::Error, reached: &str) -> Failure {
+fn usage_failure(error: &clap::Error, reached: &str) -> Failure {
     let path = usage_path(error, reached);
     let invalid = context_text(error, ContextKind::InvalidArg);
     let (reason, headline, action_required) = match error.kind() {
-        ErrorKind::UnknownArgument => (
-            "unknown_option",
-            format!(
-                "Unknown option {} for {path}.",
-                invalid.as_deref().unwrap_or("?")
+        // clap's one kind covers an unknown option and a stray positional word.
+        ErrorKind::UnknownArgument => match invalid.as_deref() {
+            Some(word) if !word.starts_with('-') => (
+                "unexpected_argument",
+                format!("Unexpected argument {word} for {path}."),
+                false,
             ),
-            false,
-        ),
+            word => (
+                "unknown_option",
+                format!("Unknown option {} for {path}.", word.unwrap_or("?")),
+                false,
+            ),
+        },
         ErrorKind::InvalidSubcommand => (
             "unknown_command",
             format!(
@@ -742,7 +778,7 @@ pub(crate) fn usage_failure(error: &clap::Error, reached: &str) -> Failure {
             ),
             false,
         ),
-        ErrorKind::MissingRequiredArgument | ErrorKind::MissingSubcommand => (
+        ErrorKind::MissingRequiredArgument => (
             "missing_argument",
             format!(
                 "Can't run {path} without {}.",

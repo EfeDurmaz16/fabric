@@ -45,8 +45,9 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
   | `retryable` | `true` only when running the same command again is safe; `false` for a refusal and for a lost connection whose outcome is unknown |
   | `userActionRequired` | `true` when a human must approve: `--force` over a preflight, `--yes` for setup steps |
 
-  The CLI's own reasons: `unknown_option`, `unknown_command`, `missing_argument`, `invalid_arguments` (usage, exit 2), `no_daemon` (exit 80), `untrusted_state`, `incompatible_node`, `unknown_outcome`, `unreadable_record`, `confirmation_required`, `workspace_busy`, `node_error`, and `failed` for any other error (exit 1).
+  The CLI's own reasons: `unknown_option`, `unexpected_argument` (a stray word no argument takes), `unknown_command`, `missing_argument`, `invalid_arguments` (usage, exit 2), `no_daemon` (exit 80), `untrusted_state`, `incompatible_node`, `unknown_outcome`, `unreadable_record`, `confirmation_required`, `workspace_busy`, `node_error`, and `failed` for any other error (exit 1).
 - `job run` and `job resume` refuse `--json` as a usage error (exit 2), because the harness owns standard output. This is a recorded exception to "every command that reads or changes a resource supports it".
+- Help is text under `--json` too: `fabric help --json`, `fabric job --help --json` and a bare group with `--json` print the help and exit 0. Help as JSON waits for the rename (below).
 - `managed create` and `managed cancel` without `--operation-key` run under a key the CLI makes. In words it is on standard error before the request; under `--json` it is the answer's `operation.operation_key`, and every failure carries it as `data.operation_key`. When the answer was lost (`unknown_outcome`) the failure's `next` is the same command with `--operation-key <key>`, which the node answers with its first answer and never runs twice; the same command without it would make a second job.
 - `--version --json` prints `{"version":"0.1.0"}`.
 - Keys are the client API's `snake_case`, not the guide's `camelCase`, because the guide's first JSON rule is to mirror the API and never to rewrite its keys; the SDK and the CLI then read the same names. The error document's own fields (`userActionRequired`) follow the guide.
@@ -89,7 +90,7 @@ Error: No Fabric node is running for this user.
 - The first line is the headline: what failed and the known cause, as one sentence. On a terminal it starts with `✗` instead of `Error:`.
 - Context and identifiers follow as rows, the label in a 16-character column.
 - After a blank line comes the recovery: an instruction ending in `:` and the command, indented 4 spaces, on its own line so it can be copied. A refusal whose sentence names a `fabric` command offers that command; a refusal `--force` would waive offers the same command with `--force`, for after a human approves; unapproved setup steps offer it with `--yes`.
-- A usage error names the unknown option or command and the command path, gives clap's one suggestion as a `Did you mean` row, and points to the command's help: `Error: Unknown option --bogus for fabric job ls.` then `fabric job ls --help`.
+- A usage error names the unknown option, the stray argument or the unknown command and the command path, gives clap's one suggestion as a `Did you mean` row, and points to the command's help: `Error: Unknown option --bogus for fabric job ls.` or `Error: Unexpected argument extra for fabric job ls.`, then `fabric job ls --help`.
 - Text that came from a node, a peer or an agent prints with its control characters escaped, in errors as everywhere else (`write_lines`, `fabric_client::sentences::printable`) [Files, stdin & sensitive data: remote text is data].
 
 ## Modes
@@ -112,7 +113,7 @@ Color resolves highest first: `--no-color`, a nonempty `NO_COLOR`, `FORCE_COLOR`
 
 [Help & discovery; Examples & suggestions]
 
-- `fabric --help`, `fabric -h`, `fabric help` and a bare `fabric` print the root help; `fabric <path> --help`, `-h` and `fabric help <path>` print the same text at any depth. A group without an action, such as `fabric job`, prints its help. Help goes to standard output, exits 0, and does no work.
+- `fabric --help`, `fabric -h`, `fabric help` and a bare `fabric` print the root help; `fabric <path> --help`, `-h` and `fabric help <path>` print the same text at any depth. A group without an action, such as `fabric job`, prints its help, with or without options (`fabric job --json`). `fabric help` is a command like the others: it takes the global options and `-h`/`--help`. Help goes to standard output, exits 0, and does no work.
 - Each help has, in order: the usage line, a one-line summary, the commands or the arguments and options (options sorted by long name), a one-line pointer to the global options in the root help, examples, and a `Learn more:` link to the command's section of the reference.
 - The root help lists the commands grouped in the order a user meets them (set up a node, work on jobs, managed jobs) instead of one `Commands:` list, then the global options in full.
 - Every leaf command has examples, from `contract::EXAMPLES`. They use canonical names and long options with `<UPPER_CASE>` placeholders, and the test fills each placeholder in and parses every example through the real command tree.
@@ -127,7 +128,7 @@ Every command takes these at any depth, before or after the command path:
 | Option | Meaning |
 |---|---|
 | `-h, --help` | Print help |
-| `-v, --version` | Print the version alone (`0.1.0`), and exit 0 |
+| `-v, --version` | Print the version alone (`0.1.0`), and exit 0, even where the command's required input is missing; an unknown option or an invalid value beside it still fails |
 | `--json` | One JSON document on standard output; a failure as one JSON line on standard error |
 | `--non-interactive` | Never prompt; fail with what is needed instead |
 | `--no-color` | Disable color |

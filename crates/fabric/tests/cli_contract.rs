@@ -3,9 +3,12 @@
 //! Each test walks the real command tree (`fabric::contract::paths`), so a
 //! command added later is held to the same rules without a line here: its
 //! help must have the layout, its examples must parse, an unknown option
-//! must be a usage error with a hint, a failure under `--json` must be one
-//! JSON document on standard error with standard output empty, and
-//! `NO_COLOR` must take every escape sequence out. A command whose
+//! must be a usage error with a hint, so must a stray word and an unknown
+//! option beside `--version`, a failure under `--json` must be one JSON
+//! document on standard error with standard output empty, a key the CLI
+//! makes must be in that document, and `NO_COLOR` must take every escape
+//! sequence out. `fabric help` is a command of the tree like any other. A
+//! command whose
 //! required arguments this file has no sample for fails until one is
 //! added to `sample`.
 //!
@@ -126,11 +129,30 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "node" | "to" | "on" | "peer" | "NODE" => node(),
         "repo" | "path" | "PATH" => sandbox.path("repo").display().to_string(),
         "goal" | "prompt" | "reason" | "note" | "TEXT" => "demo".to_owned(),
-        "HOST:PORT" => "127.0.0.1:7777".to_owned(),
+        "addr" | "HOST:PORT" => "127.0.0.1:7777".to_owned(),
         "KEY" => "retry-1".to_owned(),
         "REVISION" => "3".to_owned(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
+}
+
+/// `path` with every positional argument given a sample value, so one
+/// more word is one too many; `None` for a command that takes any number.
+fn filled(path: &[String], sandbox: &Sandbox) -> Option<Vec<String>> {
+    let cmd = find(path);
+    let mut args = runnable(path, sandbox);
+    for arg in cmd.get_positionals() {
+        if arg
+            .get_num_args()
+            .is_some_and(|range| range.max_values() > 1)
+        {
+            return None;
+        }
+        if !arg.is_required_set() {
+            args.push(sample(arg.get_id().as_str(), sandbox));
+        }
+    }
+    Some(args)
 }
 
 /// `path` with every required argument given a sample value.
@@ -228,11 +250,27 @@ fn every_help_has_the_layout_and_prints_on_stdout() {
             assert_eq!(output.status.code(), Some(0), "fabric help {name}");
             assert_eq!(stdout(&output), help, "fabric help {name}");
         }
+        // `fabric help` takes the global options as every command does.
+        let mut asked = vec!["help".to_owned()];
+        asked.extend(path.iter().cloned());
+        asked.extend(words(&["--json", "--no-color"]));
+        let output = sandbox.run(&asked);
+        assert_eq!(output.status.code(), Some(0), "fabric help {name} --json");
+        assert_eq!(stdout(&output), help, "fabric help {name} --json");
         if !is_leaf(&path) {
             let bare = sandbox.run(&path);
             assert_eq!(bare.status.code(), Some(0), "bare {name}");
             assert_eq!(stdout(&bare), help, "bare {name}");
             assert_eq!(stderr(&bare), "", "bare {name}");
+            // An option does not turn a group without a command into an error.
+            for option in ["--json", "--no-color", "--non-interactive"] {
+                let mut args = path.clone();
+                args.push(option.to_owned());
+                let output = sandbox.run(&args);
+                assert_eq!(output.status.code(), Some(0), "{name} {option}");
+                assert_eq!(stdout(&output), help, "{name} {option}");
+                assert_eq!(stderr(&output), "", "{name} {option}");
+            }
         }
     }
 }
@@ -316,6 +354,33 @@ fn an_unknown_option_is_a_usage_error_with_a_hint() {
     }
 }
 
+/// A word no argument takes is a usage error that calls it an argument, not an option.
+#[test]
+fn a_stray_word_is_a_usage_error_that_names_it() {
+    let sandbox = Sandbox::new();
+    for path in contract::paths().into_iter().filter(|path| is_leaf(path)) {
+        let name = joined(&path);
+        let Some(mut args) = filled(&path, &sandbox) else {
+            continue;
+        };
+        args.extend(words(&["stray", "--json"]));
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{name} stray");
+        let doc = error_document(&output, &name);
+        assert_eq!(doc["reason"], "unexpected_argument", "{name}: {doc}");
+        assert_eq!(
+            doc["message"],
+            format!("Unexpected argument stray for {name}."),
+            "{name}: {doc}"
+        );
+    }
+}
+
+/// `fabric help` reads no state, so no failure of the state reaches it.
+fn does_no_work(path: &[String]) -> bool {
+    path == ["help"]
+}
+
 /// The commands that run a harness; `--json` there is a usage error,
 /// because the harness owns standard output.
 fn runs_a_harness(path: &[String]) -> bool {
@@ -345,6 +410,10 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
             .env("FABRIC_HOME", "state")
             .output()
             .unwrap();
+        if does_no_work(&path) {
+            assert_eq!(output.status.code(), Some(0), "{name}");
+            continue;
+        }
         let doc = error_document(&output, &format!("{name} (relative FABRIC_HOME)"));
         if harness {
             assert_eq!(output.status.code(), Some(2), "{name}: {doc}");
@@ -409,7 +478,10 @@ fn no_color_removes_every_escape_sequence() {
             .env("FORCE_COLOR", "1")
             .output()
             .unwrap();
-        assert!(escapes(&forced), "{name}: FORCE_COLOR shows no color");
+        // Only an error is colored, and `fabric help` does not fail.
+        if !does_no_work(&path) {
+            assert!(escapes(&forced), "{name}: FORCE_COLOR shows no color");
+        }
         let off = sandbox
             .command(&args)
             .env("FORCE_COLOR", "1")
@@ -456,6 +528,17 @@ fn the_version_prints_alone_at_any_depth() {
         let output = sandbox.run(&args);
         let doc: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
         assert_eq!(doc, serde_json::json!({ "version": version }), "{name}");
+
+        // `--version` stands in for missing input, never for invalid input.
+        let mut args = path.clone();
+        args.extend(words(&["--version", "--no-such-option"]));
+        let output = sandbox.run(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{name} --version --no-such-option"
+        );
+        assert_eq!(stdout(&output), "", "{name} --version --no-such-option");
     }
 }
 

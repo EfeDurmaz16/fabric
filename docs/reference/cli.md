@@ -577,3 +577,21 @@ Examples:
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-doctor
 ```
+
+## fabric help
+
+```text
+Usage: fabric help [COMMAND]...
+Print the help of a command
+
+Arguments:
+  [COMMAND]...  The command, such as `job move`
+
+Global Options: See `fabric --help`
+
+Examples:
+  Print the help of a command
+    fabric help job move
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-help
+```
