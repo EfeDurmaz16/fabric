@@ -168,6 +168,10 @@ fn a_package_over_a_limit_is_refused_naming_the_field() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "every planted source reads best as one script"
+)]
 fn planted_credentials_and_approvals_never_enter_a_package() {
     let token = format!("ghp_{}", "a".repeat(40));
     let state = state_with("goal", Vec::new());

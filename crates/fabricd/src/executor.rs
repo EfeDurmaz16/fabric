@@ -413,6 +413,13 @@ impl Executor {
     }
 
     /// Completes a launch record with its pid.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "the tests fail the completion through the executor"
+        )
+    )]
     fn complete_record(&self, path: &Path, record: &LaunchRecord) -> Result<(), local::LocalError> {
         #[cfg(test)]
         if self.fail_completion.swap(false, Ordering::Relaxed) {

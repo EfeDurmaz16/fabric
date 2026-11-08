@@ -276,13 +276,13 @@ pub(crate) fn create_command(submit: &Submit, source: SourceBinding) -> Result<C
 /// token holder never widens the allowance (ADR 0024: the owner does);
 /// when nothing is left the domain refuses the continue as `fidelity`.
 pub(crate) fn facade_allowance(names: Option<&[FidelityName]>, job: &JobPolicy) -> AllowedFidelity {
-    let named = allowance(names, job);
+    let asked = allowance(names, job);
     let policy = job.allowed_fidelity;
     AllowedFidelity {
-        native_session: named.native_session && policy.native_session,
-        new_native_session_with_package: named.new_native_session_with_package
+        native_session: asked.native_session && policy.native_session,
+        new_native_session_with_package: asked.new_native_session_with_package
             && policy.new_native_session_with_package,
-        workspace_only: named.workspace_only && policy.workspace_only,
+        workspace_only: asked.workspace_only && policy.workspace_only,
     }
 }
 
