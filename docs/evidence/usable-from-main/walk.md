@@ -201,3 +201,15 @@ No harness process the node had launched (pids 44103, 48153, 49774) was left run
 ## What changed because of the walk
 
 README: a `One Mac, first run` section with the commands above, the `fabric-journal` crate in the status table, ADRs 0019 to 0021 in the status row and the Decisions table, `--locked` on the release build. CONTRIBUTING: `scripts/check-fixtures.sh` in the gate list (CI already ran it) and a pointer to the bridge tests. Status lines of docs/managed-jobs.md, docs/bridge-protocol.md and ADRs 0019 to 0021 now say they are on `main`. No code changed: nothing the walk met was a bug in Fabric.
+
+## Again after M4, 2026-11-08
+
+`main` at `f59f027` (merge of PR #36, M4) merged into this branch, built again in a fresh worktree with `cargo build --release --locked` (2 m 10 s). The parts the merge could break were walked again on one Mac with a scratch `FABRIC_HOME` and a scratch `HOME`, under the fake `codex` of the end-to-end tests (`crates/fabric/tests/e2e/world.rs`), so no real turn ran:
+
+- `serve`, `node id` and `doctor` as above (`codex.login: yes` from the fake).
+- `job new`, `job run --headless`, `job suspend`, `job resume --headless`, `job status` and `job log` printed the same lines as on 2026-11-03: the session recorded, captured in the snapshot, and continued with the model, effort and sandbox it carried; five ledger records.
+- `managed create` twice with key `k1` (the second `answered again for key k1`), `managed status`, `managed cancel --operation-key k2` (revision 2, cancelled) and `managed ls`.
+- `sdk/typescript`: `bun install --frozen-lockfile`, `bun run build` and `bun test` against that release binary, 62 pass, 0 fail.
+- `scripts/check-hygiene.sh`, `scripts/check-fixtures.sh` and `scripts/check-budget.sh` against `origin/main` pass.
+
+M4 adds no command to the README's walk: reconciliation runs inside the node against a bridge worker, and its proof is the bridge tests against the Capsule worker that CI runs at the pinned Capsule commit (M4's head, on Capsule `main` since its PR #318).

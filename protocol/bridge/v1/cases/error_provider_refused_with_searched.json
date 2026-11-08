@@ -1,0 +1,29 @@
+{
+  "case": "error_provider_refused_with_searched",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "unknown_field"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-3",
+    "operation_id": "01K8W3A00000000000000000P3",
+    "error": {
+      "code": "provider_failed",
+      "reason": "provider_refused",
+      "message": "provider_failed: provider_refused",
+      "effect": "none",
+      "searched": {
+        "provider": "fixture",
+        "scope": {
+          "account": "acct-a",
+          "project": "proj-1"
+        },
+        "kind": "sandbox"
+      }
+    }
+  }
+}

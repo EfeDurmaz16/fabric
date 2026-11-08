@@ -50,11 +50,12 @@ use fabric_bridge::wire::{
     ToFabric, ToWorker,
 };
 use fabric_bridge::{Answer, Bridge, BridgeError, Config, Effect, Event, LogError, Outcome};
-use fabric_core::id::JobId;
+use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
-    AttemptId, AttemptStatus, Generation, OperationId, OperationKey, TaskId,
+    AttemptId, AttemptStatus, Command, DomainError, Envelope, Generation, NewIds, Observation,
+    OperationId, OperationKey, OperationMark, RequestDigest, ResourceRef, StoredResult, TaskId,
 };
-use fabric_journal::{Journal, ProviderOperation, ProviderStatus};
+use fabric_journal::{AbandonApproval, Blocker, Journal, ProviderOperation, ProviderStatus};
 use serde_json::{Value, json};
 
 fn root() -> PathBuf {
@@ -104,8 +105,8 @@ fn id(n: u8) -> OperationId {
 }
 
 /// What the journal stores for `locator`: its JSON text.
-fn stored(locator: &Locator) -> String {
-    locator.to_value().to_string()
+fn stored(locator: &Locator) -> fabric_journal::LocatorRecord {
+    fabric_bridge::wire::locator_record(locator)
 }
 
 fn result(outcome: &Outcome) -> &ResultMessage {
@@ -390,8 +391,9 @@ async fn replay(name: &str, dir: &Path) -> Tally {
 /// matches the fixture exactly (bar `message` strings) and parses with
 /// Fabric's own parser. Steps that read the in-process provider
 /// (`provider_calls`, `sandbox`, `advance`) or Fabric's journal are the
-/// other runs' to check; `exec_observed_until_exit` and
-/// `pending_destroy_with_locator` stop at their `advance`.
+/// other runs' to check; `attach_then_observe_until_ready`,
+/// `exec_observed_until_exit` and `pending_destroy_with_locator` stop at
+/// their `advance`.
 #[tokio::test]
 #[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
 async fn every_shared_scenario_over_the_workers_stdio() {
@@ -408,7 +410,7 @@ async fn every_shared_scenario_over_the_workers_stdio() {
         })
         .collect();
     names.sort();
-    assert_eq!(names.len(), 18, "the v1 scenario set");
+    assert_eq!(names.len(), 25, "the v1 scenario set");
     let mut stopped = Vec::new();
     for name in &names {
         let tally = replay(name, dir.path()).await;
@@ -423,7 +425,11 @@ async fn every_shared_scenario_over_the_workers_stdio() {
     }
     assert_eq!(
         stopped,
-        ["exec_observed_until_exit", "pending_destroy_with_locator"]
+        [
+            "attach_then_observe_until_ready",
+            "exec_observed_until_exit",
+            "pending_destroy_with_locator"
+        ]
     );
 }
 
@@ -495,7 +501,8 @@ fn fixture_config(extra_sandboxes: &[(&str, OperationId)]) -> Value {
 fn assert_scope_retained(journal: &Journal, ids: &[OperationId]) {
     for &op in ids {
         let entry = entry(journal, op);
-        let locator: Value = serde_json::from_str(entry.locator.as_deref().unwrap()).unwrap();
+        let locator: Value =
+            serde_json::from_str(entry.locator.as_ref().map(|l| l.text.as_str()).unwrap()).unwrap();
         assert_eq!(locator["provider"], "fixture", "{op:?}");
         assert_eq!(locator["kind"], "sandbox", "{op:?}");
         assert_eq!(
@@ -1200,7 +1207,8 @@ async fn observe_reads_only_the_operations_own_resource() {
         "{refused:?}"
     );
     // The restarted fixture provider holds fx-b again, so it is not gone:
-    // still unknown, never settled from another resource.
+    // seen under way after the loss, observed, never settled from another
+    // resource.
     let observed = bridge
         .observe(&mut journal, id(62), "sandbox.destroy", fx("fx-b"), 1_000)
         .await
@@ -1208,7 +1216,7 @@ async fn observe_reads_only_the_operations_own_resource() {
         .finish(&mut journal)
         .await
         .unwrap();
-    assert_eq!(observed.status, ProviderStatus::Unknown);
+    assert_eq!(observed.status, ProviderStatus::Observed);
     assert_eq!(refusal(&observed).0, ErrorCode::Pending);
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
@@ -1489,9 +1497,13 @@ async fn the_docker_profile_on_the_local_engine() {
     assert_eq!(result(&nonzero).output["exit_code"], 7);
 
     // An exec still running at its deadline is answered running and stays
-    // dispatched; observe by its original id reads how it ended.
-    let mut slow = run(12, &["sh", "-c", "sleep 2; echo done"], 1024);
-    slow.deadline_ms = 500;
+    // dispatched; observe by its original id reads how it ended. The
+    // deadline also covers the worker's checks before the exec (an inspect
+    // through the docker CLI), which took over 500 ms on a loaded host and
+    // made the worker refuse before any effect; 3 s leaves them room while
+    // the exec still outlives the deadline.
+    let mut slow = run(12, &["sh", "-c", "sleep 6; echo done"], 1024);
+    slow.deadline_ms = 3_000;
     let slow_id = slow.operation.id;
     let answered = bridge
         .request(&mut journal, slow)
@@ -1628,5 +1640,881 @@ async fn the_docker_profile_on_the_local_engine() {
         "the container is still there"
     );
     assert_eq!(containers(), 0);
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// What a lost create leaves, once Fabric and the worker both restarted:
+/// a create `unknown` with no locator. Neither it nor a new create of the
+/// job is sent; an attach by its identity finds the one resource the
+/// provider made; a cleanup of it needs its own destroy grant.
+async fn attach_after_both_restart(
+    journal: Logged,
+    bridge: &Bridge,
+    create_again: Effect,
+    another_create: Effect,
+    lost: OperationId,
+) -> (Logged, Outcome) {
+    let mut restarted = journal.into_inner().await;
+    let recovery = restarted
+        .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert_eq!(recovery.provider_unknown.len(), 1, "{recovery:?}");
+    assert_eq!(recovery.provider_unknown[0].1, lost);
+    let mut journal = Logged::new(restarted);
+    assert_eq!(entry(&journal, lost).status, ProviderStatus::Unknown);
+    assert_eq!(entry(&journal, lost).locator, None, "no answer was read");
+    let again = bridge.request(&mut journal, create_again).await;
+    assert!(
+        matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
+        "{again:?}"
+    );
+    let waits = bridge.request(&mut journal, another_create).await;
+    assert!(
+        matches!(waits, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{waits:?}"
+    );
+    let found = bridge
+        .attach(&mut journal, lost, 10_000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    (journal, found)
+}
+
+/// A create whose answer was never read, with the worker killed and
+/// Fabric restarted after the provider made the sandbox: the restarted
+/// worker (seeded with the sandbox, since the fixture provider lives in
+/// the worker and the real one outlives it) attaches it by the create's
+/// own identity, and Fabric never makes it twice. A cleanup under the
+/// create's grant is refused before any effect; under its own fresh
+/// destroy grant it removes the residual.
+#[tokio::test]
+#[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
+async fn a_create_lost_with_its_worker_is_attached_and_never_made_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let mut config = fixture_config(&[]);
+    config["approvals"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"ref": "apr-cleanup-60", "action": "sandbox.destroy", "native_id": "fx-key-60", "expired": false}));
+    let path = write_config(dir.path(), "worker.json", &config);
+    let bridge = spawn("fixture", &path).await;
+    let flight = bridge
+        .request(&mut journal, create(60, "fixture/ok"))
+        .await
+        .unwrap();
+    // Fabric stops before it reads the answer, and the worker is killed.
+    drop(flight);
+    bridge.kill().await;
+    drop(bridge);
+
+    config["sandboxes"].as_array_mut().unwrap().push(json!({
+        "native_id": "fx-key-60", "project": "proj-1", "owner_job": JOB,
+        "operation": id(60).to_string(), "status": "ready",
+    }));
+    let seeded = write_config(dir.path(), "restarted.json", &config);
+    let bridge = spawn("fixture", &seeded).await;
+    let (mut journal, found) = attach_after_both_restart(
+        journal,
+        &bridge,
+        create(60, "fixture/ok"),
+        create(61, "fixture/ok"),
+        id(60),
+    )
+    .await;
+    assert_eq!(
+        found.status,
+        ProviderStatus::Succeeded,
+        "{:?}",
+        found.answer
+    );
+    assert!(!result(&found).replayed);
+    assert_eq!(
+        entry(&journal, id(60)).locator,
+        Some(stored(&fx("fx-key-60")))
+    );
+
+    let cleanup = |n: u8, approval: &str| fabric_bridge::Cleanup {
+        creating: id(60),
+        id: id(n),
+        key: OperationKey::parse(&format!("key-{n}")).unwrap(),
+        approval: approval.into(),
+        deadline_ms: 30_000,
+    };
+    let refused = bridge
+        .cleanup(&mut journal, cleanup(62, "apr-create-only"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(refused.status, ProviderStatus::Rejected);
+    assert_eq!(
+        refusal(&refused),
+        (ErrorCode::Denied, "approval_scope", EffectState::None)
+    );
+    assert_eq!(journal.residuals(scope().job).unwrap().len(), 1);
+    let destroyed = bridge
+        .cleanup(&mut journal, cleanup(63, "apr-cleanup-60"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status, ProviderStatus::Succeeded);
+    assert!(journal.residuals(scope().job).unwrap().is_empty());
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// The same on the local Docker engine, whose containers outlive the
+/// worker: the attach finds the one container labelled with the create's
+/// operation, and the cleanup removes it.
+#[tokio::test]
+#[ignore = "needs the Capsule worker and a local Docker engine: set CAPSULE_BRIDGE_WORKER and CAPSULE_BRIDGE_DOCKER_IMAGE, run with --ignored"]
+async fn a_docker_create_lost_with_its_worker_is_attached_and_never_made_twice() {
+    let image = match docker_image() {
+        Ok(image) => image,
+        Err(why) if std::env::var_os(DOCKER_IMAGE_VAR).is_none() => {
+            eprintln!("skipped: {why}");
+            return;
+        }
+        Err(why) => panic!("{DOCKER_IMAGE_VAR} is set, but {why}"),
+    };
+    let scope = Scope {
+        job: JobId::from_bytes(fresh("attach-job")),
+        task: TaskId::from_bytes(fresh("attach-task")),
+        attempt: AttemptId::from_bytes(fresh("attach-attempt")),
+        generation: Generation::FIRST,
+    };
+    let label = format!("label=fabric.job={}", scope.job);
+    let _cleanup = Cleanup(label.clone());
+    let containers = |filter: &str| {
+        docker(&["ps", "-a", "-q", "--filter", filter])
+            .unwrap()
+            .split_whitespace()
+            .count()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Logged::new(journal_for(dir.path(), scope));
+    let path = write_config(
+        dir.path(),
+        "docker.json",
+        &json!({
+            "policy": {"images": [image]},
+            "approvals": [{"ref": "apr-destroy", "action": "sandbox.destroy", "native_id": null}]
+        }),
+    );
+    let make = |n: u8| {
+        docker_effect(
+            scope,
+            n,
+            Action::Create(CreateParams {
+                image: image.clone(),
+                env: BTreeMap::new(),
+                secret_names: Vec::new(),
+                labels: BTreeMap::new(),
+            }),
+            None,
+        )
+    };
+    let lost = make(1);
+    let lost_id = lost.operation.id;
+    let own = format!("label=fabric.operation={lost_id}");
+    let mut journal = journal;
+    let bridge = spawn("docker", &path).await;
+    let flight = bridge.request(&mut journal, lost.clone()).await.unwrap();
+    drop(flight);
+    let started = Instant::now();
+    while containers(&own) == 0 {
+        assert!(
+            started.elapsed() < Duration::from_mins(1),
+            "the engine never made the container"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bridge.kill().await;
+    drop(bridge);
+
+    let bridge = spawn("docker", &path).await;
+    let (mut journal, found) =
+        attach_after_both_restart(journal, &bridge, lost, make(2), lost_id).await;
+    assert_eq!(
+        found.status,
+        ProviderStatus::Succeeded,
+        "{:?}",
+        found.answer
+    );
+    assert_eq!(containers(&own), 1, "made once");
+    assert_eq!(containers(&label), 1);
+    let destroyed = bridge
+        .cleanup(
+            &mut journal,
+            fabric_bridge::Cleanup {
+                creating: lost_id,
+                id: OperationId::from_bytes(fresh("cleanup")),
+                key: OperationKey::parse("docker-cleanup-1").unwrap(),
+                approval: "apr-destroy".into(),
+                deadline_ms: 60_000,
+            },
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status, ProviderStatus::Succeeded);
+    assert_eq!(containers(&label), 0);
+    assert!(journal.residuals(scope.job).unwrap().is_empty());
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// The operation `journal_for` started the attempt with: what a loss of
+/// that attempt is reported against.
+const START_OPERATION: [u8; 16] = [0xf2; 16];
+
+/// The attempt of `scope` is lost, as fabricd reports one whose node is
+/// gone, so a replacement may be asked for.
+async fn lose_attempt(journal: &Logged, scope: Scope) {
+    journal
+        .log()
+        .call(move |j| {
+            j.mark(
+                scope.job,
+                OperationId::from_bytes(START_OPERATION),
+                OperationMark::Dispatched,
+                1_770_000_000_001,
+            )?;
+            j.observe(
+                scope.job,
+                &Observation::Lost {
+                    attempt: scope.attempt,
+                    generation: scope.generation,
+                },
+                1_770_000_000_002,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// Asks for a replacement attempt of `scope`'s task under `key`, as a
+/// node's command would, through the log thread: what the barrier
+/// answers, and the attempt id it would run under.
+async fn replace(journal: &Logged, scope: Scope, key: &str) -> (StoredResult, AttemptId) {
+    let attempt = AttemptId::from_bytes(fresh(key));
+    let envelope = Envelope {
+        key: OperationKey::parse(key).unwrap(),
+        job: Some(scope.job),
+        expected: None,
+        body: Command::StartAttempt {
+            task: scope.task,
+            resource: ResourceRef::Node {
+                node: NodeId::from_bytes([4; 32]),
+            },
+            initial_checkpoint: None,
+        },
+    };
+    let ids = NewIds {
+        job: scope.job,
+        task: scope.task,
+        attempt,
+        operation: OperationId::from_bytes(fresh(&format!("{key}-operation"))),
+        at_ms: 1_770_000_000_010,
+    };
+    let answer = journal
+        .log()
+        .call(move |j| j.submit(&envelope, ids))
+        .await
+        .unwrap()
+        .unwrap();
+    (answer.result, attempt)
+}
+
+/// The provider operation a refused replacement names, if it was refused
+/// by the barrier.
+fn blocked_by(result: &StoredResult) -> Option<OperationId> {
+    match result {
+        StoredResult::Rejected(DomainError::ReplacementBlocked { operation }) => Some(*operation),
+        _ => None,
+    }
+}
+
+/// Fabric restarts: the journal is reopened on a new log thread and
+/// recovery runs with no way to tell what the worker did. What it found
+/// `dispatched` and made `unknown` is returned with it.
+async fn restart(journal: Logged) -> (Logged, Vec<OperationId>) {
+    let mut restarted = journal.into_inner().await;
+    let recovery = restarted
+        .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    let unknown = recovery
+        .provider_unknown
+        .iter()
+        .map(|(_, operation)| *operation)
+        .collect();
+    (Logged::new(restarted), unknown)
+}
+
+/// The owner gives up on an operation as they saw it, through the log thread.
+async fn abandon(journal: &Logged, approval: AbandonApproval) {
+    journal
+        .log()
+        .call(move |j| j.provider_abandon(&approval, 1_770_000_000_020))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// A destroy whose answer was never read, with the worker killed and
+/// Fabric restarted before it: the destroy is `unknown` and still names
+/// its target. While it is, a replacement attempt is refused by it; an
+/// observe that finds the sandbox still there records `observed` and the
+/// refusal stands; a cleanup waits on the destroy in flight and writes
+/// nothing; abandoning the destroy does not unblock it either. Only a
+/// fresh destroy under its own grant, confirmed gone, lifts the barrier,
+/// and the refusal stays under its key.
+#[tokio::test]
+#[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
+#[expect(clippy::too_many_lines, reason = "one physical run, step by step")]
+async fn a_destroy_lost_with_its_worker_blocks_a_replacement_until_a_stop_is_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let job = scope().job;
+    let mut config = fixture_config(&[]);
+    config["approvals"].as_array_mut().unwrap().extend([
+        json!({"ref": "apr-destroy-70", "action": "sandbox.destroy", "native_id": "fx-key-70", "expired": false}),
+        json!({"ref": "apr-cleanup-70", "action": "sandbox.destroy", "native_id": "fx-key-70", "expired": false}),
+    ]);
+    let path = write_config(dir.path(), "worker.json", &config);
+    let bridge = spawn("fixture", &path).await;
+    let created = bridge
+        .request(&mut journal, create(70, "fixture/ok"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(created.status, ProviderStatus::Succeeded);
+    let target = result(&created).resource.clone();
+    assert_eq!(target, fx("fx-key-70"));
+    let flight = bridge
+        .request(&mut journal, destroy(71, &target, Some("apr-destroy-70")))
+        .await
+        .unwrap();
+    assert_eq!(entry(&journal, id(71)).status, ProviderStatus::Dispatched);
+    // Fabric stops before it reads the answer, and the worker is killed.
+    drop(flight);
+    bridge.kill().await;
+    drop(bridge);
+
+    let (journal, unknown) = restart(journal).await;
+    assert_eq!(unknown, vec![id(71)]);
+    let row = entry(&journal, id(71));
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(
+        row.dispatch.target,
+        Some(stored(&target)),
+        "it names what it was sent to"
+    );
+    lose_attempt(&journal, scope()).await;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![Blocker::StopNotConfirmed {
+            operation: id(71),
+            status: ProviderStatus::Unknown
+        }]
+    );
+    let (refused, _) = replace(&journal, scope(), "replace-1").await;
+    assert_eq!(blocked_by(&refused), Some(id(71)));
+
+    // The restarted worker holds the sandbox: the destroy never reached
+    // the provider. The destroy is not sent again; observed, the sandbox
+    // is still there.
+    config["sandboxes"].as_array_mut().unwrap().push(json!({
+        "native_id": "fx-key-70", "project": "proj-1", "owner_job": JOB,
+        "operation": id(70).to_string(), "status": "ready",
+    }));
+    let seeded = write_config(dir.path(), "restarted.json", &config);
+    let bridge = spawn("fixture", &seeded).await;
+    let mut journal = journal;
+    let again = bridge
+        .request(&mut journal, destroy(71, &target, Some("apr-destroy-70")))
+        .await;
+    assert!(
+        matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
+        "{again:?}"
+    );
+    let observed = bridge
+        .observe(
+            &mut journal,
+            id(71),
+            "sandbox.destroy",
+            target.clone(),
+            1_000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.status,
+        ProviderStatus::Observed,
+        "{:?}",
+        observed.answer
+    );
+    assert_eq!(
+        refusal(&observed),
+        (
+            ErrorCode::Pending,
+            "observation_deadline",
+            EffectState::Pending
+        )
+    );
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![Blocker::StopNotConfirmed {
+            operation: id(71),
+            status: ProviderStatus::Observed
+        }]
+    );
+    let (refused, _) = replace(&journal, scope(), "replace-2").await;
+    assert_eq!(blocked_by(&refused), Some(id(71)));
+
+    // A cleanup waits on the destroy in flight: nothing is written or sent.
+    let cleanup = |n: u8, approval: &str| fabric_bridge::Cleanup {
+        creating: id(70),
+        id: id(n),
+        key: OperationKey::parse(&format!("key-{n}")).unwrap(),
+        approval: approval.into(),
+        deadline_ms: 30_000,
+    };
+    let waits = bridge
+        .cleanup(&mut journal, cleanup(72, "apr-cleanup-70"))
+        .await;
+    assert!(
+        matches!(
+            waits,
+            Err(BridgeError::Cleanup {
+                creating,
+                refusal: fabric_journal::CleanupRefusal::InFlight { operation }
+            }) if creating == id(70) && operation == id(71)
+        ),
+        "{waits:?}"
+    );
+    assert!(journal.provider_operation(id(72)).unwrap().is_none());
+
+    // The owner gives the destroy up, acknowledging the sandbox it names:
+    // the cleanup may go, and the replacement is still refused.
+    abandon(
+        &journal,
+        AbandonApproval {
+            operation: id(71),
+            expected: ProviderStatus::Observed,
+            acknowledged: fabric_journal::Acknowledged::Resource(stored(&target).key),
+            reason: "the test gives it up".into(),
+        },
+    )
+    .await;
+    assert_eq!(entry(&journal, id(71)).status, ProviderStatus::Abandoned);
+    let (refused, _) = replace(&journal, scope(), "replace-3").await;
+    assert_eq!(blocked_by(&refused), Some(id(71)));
+
+    // The cleanup needs its own destroy grant; confirmed gone, it lifts
+    // the barrier.
+    let scoped = bridge
+        .cleanup(&mut journal, cleanup(73, "apr-create-only"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(scoped.status, ProviderStatus::Rejected);
+    assert_eq!(
+        refusal(&scoped),
+        (ErrorCode::Denied, "approval_scope", EffectState::None)
+    );
+    assert_eq!(
+        blocked_by(&replace(&journal, scope(), "replace-4").await.0),
+        Some(id(71))
+    );
+    let destroyed = bridge
+        .cleanup(&mut journal, cleanup(74, "apr-cleanup-70"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(
+        destroyed.status,
+        ProviderStatus::Succeeded,
+        "{:?}",
+        destroyed.answer
+    );
+    assert_eq!(result(&destroyed).output["status"], "destroyed");
+    assert!(journal.replacement_blockers(job).unwrap().is_empty());
+    assert!(journal.residuals(job).unwrap().is_empty());
+    // The refusal stays under its key; a new key is granted.
+    assert_eq!(
+        blocked_by(&replace(&journal, scope(), "replace-3").await.0),
+        Some(id(71))
+    );
+    let (granted, _) = replace(&journal, scope(), "replace-5").await;
+    assert!(matches!(granted, StoredResult::Accepted(_)), "{granted:?}");
+    assert_eq!(
+        journal.job(job).unwrap().unwrap().job.generation,
+        Generation::new(2).unwrap()
+    );
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// Fabric stops between the intent and the frame: the create's row is
+/// committed and nothing reached the worker. Recovery makes it unknown;
+/// no create of the job is sent while it is; an attach finds nothing made
+/// by it in the worker's scope and says which scope it searched, so it
+/// stays unknown with that scope kept; it is a residual and blocks a
+/// replacement until the owner abandons it acknowledging that search.
+/// Then the replacement is granted and the job creates again, once.
+#[tokio::test]
+#[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
+#[expect(clippy::too_many_lines, reason = "one physical run, step by step")]
+async fn a_create_whose_frame_never_left_stays_unknown_after_an_absent_attach_until_abandoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = journal(dir.path());
+    let job = scope().job;
+    let effect = create(80, "fixture/ok");
+    let intent = fabric_journal::ProviderDispatch {
+        operation: effect.operation.id,
+        key: effect.operation.key.clone(),
+        digest: RequestDigest::from_bytes(effect.operation.digest.0),
+        job,
+        task: scope().task,
+        attempt: scope().attempt,
+        generation: scope().generation,
+        profile: "fixture".into(),
+        action: "sandbox.create".into(),
+        effect: fabric_journal::EffectClass::Create,
+        purpose: fabric_journal::Purpose::Effect,
+        target: None,
+    };
+    journal
+        .log()
+        .call(move |j| j.provider_begin(&intent, None, 1_769_999_999_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry(&journal, id(80)).status, ProviderStatus::Dispatched);
+    // Fabric stops here. No frame left.
+    let (mut journal, unknown) = restart(journal).await;
+    assert_eq!(unknown, vec![id(80)]);
+    assert_eq!(entry(&journal, id(80)).status, ProviderStatus::Unknown);
+
+    let path = write_config(dir.path(), "worker.json", &fixture_config(&[]));
+    let bridge = spawn("fixture", &path).await;
+    let again = bridge.request(&mut journal, create(80, "fixture/ok")).await;
+    assert!(
+        matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
+        "{again:?}"
+    );
+    let waits = bridge.request(&mut journal, create(81, "fixture/ok")).await;
+    assert!(
+        matches!(waits, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{waits:?}"
+    );
+    let absent = bridge
+        .attach(&mut journal, id(80), 1_000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(
+        absent.status,
+        ProviderStatus::Unknown,
+        "{:?}",
+        absent.answer
+    );
+    assert_eq!(
+        refusal(&absent),
+        (ErrorCode::Unknown, "absent", EffectState::Unknown)
+    );
+    let row = entry(&journal, id(80));
+    assert_eq!(row.locator, None);
+    let searched = row.searched.expect("the scope searched is kept");
+    assert_eq!(
+        serde_json::from_str::<Value>(&searched).unwrap(),
+        json!({"provider": "fixture", "scope": {"account": "acct-a", "project": "proj-1"}, "kind": "sandbox"})
+    );
+    // Absence settles nothing: the same attach reads the same answer.
+    let still = bridge
+        .attach(&mut journal, id(80), 1_000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(still.status, ProviderStatus::Unknown);
+    lose_attempt(&journal, scope()).await;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![Blocker::CreateUnresolved {
+            operation: id(80),
+            status: ProviderStatus::Unknown
+        }]
+    );
+    assert_eq!(
+        blocked_by(&replace(&journal, scope(), "replace-1").await.0),
+        Some(id(80))
+    );
+    assert_eq!(
+        journal.residuals(job).unwrap(),
+        vec![fabric_journal::Residual {
+            creating: id(80),
+            status: ProviderStatus::Unknown,
+            locator: None,
+            searched: Some(searched.clone()),
+        }]
+    );
+
+    // Abandoned with the search acknowledged, it blocks nothing and stays
+    // a residual; the replacement is granted and creates again, once.
+    abandon(
+        &journal,
+        AbandonApproval {
+            operation: id(80),
+            expected: ProviderStatus::Unknown,
+            acknowledged: fabric_journal::Acknowledged::Searched(searched),
+            reason: "nothing in the searched scope carries it".into(),
+        },
+    )
+    .await;
+    assert_eq!(entry(&journal, id(80)).status, ProviderStatus::Abandoned);
+    assert!(journal.replacement_blockers(job).unwrap().is_empty());
+    assert_eq!(journal.residuals(job).unwrap().len(), 1);
+    let (granted, attempt) = replace(&journal, scope(), "replace-2").await;
+    assert!(matches!(granted, StoredResult::Accepted(_)), "{granted:?}");
+    let mut next = create(82, "fixture/ok");
+    next.scope = Scope {
+        attempt,
+        generation: Generation::new(2).unwrap(),
+        ..scope()
+    };
+    let made = bridge
+        .request(&mut journal, next)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(made.status, ProviderStatus::Succeeded, "{:?}", made.answer);
+    assert_eq!(result(&made).resource, fx("fx-key-82"));
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// The destroy lost with its worker on the local Docker engine: the
+/// container, made once, is the one the destroy named. While the destroy
+/// is unknown a replacement is refused and no second container appears.
+/// The engine may or may not have run the `docker rm` the worker started
+/// before it was killed; an observe by the destroy's target reads which,
+/// and either the destroy is confirmed gone, or it is `observed`, given up
+/// and a fresh destroy under its own grant removes the container. Either
+/// way the barrier lifts only once no container is left.
+#[tokio::test]
+#[ignore = "needs the Capsule worker and a local Docker engine: set CAPSULE_BRIDGE_WORKER and CAPSULE_BRIDGE_DOCKER_IMAGE, run with --ignored"]
+#[expect(clippy::too_many_lines, reason = "one physical run, step by step")]
+async fn a_docker_destroy_lost_with_its_worker_blocks_a_replacement_until_no_container_is_left() {
+    let image = match docker_image() {
+        Ok(image) => image,
+        Err(why) if std::env::var_os(DOCKER_IMAGE_VAR).is_none() => {
+            eprintln!("skipped: {why}");
+            return;
+        }
+        Err(why) => panic!("{DOCKER_IMAGE_VAR} is set, but {why}"),
+    };
+    let scope = Scope {
+        job: JobId::from_bytes(fresh("stop-job")),
+        task: TaskId::from_bytes(fresh("stop-task")),
+        attempt: AttemptId::from_bytes(fresh("stop-attempt")),
+        generation: Generation::FIRST,
+    };
+    let label = format!("label=fabric.job={}", scope.job);
+    let _cleanup = Cleanup(label.clone());
+    let containers = || {
+        docker(&["ps", "-a", "-q", "--filter", &label])
+            .unwrap()
+            .split_whitespace()
+            .count()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = Logged::new(journal_for(dir.path(), scope));
+    let path = write_config(
+        dir.path(),
+        "docker.json",
+        &json!({
+            "policy": {"images": [image]},
+            "approvals": [{"ref": "apr-destroy", "action": "sandbox.destroy", "native_id": null}]
+        }),
+    );
+    let bridge = spawn("docker", &path).await;
+    let creation = docker_effect(
+        scope,
+        1,
+        Action::Create(CreateParams {
+            image: image.clone(),
+            env: BTreeMap::new(),
+            secret_names: Vec::new(),
+            labels: BTreeMap::new(),
+        }),
+        None,
+    );
+    let creating = creation.operation.id;
+    let created = bridge
+        .request(&mut journal, creation)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status,
+        ProviderStatus::Succeeded,
+        "{:?}",
+        created.answer
+    );
+    let container = result(&created).resource.clone();
+    assert_eq!(containers(), 1);
+    let remove = docker_effect(
+        scope,
+        2,
+        Action::Destroy {
+            target: container.clone(),
+        },
+        Some("apr-destroy"),
+    );
+    let removing = remove.operation.id;
+    let flight = bridge.request(&mut journal, remove.clone()).await.unwrap();
+    assert_eq!(entry(&journal, removing).status, ProviderStatus::Dispatched);
+    // Fabric stops before it reads the answer, and the worker is killed.
+    drop(flight);
+    bridge.kill().await;
+    drop(bridge);
+
+    let (journal, unknown) = restart(journal).await;
+    assert_eq!(unknown, vec![removing]);
+    assert_eq!(
+        entry(&journal, removing).dispatch.target,
+        Some(stored(&container))
+    );
+    lose_attempt(&journal, scope).await;
+    assert_eq!(
+        journal.replacement_blockers(scope.job).unwrap(),
+        vec![Blocker::StopNotConfirmed {
+            operation: removing,
+            status: ProviderStatus::Unknown
+        }]
+    );
+    assert_eq!(
+        blocked_by(&replace(&journal, scope, "replace-1").await.0),
+        Some(removing)
+    );
+    let left = containers();
+    assert!(
+        left <= 1,
+        "{left} containers: one was made, none replaced it"
+    );
+    eprintln!("after the kill the engine holds {left} container(s) of the job");
+
+    let mut journal = journal;
+    let bridge = spawn("docker", &path).await;
+    let again = bridge.request(&mut journal, remove).await;
+    assert!(
+        matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
+        "{again:?}"
+    );
+    let observed = bridge
+        .observe(
+            &mut journal,
+            removing,
+            "sandbox.destroy",
+            container.clone(),
+            10_000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    match observed.status {
+        ProviderStatus::Succeeded => {
+            eprintln!("the rm the worker started ran: the destroy is confirmed gone");
+            assert_eq!(result(&observed).output["status"], "destroyed");
+            assert_eq!(containers(), 0);
+        }
+        ProviderStatus::Observed => {
+            eprintln!("the container is still there: the destroy is observed, not confirmed");
+            assert_eq!(containers(), 1);
+            assert_eq!(
+                blocked_by(&replace(&journal, scope, "replace-2").await.0),
+                Some(removing)
+            );
+            abandon(
+                &journal,
+                AbandonApproval {
+                    operation: removing,
+                    expected: ProviderStatus::Observed,
+                    acknowledged: fabric_journal::Acknowledged::Resource(stored(&container).key),
+                    reason: "the test gives it up".into(),
+                },
+            )
+            .await;
+            assert_eq!(
+                blocked_by(&replace(&journal, scope, "replace-3").await.0),
+                Some(removing)
+            );
+            let destroyed = bridge
+                .cleanup(
+                    &mut journal,
+                    fabric_bridge::Cleanup {
+                        creating,
+                        id: OperationId::from_bytes(fresh("stop-cleanup")),
+                        key: OperationKey::parse("docker-stop-cleanup").unwrap(),
+                        approval: "apr-destroy".into(),
+                        deadline_ms: 60_000,
+                    },
+                )
+                .await
+                .unwrap()
+                .finish(&mut journal)
+                .await
+                .unwrap();
+            assert_eq!(
+                destroyed.status,
+                ProviderStatus::Succeeded,
+                "{:?}",
+                destroyed.answer
+            );
+        }
+        other => panic!(
+            "the observe settled the destroy as {other:?}: {:?}",
+            observed.answer
+        ),
+    }
+    assert_eq!(containers(), 0, "no container is left");
+    assert!(journal.replacement_blockers(scope.job).unwrap().is_empty());
+    assert!(journal.residuals(scope.job).unwrap().is_empty());
+    assert_eq!(
+        blocked_by(&replace(&journal, scope, "replace-1").await.0),
+        Some(removing)
+    );
+    let (granted, _) = replace(&journal, scope, "replace-4").await;
+    assert!(matches!(granted, StoredResult::Accepted(_)), "{granted:?}");
+    assert_eq!(
+        journal.job(scope.job).unwrap().unwrap().job.generation,
+        Generation::new(2).unwrap()
+    );
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }

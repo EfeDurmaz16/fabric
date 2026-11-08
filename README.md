@@ -24,7 +24,7 @@ That run found that the resumed agent used the other Mac's model setting instead
 | What | State |
 |---|---|
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
-| ADRs 0001 to 0016, 0018 to 0021 | Written, see below; amended 2026-10-19 after the step 1 research; 0013 to 0016 record the network protocol, the store, the harness trait, and the node and CLI as built; 0018 records the client API; 0019 to 0021 record managed jobs, the authority journal and the Capsule provider bridge, on `main` since 2026-11-03 |
+| ADRs 0001 to 0016, 0018 to 0022 | Written, see below; amended 2026-10-19 after the step 1 research; 0013 to 0016 record the network protocol, the store, the harness trait, and the node and CLI as built; 0018 records the client API; 0019 to 0021 record managed jobs, the authority journal and the Capsule provider bridge, on `main` since 2026-11-03; 0022 records reconciliation and cleanup authorization, on `main` since 2026-11-08 |
 | `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests, the environment spec and the secret policy. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants; the secret staging contract is tested against real `git`. |
 | `crates/fabric-store` | Content-addressed objects (blake3, zstd, FastCDC above 8 MiB), the SQLite catalog with refcounts and a graced gc, workspace capture (git state as two private commits and a bundle, ignored files by class, secrets denied) and restore into an empty directory through a staging rename. Crash-tested with `SIGKILL` at every publish and restore checkpoint. Capture still applies its own secret list, not `fabric_core::secret` (ADR 0004). |
 | `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports on one port behind one endpoint, framed and typed RPC with deadlines, paged ledger records, verified zstd chunk transfer, the facts doctor compares, the peer book. See [docs/net.md](docs/net.md). |
@@ -60,7 +60,7 @@ sequenceDiagram
 
 ## One Mac, first run
 
-This is the walk a new checkout of `main` was taken through on 2026-11-03 on one Mac ([docs/evidence/usable-from-main/walk.md](docs/evidence/usable-from-main/walk.md) has every command and what it printed). It needs `git` on the `PATH`, and Codex or Claude Code logged in for a real turn.
+This is the walk a new checkout of `main` was taken through on 2026-11-03 on one Mac, and again on 2026-11-08 after M4 merged ([docs/evidence/usable-from-main/walk.md](docs/evidence/usable-from-main/walk.md) has every command and what it printed). It needs `git` on the `PATH`, and Codex or Claude Code logged in for a real turn.
 
 Build the binary and start a node in a state directory of your own. `FABRIC_HOME` names the state directory (`~/.fabric` without it); keep the path short, because the control socket `fabric.sock` lives in it and a Unix socket path has a small limit, which `serve` reports before it listens. Leave `serve` running in its terminal; every other command talks to it.
 
@@ -202,6 +202,7 @@ A resume continues with the settings the session ran with, not the ones the othe
 | [0019](docs/adr/0019-managed-job-task-attempt.md) | Managed jobs, tasks, attempts and operations |
 | [0020](docs/adr/0020-managed-authority-journal.md) | The managed authority, its journal and fencing eligibility |
 | [0021](docs/adr/0021-capsule-provider-bridge.md) | Versioned provider bridge to a Capsule worker |
+| [0022](docs/adr/0022-reconciliation-and-cleanup-authorization.md) | Reconciliation of provider operations and cleanup authorization |
 
 Start with the architecture page, then read the ADRs in order. ADR 0003 deserves the most attention; it is the one that protects the user's work. The research notes the ADRs cite are private and live outside this repository; the architecture page says what they are.
 

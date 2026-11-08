@@ -234,12 +234,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: EfeDurmaz16/capsule
-          # Capsule's main after its m3/bridge-worker merge (#317): the
-          # worker with the v1 corrections of 2026-10-29 and its docker
-          # clients out of its process group, which
-          # docs/evidence/usable-from-main ran all eight tests against on
-          # 2026-11-03.
-          ref: 34f2a2d56ecb00b7389890f374a7139d0b55e84a
+          # Capsule's m4/reconciliation head: the M4 worker with its review
+          # fixes (an approval ref bound to the first operation it resolves
+          # for, a container kept when its start timed out), merged with
+          # Capsule main (M1 and M3), and itself on Capsule main since its
+          # #318 merge on 2026-11-08. Move it, and the pin below, whenever
+          # the worker or a package it bundles changes.
+          ref: b5d436cf5e44146e61db783e5992537255059f59
           path: capsule
           persist-credentials: false
 
@@ -291,7 +292,7 @@ jobs:
         with:
           repository: EfeDurmaz16/capsule
           # The same worker as bridge-interop; move both pins together.
-          ref: a4d597aa8df665f403389bd34f592ad2ce2056c4
+          ref: b5d436cf5e44146e61db783e5992537255059f59
           path: capsule
           persist-credentials: false
 

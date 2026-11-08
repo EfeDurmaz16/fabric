@@ -17,7 +17,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{create, double, journal, operation, scope};
+use common::{Logged, create, double, journal, operation, scope};
 use fabric_bridge::wire::{
     Action, CancelState, CreateParams, ErrorCode, ExecParams, Locator, ResultState, Versions,
 };
@@ -25,7 +25,7 @@ use fabric_bridge::{
     Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError, Recorder, Slot,
 };
 use fabric_core::managed::OperationId;
-use fabric_journal::{Journal, ProviderStatus};
+use fabric_journal::{AbandonApproval, Acknowledged, CleanupRefusal, Journal, ProviderStatus};
 use rustix::process::Pid;
 use tokio::sync::Notify;
 
@@ -46,6 +46,23 @@ fn status(journal: &Journal, n: u8) -> Option<ProviderStatus> {
         .provider_operation(OperationId::from_bytes([n; 16]))
         .unwrap()
         .map(|op| op.status)
+}
+
+/// The owner gives up on operation `n`, which is `unknown`, through the
+/// log thread, acknowledging what it names.
+async fn abandon(journal: &Logged, n: u8, acknowledged: Acknowledged) {
+    let approval = AbandonApproval {
+        operation: OperationId::from_bytes([n; 16]),
+        expected: ProviderStatus::Unknown,
+        acknowledged,
+        reason: "the test gives up on it".into(),
+    };
+    journal
+        .log()
+        .call(move |j| j.provider_abandon(&approval, 0))
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 fn fx(key: &str) -> Locator {
@@ -88,8 +105,12 @@ async fn a_create_is_recorded_dispatched_then_succeeded_with_its_locator() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        op.locator.as_deref(),
-        Some(fx("key-1").to_value().to_string().as_str())
+        op.locator.as_ref().map(|l| l.text.as_str()),
+        Some(
+            fabric_bridge::wire::locator_record(&fx("key-1"))
+                .text
+                .as_str()
+        )
     );
     let exit = bridge.close().await.unwrap();
     assert_eq!(exit.code(), Some(0), "closing stdin is a clean shutdown");
@@ -187,8 +208,12 @@ async fn a_locator_reported_before_a_crash_is_kept_with_unknown() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        op.locator.as_deref(),
-        Some(fx("key-5").to_value().to_string().as_str())
+        op.locator.as_ref().map(|l| l.text.as_str()),
+        Some(
+            fabric_bridge::wire::locator_record(&fx("key-5"))
+                .text
+                .as_str()
+        )
     );
 }
 
@@ -216,6 +241,28 @@ async fn a_timeout_leaves_unknown_and_the_operation_is_never_sent_again() {
         "{again:?}"
     );
     assert_eq!(status(&journal, 6), Some(ProviderStatus::Unknown));
+    // A second create of the job waits while this one is unknown: never a
+    // second sandbox beside one nobody can name. Nothing is written.
+    let waits = bridge.request(&mut journal, create(7, "fixture/ok")).await;
+    assert!(
+        matches!(waits, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{waits:?}"
+    );
+    assert_eq!(status(&journal, 7), None);
+    // An attach finds nothing it made: it stays unknown, with the scope
+    // searched, and the owner gives up on it.
+    let lost = OperationId::from_bytes([6; 16]);
+    let absent = bridge
+        .attach(&mut journal, lost, 1000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(absent.status, ProviderStatus::Unknown);
+    let row = journal.provider_operation(lost).unwrap().unwrap();
+    assert_eq!(row.answer.reason.as_deref(), Some("absent"));
+    abandon(&journal, 6, Acknowledged::Searched(row.searched.unwrap())).await;
     // The worker is still there for other operations.
     let ok = bridge
         .request(&mut journal, create(7, "fixture/ok"))
@@ -450,6 +497,15 @@ async fn the_in_flight_limit_refuses_before_the_journal_and_shutdown_lists_the_r
         "{refused:?}"
     );
     assert_eq!(status(&journal, 25), None);
+    // So is an attach, though it only reads: of a create the shutdown left
+    // unknown with no locator, the one kind of operation it reaches.
+    let attach = bridge
+        .attach(&mut journal, OperationId::from_bytes([20; 16]), 1000)
+        .await;
+    assert!(
+        matches!(attach, Err(BridgeError::ShuttingDown)),
+        "{attach:?}"
+    );
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
 
@@ -653,7 +709,7 @@ async fn a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_res
         deadline_ms: 5000,
     };
     let flight = bridge.request(&mut journal, destroy).await.unwrap();
-    let target = Some(fx("key-a").to_value().to_string());
+    let target = Some(fabric_bridge::wire::locator_record(&fx("key-a")));
     let row = journal
         .provider_operation(OperationId::from_bytes([60; 16]))
         .unwrap()
@@ -682,7 +738,7 @@ async fn a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_res
     assert_eq!(row.dispatch.target, target);
 }
 
-fn locator(journal: &Journal, n: u8) -> Option<String> {
+fn locator(journal: &Journal, n: u8) -> Option<fabric_journal::LocatorRecord> {
     journal
         .provider_operation(OperationId::from_bytes([n; 16]))
         .unwrap()
@@ -767,6 +823,8 @@ async fn observe_reads_only_the_operations_own_action_and_resource() {
         "{refused:?}"
     );
     assert_eq!(status(&journal, 72), Some(ProviderStatus::Unknown));
+    // It names nothing; the owner gives up on it, so the job creates again.
+    abandon(&journal, 72, Acknowledged::Nothing).await;
 
     // A create that reported its sandbox and was lost: another job's
     // sandbox is not it.
@@ -778,7 +836,7 @@ async fn observe_reads_only_the_operations_own_action_and_resource() {
         .await
         .unwrap();
     assert_eq!(lost.status, ProviderStatus::Unknown);
-    let own = Some(fx("key-71").to_value().to_string());
+    let own = Some(fabric_bridge::wire::locator_record(&fx("key-71")));
     assert_eq!(locator(&journal, 71), own);
     let bridge = spawn().await;
     let create_op = OperationId::from_bytes([71; 16]);
@@ -812,7 +870,10 @@ async fn observe_reads_only_the_operations_own_action_and_resource() {
             .unwrap();
         assert_eq!(outcome.status, ProviderStatus::Succeeded, "{action}");
         let row = journal.provider_operation(op).unwrap().unwrap();
-        assert_eq!(row.locator, Some(resource.to_value().to_string()));
+        assert_eq!(
+            row.locator,
+            Some(fabric_bridge::wire::locator_record(&resource))
+        );
     }
     assert_eq!(
         bridge.late_answers(),
@@ -864,7 +925,7 @@ async fn progress_is_bounded_to_sixteen_frames_in_order() {
     assert_eq!(outcome.status, ProviderStatus::Unknown);
     assert_eq!(
         locator(&journal, 81),
-        Some(fx("key-81").to_value().to_string())
+        Some(fabric_bridge::wire::locator_record(&fx("key-81")))
     );
     assert!(bridge.lost().unwrap().contains("after progress 1"));
     let exit = bridge.close().await.unwrap();
@@ -950,7 +1011,10 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
     bridge.record_late(&mut journal).await.unwrap();
     let own = fx("key-100");
     assert_eq!(status(&journal, 100), Some(ProviderStatus::Unknown));
-    assert_eq!(locator(&journal, 100), Some(own.to_value().to_string()));
+    assert_eq!(
+        locator(&journal, 100),
+        Some(fabric_bridge::wire::locator_record(&own))
+    );
     let observed = bridge
         .observe(
             &mut journal,
@@ -966,8 +1030,11 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
         .unwrap();
     assert_eq!(observed.status, ProviderStatus::Succeeded);
 
-    // A caller drops its request; the next request records the locator
-    // the answer named, and the operation stays dispatched.
+    // A caller drops its request: nothing will settle it, so the next
+    // call handed the journal records it unknown, as at its deadline,
+    // with the locator the late answer named. The journal then sees it
+    // as it sees any lost create: a second create of the job is refused
+    // until it is settled, and it is listed as a residual.
     let dropped = bridge
         .request(&mut journal, create(101, "double/late"))
         .await
@@ -977,15 +1044,45 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
         assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let refused = bridge
+        .request(&mut journal, create(102, "fixture/ok"))
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{refused:?}"
+    );
+    assert_eq!(status(&journal, 101), Some(ProviderStatus::Unknown));
+    let own = fx("key-101");
+    assert_eq!(
+        locator(&journal, 101),
+        Some(fabric_bridge::wire::locator_record(&own))
+    );
+    assert!(
+        journal
+            .residuals(scope().job)
+            .unwrap()
+            .iter()
+            .any(|r| r.creating == OperationId::from_bytes([101; 16])),
+        "the dropped create is not a residual"
+    );
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([101; 16]),
+            "sandbox.create",
+            own,
+            1000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
     let next = bridge
         .request(&mut journal, create(102, "fixture/ok"))
         .await
         .unwrap();
-    assert_eq!(status(&journal, 101), Some(ProviderStatus::Dispatched));
-    assert_eq!(
-        locator(&journal, 101),
-        Some(fx("key-101").to_value().to_string())
-    );
     assert_eq!(
         next.finish(&mut journal).await.unwrap().status,
         ProviderStatus::Succeeded
@@ -1232,6 +1329,301 @@ async fn an_exec_answered_running_is_settled_by_observe() {
     );
 }
 
+/// A double whose provider keeps what it made in `provider`, so a
+/// restarted double attaches what an earlier one made.
+async fn spawn_with_provider(provider: &std::path::Path) -> Bridge {
+    let mut command = double();
+    command.env("FABRIC_BRIDGE_DOUBLE_PROVIDER", provider);
+    Bridge::spawn(command, config()).await.unwrap()
+}
+
+/// The worker dies after its provider made the sandbox and before it
+/// answered, and the authority restarts too. The create is unknown with
+/// no locator; nothing creates again: a second create of the job waits,
+/// and the lost one, attached by its own identity under a restarted
+/// worker, is settled with the sandbox the provider made, the only one.
+#[tokio::test]
+async fn a_create_lost_with_its_worker_is_attached_and_never_made_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn_with_provider(provider.path()).await;
+    let lost = bridge
+        .request(&mut journal, create(110, "double/made-crash"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert!(matches!(lost.answer, Answer::Lost(_)), "{:?}", lost.answer);
+    assert_eq!(lost.status, ProviderStatus::Unknown);
+    assert_eq!(locator(&journal, 110), None, "no answer named it");
+    drop(bridge);
+    // The authority restarts: recovery sends nothing.
+    let mut restarted = journal.into_inner().await;
+    let recovery = restarted
+        .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert!(
+        recovery.provider_unknown.is_empty(),
+        "it was unknown already"
+    );
+    let mut journal = Logged::new(restarted);
+    let bridge = spawn_with_provider(provider.path()).await;
+    // The same create is never sent again, and neither is a new one.
+    let again = bridge
+        .request(&mut journal, create(110, "fixture/ok"))
+        .await;
+    assert!(
+        matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
+        "{again:?}"
+    );
+    let second = bridge
+        .request(&mut journal, create(111, "fixture/ok"))
+        .await;
+    assert!(
+        matches!(second, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{second:?}"
+    );
+    assert_eq!(status(&journal, 111), None);
+    // Attach by its own identity finds what the provider made.
+    let found = bridge
+        .attach(&mut journal, OperationId::from_bytes([110; 16]), 1000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(found.status, ProviderStatus::Succeeded);
+    assert_eq!(
+        locator(&journal, 110),
+        Some(fabric_bridge::wire::locator_record(&fx("key-110")))
+    );
+    let made: Vec<_> = std::fs::read_dir(provider.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(made, vec!["key-110".to_owned()], "made once");
+    // Settled, it is not attached again: it names its sandbox.
+    let twice = bridge
+        .attach(&mut journal, OperationId::from_bytes([110; 16]), 1000)
+        .await;
+    assert!(
+        matches!(twice, Err(BridgeError::NotAttachable { .. })),
+        "{twice:?}"
+    );
+    // And the job creates again.
+    let next = bridge
+        .request(&mut journal, create(111, "fixture/ok"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(next.status, ProviderStatus::Succeeded);
+    journal.verify().unwrap();
+}
+
+/// Attach and observe are reads: an attach outside the profile is refused
+/// before anything is sent, one of an operation that names its resource
+/// is observed instead, and a worker lost during an attach leaves the
+/// operation as it was.
+#[tokio::test]
+async fn an_attach_is_a_read_refused_where_the_profile_or_the_journal_says() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    // A create lost before it named its sandbox.
+    let mut lost = create(120, "double/silent");
+    lost.deadline_ms = 100;
+    let lost = bridge
+        .request(&mut journal, lost)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(lost.status, ProviderStatus::Unknown);
+    let op = OperationId::from_bytes([120; 16]);
+    for wait in [0, 30_001] {
+        let refused = bridge.attach(&mut journal, op, wait).await;
+        assert!(
+            matches!(&refused, Err(BridgeError::RefusedLocally(r)) if r.reason == "limit"),
+            "{refused:?}"
+        );
+    }
+    let exec = Effect {
+        operation: operation(121),
+        scope: scope(),
+        action: Action::Exec {
+            target: fx("key-x"),
+            params: ExecParams {
+                argv: vec!["double/running".into()],
+                stdin: None,
+                cwd: None,
+                timeout_ms: 1000,
+                max_output_bytes: 1024,
+                secret_names: Vec::new(),
+            },
+        },
+        approval: None,
+        policy: None,
+        deadline_ms: 5000,
+    };
+    let running = bridge
+        .request(&mut journal, exec)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(running.status, ProviderStatus::Dispatched);
+    let refused = bridge
+        .attach(&mut journal, OperationId::from_bytes([121; 16]), 1000)
+        .await;
+    assert!(
+        matches!(&refused, Err(BridgeError::RefusedLocally(r)) if r.reason == "attach"),
+        "{refused:?}"
+    );
+    // Not in the journal, and not unknown.
+    for (n, why) in [(122, "absent"), (121, "dispatched")] {
+        let refused = bridge
+            .attach(&mut journal, OperationId::from_bytes([n; 16]), 1000)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(BridgeError::RefusedLocally(_) | BridgeError::NotAttachable { .. })
+            ),
+            "{why}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        bridge.late_answers(),
+        0,
+        "nothing refused reached the worker"
+    );
+    // The worker is lost during the attach: the create stays unknown.
+    let flight = bridge.attach(&mut journal, op, 1000).await.unwrap();
+    bridge.kill().await;
+    let outcome = flight.finish(&mut journal).await.unwrap();
+    assert!(
+        matches!(outcome.answer, Answer::Lost(_)),
+        "{:?}",
+        outcome.answer
+    );
+    assert_eq!(outcome.status, ProviderStatus::Unknown);
+    let row = journal.provider_operation(op).unwrap().unwrap();
+    assert_eq!(row.searched, None);
+}
+
+/// A cleanup names a create of the journal with a sandbox: one that is
+/// not a create, has no locator, or whose sandbox a destroy removed, is
+/// refused before anything is written, and one without an approval ref is
+/// refused before any effect. With a fresh one, the sandbox is destroyed
+/// and is no longer a residual.
+#[tokio::test]
+async fn a_cleanup_without_a_named_resource_is_refused_before_anything_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let cleanup = |creating: u8, n: u8, approval: &str| fabric_bridge::Cleanup {
+        creating: OperationId::from_bytes([creating; 16]),
+        id: OperationId::from_bytes([n; 16]),
+        key: fabric_core::managed::OperationKey::parse(&format!("cleanup-{n}")).unwrap(),
+        approval: approval.into(),
+        deadline_ms: 5000,
+    };
+    let refused = |result: Result<fabric_bridge::InFlight, BridgeError>| match result {
+        Err(BridgeError::Cleanup { refusal, .. }) => refusal,
+        other => panic!("{other:?}"),
+    };
+    // Nothing of that id.
+    assert_eq!(
+        refused(
+            bridge
+                .cleanup(&mut journal, cleanup(130, 140, "apr-1"))
+                .await
+        ),
+        CleanupRefusal::NotACreate
+    );
+    // A create lost before it named its sandbox.
+    let mut silent = create(131, "double/silent");
+    silent.deadline_ms = 100;
+    bridge
+        .request(&mut journal, silent)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused(
+            bridge
+                .cleanup(&mut journal, cleanup(131, 141, "apr-1"))
+                .await
+        ),
+        CleanupRefusal::Unlocated
+    );
+    abandon(&journal, 131, Acknowledged::Nothing).await;
+    // A create that made its sandbox.
+    bridge
+        .request(&mut journal, create(132, "fixture/ok"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    for n in [140, 141] {
+        assert_eq!(status(&journal, n), None, "nothing was written for {n}");
+    }
+    // An empty approval ref is no grant: refused before it is sent, and
+    // recorded rejected, as the worker would refuse it.
+    let job = scope().job;
+    let denied = bridge.cleanup(&mut journal, cleanup(132, 142, "")).await;
+    assert!(
+        matches!(&denied, Err(BridgeError::RefusedLocally(_))),
+        "an empty approval ref does not leave Fabric: {denied:?}"
+    );
+    assert_eq!(status(&journal, 142), Some(ProviderStatus::Rejected));
+    assert_eq!(journal.residuals(job).unwrap().len(), 2);
+    let done = bridge
+        .cleanup(&mut journal, cleanup(132, 143, "apr-cleanup-1"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ProviderStatus::Succeeded);
+    let row = journal
+        .provider_operation(OperationId::from_bytes([143; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.dispatch.purpose,
+        fabric_journal::Purpose::Cleanup {
+            cleans: OperationId::from_bytes([132; 16])
+        }
+    );
+    assert_eq!(
+        row.dispatch.target,
+        Some(fabric_bridge::wire::locator_record(&fx("key-132")))
+    );
+    // Only the lost create is left; its sandbox, if any, cannot be named.
+    let residuals = journal.residuals(job).unwrap();
+    assert_eq!(residuals.len(), 1);
+    assert_eq!(residuals[0].creating, OperationId::from_bytes([131; 16]));
+    assert_eq!(
+        refused(
+            bridge
+                .cleanup(&mut journal, cleanup(132, 144, "apr-2"))
+                .await
+        ),
+        CleanupRefusal::AlreadyDestroyed
+    );
+    journal.verify().unwrap();
+}
+
 /// A shutdown the bridge refuses because the worker is already gone sent
 /// nothing, so it changes nothing: what comes next is refused as lost,
 /// which is what happened, not as shutting down, which never began.
@@ -1305,7 +1697,7 @@ async fn a_refused_request_records_no_late_locator() {
     assert_eq!(status(&journal, 120), Some(ProviderStatus::Unknown));
     assert_eq!(
         locator(&journal, 120),
-        Some(fx("key-120").to_value().to_string())
+        Some(fabric_bridge::wire::locator_record(&fx("key-120")))
     );
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
@@ -1396,7 +1788,7 @@ async fn a_request_refused_when_it_registers_has_recorded_the_late_locator() {
     assert_eq!(status(&journal, 130), Some(ProviderStatus::Unknown));
     assert_eq!(
         locator(&journal, 130),
-        Some(fx("key-130").to_value().to_string()),
+        Some(fabric_bridge::wire::locator_record(&fx("key-130"))),
         "the late locator was not recorded before the request waited on the log"
     );
     assert_eq!(bridge.late_answers(), 1);

@@ -704,6 +704,16 @@ pub enum DomainError {
         /// What is wrong.
         reason: String,
     },
+    /// A provider effect of the job may still act on its resources (a
+    /// create unresolved, an exec that may run, a stop not confirmed), so
+    /// no replacement attempt is granted (docs/managed-jobs.md, the
+    /// replacement barrier). Appended after every earlier variant, so
+    /// stored refusals keep their encoding.
+    #[error("provider operation {operation} blocks a replacement attempt")]
+    ReplacementBlocked {
+        /// The oldest provider operation that blocks it.
+        operation: OperationId,
+    },
 }
 
 /// The ids and the time a command may need, made by the authority before it applies one.

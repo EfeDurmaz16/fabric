@@ -23,19 +23,35 @@ use fabric_bridge::{
     frames,
 };
 use fabric_core::managed::{Generation, OperationId};
-use fabric_journal::{Journal, ProviderAnswer, ProviderDispatch, ProviderStatus};
+use fabric_journal::{
+    CleanupRefusal, Journal, LocatorRecord, ProviderAnswer, ProviderDispatch, ProviderStatus,
+};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 
 const PROFILE: &str = include_str!("../../../protocol/bridge/v1/profiles/fixture.json");
 
+// The v1 correction of 2026-11-02 gives every profile a `max_timeout_ms`,
+// the bound on an exec's `timeout_ms` advertised in `hello_ack`. The
+// on-disk profile carries it once the Ship step copies the Capsule-written
+// fixtures; until then this adds the bound v1 names for the fixture
+// profile, 60000 ms, when it is absent. Remove with that copy.
+fn with_timeout_bound(mut value: Value) -> Value {
+    if let Some(limits) = value["limits"].as_object_mut() {
+        limits
+            .entry("max_timeout_ms")
+            .or_insert_with(|| 60_000.into());
+    }
+    value
+}
+
 fn ack(hello: &Value) -> Value {
     json!({
         "type": "hello_ack",
         "protocol": 1,
         "worker": "stream-test/0",
-        "profile": serde_json::from_str::<Value>(PROFILE).unwrap(),
+        "profile": with_timeout_bound(serde_json::from_str::<Value>(PROFILE).unwrap()),
         "limits": hello["limits"].clone(),
     })
 }
@@ -153,17 +169,42 @@ impl OperationLog for Gated {
         operation: OperationId,
         status: ProviderStatus,
         answer: &ProviderAnswer,
-        locator: Option<&str>,
+        locator: Option<&LocatorRecord>,
     ) -> Result<(), LogError> {
         self.log.record(operation, status, answer, locator)
     }
 
-    fn locate(&mut self, operation: OperationId, locator: &str) -> Result<(), LogError> {
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.log.searched(operation, answer, searched)
+    }
+
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.log.absent(operation, answer, searched)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         self.log.locate(operation, locator)
     }
 
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         self.log.entry(operation)
+    }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        self.log.cleanup_target(creating)
     }
 }
 
@@ -171,9 +212,9 @@ impl OperationLog for Gated {
 /// is sent and acknowledged by a worker that, with nothing in flight,
 /// closes its output. Written now, behind the shutdown, the request would
 /// never be read by the worker yet settle `unknown`, and a create with no
-/// locator cannot be observed. It is recorded `rejected` as a draining
-/// worker answers a request read after a shutdown, and the worker reads
-/// only the shutdown. The order is the same on every run.
+/// locator cannot be observed, only attached. It is recorded `rejected`
+/// as a draining worker answers a request read after a shutdown, and the
+/// worker reads only the shutdown. The order is the same on every run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_admitted_before_a_shutdown_is_never_written_after_it() {
     let (fabric, worker) = tokio::io::duplex(64 << 10);
@@ -233,6 +274,182 @@ async fn a_request_admitted_before_a_shutdown_is_never_written_after_it() {
     assert_eq!(entry.map(|e| e.status), Some(ProviderStatus::Rejected));
     assert_eq!(bridge.close().await, None);
     assert_eq!(script.await.unwrap(), ["shutdown:r-2"]);
+}
+
+fn fx(key: &str) -> fabric_bridge::wire::Locator {
+    fabric_bridge::wire::Locator::from_value(&json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+        "native_id": format!("fx-{key}"),
+    }))
+    .unwrap()
+}
+
+/// An error frame answering `request_id` for `operation_id`.
+fn error(
+    request_id: &Value,
+    operation_id: &Value,
+    code: &str,
+    reason: &str,
+    effect: &str,
+) -> Value {
+    json!({
+        "type": "error",
+        "request_id": request_id,
+        "operation_id": operation_id,
+        "error": {
+            "code": code,
+            "reason": reason,
+            "message": format!("{code}: {reason}"),
+            "effect": effect,
+        },
+    })
+}
+
+/// A worker reads an exec, and before it has sent the exec anywhere
+/// Fabric observes it: the worker knows nothing of it yet and answers
+/// `unknown`/`observation_failed`. A read that learned nothing changes
+/// nothing, so the exec stays `dispatched` and the request's own answer,
+/// a refusal before any effect, settles it `rejected`. Were the observe
+/// to move it `unknown`, the refusal could not be recorded and the exec
+/// would block the job's replacement although nothing ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_observe_that_learned_nothing_leaves_a_dispatched_request_to_its_answer() {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let request = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(request["type"], "request", "{request}");
+        let observe = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(observe["type"], "observe", "{observe}");
+        let mut answer = error(
+            &observe["request_id"],
+            &observe["operation_id"],
+            "unknown",
+            "observation_failed",
+            "unknown",
+        );
+        answer["error"]["resource"] = observe["resource"].clone();
+        let frame = frames::encode(&answer, 16 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let refusal = error(
+            &request["request_id"],
+            &request["operation"]["id"],
+            "denied",
+            "policy_denied",
+            "none",
+        );
+        let frame = frames::encode(&refusal, 16 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        (reader, writer)
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let target = fx("key-9");
+    let exec = fabric_bridge::Effect {
+        operation: operation(1),
+        scope: common::scope(),
+        action: Action::Exec {
+            target: target.clone(),
+            params: fabric_bridge::wire::ExecParams {
+                argv: vec!["true".into()],
+                stdin: None,
+                cwd: None,
+                timeout_ms: 1000,
+                max_output_bytes: 1024,
+                secret_names: Vec::new(),
+            },
+        },
+        approval: None,
+        policy: None,
+        deadline_ms: 5000,
+    };
+    let running = bridge.request(&mut log, exec).await.unwrap();
+    let observed = bridge
+        .observe(
+            &mut log,
+            OperationId::from_bytes([1; 16]),
+            "sandbox.exec",
+            target,
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut log))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Dispatched);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), running.finish(&mut log))
+        .await
+        .expect("the request was never answered");
+    let outcome = outcome.unwrap_or_else(|e| panic!("the refusal was not recorded: {e}"));
+    assert_eq!(outcome.status, ProviderStatus::Rejected);
+    let entry = log
+        .entry(OperationId::from_bytes([1; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.status, ProviderStatus::Rejected);
+    let _streams = script.await.unwrap();
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// A caller drops a create before its answer, and the worker is then
+/// lost with it in flight. Nothing waits on it, so no answer or loss can
+/// settle it; the next call handed the log records it `unknown`, as the
+/// protocol's loss rule says of every dispatched operation of a lost
+/// worker, instead of leaving it `dispatched` until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lost() {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let (read, was_read) = oneshot::channel::<()>();
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let request = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(request["type"], "request", "{request}");
+        read.send(()).unwrap();
+        // The worker ends with the request in flight: its output closes.
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        reader
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let dropped = bridge
+        .request(&mut log, create(1, "fixture/ok"))
+        .await
+        .unwrap();
+    drop(dropped);
+    was_read.await.unwrap();
+    let started = std::time::Instant::now();
+    while bridge.lost().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the worker was never lost"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bridge.record_late(&mut log).await.unwrap();
+    let entry = log
+        .entry(OperationId::from_bytes([1; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    assert_eq!(entry.locator, None);
+    let _reader = script.await.unwrap();
 }
 
 /// A worker that answers the handshake, then reads every frame until its
@@ -525,4 +742,471 @@ async fn an_observe_after_a_shutdown_is_refused_as_shutting_down() {
     }
     assert_eq!(shutdown.wait().await.unwrap(), []);
     assert_eq!(worker.read(bridge).await, ["shutdown"]);
+}
+
+/// After `shutdown`, an attach and a cleanup are refused as shutting down
+/// before anything else is looked at, as a request and an observe are:
+/// an attach of an operation the journal does not hold and with a wait of
+/// 0, a cleanup of a create it does not hold. Nothing is written after
+/// the shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_and_a_cleanup_after_a_shutdown_are_refused_as_shutting_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (mut worker, bridge) = Draining::start(config()).await;
+    let shutdown = bridge.shutdown(5000).await.unwrap();
+    for exited in [false, true] {
+        if exited {
+            worker.exit(&bridge).await;
+        } else {
+            assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+        }
+        let attach = bridge
+            .attach(&mut journal, OperationId::from_bytes([1; 16]), 0)
+            .await;
+        assert!(
+            matches!(attach, Err(BridgeError::ShuttingDown)),
+            "attach, exited {exited}: {attach:?}"
+        );
+        let cleanup = bridge
+            .cleanup(
+                &mut journal,
+                fabric_bridge::Cleanup {
+                    creating: OperationId::from_bytes([1; 16]),
+                    id: OperationId::from_bytes([2; 16]),
+                    key: fabric_core::managed::OperationKey::parse("cleanup-key").unwrap(),
+                    approval: "apr-1".into(),
+                    deadline_ms: 1000,
+                },
+            )
+            .await;
+        assert!(
+            matches!(cleanup, Err(BridgeError::ShuttingDown)),
+            "cleanup, exited {exited}: {cleanup:?}"
+        );
+    }
+    assert_eq!(shutdown.wait().await.unwrap(), []);
+    assert_eq!(worker.read(bridge).await, ["shutdown"]);
+}
+
+/// A `sandbox.destroy` of `target` as operation `n`, under approval `ref`.
+fn destroy_of(n: u8, target: &fabric_bridge::wire::Locator, approval: &str) -> Effect {
+    Effect {
+        operation: operation(n),
+        scope: common::scope(),
+        action: Action::Destroy {
+            target: target.clone(),
+        },
+        approval: Some(approval.to_owned()),
+        policy: None,
+        deadline_ms: 5000,
+    }
+}
+
+/// A `result` `completed` answering a request for `resource`.
+fn completed(request: &Value, resource: &Value, output: &Value) -> Value {
+    json!({
+        "type": "result",
+        "request_id": request["request_id"],
+        "operation_id": request["operation"]["id"],
+        "state": "completed",
+        "resource": resource,
+        "output": output,
+        "replayed": false,
+        "receipts": [],
+    })
+}
+
+/// A worker that acknowledges `hello`, then reads session frames and
+/// answers each in turn with what `answers` makes of it, in order, and
+/// hands back the frames it read once the script ran out.
+fn play(
+    mut reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    mut writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    answers: Vec<fn(&Value) -> Value>,
+) -> tokio::task::JoinHandle<Vec<Value>> {
+    tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let mut read = Vec::new();
+        for answer in answers {
+            let frame = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+            let reply = answer(&frame);
+            read.push(frame);
+            let encoded = frames::encode(&reply, 16 << 20).unwrap();
+            frames::write(&mut writer, &encoded).await.unwrap();
+        }
+        // Kept open until the test is done with the bridge.
+        std::mem::forget((reader, writer));
+        read
+    })
+}
+
+/// The fixture locator of `fx-key-1` as JSON.
+fn fx_key_1() -> Value {
+    json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+        "native_id": "fx-key-1",
+    })
+}
+
+fn create_done(request: &Value) -> Value {
+    assert_eq!(request["type"], "request", "{request}");
+    assert_eq!(request["action"], "sandbox.create", "{request}");
+    completed(request, &fx_key_1(), &json!({"status": "ready"}))
+}
+
+fn destroy_not_found(request: &Value) -> Value {
+    assert_eq!(request["type"], "request", "{request}");
+    assert_eq!(request["action"], "sandbox.destroy", "{request}");
+    error(
+        &request["request_id"],
+        &request["operation"]["id"],
+        "provider_failed",
+        "not_found",
+        "none",
+    )
+}
+
+fn observe_failed(observe: &Value) -> Value {
+    assert_eq!(observe["type"], "observe", "{observe}");
+    let mut answer = error(
+        &observe["request_id"],
+        &observe["operation_id"],
+        "unknown",
+        "observation_failed",
+        "unknown",
+    );
+    answer["error"]["resource"] = observe["resource"].clone();
+    answer
+}
+
+fn observe_absent(observe: &Value) -> Value {
+    assert_eq!(observe["type"], "observe", "{observe}");
+    let mut answer = error(
+        &observe["request_id"],
+        &observe["operation_id"],
+        "unknown",
+        "absent",
+        "unknown",
+    );
+    answer["error"]["observations"] = json!(1);
+    answer["error"]["deadline_ms"] = observe["wait_ms"].clone();
+    answer["error"]["searched"] = json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+    });
+    answer
+}
+
+/// An `absent` answer whose `searched` is another project than the
+/// resource observed: a worker bound elsewhere, or one that misreports.
+fn observe_absent_elsewhere(observe: &Value) -> Value {
+    let mut answer = observe_absent(observe);
+    answer["error"]["searched"]["scope"]["project"] = json!("proj-2");
+    answer
+}
+
+/// The scope `observe_absent` says it searched, as the journal stores it.
+const SEARCHED: &str =
+    r#"{"kind":"sandbox","provider":"fixture","scope":{"account":"acct-a","project":"proj-1"}}"#;
+
+/// A job's create succeeded, then its destroy is answered `not_found`.
+/// Returns the bridge, the journal and the script, with the destroy
+/// `unknown`, its answer on the row and the barrier up.
+async fn not_found_destroy(
+    answers: Vec<fn(&Value) -> Value>,
+) -> (Bridge, Logged, tokio::task::JoinHandle<Vec<Value>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    std::mem::forget(dir);
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (reader, writer) = tokio::io::split(worker);
+    let mut script = vec![create_done as fn(&Value) -> Value, destroy_not_found];
+    script.extend(answers);
+    let played = play(reader, writer, script);
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let made = bridge
+        .request(&mut journal, create(1, "fixture/ok"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(made.status, ProviderStatus::Succeeded);
+    let stop = bridge
+        .request(&mut journal, destroy_of(2, &fx("key-1"), "apr-destroy-1"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(
+        stop.status,
+        ProviderStatus::Unknown,
+        "not_found says the provider did not find it, not where it went"
+    );
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.answer,
+        ProviderAnswer {
+            code: Some("provider_failed".into()),
+            reason: Some("not_found".into()),
+            effect: Some("none".into()),
+        },
+        "the reason stays visible"
+    );
+    assert_eq!(row.searched, None);
+    let job = common::scope().job;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![fabric_journal::Blocker::StopNotConfirmed {
+            operation: OperationId::from_bytes([2; 16]),
+            status: ProviderStatus::Unknown,
+        }]
+    );
+    assert_eq!(journal.residuals(job).unwrap().len(), 1);
+    (bridge, journal, played)
+}
+
+/// A destroy the worker answers `provider_failed`/`not_found` is
+/// recorded `unknown`, not `failed`: the provider did not find the
+/// resource, and nothing says it is gone from the scope. It keeps the
+/// replacement barrier with its reason on the row. An observe of the
+/// resource that answers `unknown`/`absent` with the scope it searched
+/// is the evidence that lifts it: the destroy settles `succeeded`, the
+/// searched scope is stored, and the create is no residual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_destroy_is_unknown_until_an_observe_finds_its_resource_absent() {
+    let (bridge, mut journal, played) = not_found_destroy(vec![observe_absent]).await;
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([2; 16]),
+            "sandbox.destroy",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut journal))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Succeeded);
+    assert_eq!(row.searched.as_deref(), Some(SEARCHED));
+    assert_eq!(row.answer.reason.as_deref(), Some("absent"));
+    let job = common::scope().job;
+    assert!(journal.replacement_blockers(job).unwrap().is_empty());
+    assert_eq!(journal.residuals(job).unwrap(), vec![]);
+    assert_eq!(played.await.unwrap().len(), 3);
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// Absence settles the destroy only where the resource is: an observe of
+/// the `not_found` destroy answered `absent` for another scope than the
+/// destroy's target (a worker bound to another project, or one that
+/// misreports what it searched) is not evidence about that resource. The
+/// destroy stays `unknown`, nothing is stored as searched, the barrier
+/// and the residual stay, and the worker is not lost over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absent_observe_of_another_scope_does_not_settle_a_not_found_destroy() {
+    let (bridge, mut journal, played) = not_found_destroy(vec![observe_absent_elsewhere]).await;
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([2; 16]),
+            "sandbox.destroy",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut journal))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Unknown);
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(row.searched, None, "a search elsewhere is not about it");
+    assert_eq!(row.answer.reason.as_deref(), Some("not_found"));
+    let job = common::scope().job;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![fabric_journal::Blocker::StopNotConfirmed {
+            operation: OperationId::from_bytes([2; 16]),
+            status: ProviderStatus::Unknown,
+        }]
+    );
+    assert_eq!(journal.residuals(job).unwrap().len(), 1);
+    assert_eq!(played.await.unwrap().len(), 3);
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// Without absent evidence the barrier stays: an observe of the
+/// `not_found` destroy that cannot read the resource
+/// (`unknown`/`observation_failed`) learns nothing, so the destroy stays
+/// `unknown`, blocks a replacement and keeps its residual listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_destroy_keeps_the_barrier_while_nothing_finds_its_resource_absent() {
+    let (bridge, mut journal, played) = not_found_destroy(vec![observe_failed]).await;
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([2; 16]),
+            "sandbox.destroy",
+            fx("key-1"),
+            1000,
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed.finish(&mut journal))
+        .await
+        .expect("the observe was never answered")
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Unknown);
+    let row = journal
+        .provider_operation(OperationId::from_bytes([2; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(row.searched, None, "nothing was searched");
+    let job = common::scope().job;
+    assert_eq!(
+        journal.replacement_blockers(job).unwrap(),
+        vec![fabric_journal::Blocker::StopNotConfirmed {
+            operation: OperationId::from_bytes([2; 16]),
+            status: ProviderStatus::Unknown,
+        }]
+    );
+    assert_eq!(journal.residuals(job).unwrap().len(), 1);
+    assert_eq!(played.await.unwrap().len(), 3);
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// An exec of `target` as operation `n` with these bounds.
+fn exec_of(
+    n: u8,
+    target: &fabric_bridge::wire::Locator,
+    timeout_ms: u64,
+    max_output_bytes: u64,
+) -> Effect {
+    Effect {
+        operation: operation(n),
+        scope: common::scope(),
+        action: Action::Exec {
+            target: target.clone(),
+            params: ExecParams {
+                argv: vec!["true".into()],
+                stdin: None,
+                cwd: None,
+                timeout_ms,
+                max_output_bytes,
+                secret_names: Vec::new(),
+            },
+        },
+        approval: None,
+        policy: None,
+        deadline_ms: 5000,
+    }
+}
+
+/// What the profile in `ack` bounds an exec's `timeout_ms` and
+/// `max_output_bytes` at.
+fn exec_bounds() -> (u64, u64) {
+    let hello = json!({"limits": {}});
+    let profile = fabric_bridge::wire::Profile::from_value(&ack(&hello)["profile"]).unwrap();
+    (
+        profile.limits.max_timeout_ms,
+        profile.limits.max_output_bytes,
+    )
+}
+
+/// An exec whose `timeout_ms` or `max_output_bytes` is above the bound
+/// the profile advertises in `hello_ack`, and a destroy or an exec whose
+/// target has an empty `native_id`, are refused before sending with the
+/// code and reason the worker would answer, `invalid`/`limit` and
+/// `invalid`/`missing_field`, and recorded `rejected`: the first frame the
+/// worker reads is the request within the bounds that follows them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_above_the_profile_bounds_or_at_no_resource_is_refused_before_sending() {
+    fn exec_done(request: &Value) -> Value {
+        assert_eq!(request["type"], "request", "{request}");
+        let stream = json!({"text": "", "captured_bytes": 0, "truncated": false, "lossy": false});
+        completed(
+            request,
+            &request["target"],
+            &json!({"exit_code": 0, "stdout": stream, "stderr": stream}),
+        )
+    }
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (reader, writer) = tokio::io::split(worker);
+    let played = play(reader, writer, vec![exec_done]);
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let (max_timeout_ms, max_output_bytes) = exec_bounds();
+    let target = fx("key-1");
+    let mut unnamed = target.clone();
+    unnamed.native_id = String::new();
+    let refused = [
+        (exec_of(1, &target, max_timeout_ms + 1, 1024), "limit"),
+        (exec_of(2, &target, 1000, max_output_bytes + 1), "limit"),
+        (exec_of(3, &unnamed, 1000, 1024), "missing_field"),
+        (destroy_of(4, &unnamed, "apr-destroy-1"), "missing_field"),
+    ];
+    for (effect, reason) in refused {
+        let n = effect.operation.id.to_bytes()[0];
+        let result = bridge.request(&mut log, effect).await;
+        match result {
+            Err(BridgeError::RefusedLocally(refusal)) => {
+                assert_eq!((refusal.code, refusal.reason), ("invalid", reason), "{n}");
+            }
+            other => panic!("{n}: {other:?}"),
+        }
+        let entry = log
+            .entry(OperationId::from_bytes([n; 16]))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{n}: recorded rejected"));
+        assert_eq!(entry.status, ProviderStatus::Rejected, "{n}");
+    }
+    let within = bridge
+        .request(
+            &mut log,
+            exec_of(5, &target, max_timeout_ms, max_output_bytes),
+        )
+        .await
+        .unwrap()
+        .finish(&mut log)
+        .await
+        .unwrap();
+    assert_eq!(within.status, ProviderStatus::Succeeded);
+    let read = played.await.unwrap();
+    assert_eq!(read.len(), 1, "nothing refused reached the worker");
+    assert_eq!(
+        read[0]["operation"]["id"],
+        OperationId::from_bytes([5; 16]).to_string()
+    );
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
 }

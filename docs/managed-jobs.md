@@ -1,6 +1,6 @@
 # Managed jobs: identity, journal v1, operation states and replay
 
-Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day; on `main` since 2026-11-03 (PR #31), with schema version 2 (PR #32) beside it. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`.
+Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day; on `main` since 2026-11-03 (PR #31), with schema version 2 (PR #32) beside it. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; it is on `main` since 2026-11-08 (PR #36), and its "As built (M4)" notes record where the code differs.
 
 ## Identity
 
@@ -309,6 +309,8 @@ Version 2 (M3, ADR 0021) adds one table, `provider_operations`, and changes noth
 - `provider_record` moves `dispatched` to any answer, `unknown` only to `succeeded`, `failed` or `cancelled`, and never moves a terminal status. Recording the status a row has stores the answer and the locator alone, as a `pending` answer does.
 - `recover` makes every provider operation left `dispatched` `unknown` and lists it in `Recovery::provider_unknown`; nothing is sent again.
 
+M4 (ADR 0022) amends this table in place, since version 2 has never shipped: it gains the columns and statuses of "Reconciliation and cleanup (M4)" below, and `tests/fixtures/v2.sqlite` is regenerated with them.
+
 ### Versioning and migration
 
 - `create` builds the file as `journal.sqlite.tmp`, sets the pragmas, runs the version 1 DDL, every migration and the `meta` rows in one transaction, closes it, renames it into place and syncs the directory, as `Catalog::create` does.
@@ -394,3 +396,448 @@ Disjoint files, so the groups can work in parallel; the defect register in `docs
 | G3 authority wiring | `crates/fabricd/src/authority.rs` (new), `crates/fabricd/src/control.rs`, `crates/fabricd/src/node.rs`, `crates/fabric-client/src/api.rs`, `protocol/*`, `sdk/typescript/src/*`, `crates/fabric/src/managed.rs` (new). The one dispatch line for the managed subcommands in `crates/fabric/src/lib.rs` lands after group A's launch change, which owns that file. |
 
 As built, the core change also touched, each in one place: `crates/fabricd/src/ops.rs` (one dispatch arm sending the four managed ops to `crates/fabricd/src/managed.rs`), `crates/fabricd/src/error.rs` (the `NodeError::Managed` variant and its reason), `crates/fabric/src/render.rs` (the reply lines of the four ops), and `crates/fabric/tests/e2e/main.rs` (two module lines). The owners of those files keep them; the lines above are the only ones this change added.
+
+## Reconciliation and cleanup (M4)
+
+Status: proposed with ADR 0022, 2026-10-29; implemented in Fabric the same day (`crates/fabric-journal/src/provider.rs`, `crates/fabric-bridge`), and the Capsule worker's `attach` on Capsule `m4/reconciliation`; the seam is run both ways in docs/evidence/m4. The wire side (the `attach` message, its answers and fixtures) is in docs/bridge-protocol.md, section "Reconciliation (M4)".
+
+Acceptance (roadmap M4): a lost response or a worker restart never triggers a blind duplicate creation; unknown remains explicit; a stop failure blocks an unsafe replacement.
+
+### What M3 already provides
+
+M4 adds only what is missing. These are in the M3 code and tests and do not change:
+
+| Need | M3 mechanism | Pinned by |
+|---|---|---|
+| Durable intent before any frame | `Journal::provider_begin` commits the row `dispatched` (or `rejected`) in its own `BEGIN IMMEDIATE` transaction; the client records it and queues the frame in one call on the log thread, so the record always precedes the frame | `fabric-journal` `provider::tests::a_key_or_an_id_is_dispatched_once`, `fabric-bridge` `tests/off_runtime.rs`, `tests/process.rs` |
+| Nothing sent twice | key and id unique across `operations` and `provider_operations`; `Log(Used)` before any frame | `a_key_or_an_id_is_dispatched_once`, `a_command_cannot_take_a_provider_key` |
+| Fencing of effects | `provider_begin` refuses a closed job and any attempt that is not the job's current grant, `granted` or `running`, at the job's generation | `only_the_current_live_attempt_dispatches` |
+| Unknown on loss | worker lost, framing broken, deadline plus grace passed, the caller stopped waiting, or authority restarted: `dispatched` becomes `unknown`; `unknown` moves only to an observed terminal state | `statuses_move_only_forward`, `the_target_is_kept_from_dispatch_through_recovery`, scenario `worker_loss_is_not_cancellation`, `tests/process.rs` `a_late_answer_records_the_locator_it_names_and_not_its_status`, `tests/stream.rs` `a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lost` |
+| Target kept from dispatch | the target locator is written once with the dispatch, so a destroy lost before any answer still names its resource | `the_target_is_kept_from_dispatch_through_recovery` |
+| Locator as early as known | `progress` and late answers store the locator (`provider_locate`, `record_late`) | `tests/process.rs`, `tests/capsule_worker.rs` |
+| Observe by original identity | `Bridge::observe` for `dispatched` or `unknown` only, with the journal's scope, action and target or locator (`ObserveMismatch` otherwise); the worker checks owner labels | scenarios `unknown_after_dispatch_with_locator`, `observe_checks_owner`, `exec_observed_until_exit`, `exec_observe_after_worker_loss` |
+| Fresh per-operation approval | the `approval` slot; destroy needs its own grant in both profiles; a create grant or an expired grant is refused before any effect | scenario `fresh_approval_required` |
+| Worker-side find by identity | the worker's `findCreated` (fixture: `fx-<key>`; Docker: `docker ps` by the `fabric.operation` label) deduplicates a create; Docker create, start and rm clients run in groups of their own, so losing the worker never aborts an effect | Capsule `packages/bridge-worker` tests, `docker.test.ts` |
+
+What is missing, and what M4 adds:
+
+| Gap in M3 | M4 addition |
+|---|---|
+| A create lost before any answer has no locator, so it can never be observed | the `attach` message and `Bridge::attach` |
+| `unknown` has no exit except an observed terminal state | the statuses `attached`, `observed`, `abandoned` and `Journal::provider_abandon` |
+| A runner can create again while a create is `unknown` | `provider_begin` refuses a create while the job holds a create `unknown` |
+| `StartAttempt` ignores provider effects | the replacement barrier, `DomainError::ReplacementBlocked` |
+| No cleanup once the attempt ended or the job closed | purpose `cleanup`, `Bridge::cleanup`, `Journal::residuals` |
+| Locators compared as text, which depends on key order | `ResourceKey`, a digest of the locator's identity |
+
+### The pre-dispatch intent record
+
+The `provider_operations` row, committed before the frame, is the intent. M4 completes it; it stays one write per dispatch.
+
+```rust
+// fabric-journal, provider module
+
+/// What an effect does to its resource: the `effect` of its action in the
+/// capability profile it was dispatched under.
+pub enum EffectClass { Create, Mutate, Destroy }
+
+/// Why a provider operation was dispatched.
+pub enum Purpose {
+    /// An effect the attempt asked for.
+    Effect,
+    /// A destroy of the resource that the create `cleans` made (same job).
+    Cleanup { cleans: OperationId },
+}
+
+/// blake3 of "fabric.bridge.locator.v1\0" followed by the canonical JSON
+/// (keys sorted) of a locator's provider, scope, kind and native_id;
+/// native_operation_id is left out. Computed by fabric-bridge, compared by
+/// the journal, never parsed by it.
+pub struct ResourceKey([u8; 32]);
+
+/// A locator as the journal stores it.
+pub struct LocatorRecord {
+    /// Fabric's canonical JSON of the locator (keys sorted), as it would send it.
+    pub text: String,
+    /// Its key.
+    pub key: ResourceKey,
+}
+
+pub struct ProviderDispatch {
+    pub operation: OperationId,
+    pub key: OperationKey,
+    pub digest: RequestDigest,
+    pub job: JobId,
+    pub task: TaskId,
+    pub attempt: AttemptId,
+    pub generation: Generation,
+    /// New: the profile negotiated with the worker the frame goes to.
+    pub profile: String,
+    pub action: String,
+    /// New: from the profile, so the journal never reads a profile.
+    pub effect: EffectClass,
+    /// New.
+    pub purpose: Purpose,
+    /// Was `Option<String>`: now the canonical text and its key; `None` for a create.
+    pub target: Option<LocatorRecord>,
+}
+```
+
+Rules at `provider_begin`, in this order, all inside its one transaction, nothing written on a refusal:
+
+1. Key and id unused in `operations` and `provider_operations` (M3).
+2. Purpose `effect`: the job is active and the attempt is its current grant, `granted` or `running`, at the job's generation (M3). Purpose `cleanup`: the rules of "Fresh cleanup approval flow" below instead.
+3. Effect class `create`: refused `ProviderError::CreateUnresolved { operation }` while any create of the same job is `unknown`.
+4. Insert `dispatched`, or `rejected` with Fabric's own refusal.
+
+### Schema version 2, amended
+
+Version 2 has never shipped, so M4 changes its one table in place rather than adding version 3. The table after M4:
+
+```sql
+CREATE TABLE provider_operations (
+  operation_id   BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
+  op_key         TEXT NOT NULL UNIQUE,
+  request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+  job_id         BLOB NOT NULL REFERENCES jobs(job_id),
+  task_id        BLOB NOT NULL REFERENCES tasks(task_id),
+  attempt_id     BLOB NOT NULL REFERENCES attempts(attempt_id),
+  generation     INTEGER NOT NULL CHECK (generation >= 1),
+  profile        TEXT NOT NULL,
+  action         TEXT NOT NULL,
+  effect_class   TEXT NOT NULL CHECK (effect_class IN ('create','mutate','destroy')),
+  purpose        TEXT NOT NULL CHECK (purpose IN ('effect','cleanup')),
+  cleans         BLOB REFERENCES provider_operations(operation_id),
+  target         TEXT,
+  target_key     BLOB CHECK (target_key IS NULL OR length(target_key) = 32),
+  status         TEXT NOT NULL CHECK (status IN ('dispatched','unknown','attached','observed',
+                   'succeeded','failed','cancelled','rejected','abandoned')),
+  code           TEXT,
+  reason         TEXT,
+  effect         TEXT CHECK (effect IS NULL OR effect IN ('none','applied','pending','unknown')),
+  locator        TEXT,
+  locator_key    BLOB CHECK (locator_key IS NULL OR length(locator_key) = 32),
+  searched       TEXT,
+  abandon_reason TEXT,
+  dispatched_ms  INTEGER NOT NULL,
+  updated_ms     INTEGER NOT NULL,
+  CHECK ((target IS NULL) = (target_key IS NULL)),
+  CHECK ((locator IS NULL) = (locator_key IS NULL)),
+  CHECK ((purpose = 'cleanup') = (cleans IS NOT NULL)),
+  CHECK (purpose = 'effect' OR effect_class = 'destroy'),
+  CHECK ((status = 'abandoned') = (abandon_reason IS NOT NULL)),
+  CHECK (status NOT IN ('attached','observed') OR locator IS NOT NULL OR target IS NOT NULL)
+) STRICT;
+CREATE INDEX provider_operations_by_status ON provider_operations (status, dispatched_ms);
+CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
+  WHERE target_key IS NOT NULL;
+```
+
+- `profile`, `effect_class` and `purpose` are written once at dispatch, like `target` and `target_key`.
+- `locator` and `locator_key` are the last locator the worker reported, re-encoded canonically by the bridge before it is stored, so two reports of one resource store equal text.
+- `searched` is the canonical JSON of the scope the last `absent` answer searched (`{ "provider", "scope", "kind" }`): an attach of a create, or the observe that settled a destroy (2026-11-02). It is kept for the owner and for the abandonment acknowledgement.
+- `abandon_reason` is set exactly when the status is `abandoned`.
+- The `by_status` index serves recovery, the barrier and the create guard (they read the few non-settled rows); the partial `by_target` index serves "a destroy of this resource settled `succeeded`". No other index is added, so an effect without a target writes the same index entries as in M3.
+
+### Reconciliation state machine
+
+```text
+                     provider_begin (row committed before the frame)
+  rejected <---- Fabric refused it before sending
+                          |
+                          v
+                     dispatched ---- result completed / cancelled ------------> settled
+                      |      ^ \---- provider_failed; invalid, unsupported,
+                      |      |       denied, unavailable ---------------------> settled (failed / rejected)
+                      |      +------ pending, result accepted or running,
+                      |              progress: locator and answer stored
+    unknown answer,   |
+    deadline + grace, |
+    worker lost,      v
+    restart ------> unknown ---- observe or attach result ---------------------> settled
+                    |  |  \---- attach pending, or attach unknown with a
+                    |  |        locator --------------------------------------> attached
+                    |  \------- observe pending ------------------------------> observed
+                    |            attached --- observe pending ----------------> observed
+                    |            attached, observed --- observe result -------> settled
+                    \---------- owner approval (from unknown, attached,
+                                 observed) -----------------------------------> abandoned
+```
+
+`settled` is one of `succeeded`, `failed`, `cancelled` and `rejected`; `abandoned` and every settled status are terminal. As a table, the status after each event:
+
+| Event | From | To |
+|---|---|---|
+| `provider_begin` | none | `dispatched`, or `rejected` when Fabric refused it before sending |
+| `result` `completed` / `cancelled` to the request | `dispatched` | `succeeded` / `cancelled` |
+| `error` `provider_failed` | `dispatched` | `failed` |
+| `error` `provider_failed`/`not_found` to a `sandbox.destroy` request | `dispatched` | `unknown`, answer stored: the provider did not find the resource, which does not say it is gone from the scope (2026-11-02, docs/bridge-protocol.md "Absence settles a destroy") |
+| `error` `invalid`, `unsupported`, `denied`, `unavailable` | `dispatched` | `rejected` |
+| `error` `pending`, `result` `accepted` or `running`, `progress` | `dispatched` | `dispatched`, locator and answer stored |
+| `error` `unknown`; no answer by the deadline plus grace; worker lost; the caller dropped the request; `recover` | `dispatched` | `unknown` |
+| observe or attach `result` (an observed terminal state) | `unknown`, `attached`, `observed` | `succeeded` or `cancelled` (`failed` stays reachable from these for an observed terminal failure, as in M3) |
+| attach `error` `pending`; attach `error` `unknown`/`observation_failed` with a locator | `unknown` | `attached`, locator stored |
+| attach `error` `unknown`/`absent` | `unknown` | `unknown`, answer and `searched` stored |
+| observe `error` `unknown`/`absent` of a destroy's resource | `dispatched`, `unknown`, `observed` | `succeeded`, answer and `searched` stored: the resource is absent from the scope the destroy was to remove it from (`provider_absent`, 2026-11-02) |
+| observe `error` `unknown`/`absent` of anything but a destroy | any | unchanged; `searched` stored for an `unknown` operation |
+| observe `error` `pending` | `unknown`, `attached`, `observed` | `observed`, locator stored |
+| observe `error` `pending` | `dispatched` | `dispatched`, locator stored (M3, unchanged) |
+| observe or attach refused, `unknown` without a new locator, worker lost or timed out during the read | any | unchanged: a read that learned nothing changes nothing |
+| observe `error` `unknown`, or the observe lost or timed out, of a `dispatched` operation whose request is in flight on this bridge | `dispatched` | unchanged: that request's own answer, deadline or loss settles it, and a refusal it answers is still recorded `rejected` (`tests/stream.rs` `an_observe_that_learned_nothing_leaves_a_dispatched_request_to_its_answer`) |
+| observe `error` `unknown`, or the observe lost or timed out, of a `dispatched` operation with no request in flight (one answered `running`) | `dispatched` | `unknown` (M3, scenario `exec_observe_after_worker_loss`) |
+| `provider_abandon` with a matching approval | `unknown`, `attached`, `observed` | `abandoned` |
+
+Meaning of the new states:
+
+- `attached`: the operation's resource was found by its identity after its answer was lost; its locator is now known; its action has not been seen terminal.
+- `observed`: after the operation went `unknown`, a read saw its effect in a non-terminal state (a destroy `stopping`, an exec `running`).
+- `abandoned`: the owner approved giving up on certainty for this operation. It says nothing about whether the effect happened or stopped.
+
+Restart recovery is unchanged: only `dispatched` becomes `unknown`. `attached`, `observed` and `abandoned` hold no request in flight and stay as they are.
+
+### Which profiles observe or attach
+
+`observe` is supported for an action exactly when its profile entry says `observe: true` (v1). `attach` is supported for an action exactly when its `effect` is `create` and its `dedupe` is `provider_key` or `label_query`; there is no separate profile field. An action outside these is refused before anything is sent, with the code and reason the worker would answer (`unsupported`/`observe`, `unsupported`/`attach`).
+
+| Profile | `sandbox.create` | `sandbox.exec` | `sandbox.destroy` |
+|---|---|---|---|
+| fixture | observe: yes. attach: yes (`provider_key`: the resource is `fx-<operation key>`; its owner and operation labels must name the attaching job and operation) | observe: yes, from the worker's exec ledger; a restarted worker answers `unknown`. attach: no (`dedupe: none`) | observe: yes (gone is terminal). attach: no (not a create) |
+| docker | observe: yes (`docker inspect`; running is terminal). attach: yes (`label_query`: the container labelled `fabric.operation=<operation id>` in the bound engine; its `fabric.job` label must name the attaching job) | observe: yes, from the exec ledger only. attach: no: an exec instance cannot be attached again after its client ended | observe: yes (container gone is terminal). attach: no |
+
+No profile retries a create: Fabric never resends one, whatever its `dedupe`.
+
+### The replacement barrier
+
+```rust
+// fabric-journal
+
+/// A provider operation that keeps a replacement attempt from being granted.
+pub enum Blocker {
+    /// A create that is `dispatched` or `unknown`: its resource cannot be named.
+    CreateUnresolved { operation: OperationId, status: ProviderStatus },
+    /// An exec not settled (`abandoned` included) whose sandbox has no
+    /// destroy settled `succeeded`.
+    ExecMayRun { operation: OperationId, status: ProviderStatus },
+    /// A destroy `dispatched`, `unknown`, `observed`, `failed`, `cancelled`
+    /// or `abandoned` whose resource has no destroy settled `succeeded`.
+    StopNotConfirmed { operation: OperationId, status: ProviderStatus },
+}
+
+impl Journal {
+    /// Every blocker of the job, oldest dispatch first.
+    pub fn replacement_blockers(&self, job: JobId) -> Result<Vec<Blocker>, CommitError>;
+}
+
+// fabric-core, managed: DomainError gains, after its last variant,
+ReplacementBlocked { operation: OperationId },
+```
+
+Rule: `Journal::submit` evaluates the barrier in the transaction of every `StartAttempt` the domain accepts. When the job has a blocker, the command is stored `rejected` with `ReplacementBlocked` naming the oldest blocker, like any domain refusal: a retry under the same key gets the same refusal, and a new key is needed once the blocker is gone. Matching "the same resource" is equality of `ResourceKey`: an exec's or a destroy's `target_key` against a destroy's `target_key`.
+
+What does not block: a destroy settled `succeeded` or `rejected` (no effect); an exec settled; a create `attached`, `observed`, settled or `abandoned`. What unblocks a stop that failed: a new destroy of the same resource, with its own fresh approval, that settles `succeeded`. What unblocks a destroy the provider answered `not_found`, which is `unknown` with that reason on its row: an observe of its resource that answers `absent` with the scope it searched, which settles that destroy `succeeded` with the scope stored (2026-11-02); the `not_found` answer alone keeps the barrier. Abandoning a destroy or an exec never unblocks.
+
+### Fresh cleanup approval flow
+
+1. `Journal::residuals(job)` lists what the job's creates may have left: every create `succeeded`, `attached`, `observed`, `unknown` or `abandoned`, and every create `failed` with a locator, whose resource has no destroy settled `succeeded`. A create with no locator is listed without one, with `searched` when an attach looked.
+2. The caller asks for a cleanup of one listed create with an approval reference supplied for this call: `Bridge::cleanup`. Fabric stores no approval reference, so it can never reuse one.
+3. Fabric refuses before writing anything, with `CleanupRefusal`, when: the named operation is not a create of a provider operation the journal holds (`NotACreate`); it has no locator (`Unlocated`: attach it first, or it stays a residual); it is still `dispatched` (`StillDispatched`); its resource has a destroy settled `succeeded` (`AlreadyDestroyed`); or a destroy of that resource is `dispatched`, `unknown` or `observed` (`InFlight`: observe that one first). A cleanup with no approval reference does not type-check.
+4. Fabric commits the cleanup `dispatched` with purpose `cleanup`, `cleans` the create, the create's own scope (job, task, attempt, generation), and the create's locator as its target. Unlike an effect it is accepted when the attempt has ended and when the job has finished or been cancelled. Then it writes an ordinary `request` for `sandbox.destroy` with that scope, target and approval reference. There is no cleanup message on the wire.
+5. The worker resolves the reference to a grant scoped to `sandbox.destroy` on that resource and refuses before any effect when there is none (`approval_required`), when it names another action or resource (`approval_scope`, so a create grant never authorizes a destroy) or when it expired (`approval_expired`). Fabric records each refusal `rejected`; the residual stays listed. A destroy that settles `succeeded` removes it from `residuals` and satisfies the barrier for that resource.
+6. Fabric never starts a cleanup itself, after a cancel or otherwise.
+
+```rust
+// fabric-journal
+pub struct Residual {
+    pub creating: OperationId,
+    pub status: ProviderStatus,
+    pub locator: Option<LocatorRecord>,
+    pub searched: Option<String>,
+}
+pub enum CleanupRefusal {
+    NotACreate,
+    Unlocated,
+    StillDispatched,
+    AlreadyDestroyed,
+    InFlight { operation: OperationId },
+}
+impl Journal {
+    pub fn residuals(&self, job: JobId) -> Result<Vec<Residual>, CommitError>;
+}
+
+// fabric-bridge
+pub struct Cleanup {
+    /// The create whose resource is destroyed.
+    pub creating: OperationId,
+    /// A fresh operation id and key for the cleanup itself.
+    pub id: OperationId,
+    pub key: OperationKey,
+    /// The approval reference for this call; never stored.
+    pub approval: String,
+    pub deadline_ms: u64,
+}
+impl Bridge {
+    /// Builds the destroy from the journal (scope, target), computes its
+    /// digest with `wire::request_digest`, records it and queues it.
+    pub async fn cleanup<L: Recorder>(&self, log: &mut L, cleanup: Cleanup) -> Result<InFlight, BridgeError>;
+}
+```
+
+### Abandonment
+
+```rust
+// fabric-journal
+
+/// The owner's approval to stop reconciling one provider operation. It is
+/// bound to the row as the owner saw it, so it cannot apply to a later state.
+pub struct AbandonApproval {
+    pub operation: OperationId,
+    /// `Unknown`, `Attached` or `Observed`: the status the owner saw.
+    pub expected: ProviderStatus,
+    /// What the owner accepts may remain.
+    pub acknowledged: Acknowledged,
+    /// 1 to 512 characters, no control character.
+    pub reason: String,
+}
+pub enum Acknowledged {
+    /// The resource the row names (`locator_key`, else `target_key`).
+    Resource(ResourceKey),
+    /// The scope the row's last absent attach searched, as `searched` holds it.
+    Searched(String),
+    /// The row names no resource and no search.
+    Nothing,
+}
+pub enum AbandonRefusal {
+    /// The status is not `unknown`, `attached` or `observed`.
+    NotAbandonable { status: ProviderStatus },
+    /// The status is not the one the approval expects.
+    Stale { status: ProviderStatus },
+    /// The acknowledgement does not match the row.
+    Acknowledgement,
+    /// The reason is empty, too long or holds a control character.
+    Reason,
+}
+impl Journal {
+    pub fn provider_abandon(&mut self, approval: &AbandonApproval, at_ms: u64) -> Result<(), CommitError>;
+}
+```
+
+M4 has one principal, the local owner, and no control surface drives the bridge yet, so the approval is the owner's call itself. A principal and an expiry come with remote principals (draft P07).
+
+### Signatures M4 changes or adds
+
+```rust
+// fabric-journal
+pub enum ProviderStatus { Dispatched, Unknown, Attached, Observed, Succeeded, Failed, Cancelled, Rejected, Abandoned }
+pub struct ProviderOperation {
+    pub dispatch: ProviderDispatch,
+    pub status: ProviderStatus,
+    pub answer: ProviderAnswer,
+    pub locator: Option<LocatorRecord>,
+    pub searched: Option<String>,
+    pub abandon_reason: Option<String>,
+}
+pub enum ProviderError {
+    KeyUsed { key: OperationKey },
+    OperationUsed { operation: OperationId },
+    UnknownOperation { operation: OperationId },
+    Transition { operation: OperationId, from: &'static str, to: &'static str },
+    CreateUnresolved { operation: OperationId },
+    Cleanup { creating: OperationId, refusal: CleanupRefusal },
+    Abandon { operation: OperationId, refusal: AbandonRefusal },
+}
+impl Journal {
+    pub fn provider_begin(&mut self, dispatch: &ProviderDispatch, refusal: Option<&ProviderAnswer>, at_ms: u64) -> Result<(), CommitError>;
+    pub fn provider_record(&mut self, operation: OperationId, status: ProviderStatus, answer: &ProviderAnswer, locator: Option<&LocatorRecord>, at_ms: u64) -> Result<(), CommitError>;
+    pub fn provider_searched(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str, at_ms: u64) -> Result<(), CommitError>;
+    /// 2026-11-02: an absent observe of a destroy's resource settles the destroy succeeded with the scope stored.
+    pub fn provider_absent(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str, at_ms: u64) -> Result<(), CommitError>;
+    pub fn provider_locate(&mut self, operation: OperationId, locator: &LocatorRecord, at_ms: u64) -> Result<(), CommitError>;
+    pub fn provider_abandon(&mut self, approval: &AbandonApproval, at_ms: u64) -> Result<(), CommitError>;
+    pub fn provider_operation(&self, operation: OperationId) -> Result<Option<ProviderOperation>, CommitError>;
+    pub fn replacement_blockers(&self, job: JobId) -> Result<Vec<Blocker>, CommitError>;
+    pub fn residuals(&self, job: JobId) -> Result<Vec<Residual>, CommitError>;
+}
+
+// fabric-bridge, log module: OperationLog gains, and Entry carries more of the row
+pub trait OperationLog {
+    fn begin(&mut self, dispatch: &ProviderDispatch, refusal: Option<&ProviderAnswer>) -> Result<(), LogError>;
+    fn record(&mut self, operation: OperationId, status: ProviderStatus, answer: &ProviderAnswer, locator: Option<&LocatorRecord>) -> Result<(), LogError>;
+    fn searched(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str) -> Result<(), LogError>;
+    fn absent(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str) -> Result<(), LogError>;
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError>;
+    fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError>;
+    fn cleanup_target(&self, creating: OperationId) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError>;
+}
+pub struct Entry {
+    pub scope: Scope,
+    pub key: OperationKey,
+    pub profile: String,
+    pub action: String,
+    pub effect: EffectClass,
+    pub purpose: Purpose,
+    pub target: Option<LocatorRecord>,
+    pub status: ProviderStatus,
+    pub locator: Option<LocatorRecord>,
+}
+
+// fabric-bridge, wire module
+pub fn resource_key(locator: &Locator) -> ResourceKey;
+pub fn attachable(action: &str, wait_ms: u64, profile: &Profile) -> Result<(), Refusal>;
+
+// fabric-bridge, client
+impl Bridge {
+    /// Sends `attach` for an operation the log holds `unknown` with no
+    /// target and no locator, under the profile it was dispatched with, by
+    /// its original id, key, scope and action.
+    pub async fn attach<L: Recorder>(&self, log: &mut L, operation: OperationId, wait_ms: u64) -> Result<InFlight, BridgeError>;
+    /// M3, widened: also for an operation `attached` or `observed`.
+    pub async fn observe<L: Recorder>(&self, log: &mut L, operation: OperationId, action: &str, resource: Locator, wait_ms: u64) -> Result<InFlight, BridgeError>;
+}
+pub enum BridgeError {
+    // M3 variants, and:
+    /// The log holds no operation `unknown` without a locator under this
+    /// profile for this id. Nothing was sent.
+    NotAttachable { operation: OperationId, why: String },
+    /// Refused before anything was written.
+    Cleanup { creating: OperationId, refusal: CleanupRefusal },
+}
+```
+
+`LogError` carries the journal's `CreateUnresolved` and `Cleanup` refusals as `Fenced` with their reason, as it does for M3's fencing refusals.
+
+### As built (M4)
+
+- The barrier is evaluated by `provider::accept`, which `Journal::submit` calls in the command's transaction; a `StartAttempt` it refuses is stored `rejected` with `ReplacementBlocked`, and fabricd reports it through the client API as `managed_refused` with refusal `replacement_blocked`.
+- `Journal::provider_destroys(resource)` lists the destroys of one resource with their status (the `by_target` index); the journal's `OperationLog::cleanup_target` reads it to refuse a cleanup before anything is written, and `provider_begin` checks the same rules again in its transaction.
+- A cleanup whose target is not the create's locator, whose scope is not the create's, or that is not a destroy is refused `NotACreate`.
+- An action outside the negotiated profile, which Fabric refuses before sending, is recorded with effect class `mutate`: it neither names a new resource nor removes one.
+- An observe of an operation found after a loss (`unknown`, `attached`) that answers a `result` `accepted` or `running` records `observed`, as a `pending` does.
+- `Journal::open` refuses a version 2 journal whose `provider_operations` table is the draft that unreleased M3 builds wrote (`OpenError::DraftSchema`) instead of failing later on a missing column.
+- Locator text is written straight from the locator in key order (`wire::locator_record`), one buffer and one blake3 per locator, so an exec or a destroy costs no extra JSON tree on its hot path. The dispatch stays one committed write and the settle one read and one write (`tests/off_runtime.rs`, unchanged).
+- The test double attaches `fx-<key>` by the operation that made it and keeps what it made in `FABRIC_BRIDGE_DOUBLE_PROVIDER`, so `tests/process.rs` runs a lost create through a worker and an authority restart without Capsule.
+- 2026-11-02: a `sandbox.destroy` answered `provider_failed`/`not_found` is recorded `unknown` with the answer on its row, keeps the barrier and holds a cleanup back; an observe of its resource answered `unknown`/`absent` with `searched` settles it `succeeded` through `OperationLog::absent` and `Journal::provider_absent`, which store the scope searched. An absent observe of anything but a destroy settles nothing, and an absent observe whose `searched` is not the observed resource's provider, scope and kind settles and stores nothing (2026-11-03). The bridge refuses before sending an exec above the profile's `max_timeout_ms` or `max_output_bytes` (`invalid`/`limit`) and a destroy or exec whose target `native_id` is `null` or empty (`invalid`/`missing_field`).
+
+### M4 acceptance mapped to tests
+
+Each test is written first and fails on the M3 code (an M4 rule that already holds needs no test). Names are the ones the implementation uses; the shared fixtures are in `protocol/bridge/v1`.
+
+| Acceptance | Tests |
+|---|---|
+| A lost response never triggers a blind duplicate creation | scenarios `attach_after_lost_create`, `attach_absent_stays_unknown`, `attach_then_observe_until_ready` (Fabric scripted run, Capsule fixture run, interop over the worker's stdio); `fabric-journal` `provider::tests::a_create_waits_while_a_create_of_the_job_is_unknown`; interop `a_create_lost_with_its_worker_is_attached_and_never_made_twice` (fixture profile, and the Docker profile on a local engine with an image it already holds); interop `a_create_whose_frame_never_left_stays_unknown_after_an_absent_attach_until_abandoned` (Fabric stopped between the intent and the frame: attached absent, the scope searched kept, no create of the job until the owner abandons it acknowledging that search) |
+| A worker restart never triggers a blind duplicate creation | interop `a_create_lost_with_its_worker_is_attached_and_never_made_twice` kills the worker after the provider made the resource and before the answer, restarts it and attaches; `fabric-journal` `provider::tests::recovery_makes_a_dispatched_create_unknown_and_it_is_attached_not_resent` |
+| Unknown remains explicit | `fabric-journal` `provider::tests::statuses_move_only_along_the_machine` (every pair of the table above), `provider::tests::recovery_leaves_attached_observed_and_abandoned_as_they_are`, `provider::tests::an_abandonment_needs_the_state_the_owner_saw`; scenario `attach_absent_stays_unknown` |
+| A `not_found` destroy keeps the barrier until absence is observed | `fabric-journal` `provider::tests::a_not_found_destroy_stays_unknown_until_an_observe_finds_its_resource_absent`, `provider::tests::an_absent_observe_settles_nothing_but_a_destroy`; `fabric-bridge` `tests/stream.rs` `a_not_found_destroy_is_unknown_until_an_observe_finds_its_resource_absent` (the barrier exit) and `a_not_found_destroy_keeps_the_barrier_while_nothing_finds_its_resource_absent` (no evidence, no exit); `tests/stream.rs` `a_request_above_the_profile_bounds_or_at_no_resource_is_refused_before_sending` and `wire::tests::a_locator_with_a_null_or_empty_native_id_is_a_missing_field` for the two refusals |
+| A stop failure blocks an unsafe replacement | `fabric-journal` `provider::tests::a_failed_or_unknown_destroy_blocks_a_replacement_until_a_destroy_succeeds`, `provider::tests::an_unsettled_exec_blocks_a_replacement_until_its_sandbox_is_destroyed`, `provider::tests::abandoning_a_destroy_or_an_exec_never_unblocks_a_replacement`, `provider::tests::an_attached_or_abandoned_create_does_not_block`; the refusal is stored under its key like any domain refusal; interop `a_destroy_lost_with_its_worker_blocks_a_replacement_until_a_stop_is_confirmed` (the worker killed mid-destroy, Fabric restarted: the replacement is refused while the destroy is unknown, observed and abandoned, and granted once a fresh destroy under its own grant is confirmed gone) and `a_docker_destroy_lost_with_its_worker_blocks_a_replacement_until_no_container_is_left` (the same on the local engine: one container, never two) |
+| Fresh cleanup approval | scenario `cleanup_after_attach_needs_fresh_approval`; `fabric-journal` `provider::tests::a_cleanup_runs_after_the_job_is_cancelled`, `provider::tests::a_cleanup_needs_a_named_resource_of_this_job`, `provider::tests::residuals_list_what_no_cleanup_removed`; `fabric-bridge` `tests/process.rs` `a_cleanup_without_a_named_resource_is_refused_before_anything_is_written` |
+| Attach and observe only where the profile supports them | scenario `attach_unsupported`; cases `attach_*` and `error_*absent*`; `fabric-bridge` `golden` |
+| Owner labels decide | scenario `attach_checks_owner` |
+| Version 2 fixture | `crates/fabric-journal/tests/fixtures/v2.sqlite` regenerated with the amended table; `tests/fixtures.rs` opens and verifies it |
+| No hot-path regression | the perf phase alone: bridge round trip and spawn (`scripts/bench-bridge.sh`), `budget::hot_paths`, against the anchor; counters (thread hops and committed writes per effect in `tests/off_runtime.rs`) unchanged at one write to dispatch and one read and one write to settle |
+
+### Carried to M5: the read surface for provider operations
+
+M4 exposes provider operations as library calls only (ADR 0022, selection 6). Efe decided on 2026-10-29 that their read surface in the client API, the TypeScript SDK and the CLI belongs to M5, where fabricd starts driving the bridge, so it is M5 scope and not an open M4 item. It enters M5 as this acceptance row:
+
+| Acceptance (M5) | Surfaces | Tests |
+|---|---|---|
+| A client reads, for one managed job, every provider operation as the journal holds it (its status, with `unknown`, `attached`, `observed` and `abandoned` shown as they are and never folded into another; its action, effect class, purpose and the create a cleanup cleans; its target and locator; the scope its last absent attach searched; its abandonment reason), the job's replacement blockers (`CreateUnresolved`, `ExecMayRun`, `StopNotConfirmed`, each with its operation and status, from `Journal::replacement_blockers`) and its residuals (each create's locator, or the scope an absent attach searched, from `Journal::residuals`). The read writes nothing and sends nothing to a worker. | one read op of the node's client API beside `managed_status`; the matching `fabric-client` method; the TypeScript SDK method beside `managedStatus`; a `fabric managed` subcommand beside `status` | written first and failing on the M4 code: a node test over a journal seeded with an operation in each of `unknown` (with and without a searched scope), `attached`, `observed` and `abandoned`, a blocker of each kind and a residual of each kind, answered through the client API with each value as the journal holds it and the journal unchanged after the read; the TypeScript SDK test of the same op against the node built in the same run; a CLI test of the subcommand's sentences for each status, blocker and residual |
