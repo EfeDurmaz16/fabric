@@ -18,6 +18,7 @@
 - [Managed job](concepts/managed-job.md)
 - [Attempt](concepts/attempt.md)
 - [Fence](concepts/fence.md)
+- [Residuals](concepts/residuals.md)
 - [Glossary](glossary.md)
 
 # Guides
