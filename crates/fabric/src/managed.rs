@@ -33,7 +33,10 @@ use fabric_core::path::RelPath;
 
 use crate::{Notes, ask, contract, harness_arg, repository, system_path};
 
-/// The source flags a create and a facade submit share.
+// The source flags a create and a facade submit share. The flattened
+// argument structs here carry plain comments: clap makes a doc comment
+// the summary of the command that flattens the struct, and since the
+// commands defer their arguments it would replace the command's own.
 #[derive(Debug, Args, Clone)]
 #[group(required = true, multiple = true)]
 pub(crate) struct SourceArgs {
@@ -57,8 +60,8 @@ pub(crate) struct SourceArgs {
     import: Option<PathBuf>,
 }
 
-/// The source flags of a facade submit: only what names the same thing on
-/// every node, since a path is a path on one node.
+// The source flags of a facade submit: only what names the same thing on
+// every node, since a path is a path on one node.
 #[derive(Debug, Args, Clone)]
 #[group(required = true, multiple = true)]
 pub(crate) struct FacadeSourceArgs {
@@ -89,7 +92,7 @@ impl From<FacadeSourceArgs> for SourceArgs {
     }
 }
 
-/// The policy flags.
+// The policy flags.
 #[derive(Debug, Args, Clone, Default)]
 pub(crate) struct PolicyArgs {
     /// What the work must satisfy, in your words; repeatable.
@@ -146,6 +149,7 @@ impl PolicyArgs {
 
 /// Make, cancel and read managed jobs.
 #[derive(Debug, Subcommand)]
+#[command(defer = true)]
 #[expect(
     clippy::large_enum_variant,
     reason = "clap flattens the source and policy flags into the variants; one command is parsed per run"
@@ -293,6 +297,7 @@ pub(crate) enum ManagedCommand {
 
 /// Mint and revoke facade tokens, and reach a job's authority from any of your nodes.
 #[derive(Debug, Subcommand)]
+#[command(defer = true)]
 #[expect(
     clippy::large_enum_variant,
     reason = "clap flattens the source and policy flags into the variants; one command is parsed per run"
@@ -413,7 +418,7 @@ pub(crate) enum FacadeCommand {
     },
 }
 
-/// Which authority a facade message goes to, and the bearer it carries.
+// Which authority a facade message goes to, and the bearer it carries.
 #[derive(Debug, Args, Clone)]
 pub(crate) struct Authority {
     /// The authority node; this node's own id is allowed.
