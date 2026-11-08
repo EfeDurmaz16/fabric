@@ -147,6 +147,9 @@ pub enum SettingName {
     Reviewer,
     /// The agent profile the session runs as, such as OpenCode's `build`.
     Agent,
+    /// The conversation itself, which a harness whose store cannot travel
+    /// (Cursor) leaves on the node that wrote it.
+    Chat,
 }
 
 impl std::fmt::Display for SettingName {
@@ -161,6 +164,7 @@ impl std::fmt::Display for SettingName {
             SettingName::Approval => "approval",
             SettingName::Reviewer => "approvals reviewer",
             SettingName::Agent => "agent",
+            SettingName::Chat => "chat",
         })
     }
 }
@@ -189,6 +193,8 @@ pub struct PassedSetting {
 #[cfg(any(
     feature = "claude",
     feature = "codex",
+    feature = "cursor",
+    feature = "gemini",
     feature = "opencode",
     feature = "pi"
 ))]
@@ -216,6 +222,8 @@ pub struct NotCarried {
 #[cfg(any(
     feature = "claude",
     feature = "codex",
+    feature = "cursor",
+    feature = "gemini",
     feature = "opencode",
     feature = "pi"
 ))]
@@ -236,6 +244,8 @@ impl NotCarried {
     #[cfg(any(
         feature = "claude",
         feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
         feature = "opencode",
         feature = "pi"
     ))]
@@ -374,6 +384,8 @@ impl Running {
         feature = "acp",
         feature = "claude",
         feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
         feature = "opencode",
         feature = "pi"
     ))]
@@ -428,7 +440,7 @@ impl Running {
     }
 
     /// Records the version the launch asked of the binary it started.
-    #[cfg(any(feature = "codex", feature = "opencode"))]
+    #[cfg(any(feature = "codex", feature = "gemini", feature = "opencode"))]
     pub(crate) fn with_version(mut self, version: Option<crate::version::HarnessVersion>) -> Self {
         self.version = version;
         self
@@ -449,6 +461,8 @@ impl Running {
     #[cfg(any(
         feature = "claude",
         feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
         feature = "opencode",
         feature = "pi"
     ))]
@@ -562,6 +576,8 @@ impl TurnReport {
     #[cfg(any(
         feature = "claude",
         feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
         feature = "opencode",
         feature = "pi"
     ))]

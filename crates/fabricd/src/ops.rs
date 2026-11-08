@@ -2864,7 +2864,18 @@ impl Node {
         // (`Restored::session`); the job records the one it will run, so
         // the next capture takes that session and not a stale id.
         let session = restored.session;
-        if session != *state.session() {
+        if session == *state.session() {
+            // Until the job's record holds it (M5b), the log says what this
+            // restore reached, such as workspace_only for Cursor.
+            tracing::info!(
+                harness = %state.kind(),
+                %session,
+                fidelity = %restored.fidelity,
+                "restored {} session {session} at fidelity {}",
+                state.kind(),
+                restored.fidelity
+            );
+        } else {
             tracing::info!(
                 harness = %state.kind(),
                 captured = %state.session(),
@@ -3602,17 +3613,26 @@ pub(crate) fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeErr
         .and_then(|record| record.known_writer))
 }
 
+/// True for a harness whose session does not record every version that
+/// wrote it, so the job carries the newest writer: Codex, which writes its
+/// version only into the rollout it creates, and Gemini CLI, whose chat
+/// records none.
+fn carries_known_writer(kind: &HarnessKind) -> bool {
+    matches!(kind, HarnessKind::Codex | HarnessKind::GeminiCli)
+}
+
 /// The newest harness version known to have written the session a
-/// capture holds, read from its manifest, for a Codex session only; `None`,
-/// logged, when a Codex manifest records none that parses, and the session
-/// record then keeps the known writer it held (`writer_after`). A Codex
-/// resume writes no version into the rollout, so the job carries this
-/// one. A Claude transcript records the version of every Claude that
+/// capture holds, read from its manifest, for a Codex or Gemini CLI
+/// session only (`carries_known_writer`); `None`, logged, when such a
+/// manifest records none that parses, and the session record then keeps
+/// the known writer it held (`writer_after`). A Codex resume writes no
+/// version into the rollout, and a Gemini chat records none, so the job
+/// carries this one. A Claude transcript records the version of every Claude that
 /// wrote a line, and an ACP agent's state is opaque, so for them the
 /// version a capture records is only the one installed where it ran,
 /// which no guard reads (ADR 0006).
 fn known_writer(manifest: &StateManifest) -> Option<HarnessVersion> {
-    if *manifest.kind() != HarnessKind::Codex {
+    if !carries_known_writer(manifest.kind()) {
         return None;
     }
     let text = manifest.harness_version()?;
@@ -3639,7 +3659,7 @@ fn writer_after(
     previous: Option<HarnessVersion>,
     manifest: &StateManifest,
 ) -> Option<HarnessVersion> {
-    if *manifest.kind() != HarnessKind::Codex {
+    if !carries_known_writer(manifest.kind()) {
         return None;
     }
     known_writer(manifest).or(previous)

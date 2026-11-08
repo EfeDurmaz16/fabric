@@ -39,6 +39,8 @@ pub(crate) mod markers;
     feature = "acp",
     feature = "claude",
     feature = "codex",
+    feature = "cursor",
+    feature = "gemini",
     feature = "opencode",
     feature = "pi"
 ))]

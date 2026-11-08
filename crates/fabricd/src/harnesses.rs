@@ -282,11 +282,12 @@ impl HarnessEnv {
 
 /// Builds the adapter for `kind` on this node. `known_writer` is the
 /// newest harness version known to have written the session the adapter
-/// will capture (`SessionRecord::known_writer`); only the Codex adapter
-/// takes it, because a Claude transcript records the version of every
-/// Claude that wrote a line and an ACP agent's state is opaque. The PR 5
-/// adapters (docs/harness-adapters.md) take the home and the `PATH` alone
-/// until their owners give them a known writer of their own.
+/// will capture (`SessionRecord::known_writer`); the Codex and Gemini CLI
+/// adapters take it, because neither records the version of every writer
+/// in the session, while a Claude transcript does and an ACP agent's
+/// state is opaque. The other PR 5 adapters (docs/harness-adapters.md)
+/// take the home and the `PATH` alone until their owners give them a
+/// known writer of their own.
 pub fn adapter(
     kind: &HarnessKind,
     env: &HarnessEnv,
@@ -302,7 +303,9 @@ pub fn adapter(
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
         HarnessKind::OpenCode => Box::new(OpenCode::new(env.home.clone(), env.path_var.clone())),
         HarnessKind::Pi => Box::new(Pi::new(env.home.clone(), env.path_var.clone())),
-        HarnessKind::GeminiCli => Box::new(GeminiCli::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::GeminiCli => Box::new(
+            GeminiCli::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
+        ),
         HarnessKind::CursorAgent => {
             Box::new(CursorAgent::new(env.home.clone(), env.path_var.clone()))
         }
@@ -354,7 +357,9 @@ pub fn adapter_with_installed(
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
         HarnessKind::OpenCode => Box::new(OpenCode::new(env.home.clone(), env.path_var.clone())),
         HarnessKind::Pi => Box::new(Pi::new(env.home.clone(), env.path_var.clone())),
-        HarnessKind::GeminiCli => Box::new(GeminiCli::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::GeminiCli => Box::new(
+            GeminiCli::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
+        ),
         HarnessKind::CursorAgent => {
             Box::new(CursorAgent::new(env.home.clone(), env.path_var.clone()))
         }

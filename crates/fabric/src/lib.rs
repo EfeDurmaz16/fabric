@@ -804,6 +804,8 @@ fn headless_reader(mode: &Mode, harness: &HarnessKind) -> Option<ReadLine> {
         (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
         (Mode::Headless(_), HarnessKind::OpenCode) => Some(OpenCode::read_headless_line),
         (Mode::Headless(_), HarnessKind::Pi) => Some(Pi::read_headless_line),
+        (Mode::Headless(_), HarnessKind::GeminiCli) => Some(GeminiCli::read_headless_line),
+        (Mode::Headless(_), HarnessKind::CursorAgent) => Some(CursorAgent::read_headless_line),
         _ => None,
     }
 }
@@ -1019,10 +1021,10 @@ async fn adapter_for(
             launch,
         ),
         HarnessKind::GeminiCli => (
-            Box::new(GeminiCli::new(
-                harness_env.home.clone(),
-                harness_env.path_var.clone(),
-            )),
+            Box::new(
+                GeminiCli::new(harness_env.home.clone(), harness_env.path_var.clone())
+                    .with_known_writer(plan.known_writer.clone()),
+            ),
             launch,
         ),
         HarnessKind::CursorAgent => (
