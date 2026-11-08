@@ -1285,4 +1285,3 @@ fn same_refusal(seen: &FenceVerdict, verdict: &FenceVerdict) -> bool {
 
 #[cfg(test)]
 mod tests;
-
