@@ -18,6 +18,10 @@ const POINTS: &[&str] = &[
 ];
 
 /// Refuses a fault the build does not know.
+#[cfg_attr(
+    not(feature = "faults"),
+    expect(clippy::unnecessary_wraps, reason = "only the faults build can refuse")
+)]
 pub(crate) fn check() -> Result<(), String> {
     #[cfg(feature = "faults")]
     if let Some(armed) = armed()
