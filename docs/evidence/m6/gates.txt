@@ -1,28 +1,22 @@
-Gates run once at the end of the step that merged M5 into M6 the second time (m5/placement-continuity at f09cc8d, merge f000963), 2026-11-08 around 17:00Z UTC, on the working tree of 496f358, with CARGO_TARGET_DIR in a scratch directory and cargo -j 6. Load average 10 to 20 from other work. Each line: the command, its exit code, and its last line or count. The fmt and clippy failures were fixed by 7b4422f and bbef4fa and both were run again on bbef4fa.
+One full gate run on the working tree of 9304f64, 2026-11-08 23:24Z to 23:37Z UTC, CARGO_TARGET_DIR one shared target, cargo -j 4, load 8.27 7.89 7.64 from other work. Each line: the gate, its exit code, its last line. GitHub CI not waited for.
 
-cargo fmt --all --check                                                      exit 1, then exit 0 on bbef4fa (one line of the derived call's reply)
-cargo clippy --workspace --all-targets --locked -- -D warnings               exit 101, then exit 0 on bbef4fa (redundant_closure_for_method_calls in fabricd facade.rs, a line M5's launch path contract added at 1c6bedb)
-cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features ""     exit 0
-cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features acp    exit 0
-cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features claude exit 0
-cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features codex  exit 0
-cargo test --workspace --locked --no-fail-fast -- --skip e2e_                exit 101  (1395 passed, 9 failed; see below)
-cargo test -p fabric --test e2e --locked                                     exit 0  (79 passed, 0 failed, 9 ignored, 92.11 s)
-cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths   exit 0  (1 passed, 78.91 s, count mode)
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked          exit 0
-cargo deny check                                                             exit 0
-scripts/check-hygiene.sh f09cc8d                                             exit 0
-scripts/test-check-hygiene.sh                                                exit 0
-scripts/check-budget.sh f09cc8d                                              exit 0
-scripts/test-check-budget.sh                                                 exit 0
-scripts/check-fixtures.sh f09cc8d                                            exit 0
-scripts/test-check-fixtures.sh                                               exit 0
-sdk/typescript: bun install --frozen-lockfile; bun run typecheck; bun run build; FABRIC_BIN=<target>/debug/fabric bun test   exit 0, 0, 0, 1  (63 pass, 6 fail)
-cargo test -p fabricd --lib --locked (on bbef4fa)                            exit 0  (322 passed, 3 ignored)
+cargo fmt --all --check                                                                                        exit 0  
+cargo clippy --workspace --all-targets --locked -- -D warnings                                                 exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.42s
+cargo clippy -p fabric-harness per feature (none acp claude codex cursor gemini opencode pi)                   exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.96s
+cargo clippy -p fabric-sync --lib --bins --locked -- -D warnings                                               exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.32s
+cargo test --workspace --locked --no-fail-fast -- --skip e2e_                                                  exit 101  error: 1 target failed:
+cargo test -p fabric --test e2e --locked                                                                       exit 0  test result: ok. 105 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 108.96s
+cargo test -p fabric --test cli_contract --locked                                                              exit 0  test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.17s
+cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths                                exit 0  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out; finished in 100.27s
+RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked                                              exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.72s
+cargo deny check                                                                                               exit 0  advisories ok, bans ok, licenses ok, sources ok
+scripts/check-hygiene.sh origin/main                                                                           exit 0  
+scripts/check-budget.sh origin/main                                                                            exit 0  
+scripts/check-fixtures.sh origin/main                                                                          exit 0  
+scripts/docs/gen.py --check                                                                                    exit 0  
+cargo build -p fabric --locked; scripts/docs/cli-reference.sh --check                                          exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+scripts/check-docs.sh                                                                                          exit 0   INFO HTML book written to `<worktree>/target/docs-site`
+scripts/test-check-docs.sh                                                                                     exit 0  ok   an em dash in a rendered page
+sdk/typescript: bun install --frozen-lockfile; bun run typecheck; bun test                                     exit 0   0 fail
 
-The 9 failed Rust tests and the 6 failed TS tests:
-- 7 Rust (fabric-client contract: 6; fabric-client facade_fixtures: every_answer_reads_as_a_client_reads_it) and all 6 TS: the M5 launch path fixtures that f09cc8d added to protocol/fixtures (request and reply managed_register, the facade inspection_continued answer) before the code that parses them. No crate at f09cc8d names managed_register. These fail on the M5 head the same way and pass once M5's launch path code lands; M6 adds no fixture and changes none of these.
-- fabric-bridge stream::a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lost (M5's test, 765917c): failed in the full run and in one of the next four runs of its binary under load 15 to 20; passed 3 of 3 alone and 2 of 2 on the M5 head. fabric-bridge is unchanged by M6 except one test file's two lines. A timing race in the test, left to its owner.
-- fabric-harness crash::a_codex_restore_killed_mid_way_frees_the_writer_lock_and_converges: failed once in the full run under load; passed 3 of 3 alone and its binary passed after. fabric-harness is unchanged by M6.
-
-Not run here: GitHub CI (never waited for) and the Capsule worker interop jobs, which need the Capsule worktree this step does not touch.
+The workspace test line: 1587 passed, 1 failed. The one failure is fabricd ops::tests::a_capture_for_a_peers_pull_measures_in_the_environment_a_client_sent (main's test of the toolchain measurement, Unmeasured instead of the shell's rustc under load). It passed 3 of 3 alone right after; M6 does not touch the measurement. Recorded, not retried into the run.
