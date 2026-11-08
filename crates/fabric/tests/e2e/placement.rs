@@ -17,7 +17,7 @@ use crate::world::{Env, Fallible, Node, Wire, pair};
 const PLACED_WITHIN: Duration = Duration::from_secs(20);
 
 /// The `bearer <hex>` line `fabric facade mint` prints.
-fn bearer(text: &str) -> Fallible<String> {
+pub fn bearer(text: &str) -> Fallible<String> {
     text.lines()
         .find_map(|line| line.strip_prefix("bearer "))
         .and_then(|rest| rest.split_whitespace().next())
@@ -26,7 +26,7 @@ fn bearer(text: &str) -> Fallible<String> {
 }
 
 /// The JSON a facade command printed.
-fn answer(text: &str) -> Fallible<Value> {
+pub fn answer(text: &str) -> Fallible<Value> {
     let start = text.find('{').ok_or("no JSON in the answer")?;
     Ok(serde_json::from_str(&text[start..])?)
 }
