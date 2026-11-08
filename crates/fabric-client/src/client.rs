@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId};
-use fabric_core::managed::{OperationKey, WorkRevision};
+use fabric_core::managed::{OperationKey, TaskId, WorkRevision};
 use fabric_core::session::SessionId;
 use fabric_core::version::HarnessVersion;
 use tokio::net::UnixStream;
@@ -22,8 +22,8 @@ use crate::api::{
     API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Exported, FidelityName, Hello,
     HelloAnswer, Imported, Inspection, JobCreated, JobList, JobLog, JobScopeWire, JobStatus, Lease,
     ManagedJob, ManagedJobs, ManagedOperation, Minted, NodeIdentity, NoteWire, Op, Paired,
-    PeerList, Pong, Refusal, Registered, Repaired, Reply, Request, ResourceScopeWire, Revoked,
-    RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
+    PeerList, Pong, ProgramWire, Refusal, RegisterClass, Registered, Repaired, Reply, Request,
+    ResourceScopeWire, Revoked, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
 };
 use crate::facade::{ClientMessage, FacadeAnswer, ProtocolViolation, Submit};
 use crate::frame::{self, FrameError};
@@ -610,6 +610,38 @@ impl Client {
         match self.call(&request, on_event).await? {
             Reply::ManagedNote(reply) => Ok(*reply),
             other => Err(unexpected(Op::ManagedNote, &other)),
+        }
+    }
+
+    /// Registers a build or test task with its program under `parent` (M5,
+    /// the launch path); `key` as for [`Client::managed_create`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per field of the request, as the wire names them"
+    )]
+    pub async fn managed_register(
+        &self,
+        key: OperationKey,
+        job: JobId,
+        expected_revision: Option<WorkRevision>,
+        parent: TaskId,
+        label: String,
+        class: RegisterClass,
+        program: ProgramWire,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedRegister {
+            operation_key: key,
+            job,
+            expected_revision,
+            parent,
+            label,
+            class,
+            program,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedRegister(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedRegister, &other)),
         }
     }
 
