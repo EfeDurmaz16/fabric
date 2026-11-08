@@ -63,6 +63,11 @@
   - [ADR 0020: The managed authority, its journal and fencing eligibility](adr/0020-managed-authority-journal.md)
   - [ADR 0021: Versioned provider bridge to a Capsule worker](adr/0021-capsule-provider-bridge.md)
   - [ADR 0022: Reconciliation of provider operations and cleanup authorization](adr/0022-reconciliation-and-cleanup-authorization.md)
+  - [ADR 0023: Managed task lifecycle, containment and the checkpoint cut](adr/0023-managed-task-lifecycle-and-checkpoint-cut.md)
+  - [ADR 0024: The portable work package and continuation fidelity](adr/0024-work-package-and-continuation-fidelity.md)
+  - [ADR 0025: Source bindings, secret references and the export policy](adr/0025-source-bindings-and-secret-references.md)
+  - [ADR 0026: Resource placement among registered nodes](adr/0026-resource-placement.md)
+  - [ADR 0027: The job facade: authenticated remote job operations over the node link](adr/0027-job-facade-protocol.md)
 <!-- adr:end -->
 
 # Project
