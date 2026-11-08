@@ -1395,6 +1395,94 @@ fn counted_size_pairs(samples: &[Sample], metric: &str) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The memory rows of the gate: each daemon's sizes after the timed runs
+/// and after the counted ops, and the CLI's peak sizes per counted op.
+fn memory_series(samples: &[Sample]) -> Vec<Series> {
+    let mut memory: Vec<Series> = Vec::new();
+    for (metric, _, title, _) in DAEMON_SIZES {
+        let daemons: BTreeSet<&str> = samples
+            .iter()
+            .filter(|sample| sample.phase == "timed" && sample.metric == metric)
+            .map(|sample| sample.op.as_str())
+            .collect();
+        for daemon in daemons {
+            let found = pairs(samples, "timed", daemon, metric);
+            memory.push((
+                format!("{title}, {daemon}, KiB after each timed run"),
+                found,
+            ));
+        }
+    }
+    for (_, prefix, title, _) in DAEMON_SIZES {
+        let daemons: BTreeSet<&str> = samples
+            .iter()
+            .filter(|sample| sample.phase == "counted")
+            .filter_map(|sample| sample.metric.strip_prefix(prefix))
+            .collect();
+        for daemon in daemons {
+            let found = counted_size_pairs(samples, &format!("{prefix}{daemon}"));
+            memory.push((
+                format!("{title}, daemon {daemon}, KiB per counted op"),
+                found,
+            ));
+        }
+    }
+    for (metric, title) in [
+        ("cli_maxrss_kib", "CLI peak resident size"),
+        ("cli_footprint_kib", "CLI peak physical footprint"),
+    ] {
+        let found = counted_size_pairs(samples, metric);
+        if !found.is_empty() {
+            memory.push((format!("{title}, KiB per counted op"), found));
+        }
+    }
+    memory
+}
+
+/// The counter checks of the gate, one per counted op, with their table.
+fn counter_checks(samples: &[Sample], out: &mut String) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let counted = ops_in(samples, "counted");
+    if !counted.is_empty() {
+        out.push_str(
+            "\n#### Counters\n\n\
+             Medians over the counted runs, anchor -> candidate. An op fails when the \
+             candidate starts more processes or makes more full or barrier flushes than the anchor.\n\n\
+             | op |",
+        );
+        for (title, _) in GATED_COUNTERS {
+            let _ = write!(out, " {title} |");
+        }
+        out.push_str(" verdict |\n|---|");
+        out.push_str(&"---:|".repeat(GATED_COUNTERS.len()));
+        out.push_str("---|\n");
+        for op in &counted {
+            let _ = write!(out, "| {op} |");
+            let mut over = Vec::new();
+            for (title, metrics) in GATED_COUNTERS {
+                let mut sum = [0.0, 0.0];
+                for metric in metrics {
+                    let [anchor, candidate] = counted_medians(samples, op, metric);
+                    sum[0] += anchor;
+                    sum[1] += candidate;
+                }
+                if sum[1] > sum[0] {
+                    over.push(title);
+                }
+                let _ = write!(out, " {:.0} -> {:.0} |", sum[0], sum[1]);
+            }
+            let fails = !over.is_empty();
+            let _ = writeln!(out, " {} |", if fails { "**fail**" } else { "pass" });
+            checks.push(Check {
+                row: format!("{op}: more {}", over.join(", ")),
+                fails,
+            });
+        }
+    }
+
+    checks
+}
+
 /// The verdict of a run against the performance rule, as markdown, and
 /// the rows that break it. Times: no op's family interval above 1, the 95%
 /// interval across all timed ops at once, so that two equal builds fail
@@ -1435,44 +1523,7 @@ fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
         checks.extend(family_checks(&timed, &mut out)?);
     }
 
-    let mut memory: Vec<Series> = Vec::new();
-    for (metric, _, title, _) in DAEMON_SIZES {
-        let daemons: BTreeSet<&str> = samples
-            .iter()
-            .filter(|sample| sample.phase == "timed" && sample.metric == metric)
-            .map(|sample| sample.op.as_str())
-            .collect();
-        for daemon in daemons {
-            let found = pairs(&samples, "timed", daemon, metric);
-            memory.push((
-                format!("{title}, {daemon}, KiB after each timed run"),
-                found,
-            ));
-        }
-    }
-    for (_, prefix, title, _) in DAEMON_SIZES {
-        let daemons: BTreeSet<&str> = samples
-            .iter()
-            .filter(|sample| sample.phase == "counted")
-            .filter_map(|sample| sample.metric.strip_prefix(prefix))
-            .collect();
-        for daemon in daemons {
-            let found = counted_size_pairs(&samples, &format!("{prefix}{daemon}"));
-            memory.push((
-                format!("{title}, daemon {daemon}, KiB per counted op"),
-                found,
-            ));
-        }
-    }
-    for (metric, title) in [
-        ("cli_maxrss_kib", "CLI peak resident size"),
-        ("cli_footprint_kib", "CLI peak physical footprint"),
-    ] {
-        let found = counted_size_pairs(&samples, metric);
-        if !found.is_empty() {
-            memory.push((format!("{title}, KiB per counted op"), found));
-        }
-    }
+    let memory = memory_series(&samples);
     if !memory.is_empty() {
         let _ = write!(
             out,
@@ -1484,43 +1535,7 @@ fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
         checks.extend(family_checks(&memory, &mut out)?);
     }
 
-    let counted = ops_in(&samples, "counted");
-    if !counted.is_empty() {
-        out.push_str(
-            "\n#### Counters\n\n\
-             Medians over the counted runs, anchor -> candidate. An op fails when the \
-             candidate starts more processes or makes more full or barrier flushes than the anchor.\n\n\
-             | op |",
-        );
-        for (title, _) in GATED_COUNTERS {
-            let _ = write!(out, " {title} |");
-        }
-        out.push_str(" verdict |\n|---|");
-        out.push_str(&"---:|".repeat(GATED_COUNTERS.len()));
-        out.push_str("---|\n");
-        for op in &counted {
-            let _ = write!(out, "| {op} |");
-            let mut over = Vec::new();
-            for (title, metrics) in GATED_COUNTERS {
-                let mut sum = [0.0, 0.0];
-                for metric in metrics {
-                    let [anchor, candidate] = counted_medians(&samples, op, metric);
-                    sum[0] += anchor;
-                    sum[1] += candidate;
-                }
-                if sum[1] > sum[0] {
-                    over.push(title);
-                }
-                let _ = write!(out, " {:.0} -> {:.0} |", sum[0], sum[1]);
-            }
-            let fails = !over.is_empty();
-            let _ = writeln!(out, " {} |", if fails { "**fail**" } else { "pass" });
-            checks.push(Check {
-                row: format!("{op}: more {}", over.join(", ")),
-                fails,
-            });
-        }
-    }
+    checks.extend(counter_checks(&samples, &mut out));
 
     let failed: Vec<String> = checks
         .iter()
