@@ -639,3 +639,26 @@ Two lockstep changes the review fixes needed in Fabric's tests, both on the benc
 `m4-gates/run-gates.sh` ran the whole list once on `386f3b6` with this README's M4 section uncommitted beside it, at a load average of 5.2 to 7.2, nothing timed (`m4-gates/summary.txt`, each gate's log beside it): `cargo fmt --all --check`; clippy with `-D warnings` for the workspace and for `fabric-harness` with no features and each of `acp`, `claude`, `codex`; `cargo test --workspace --locked -- --skip e2e_`; `cargo test -p fabric --test e2e --locked`; `cargo doc` with `-D warnings`; `cargo deny check`; the hygiene, budget and fixture scripts and their self-tests against `origin/m3/capsule-bridge`; actionlint on both workflows; `cargo build -p fabric`; the TypeScript SDK install, typecheck, build and `bun test` against the node built here; and `FABRIC_BUDGET=count` `budget::hot_paths`. All 15 passed on the first run. The interop binary, `cargo test -p fabric-bridge --test capsule_worker`, ran with `--ignored` in `m4-interop/`.
 
 A note on the host: at about 00:00 on 2026-11-03, between the second and the third timed run, something outside this session deleted the untracked and most of the tracked files of every worktree under `/tmp/fabric-wt` and `/tmp/capsule-wt` (both `m4` trees among them, with their `.git` link files, `Cargo.toml` and `package.json`); the branch refs and the commits were untouched in the base repositories, the evidence under `docs/` and `benchmarks/` survived, and both trees were restored from their index (`git checkout -- .`) and, for Capsule, reinstalled and rebuilt from the pnpm store before the remaining runs. Nothing here was measured on a tree in that state: the runs that hit it failed at once and were run again.
+
+## CLI footprint
+
+The perf job of pull request #43 (`pr15/perf-in-ci`, run 42518821004) caught a regression that main took in PR #41, the CLI contract: every CLI op's peak physical footprint was 1.07x the anchor's, 176 to 368 KiB more a process, and `cli version` made 2408 allocations of 971 KB against 244 of 106 KB. No test had seen it: the time budget counts processes, not memory.
+
+The cause, counted per phase with a counting allocator in a scratch build of `contract::parse` for `fabric --version`: the decorated tree, `command()`, made 1212 allocations of 563 KB (its root template built `Cli::command()` a second time, 284 of them); the two clones of it, one for the lenient pass and one for the parse, 505 of 193 KB each; the two parses about 90 each. A plain `Cli::try_parse_from` makes 321 allocations of 125 KB, 271 of them building the tree.
+
+The fix (`fix/cli-footprint`): a run parses once, on a tree with no help layout, and builds the decorated tree only when it prints help or an error. That tree, `parsing_command`, is `Cli::command()` with the settings, `--help` and the global options that `decorate` adds and nothing else; each command below the root takes them through `Command::defer`, so clap adds them only to the commands the arguments name. `--version` with no command reads the globals from a lenient pass on the same tree, with no clone. Help, `fabric help`, every usage error and a failed conversion start again on the whole tree, so they answer exactly as before. `the_parsing_tree_parses_as_the_whole_tree_does` (a unit test in `contract.rs`) holds the two trees to the same outcome at every command path, with each global option before and after the command, `--help`, `-h`, an unknown option, a stray word and `--`. `tests/cli_contract.rs` passes unchanged.
+
+Release builds of the anchor `176622e`, of main `b5debf2` and of this branch, on the M5 Pro at a load average of 6 to 7.6. Peak footprint is `/usr/bin/time -l`'s peak memory footprint, the median of 5 runs; allocations are `scripts/perf-ab/counters.c`'s `mallocs` and `malloc_bytes` of one run, which do not change from run to run. `fabric job ls` ran with no node, so it parses, connects, fails with exit 80 and prints the failure: the parse and the failure path, not a listing.
+
+| op | anchor `176622e` | main `b5debf2` | fix | fix / main | fix / anchor |
+|---|---:|---:|---:|---:|---:|
+| `--version` peak footprint | 1744 KiB | 2512 KiB | 1680 KiB | 0.67 | 0.96 |
+| `--version` allocations | 189 | 2408 | 442 | 0.18 | 2.34 |
+| `--version` bytes allocated | 87.6 KB | 971.0 KB | 142.6 KB | 0.15 | 1.63 |
+| `job ls` peak footprint | 2432 KiB | 2736 KiB | 1856 KiB | 0.68 | 0.76 |
+| `job ls` allocations | 878 | 2960 | 703 | 0.24 | 0.80 |
+| `job ls` bytes allocated | 279.0 KB | 1098.6 KB | 265.8 KB | 0.24 | 0.95 |
+
+The footprint is under the anchor's on both. `--version` still allocates more than the anchor, whose tree had fewer commands and whose clap answered `--version` itself: 271 of the 442 build `Cli::command()`, about 80 are the parse that stops at the missing command, and 73 the lenient pass that finds `--version` in it.
+
+`footprint::version_allocates_under_its_budget` (e2e) loads the counter library into a test build's `fabric --version` and holds it to 1000 allocations and 300 KB. The test build makes 466 of 145 KB; with the old parse it made 1948 of 784 KB and the test failed. It runs on macOS where `cc` builds the library, and elsewhere passes with a note that it counted nothing: on Linux CI the perf job's footprint table is the only check.
