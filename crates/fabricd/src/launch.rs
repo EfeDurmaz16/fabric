@@ -22,8 +22,8 @@ use fabric_core::managed::launch::{
 };
 use fabric_core::managed::placement::PlacementDecision;
 use fabric_core::managed::{
-    AllowedFidelity, AttemptId, CommandKind, EffectRequest, ManagedJob, ManagedState, ResourceRef,
-    TaskClass, TaskId, TaskState,
+    AllowedFidelity, AttemptId, CommandKind, EffectRequest, ManagedJob, ManagedState,
+    OperationStatus, ResourceRef, TaskClass, TaskId, TaskState,
 };
 use fabric_journal::Journal;
 use fabric_net::rpc::Service;
@@ -90,8 +90,26 @@ fn under(state: &ManagedState, task: TaskId, root: TaskId) -> bool {
     false
 }
 
+/// Whether a spawn of `task` is on its way to the live attempt: its
+/// `Spawn` is accepted, dispatched or of unknown fate. That instruction
+/// starts it, so a launch does not name it too.
+fn spawn_in_flight(state: &ManagedState, task: TaskId) -> bool {
+    state.requests.iter().any(|(op, request)| {
+        *request == EffectRequest::Spawn { task }
+            && state.operation(*op).is_some_and(|o| {
+                matches!(
+                    o.status,
+                    OperationStatus::Accepted
+                        | OperationStatus::Dispatched
+                        | OperationStatus::Unknown
+                )
+            })
+    })
+}
+
 /// The open build and test tasks under `root` that have a program, as
-/// launches, at most `MAX_TASK_LAUNCHES` (the rest wait for a spawn).
+/// launches, at most `MAX_TASK_LAUNCHES` (the rest wait for a spawn). A
+/// task whose spawn is in flight is left to it.
 pub(crate) fn task_launches(state: &ManagedState, root: TaskId) -> Vec<TaskLaunch> {
     state
         .tasks
@@ -101,6 +119,7 @@ pub(crate) fn task_launches(state: &ManagedState, root: TaskId) -> Vec<TaskLaunc
                 && t.state == TaskState::Open
                 && matches!(t.class, TaskClass::Build | TaskClass::Test)
                 && under(state, t.id, root)
+                && !spawn_in_flight(state, t.id)
         })
         .filter_map(|t| {
             t.program.clone().map(|program| TaskLaunch {
@@ -289,6 +308,34 @@ impl Link for NodeLink {
         ask: &'a PlacementAsk,
     ) -> BoxFuture<'a, PlacementDecision> {
         Box::pin(self.0.place_job(job, ask))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::{REMOTE, World};
+    use super::*;
+
+    /// A launch names the open build and test tasks with a program, and
+    /// leaves to its spawn a task registered while the attempt was live.
+    #[tokio::test]
+    async fn a_launch_names_the_open_programs_but_not_one_a_spawn_starts() {
+        let world = World::new();
+        let job = world.created("create").await;
+        let idle = world
+            .register(job, "idle", TaskClass::Build, &["cargo", "build"])
+            .await;
+        world.granted(job, REMOTE).await;
+        let live = world
+            .register(job, "live", TaskClass::Test, &["cargo", "test"])
+            .await;
+        let state = world.state(job).await;
+        let names: Vec<TaskId> = task_launches(&state, state.job.primary)
+            .into_iter()
+            .map(|t| t.task)
+            .collect();
+        assert_eq!(names, vec![idle]);
+        assert!(spawn_in_flight(&state, live));
     }
 }
 
