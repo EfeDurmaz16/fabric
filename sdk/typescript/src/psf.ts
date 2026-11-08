@@ -106,12 +106,13 @@ export const PsfManifest = z.looseObject({
     epoch: z.string(),
     platform: z.looseObject({ os: z.string(), arch: z.string() }),
   }),
-  source: z.looseObject({
-    kind: z.enum(["git", "snapshot", "empty"]),
-    uri: z.string().optional(),
-    commit: z.string().optional(),
-    snapshot: z.string().optional(),
-  }),
+  // By kind, as the rules check it: a key the kind does not use is one
+  // the reader ignores, whatever its value, null included.
+  source: z.discriminatedUnion("kind", [
+    z.looseObject({ kind: z.literal("git"), uri: z.string(), commit: z.string() }),
+    z.looseObject({ kind: z.literal("snapshot"), snapshot: z.string() }),
+    z.looseObject({ kind: z.literal("empty") }),
+  ]),
   harness: z.looseObject({
     kind: z.string(),
     program: z.string().nullable(),

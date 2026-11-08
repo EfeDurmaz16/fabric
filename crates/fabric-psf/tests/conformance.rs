@@ -153,6 +153,15 @@ fn mutations() -> Vec<String> {
                 out.push(serde_json::to_string(&changed).unwrap());
             }
         }
+        // Every source key, also on a kind that does not use it, as null
+        // or a value of another type.
+        for key in ["commit", "snapshot", "uri"] {
+            for r in [Value::Null, serde_json::json!({}), Value::Array(vec![])] {
+                let mut changed = value.clone();
+                edit(&mut changed, &["source".into(), key.into()], Some(&r));
+                out.push(serde_json::to_string(&changed).unwrap());
+            }
+        }
         let long = "g".repeat(16 * 1024 + 1);
         out.push(seed.replacen(
             "\"writer\":\"",

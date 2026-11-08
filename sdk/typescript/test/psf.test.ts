@@ -167,6 +167,15 @@ function generated(): string[] {
         out.push(JSON.stringify(changed));
       }
     }
+    for (const key of ["commit", "snapshot", "uri"]) {
+      for (const r of [null, {}, []]) {
+        const changed = structuredClone(value);
+        edit(changed, ["source", key], { value: r });
+        const source = (changed as { source: Record<string, unknown> }).source;
+        (changed as { source: unknown }).source = Object.fromEntries(Object.entries(source).sort());
+        out.push(JSON.stringify(changed));
+      }
+    }
     const long = "g".repeat(16 * 1024 + 1);
     out.push(seed.replace('"writer":"', `"writer":"${long.slice(0, 120)}`));
     out.push(seed.replace('"goal":"', `"goal":"${long}`));
