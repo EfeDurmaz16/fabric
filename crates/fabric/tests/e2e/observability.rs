@@ -62,10 +62,10 @@ fn receiver() -> Fallible<(String, Arc<Mutex<Vec<Value>>>)> {
                 }
             };
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
-            if let Some(body) = body.and_then(|b| serde_json::from_slice(&b).ok()) {
-                if let Ok(mut all) = seen.lock() {
-                    all.push(body);
-                }
+            if let Some(body) = body.and_then(|b| serde_json::from_slice(&b).ok())
+                && let Ok(mut all) = seen.lock()
+            {
+                all.push(body);
             }
         }
     });
@@ -314,9 +314,7 @@ async fn e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_se
     // A window after the run is empty.
     assert_eq!(a.ok(&["audit", "export", "--since", "2999-01-01"])?, "");
 
-    let mut daemons = Vec::new();
-    daemons.push(a.stop()?);
-    daemons.push(b.stop()?);
+    let daemons = vec![a.stop()?, b.stop()?];
     for daemon in daemons {
         finish(daemon, Duration::from_secs(20))?;
     }
