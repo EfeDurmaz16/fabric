@@ -34,7 +34,7 @@ The authority's commands and observations, the standalone client requests that c
 
 ## Consequences
 
-- The release binary grows by 557,760 bytes (+2.9%, the exporter, the two ops, their wire types and the CLI together; the research estimate for the exporter alone was 60 to 120 KB), measured on aarch64 macOS with the release profile: 18,941,648 bytes at the base (origin/main ad744de4) and 19,499,408 with this PR. CI reports the size on every pull request.
+- The release binary grows by 541,312 bytes (+2.9%, the exporter, the two ops, their wire types and the CLI together; the research estimate for the exporter alone was 60 to 120 KB), measured on aarch64 macOS with the release profile: 18,959,344 bytes at the base (origin/main 1c933fd1) and 19,500,656 with this PR merged with it. CI reports the size on every pull request.
 - The exporter speaks HTTP/1.1 with `Connection: close` and reads only the status line. A collector that needs gzip, TLS or headers sits behind a local collector.
 - A span is lost on a full queue, a failed post and a node killed with `SIGKILL`. The journal and the audit export are the record.
 - The Jaeger run of the acceptance did not happen in this PR: the Docker daemon failed the image pull (docs/evidence/pr12). The same two-daemon run against the test's own OTLP receiver is in the evidence and the end-to-end suite.
