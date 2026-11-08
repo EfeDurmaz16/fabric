@@ -121,6 +121,7 @@ export {
   type ManagedStatus,
   type Minted,
   Note,
+  Program,
   NoteAt,
   Placement,
   PlacementVerdict,
