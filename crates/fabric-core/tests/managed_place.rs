@@ -390,3 +390,47 @@ proptest! {
         }
     }
 }
+
+/// The rank keys on the node the probe authenticated, never on the id the
+/// advert claims: a peer that advertises another node's id neither takes
+/// that node's current healthy rank nor its place in the identity order.
+#[test]
+fn the_rank_keys_on_the_probed_node_not_the_advertised_one() {
+    let job = job(PlacementPolicy::DEFAULT);
+    let honest = probe(advert(4, 5_000, 1 << 40, COLD));
+    // Node 3 answers with node 4's id and a lower load.
+    let mut claim = advert(4, 10, 1 << 40, COLD);
+    claim.node = node(4);
+    let liar = Probe {
+        node: node(3),
+        ..probe(claim)
+    };
+    let healthy = Some(CurrentPlacement {
+        node: node(4),
+        healthy: true,
+    });
+    let decision = place(&input(&job, healthy, vec![liar.clone(), honest.clone()]));
+    assert_eq!(decision.chosen, Some(node(4)));
+    let rank_of = |n: u8| match &decision
+        .candidates
+        .iter()
+        .find(|c| c.node == node(n))
+        .unwrap()
+        .verdict
+    {
+        Verdict::Eligible { rank } => rank.clone(),
+        Verdict::Excluded { .. } => Vec::new(),
+    };
+    assert!(!rank_of(3).contains(&RankReason::CurrentHealthy));
+    // Two nodes alike but for the claimed id: the identity tiebreak is the
+    // probed one, so node 3 sorts before node 5 whatever 3 claims.
+    let five = probe(advert(5, 10, 1 << 40, COLD));
+    let mut claim = advert(9, 10, 1 << 40, COLD);
+    claim.node = node(9);
+    let three = Probe {
+        node: node(3),
+        ..probe(claim)
+    };
+    let decision = place(&input(&job, None, vec![five, three]));
+    assert_eq!(decision.chosen, Some(node(3)));
+}
