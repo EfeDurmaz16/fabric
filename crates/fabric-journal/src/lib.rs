@@ -42,6 +42,7 @@ use fabric_core::managed::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+pub use facade::KeyedRequest;
 pub use provider::{
     AbandonApproval, AbandonRefusal, Acknowledged, Blocker, CleanupRefusal, EffectClass,
     LocatorRecord, MAX_ABANDON_REASON, ProviderAnswer, ProviderDispatch, ProviderError,

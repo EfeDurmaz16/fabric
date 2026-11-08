@@ -24,8 +24,9 @@ use fabric_core::managed::facade::{JobScope, ResourceScope};
 use fabric_core::managed::{Command, Envelope, Note, OperationKey, SourceBinding, TaskId};
 use fabric_core::path::AbsPath;
 
+use crate::authority::request_digest;
 use crate::error::NodeError;
-use crate::facade::{allowance, create_command, remote_source};
+use crate::facade::{allowance, create_command, fidelity_bytes, remote_source, revision_bytes};
 use crate::harnesses::refuse_secret_kind;
 use crate::node::Node;
 
@@ -175,28 +176,35 @@ impl Node {
                 job,
                 expected_revision,
             } => {
-                let state = self.managed_state(job).await?;
-                let attempt = state
-                    .live_attempt()
-                    .or_else(|| state.attempts.last())
-                    .map(|a| a.id)
-                    .ok_or_else(|| {
-                        refused(
-                            Reason::ManagedRefused {
-                                refusal: "not_live".into(),
-                                job: Some(job),
-                                operation_key: operation_key.clone(),
-                                replayed: false,
-                            },
-                            "the job has no attempt to checkpoint",
-                        )
-                    })?;
+                let request = request_digest(&[
+                    b"checkpoint",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                ]);
+                let key = operation_key.clone();
                 let operation = self
-                    .managed_submit(Envelope {
-                        key: operation_key,
-                        job: Some(job),
-                        expected: expected_revision,
-                        body: Command::Checkpoint { attempt },
+                    .managed_submit_derived(operation_key, request, job, move |state| {
+                        let attempt = state
+                            .live_attempt()
+                            .or_else(|| state.attempts.last())
+                            .map(|a| a.id)
+                            .ok_or_else(|| {
+                                refused(
+                                    Reason::ManagedRefused {
+                                        refusal: "not_live".into(),
+                                        job: Some(job),
+                                        operation_key: key.clone(),
+                                        replayed: false,
+                                    },
+                                    "the job has no attempt to checkpoint",
+                                )
+                            })?;
+                        Ok(Envelope {
+                            key,
+                            job: Some(job),
+                            expected: expected_revision,
+                            body: Command::Checkpoint { attempt },
+                        })
                     })
                     .await?;
                 Ok(Reply::ManagedCheckpoint(Box::new(operation)))
@@ -208,19 +216,29 @@ impl Node {
                 fidelity,
                 pin,
             } => {
-                let state = self.managed_state(job).await?;
-                let task: TaskId = state.live_attempt().map_or(state.job.primary, |a| a.task);
-                let fidelity = allowance(fidelity.as_deref(), &state.job.policy);
+                let request = request_digest(&[
+                    b"continue",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                    &fidelity_bytes(fidelity.as_deref()),
+                    &pin.map(|p| p.to_bytes().to_vec()).unwrap_or_default(),
+                ]);
+                let key = operation_key.clone();
                 let operation = self
-                    .managed_submit(Envelope {
-                        key: operation_key,
-                        job: Some(job),
-                        expected: expected_revision,
-                        body: Command::Continue {
-                            task,
-                            fidelity,
-                            pin,
-                        },
+                    .managed_submit_derived(operation_key, request, job, move |state| {
+                        let task: TaskId =
+                            state.live_attempt().map_or(state.job.primary, |a| a.task);
+                        let fidelity = allowance(fidelity.as_deref(), &state.job.policy);
+                        Ok(Envelope {
+                            key,
+                            job: Some(job),
+                            expected: expected_revision,
+                            body: Command::Continue {
+                                task,
+                                fidelity,
+                                pin,
+                            },
+                        })
                     })
                     .await?;
                 Ok(Reply::ManagedContinue(Box::new(operation)))
@@ -294,21 +312,6 @@ impl Node {
             body,
         })
         .await
-    }
-
-    /// The job's state, or the refusal a managed op gives for a job the
-    /// authority does not hold.
-    async fn managed_state(
-        &self,
-        job: JobId,
-    ) -> Result<fabric_core::managed::ManagedState, NodeError> {
-        match self.authority.job(job).await? {
-            Some(state) => Ok(state),
-            None if self.cfg.state.job(job).ledger().exists() => {
-                Err(crate::authority::AuthorityError::Standalone(job).into())
-            }
-            None => Err(NodeError::UnknownJob(job)),
-        }
     }
 
     /// Captures `path` into a snapshot through the existing capture path

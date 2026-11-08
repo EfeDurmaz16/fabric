@@ -36,9 +36,9 @@ use std::sync::{Arc, Mutex};
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
     AttemptId, Command, CommandKind, DomainError, Envelope, ManagedState, NewIds, Observation,
-    OperationId, OperationMark, OperationStatus, StoredResult, TaskId, Transition,
+    OperationId, OperationKey, OperationMark, OperationStatus, StoredResult, TaskId, Transition,
 };
-use fabric_journal::{Answer, CommitError, FILE_NAME, Journal, Liveness, OpenError};
+use fabric_journal::{Answer, CommitError, FILE_NAME, Journal, KeyedRequest, Liveness, OpenError};
 use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
 
@@ -111,6 +111,9 @@ enum Call {
         writes: bool,
         work: JournalWork,
     },
+    /// A command whose body is derived from the job's state, deduplicated
+    /// by the caller's request (`Authority::submit_derived`).
+    Derived(DerivedWork),
 }
 
 /// An accepted operation whose effect the node has not asked for yet: a
@@ -131,6 +134,21 @@ pub(crate) struct PendingEffect {
 /// Work the facade or a read runs inside the authority's thread; it
 /// answers its own caller.
 type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
+
+type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder) + Send>;
+
+/// The digest of a caller's request for [`Authority::submit_derived`]:
+/// blake3 under its own domain over each part, length first, so two
+/// requests that differ in any part differ here.
+pub(crate) fn request_digest(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fabric.managed.request.v1\0");
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    *hasher.finalize().as_bytes()
+}
 
 /// The managed ids as the standalone paths read them, without the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +361,30 @@ impl Authority {
         self.call(|reply| Call::Submit(envelope, reply)).await
     }
 
+    /// Applies a command whose body `derive` makes from `job`'s state (a
+    /// checkpoint names the live attempt, a continue its task) once per
+    /// request: `request` is the digest of what the caller asked
+    /// ([`request_digest`]), and it, not the derived body, decides
+    /// sameness under `key`. The same request again answers the stored
+    /// answer as a replay without deriving, however the job moved since;
+    /// another request under the key is `OperationConflict`. The check,
+    /// the derivation and the commit run as one call on the authority's
+    /// thread, so nothing interleaves.
+    pub(crate) async fn submit_derived<E: Send + 'static>(
+        &self,
+        key: OperationKey,
+        request: [u8; 32],
+        job: JobId,
+        derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E> + Send + 'static,
+    ) -> Result<Result<Answer, E>, AuthorityError> {
+        self.call(|reply: Reply<Result<Answer, E>>| {
+            Call::Derived(Box::new(move |place, holder| {
+                let _ = reply.send(derived(place, holder, &key, &request, job, derive));
+            }))
+        })
+        .await
+    }
+
     /// Records what an executor reports about an attempt or an operation.
     pub(crate) async fn observe(
         &self,
@@ -524,6 +566,10 @@ fn serve(
                     tick();
                 }
             }
+            Call::Derived(work) => {
+                work(place, &mut holder);
+                tick();
+            }
             Call::Submit(envelope, reply) => {
                 let answer = submit(place, &mut holder, &envelope);
                 tick();
@@ -622,6 +668,54 @@ fn list(holder: &Holder) -> Result<Vec<ManagedState>, AuthorityError> {
 
 fn ulid() -> [u8; 16] {
     Ulid::generate().to_bytes()
+}
+
+/// The body of [`Authority::submit_derived`] on the authority's thread.
+fn derived<E>(
+    place: &Place,
+    holder: &mut Holder,
+    key: &OperationKey,
+    request: &[u8; 32],
+    job: JobId,
+    derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E>,
+) -> Result<Result<Answer, E>, AuthorityError> {
+    let unknown = || -> AuthorityError {
+        if place.standalone(job) {
+            AuthorityError::Standalone(job)
+        } else {
+            CommitError::Domain(DomainError::UnknownJob { job }).into()
+        }
+    };
+    let journal = match holder {
+        Holder::Open(journal) => journal,
+        Holder::Absent => return Err(unknown()),
+        Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
+    };
+    match journal.keyed_request(key, request)? {
+        KeyedRequest::Other => {
+            return Err(
+                CommitError::Domain(DomainError::OperationConflict { key: key.clone() }).into(),
+            );
+        }
+        KeyedRequest::Same => {
+            if let Some(answer) = journal.stored_answer(key)? {
+                return Ok(Ok(answer));
+            }
+        }
+        KeyedRequest::New => {}
+    }
+    let Some(state) = journal.job(job)? else {
+        return Err(unknown());
+    };
+    let envelope = match derive(&state) {
+        Ok(envelope) => envelope,
+        Err(e) => return Ok(Err(e)),
+    };
+    if envelope.key != *key || envelope.job != Some(job) {
+        return Err(CommitError::Domain(DomainError::BadEnvelope).into());
+    }
+    journal.record_request(key, request)?;
+    Ok(Ok(submit(place, holder, &envelope)?))
 }
 
 fn submit(

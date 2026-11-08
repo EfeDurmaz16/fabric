@@ -15,8 +15,8 @@ use fabric_client::api::{
 };
 use fabric_core::id::JobId;
 use fabric_core::managed::{
-    Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, RestartPolicy, SourceBinding,
-    StoredResult,
+    Command, DomainError, Envelope, Intent, JobPolicy, ManagedState, OperationKey, RestartPolicy,
+    SourceBinding, StoredResult,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::{Answer, CommitError};
@@ -210,10 +210,39 @@ impl Node {
         envelope: Envelope<Command>,
     ) -> Result<ManagedOperation, NodeError> {
         let key: OperationKey = envelope.key.clone();
+        refuse_facade_key(&key)?;
         let named = envelope.job;
+        let answer = self.authority.submit(envelope).await?;
+        self.managed_answer(key, named, answer).await
+    }
+
+    /// Applies an owner's command whose body is derived from the job's
+    /// state, deduplicated by `request` (`Authority::submit_derived`), so
+    /// the same request under the same key replays after the job moved.
+    pub(crate) async fn managed_submit_derived(
+        &self,
+        key: OperationKey,
+        request: [u8; 32],
+        job: JobId,
+        derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, NodeError> + Send + 'static,
+    ) -> Result<ManagedOperation, NodeError> {
+        refuse_facade_key(&key)?;
+        let answer = self
+            .authority
+            .submit_derived(key.clone(), request, job, derive)
+            .await??;
+        self.managed_answer(key, Some(job), answer).await
+    }
+
+    async fn managed_answer(
+        &self,
+        key: OperationKey,
+        named: Option<JobId>,
+        answer: Answer,
+    ) -> Result<ManagedOperation, NodeError> {
         let Answer {
             result, replayed, ..
-        } = self.authority.submit(envelope).await?;
+        } = answer;
         match result {
             StoredResult::Accepted(accepted) => Ok(ManagedOperation {
                 operation: accepted.operation,
@@ -248,4 +277,20 @@ impl Node {
             Err(e) => Some(e.into()),
         }
     }
+}
+
+/// Refuses an owner's key in the facade's namespace, so an owner's key and
+/// an actor's never share a journal row (ADR 0027: two principals never
+/// share one key).
+fn refuse_facade_key(key: &OperationKey) -> Result<(), NodeError> {
+    if key.as_str().starts_with(crate::facade::FACADE_KEY_PREFIX) {
+        return Err(refused(
+            Reason::BadRequest,
+            format!(
+                "operation key {key} starts with {:?}, which the facade's keys use",
+                crate::facade::FACADE_KEY_PREFIX
+            ),
+        ));
+    }
+    Ok(())
 }

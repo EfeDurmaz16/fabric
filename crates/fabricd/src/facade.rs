@@ -47,11 +47,12 @@ use fabric_core::managed::{
 };
 use fabric_core::managed::{SecretName, SecretRef};
 use fabric_core::path::RelPath;
-use fabric_journal::{Blocker, CommitError, Journal, ProviderOperation, Residual};
+use fabric_journal::{Answer, Blocker, CommitError, Journal, ProviderOperation, Residual};
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
 
 use crate::authority::AuthorityError;
+use crate::authority::request_digest;
 use crate::clock::now_ms;
 use crate::error::NodeError;
 use crate::managed::refusal_code;
@@ -68,18 +69,64 @@ fn refused(reason: Reason, message: impl Into<String>) -> NodeError {
     }
 }
 
+/// The prefix of every facade key in the journal. The owner's socket
+/// refuses a key that starts with it, so an owner's key and an actor's
+/// never share a row.
+pub(crate) const FACADE_KEY_PREFIX: &str = "facade:";
+
 /// The journal's key for a facade command: the client's key under the
-/// token's actor, so two actors never share one (ADR 0027). A pair too
-/// long for one key carries the key's digest instead; both forms are
+/// token's actor, in the facade's namespace, so two actors never share
+/// one and no actor shares one with the owner (ADR 0027). An actor holds
+/// no ':', so the actor ends at the first one after the prefix. A pair
+/// too long for one key carries the key's digest instead; both forms are
 /// deterministic, so a repeat lands on the same row.
 pub(crate) fn journal_key(actor: &Actor, key: &OperationKey) -> OperationKey {
-    let joined = format!("{actor}:{key}");
+    let joined = format!("{FACADE_KEY_PREFIX}{actor}:{key}");
     if let Ok(key) = OperationKey::parse(&joined) {
         return key;
     }
     let digest = blake3::hash(key.as_str().as_bytes());
     let short = hex(&digest.as_bytes()[..16]);
-    OperationKey::parse(&format!("{actor}:h:{short}")).unwrap_or_else(|_| key.clone())
+    OperationKey::parse(&format!("{FACADE_KEY_PREFIX}{actor}:h:{short}"))
+        .unwrap_or_else(|_| key.clone())
+}
+
+/// A stored answer as the facade gives it: `accepted`, or the refusal
+/// the journal stored under the key.
+fn facade_accepted(key: &OperationKey, answer: Answer) -> Result<FacadeAnswer, Refusal> {
+    match answer.result {
+        StoredResult::Accepted(accepted) => Ok(FacadeAnswer::Accepted {
+            operation: accepted.operation,
+            key: key.clone(),
+            replayed: answer.replayed,
+            job: accepted.job,
+            revision: accepted.revision,
+        }),
+        StoredResult::Rejected(refusal) => Err(domain_refusal(&refusal)),
+    }
+}
+
+/// A continue's fidelity list as a request digest's part: which names it
+/// gives, in no order, or that it gives none.
+pub(crate) fn fidelity_bytes(names: Option<&[FidelityName]>) -> Vec<u8> {
+    names.map_or_else(
+        || vec![0xff],
+        |names| {
+            let bit = |name: FidelityName, mask: u8| if names.contains(&name) { mask } else { 0 };
+            vec![
+                bit(FidelityName::NativeSession, 1)
+                    | bit(FidelityName::NewNativeSessionWithPackage, 2)
+                    | bit(FidelityName::WorkspaceOnly, 4),
+            ]
+        },
+    )
+}
+
+/// An expected revision as a request digest's part: empty when none.
+pub(crate) fn revision_bytes(expected: Option<WorkRevision>) -> Vec<u8> {
+    expected
+        .map(|r| r.get().to_be_bytes().to_vec())
+        .unwrap_or_default()
 }
 
 /// 32 bytes from the system's random source, for a bearer; read from the
@@ -397,22 +444,22 @@ impl Node {
                 expected_revision,
                 ..
             } => {
-                let state = self.state_for_facade(job).await?;
-                let attempt = state
-                    .live_attempt()
-                    .or_else(|| state.attempts.last())
-                    .map(|a| a.id)
-                    .ok_or_else(|| {
-                        Refusal::new(RefusalCode::Refused, "not_live")
-                            .saying("the job has no attempt to checkpoint")
-                    })?;
-                self.facade_command(
-                    record,
-                    &key,
-                    Some(job),
-                    expected_revision,
-                    Command::Checkpoint { attempt },
-                )
+                let request = request_digest(&[
+                    b"checkpoint",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                ]);
+                self.facade_derived(record, &key, job, request, move |state| {
+                    let attempt = state
+                        .live_attempt()
+                        .or_else(|| state.attempts.last())
+                        .map(|a| a.id)
+                        .ok_or_else(|| {
+                            Refusal::new(RefusalCode::Refused, "not_live")
+                                .saying("the job has no attempt to checkpoint")
+                        })?;
+                    Ok((expected_revision, Command::Checkpoint { attempt }))
+                })
                 .await
             }
             ClientMessage::Continue {
@@ -423,25 +470,24 @@ impl Node {
                 pin,
                 ..
             } => {
-                let state = self.state_for_facade(job).await?;
-                let task = state.live_attempt().map_or(state.job.primary, |a| a.task);
-                let command = Command::Continue {
-                    task,
-                    fidelity: facade_allowance(fidelity.as_deref(), &state.job.policy),
-                    pin,
-                };
-                self.facade_command(record, &key, Some(job), expected_revision, command)
-                    .await
+                let request = request_digest(&[
+                    b"continue",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                    &fidelity_bytes(fidelity.as_deref()),
+                    &pin.map(|p| p.to_bytes().to_vec()).unwrap_or_default(),
+                ]);
+                self.facade_derived(record, &key, job, request, move |state| {
+                    let task = state.live_attempt().map_or(state.job.primary, |a| a.task);
+                    let command = Command::Continue {
+                        task,
+                        fidelity: facade_allowance(fidelity.as_deref(), &state.job.policy),
+                        pin,
+                    };
+                    Ok((expected_revision, command))
+                })
+                .await
             }
-        }
-    }
-
-    /// The job's state for a command that needs it, or `unknown_job`.
-    async fn state_for_facade(&self, job: JobId) -> Result<ManagedState, Refusal> {
-        match self.authority.job(job).await {
-            Ok(Some(state)) => Ok(state),
-            Ok(None) => Err(Refusal::new(RefusalCode::UnknownJob, "job")),
-            Err(e) => Err(authority_refusal(&e)),
         }
     }
 
@@ -466,16 +512,38 @@ impl Node {
             .submit(envelope)
             .await
             .map_err(|e| authority_refusal(&e))?;
-        match answer.result {
-            StoredResult::Accepted(accepted) => Ok(FacadeAnswer::Accepted {
-                operation: accepted.operation,
-                key: key.clone(),
-                replayed: answer.replayed,
-                job: accepted.job,
-                revision: accepted.revision,
-            }),
-            StoredResult::Rejected(refusal) => Err(domain_refusal(&refusal)),
-        }
+        facade_accepted(key, answer)
+    }
+
+    /// Submits a command whose body `derive` makes from the job's state,
+    /// deduplicated by the client's `request` (ADR 0027, failure mode 3:
+    /// the same request repeated under its key is one operation however
+    /// the job moved between the two sends).
+    async fn facade_derived(
+        &self,
+        record: &FacadeTokenRecord,
+        key: &OperationKey,
+        job: JobId,
+        request: [u8; 32],
+        derive: impl FnOnce(&ManagedState) -> Result<(Option<WorkRevision>, Command), Refusal>
+        + Send
+        + 'static,
+    ) -> Result<FacadeAnswer, Refusal> {
+        let stored = journal_key(&record.actor, key);
+        let envelope_key = stored.clone();
+        let answer = self
+            .authority
+            .submit_derived(stored, request, job, move |state| {
+                derive(state).map(|(expected, body)| Envelope {
+                    key: envelope_key,
+                    job: Some(job),
+                    expected,
+                    body,
+                })
+            })
+            .await
+            .map_err(|e| authority_refusal(&e))??;
+        facade_accepted(key, answer)
     }
 
     /// A page of the job's events after `after`: the journal is the queue.
@@ -1559,6 +1627,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, all);
+    }
+
+    /// Grants and starts an attempt of `job`'s primary task, as an
+    /// executor's report would, and returns it.
+    async fn live_attempt(node: &Node, job: JobId, key: &str) -> fabric_core::managed::Attempt {
+        let state = node.authority.job(job).await.unwrap().unwrap();
+        let start = Envelope {
+            key: OperationKey::parse(key).unwrap(),
+            job: Some(job),
+            expected: None,
+            body: Command::StartAttempt {
+                task: state.job.primary,
+                resource: ResourceRef::Node { node: node.id },
+                initial_checkpoint: None,
+            },
+        };
+        let answer = node.authority.submit(start).await.unwrap();
+        assert!(
+            matches!(answer.result, StoredResult::Accepted(_)),
+            "{answer:?}"
+        );
+        let attempt = node
+            .authority
+            .job(job)
+            .await
+            .unwrap()
+            .unwrap()
+            .attempts
+            .last()
+            .unwrap()
+            .clone();
+        node.authority
+            .observe(
+                job,
+                fabric_core::managed::Observation::Started {
+                    attempt: attempt.id,
+                    generation: attempt.generation,
+                },
+            )
+            .await
+            .unwrap();
+        attempt
+    }
+
+    /// The same checkpoint request under the same key is one operation,
+    /// though another attempt became the live one between the two sends:
+    /// sameness is the request's, not the body the authority derived.
+    #[tokio::test]
+    async fn a_retried_checkpoint_replays_after_the_job_moved() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k1", "g").await);
+        let first = live_attempt(&node, job, "start-1").await;
+        let checkpoint = json!({ "type": "checkpoint", "facade": 1, "token": hex_of(1),
+            "key": "cp-1", "job": job.to_string(), "expected_revision": null });
+        let FacadeAnswer::Accepted {
+            operation,
+            replayed,
+            ..
+        } = node.facade_answer(&checkpoint, NOW).await
+        else {
+            panic!("not accepted");
+        };
+        assert!(!replayed);
+        node.authority
+            .observe(
+                job,
+                fabric_core::managed::Observation::Exited {
+                    attempt: first.id,
+                    generation: first.generation,
+                    outcome: fabric_core::managed::ExitOutcome::Succeeded,
+                },
+            )
+            .await
+            .unwrap();
+        live_attempt(&node, job, "start-2").await;
+        let FacadeAnswer::Accepted {
+            operation: again,
+            replayed,
+            ..
+        } = node.facade_answer(&checkpoint, NOW).await
+        else {
+            panic!("not accepted");
+        };
+        assert!(replayed);
+        assert_eq!(again, operation);
+        // Another request under the key is still a conflict.
+        let other = json!({ "type": "checkpoint", "facade": 1, "token": hex_of(1),
+            "key": "cp-1", "job": job.to_string(), "expected_revision": "1" });
+        refused_as(
+            &node.facade_answer(&other, NOW).await,
+            RefusalCode::Conflict,
+            "key",
+        );
+    }
+
+    /// The owner's keys and the facade's never share a row: the owner's
+    /// `efe:k1` and actor `efe`'s `k1` are two operations, and the owner
+    /// cannot write a key in the facade's namespace.
+    #[tokio::test]
+    async fn owner_and_facade_keys_never_collide() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k0", "g").await);
+        let owner = node
+            .managed_submit(Envelope {
+                key: OperationKey::parse("efe:k1").unwrap(),
+                job: Some(job),
+                expected: None,
+                body: Command::RecordNote {
+                    note: Note::Question {
+                        text: "from the owner".into(),
+                    },
+                },
+            })
+            .await
+            .unwrap();
+        let cancel = json!({ "type": "cancel", "facade": 1, "token": hex_of(1), "key": "k1",
+            "job": job.to_string(), "expected_revision": null, "task": null, "reason": "stop" });
+        let FacadeAnswer::Accepted {
+            operation,
+            replayed,
+            ..
+        } = node.facade_answer(&cancel, NOW).await
+        else {
+            panic!("not accepted");
+        };
+        assert!(!replayed);
+        assert_ne!(operation, owner.operation);
+        let reserved = node
+            .managed_submit(Envelope {
+                key: journal_key(
+                    &Actor::parse("efe").unwrap(),
+                    &OperationKey::parse("k2").unwrap(),
+                ),
+                job: Some(job),
+                expected: None,
+                body: Command::RecordNote {
+                    note: Note::Question { text: "q".into() },
+                },
+            })
+            .await;
+        assert!(reserved.is_err(), "{reserved:?}");
     }
 
     /// A facade `continue` cannot widen the job's fidelity allowance: what
