@@ -85,7 +85,7 @@ enum Command {
     /// Make, cancel and read managed jobs (experimental).
     #[command(subcommand)]
     Managed(managed::ManagedCommand),
-    /// Read Portable Session Format containers (ADR 0029).
+    /// Read Portable Session Format containers.
     #[command(subcommand)]
     Psf(psf::PsfCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
@@ -261,15 +261,15 @@ enum JobCommand {
         /// root; the workspace at the root when left out.
         #[arg(long, value_name = "PATH", conflicts_with = "psf")]
         path: Option<PathBuf>,
-        /// The container directory to write, which must not exist (ADR 0029).
-        #[arg(long)]
+        /// The container directory to write, which must not exist.
+        #[arg(long, value_name = "DIR")]
         psf: Option<PathBuf>,
     },
     /// Check a Portable Session Format container against the job it names
     /// on this node, and say what this node can continue.
     Import {
         /// The container directory.
-        #[arg(long)]
+        #[arg(long, value_name = "DIR")]
         psf: PathBuf,
     },
 }
