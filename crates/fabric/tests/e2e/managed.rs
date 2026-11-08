@@ -369,7 +369,7 @@ fn e2e_the_cli_registers_a_test_task_with_its_program() -> Fallible {
         "managed", "register", &job, "--parent", &primary, "--label", "leaky", "--class", "build",
         "--", "curl", "-H", &token,
     ])?;
-    assert!(refused.contains("bad_program"), "{refused}");
+    assert!(refused.contains("bad program"), "{refused}");
     assert!(
         !refused.contains(&token),
         "the refusal echoes no credential: {refused}"
