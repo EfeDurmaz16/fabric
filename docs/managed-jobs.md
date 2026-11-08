@@ -1433,7 +1433,7 @@ Added in the acceptance step, after both owners merged. The selections stand as 
 
 - `fabricd::dispatch` places every accepted `CreateJob` whose source is `snapshot`, `git` or `empty` (an imported directory is a snapshot by then): `Node::place_job` with `PlacementKind::Initial`, then the `Placed` observation, which records the decision and grants the primary task's first attempt on the chosen node in one batch, or parks the job. The list is `Authority::pending()`, read anew after every commit the authority counts, so a create accepted before a crash is placed after the restart, once. A create with a `repository` source is the M2 form and is still settled by its explicit `StartAttempt`; the loop leaves it alone, so the M2 tests and journals see no new event. The loop waits on `Authority::started()` and never starts the authority's thread itself, so a node with no managed job still starts none. A placement whose observation is refused is logged and not tried again in that process. Fault point `before_placement` (after the create's commit, before any decision) is the crash test's.
 - A harness version is advertised as the version in the harness's `--version` output (`codex-cli 0.155.1` is `0.155.1`); before this, every real Codex and Claude Code was advertised in a form the asking node could not parse and every node was excluded `harness_missing`.
-- Not built: the launch of a granted attempt, on this node or another. fabric-net protocol 4 carries `Advertise` and the facade, and no message that asks the chosen node to run a grant or carries its observations (`Started`, `Exited`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`) back to the authority; the node has no `Capturer` but the tests' fake; `RegisterTask` names no program for a build or test task, so the executor has nothing to spawn for one; and no work package is built or carried. So a `Continue` stays `accepted` and the M5 rows "A planned handoff with child-task outcomes and the fidelity achieved" and the e2e tests the table names for it (`continuity::*`, `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log`, and the attempt half of `e2e_a_submit_runs_on_the_eligible_node_without_naming_it`) are not run end to end. The question this needs is in docs/evidence/m5/README.md, "Blocked".
+- Not built: the launch of a granted attempt, on this node or another. fabric-net protocol 4 carries `Advertise` and the facade, and no message that asks the chosen node to run a grant or carries its observations (`Started`, `Exited`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`) back to the authority; the node has no `Capturer` but the tests' fake; `RegisterTask` names no program for a build or test task, so the executor has nothing to spawn for one; and no work package is built or carried. So a `Continue` stays `accepted` and the M5 rows "A planned handoff with child-task outcomes and the fidelity achieved" and the e2e tests the table names for it (`continuity::*`, `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log`, and the attempt half of `e2e_a_submit_runs_on_the_eligible_node_without_naming_it`) are not run end to end. The question this needs is in docs/evidence/m5/README.md, "Blocked". Answered 2026-11-08 by the selection "M5 launch path" (option (a), under the delegation): the contract is "Launch path (M5, as built)" below.
 
 The acceptance tests that ran through real daemons (two `fabricd` on one host, separate state roots, a TCP and TLS node link):
 
@@ -1498,6 +1498,255 @@ Facade (owner B, P07):
 - `checkpoint` on a job with no attempt at all is refused `not_live` without a stored key; with an attempt that is not live the domain refuses it under the key. `continue` names the live attempt's task, or the primary task when none is live.
 - The bearer is 32 bytes read from `/dev/urandom`, shown once. A mint before any managed job makes the journal, as a first create does. `facade_revoke` on a node without a journal answers `revoked: false`.
 - The authority gained two small additions for this part, in owner A's `authority.rs`: `with_journal`, which runs a closure in the authority's thread (the token rows, the inspect read, the watch read), and a `watch::Receiver<u64>` commit counter. `fabric-journal` gained `provider_operations(job)` beside `residuals`, for the inspection.
+
+### Launch path (M5, as built)
+
+Status: contract written 2026-11-08, before the code, under the selection "M5 launch path, selected 2026-11-08" of the decisions file (option (a): M5 adds the launch path). The selection was made by the implementation agent under Efe's delegation of 2026-11-02 and is not approved by Efe. The shared types below are in `crates/fabric-core/src/managed/launch.rs` and the amended `model.rs` since this contract's commit; the fabric-net messages, the authority side and the node side follow, each owner appending an "as built" paragraph here where the code differs. The gap this closes is docs/evidence/m5/README.md, "Blocked": M5 placed and granted attempts and never launched one.
+
+Failure modes first:
+
+1. **A node acts on a grant only while it is the job's live grant.** Every message from a node carries a `GrantToken { job, attempt, generation }`. A `Report` whose generation is not the job's is refused `StaleGeneration { current }`, recorded as `StaleObservationRefused` (replay rule 7) and never applied; a heartbeat for it is answered `Stale`, and the node stops the attempt's groups. This is M6's fence shape: M6 widens `GrantVerdict` and adds `Captured` to the observations a report may carry, and changes nothing else here.
+2. **A launch is idempotent by attempt.** The node answers a second `Launch` of an attempt it runs `AlreadyLaunched`; so an authority that restarts after it sent one sends it again, and nothing is launched twice. The authority keeps no "launch sent" event: the grant is the durable fact, the node's record is the other half.
+3. **An answer says the node took the message, never what came of it.** `Launch` and `Instruct` are answered at once (`Accepted` or `Refused { reason }`) inside the link's reply window; a clone, a pull or a drain budget takes longer than that window. Every outcome (`Started`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`, `Exited`) is a `Report`, in order, one at a time per attempt.
+4. **A refusal is never lowered.** A target that can offer no allowed fidelity starts nothing: it reports the harness receipt `Blocked { reason }` and `Exited { Failed }`; the continue fails and the task stays open. Nothing starts at `workspace_only` because `native_session` was asked.
+5. **A report that cannot reach the authority is kept, in order, and retried after the node's next heartbeat answer.** The attempt runs on; disconnect is not cancel (facade failure mode 5). A node restart loses the queue: `Executor::recover` stops what the launch records name, and the attempt's fate is M6's (`unknown` for want of heartbeats).
+6. **Nothing a node reads from a message is trusted past its check.** `Program::check`, `JobPolicy::check`, `WorkPackage` size and digest, `tasks.len() <= MAX_TASK_LAUNCHES` and `attempts.len() <= MAX_HEARTBEAT_ATTEMPTS` run on the receiving side before anything is served, on top of the frame bound.
+
+#### Shared types (fabric-core, `managed::launch`, landed with this contract)
+
+```rust
+pub const MAX_ARGV: usize = 64;
+pub const MAX_ARG_BYTES: usize = 4096;
+pub const MAX_ENV_ALLOWLIST: usize = 64;
+pub const MAX_TASK_LAUNCHES: usize = 256;
+pub const MAX_HEARTBEAT_ATTEMPTS: usize = 64;
+pub const HEARTBEAT_MS: u64 = 2_000;
+
+/// What a build or test task runs; a harness task has none.
+pub struct Program { pub argv: Vec<String>, pub cwd: Option<RelPath>, pub env_allowlist: Vec<EnvVarName> }
+pub enum ProgramError { EmptyArgv, TooManyArgs { count }, ArgTooLong { index, bytes }, ControlCharacter { index }, TooManyEnv { count }, CredentialLike { index } }
+impl Program { pub fn check(&self) -> Result<(), ProgramError>; }
+
+pub struct GrantToken { pub job: JobId, pub attempt: AttemptId, pub generation: Generation }   // M6's token
+pub struct TaskLaunch { pub task: TaskId, pub class: TaskClass, pub program: Program }
+pub struct ContinuationAsk { pub from: AttemptId, pub allowed: AllowedFidelity }
+
+pub struct LaunchRequest {
+    pub token: GrantToken,
+    pub task: TaskId,                         // the harness task the attempt runs
+    pub intent: Intent,
+    pub source: SourceBinding,
+    pub policy: JobPolicy,
+    pub initial_checkpoint: Option<SnapshotId>,
+    pub snapshot_at: Option<NodeId>,          // whose store holds the chain; required with initial_checkpoint
+    pub tasks: Vec<TaskLaunch>,               // open build and test tasks under `task` with a program
+    pub continuation: Option<ContinuationAsk>,
+    pub package: Option<WorkPackage>,         // Some exactly when continuation is
+}
+pub enum LaunchAnswer { Accepted, Refused { reason: LaunchRefusal } }
+pub enum LaunchRefusal { AlreadyLaunched, Superseded { current: Generation }, HarnessMissing { harness: HarnessKind }, SecretUnresolved { name: SecretName }, BadProgram { task: TaskId, error: ProgramError }, Inconsistent { reason: String }, Internal { reason: String } }
+
+pub enum Instruction { Spawn(TaskLaunch), Checkpoint { then: AfterCut }, Stop { reason: String } }
+pub enum AfterCut { Resume, End }
+pub enum InstructAnswer { Accepted, Refused { reason: InstructRefusal } }
+pub enum InstructRefusal { NotRunning, Superseded { current: Generation }, Frozen, Busy { what: String }, BadProgram(ProgramError), Internal { reason: String } }
+
+pub struct Report { pub token: GrantToken, pub observation: Observation }
+pub enum ReportAnswer { Recorded { revision: WorkRevision }, Refused { reason: ReportRefusal } }
+pub enum ReportRefusal { StaleGeneration { current: Generation }, UnknownJob, UnknownAttempt, WrongNode, TokenMismatch, NotReportable, Domain { reason: String }, Unavailable }
+impl Report {
+    /// The attempt and generation of a reportable observation (Started, Receipts, Checkpointed, HandoffBlocked, Continued, Exited); None for Placed, Lost, Unknown.
+    pub fn reported(observation: &Observation) -> Option<(AttemptId, Generation)>;
+    pub fn check(&self) -> Result<(), ReportRefusal>;   // NotReportable, then TokenMismatch
+}
+
+pub struct Heartbeat { pub attempts: Vec<GrantToken> }
+pub struct HeartbeatAnswer { pub verdicts: Vec<(AttemptId, GrantVerdict)> }
+pub enum GrantVerdict { Live, Stale { current: Generation }, Unknown }
+```
+
+Model amendments (fabric-core `model.rs`, codec format 2 amended in place, unshipped):
+
+```rust
+pub enum Command {
+    // and:
+    RegisterTask { parent: TaskId, kind: TaskKind, restart: RestartPolicy, class: TaskClass, program: Option<Program> },
+}
+pub enum ManagedEvent {
+    // and:
+    TaskRegistered { task: TaskId, parent: Option<TaskId>, kind: TaskKind, restart: RestartPolicy, class: TaskClass, program: Option<Program> },
+}
+pub struct Task { /* M5 fields, and */ pub program: Option<Program> }
+pub enum EffectRequest { /* and */ Spawn { task: TaskId } }
+pub enum DomainError { /* and */ ProgramRequired { class: TaskClass }, ProgramNotAllowed { class: TaskClass }, BadProgram { error: ProgramError } }
+```
+
+Rules (owner A, `transition.rs`, each with a test in `managed_rules.rs` that fails on this commit):
+
+- `RegisterTask` with class `Build` or `Test` needs `Some(program)` (`ProgramRequired`); with `Harness` or `Opaque` it refuses one (`ProgramNotAllowed`); `program.check()` failing is `BadProgram`. All three are refused before the journal records anything, like `BadPolicy`.
+- `RegisterTask` with a program is `accepted` with `effect: true` and `EffectRequested { Spawn { task } }` when the parent task has a live attempt (`granted` or `running`); its dispatch is `Instruct(Spawn)` to that attempt's node, `succeeded` on `Accepted`, `failed` on `Refused`. With no live attempt it is `succeeded` at commit as in M2, and the task rides in the next `LaunchRequest.tasks`. `CommandKind::has_effect(RegisterTask)` is `true`.
+- A granted attempt of a continue that ends (`Exited`, any outcome) before `Continued` marks the continue `failed`: the target could not offer an allowed fidelity or could not start, and the task stays open for another `Continue`.
+- Format 1 widens `TaskRegistered` with `program: None` (`frame::v1`, done). The `tasks` projection gains `program BLOB` (framed `Program`, null for none) in the version 3 DDL, amended in place; `tests/fixtures/v3.sqlite` is made again by `make_v3_fixture` and `the_v3_fixture_holds_what_it_was_made_with` pins a child with a program. A version 3 file without the column was written by the earlier draft and is refused at `open` as `DraftSchema { version: 3 }`, the refusal M6 adds for the same reason, so the two branches converge on it.
+
+#### fabric-net, protocol 4 (owner A), additive
+
+```rust
+pub enum RequestBody {
+    // M5 so far, and:
+    Launch(Box<LaunchRequest>),                              // authority to the chosen node
+    Instruct { token: GrantToken, instruction: Instruction }, // authority to the node that runs the attempt
+    Report(Box<Report>),                                      // node to the authority
+    Heartbeat(Heartbeat),                                     // node to the authority, every HEARTBEAT_MS while it runs an attempt
+}
+pub enum ResponseBody {
+    // and:
+    Launch(LaunchAnswer), Instruct(InstructAnswer), Report(ReportAnswer), Heartbeat(HeartbeatAnswer),
+}
+pub trait Service {
+    // and, each with a default that refuses (`Fault::BadRequest`), as `advertise` and `facade` have:
+    fn launch(&self, peer: NodeId, request: LaunchRequest) -> BoxFuture<'_, Result<LaunchAnswer, Fault>>;
+    fn instruct(&self, peer: NodeId, token: GrantToken, instruction: Instruction) -> BoxFuture<'_, Result<InstructAnswer, Fault>>;
+    fn report(&self, peer: NodeId, report: Report) -> BoxFuture<'_, Result<ReportAnswer, Fault>>;
+    fn heartbeat(&self, peer: NodeId, beat: Heartbeat) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>>;
+}
+impl Session {
+    pub async fn launch(&self, request: LaunchRequest, deadline: Duration) -> Result<LaunchAnswer, RpcError>;
+    pub async fn instruct(&self, token: GrantToken, instruction: Instruction, deadline: Duration) -> Result<InstructAnswer, RpcError>;
+    pub async fn report(&self, report: Report, deadline: Duration) -> Result<ReportAnswer, RpcError>;
+    pub async fn heartbeat(&self, beat: Heartbeat, deadline: Duration) -> Result<HeartbeatAnswer, RpcError>;
+}
+```
+
+All four travel in a control frame (`MAX_CONTROL_FRAME`, which holds a 1 MiB record page): a `LaunchRequest` is at most `PACKAGE_MAX_BYTES` of package plus the job's own fields, and a `Report` carries one `CheckpointCut` at most. They run under the per-peer job work cap like `Advertise`. The fixtures are [protocol/net/v4](../protocol/net/v4) (docs/net.md, "Launch path fixtures"); `crates/fabric-net/tests/launch_fixtures.rs` pins the manifest and builds every case.
+
+#### fabricd, the authority side (owner A)
+
+```rust
+// dispatch.rs (extend): one loop, read anew after every commit, as now for creates
+pub(crate) async fn run(node: Arc<Node>);
+// For each job, in this order, each at most once per process until the journal moves:
+//   CreateJob accepted            -> place (as built), the Placed grants or parks
+//   Continue dispatched/accepted  -> live attempt: mark Dispatched, Instruct(Checkpoint { then: End }) to its node;
+//                                    no live attempt: place with PlannedHandoff from the task's last cut (domain, as built)
+//   Checkpoint accepted           -> mark Dispatched, Instruct(Checkpoint { then: Resume })
+//   CancelJob, CancelTask accepted with a live attempt -> mark Dispatched, Instruct(Stop { reason })
+//   RegisterTask accepted with Spawn requested -> mark Dispatched, Instruct(Spawn(TaskLaunch)); Accepted: Succeeded, Refused: Failed
+//   every attempt `granted` on a remote node -> launch::plan then launch::send; Accepted and AlreadyLaunched record nothing
+//     (Started comes by report); Superseded records nothing; any other refusal is observed as Receipts (harness receipt
+//     Blocked { reason }) then Exited { Failed { code: None } }, so the attempt fails and the task is free
+// Fault points: `before_launch` (after the grant's commit, before Launch is sent), `after_launch_accepted`.
+
+// launch.rs (new)
+pub(crate) struct LaunchPlan { pub request: LaunchRequest, pub node: NodeId }
+/// Builds the request from the journal: intent, source and policy from the job; `initial_checkpoint` from the grant;
+/// `snapshot_at` the node of the attempt that cut it (an import's snapshot: this node); `tasks` the open Build and Test
+/// tasks under `task` with a program; `continuation` and `package` for a grant a Continue made.
+pub(crate) fn plan(journal: &Journal, state: &ManagedState, attempt: AttemptId) -> Result<LaunchPlan, AuthorityError>;
+/// This node: `Node::runner_launch(None, request)` (owner B); a peer: `Session::launch` with the link's deadline.
+pub(crate) async fn send(node: &Arc<Node>, plan: LaunchPlan) -> Result<LaunchAnswer, NodeError>;
+pub(crate) async fn instruct(node: &Arc<Node>, target: NodeId, token: GrantToken, instruction: Instruction) -> Result<InstructAnswer, NodeError>;
+
+// package.rs (new): the package of a planned handoff, from journal state at the cut
+pub(crate) fn build_for_continue(journal: &Journal, state: &ManagedState, from: AttemptId) -> Result<WorkPackage, PackageError>;
+// PackageInput: notes = Journal::notes(job); receipts = Journal::receipts(job, from); workspace = { bundle_head: the cut's
+// snapshot, ledger_head: the digest of the job's latest event }; evidence = the cut's; artifacts = none in M5.
+
+// report.rs (new): what a node sends, accepted into the journal
+impl Node {
+    /// `Report::check`, then the grant's node against `from` (`None` is this node; another node is `WrongNode`), then
+    /// `Authority::observe`; `DomainError::StaleGeneration` answers `StaleGeneration { current }` (the domain recorded it),
+    /// another domain refusal answers `Domain { reason }` by its snake-case name, a closed authority `Unavailable`.
+    pub(crate) async fn accept_report(&self, from: Option<NodeId>, report: Report) -> ReportAnswer;
+    /// One verdict per token: `Live` when the token is the job's live grant on `from`, `Stale { current }` when the job's
+    /// generation is newer, `Unknown` otherwise. Writes nothing.
+    pub(crate) async fn accept_heartbeat(&self, from: Option<NodeId>, beat: &Heartbeat) -> HeartbeatAnswer;
+}
+```
+
+#### fabricd, the node side (owner B)
+
+```rust
+// runner.rs (new): the attempts this node runs for an authority
+impl Node {
+    /// Takes a grant: checks (`Superseded`, `HarnessMissing`, `SecretUnresolved`, `BadProgram`, `Inconsistent`), writes
+    /// the launch record, answers, and runs the attempt in a task of its own. `from` is the authority (`None`: this node).
+    pub(crate) async fn runner_launch(self: &Arc<Self>, from: Option<NodeId>, request: LaunchRequest) -> LaunchAnswer;
+    pub(crate) async fn runner_instruct(self: &Arc<Self>, token: GrantToken, instruction: Instruction) -> InstructAnswer;
+}
+// The runner loop of one attempt:
+//   1. Executor::begin(attempt, job, generation, paths::job_root(home, job), policy.secrets)
+//   2. the root: initial_checkpoint Some -> transfer::fetch_snapshot from snapshot_at when the store lacks it, restore the
+//      workspace, and the harness state too when the continuation allows native_session and the adapter can; None ->
+//      sources::prepare(node, job, &source). A failure here is reported Receipts (the harness receipt Blocked { reason })
+//      then Exited { Failed { code: None } }; nothing was started.
+//   3. a continuation: offered_fidelity(&intent.harness, the restored manifest's known writer, own advert, same layout),
+//      then allowed.highest(offered); Err -> the Blocked and Exited reports of step 2 with the refusal as the reason.
+//   4. the harness task through its adapter: Launch::Headless { resume: the restored session for native_session, else None;
+//      prompt: the goal, and the package's canonical JSON written beside the root for new_native_session_with_package },
+//      the job's secrets in its environment under their names; the process is registered with the executor
+//      (Executor::adopt, below). workspace_only starts no harness.
+//   5. Report Started; for a continuation then Report Continued { from, achieved, package: Some(digest) when used };
+//      workspace_only then reports Exited { Succeeded } and ends.
+//   6. Executor::spawn each TaskLaunch (class Build or Test) in the root, cwd under it, env_allowlist applied.
+//   7. Heartbeat every HEARTBEAT_MS with every token this node runs; Stale or Unknown -> Executor::stop(budget), end,
+//      no report; a failed heartbeat is retried next interval and flushes the report queue when it answers.
+//   8. the harness process exits -> Report Receipts (every task as it stands) then Exited { Succeeded | Failed { code } }; end.
+//   9. Instruct Checkpoint { then }: Executor::quiesce(budget); blockers -> Report HandoffBlocked, Executor::resume;
+//      none -> Executor::cut, Report Checkpointed { snapshot, cut }; Recorded and Resume -> Executor::resume;
+//      Recorded and End -> Executor::stop(budget) of what still runs, Executor::end; Refused StaleGeneration -> stop, end.
+//  10. Instruct Stop { reason }: Executor::stop(budget) -> Report Receipts (interrupted) then Exited { Cancelled }; end.
+//  11. Instruct Spawn(t): Executor::spawn; Frozen or Busy are refused as such.
+//  Reports go out in order per attempt; one in flight; a link failure or `Unavailable` keeps the queue for the next
+//  heartbeat answer. Counters: launches taken, reports sent, reports refused, heartbeats, stale verdicts obeyed.
+
+// executor.rs (owner B this step): one addition
+impl Executor {
+    /// Registers a harness process the adapter spawned, in its own group, as the attempt's harness task; the launch
+    /// record is written as for `spawn`. Refused while the attempt is frozen.
+    pub async fn adopt(&self, attempt: AttemptId, task: TaskId, pid: u32, started: Option<String>) -> Result<Spawned, ExecutorError>;
+}
+
+// capturer.rs (new): the real `Capturer`
+pub(crate) struct NodeCapturer { /* the node, the job, the root, the harness adapter and env, the store, the export allowlist */ }
+impl Capturer for NodeCapturer {
+    // checkpoint_harness: the adapter's suspend path (`capture`, the marker, the manifest) into the store, as `job suspend` does
+    // capture: fabric-store capture of the root with IgnorePolicy::allow_export for the allowlist
+    // facts: NodeFacts::measure for the job's harness, as `NodeFacts::iter` gives them
+}
+
+// service.rs (owner B): the four Service methods, each one line, launch and instruct to the runner, report and
+// heartbeat to owner A's accept_report and accept_heartbeat with `Some(peer)`.
+```
+
+The client surfaces (owner B): the client API gains `managed_register` (api 1, additive): `operation_key`, `job`, optional `expected_revision`, `parent`, `label`, `class` (`build` or `test`), `program { argv, cwd?, env_allowlist }`, answered with `ManagedOperation` like `managed_note`; its fixtures `protocol/fixtures/request/managed_register.json`, `managed_register_minimal.json` and `reply/managed_register.json` are in this contract's commit, and `protocol/required.txt` is regenerated by the contract test once the parsers land. `fabric managed register <job> --parent <task> --label <text> --class build|test [--cwd <rel>] [--env NAME]... -- <argv...>`. A task in `managed_status`, `managed_inspect` and the facade's `inspection` carries `program` when it has one; the `task_registered` event carries it too and `effect_requested` has the form `{ "spawn": { "task" } }` (docs/facade-protocol.md, "Launch path"). The TypeScript SDK gains `managedRegister`. A `managed_finish` for a child task is not in this step: the acceptance needs an open, interrupted task, not a finished one.
+
+The provider read-surface row, carried from M4, closes in this step on owner B's side: `fabricd::facade::tests::an_inspection_lists_every_provider_status` over a journal seeded with one provider operation per status and the blockers and residuals they make, and `managed::e2e_the_cli_inspects_provider_operations_blockers_and_residuals` in the e2e suite for `fabric managed inspect`.
+
+#### Acceptance mapped to tests, the launch path
+
+Each test is written first and fails on this contract's commit.
+
+| Item | Tests |
+| --- | --- |
+| The program rules and the Spawn effect (owner A) | `fabric-core` `managed_rules::{a_build_or_test_task_needs_a_program, a_harness_or_opaque_task_takes_no_program, a_bad_program_is_refused_before_the_journal, a_program_registered_under_a_live_attempt_asks_for_a_spawn, a_continue_s_grant_that_ends_before_continued_fails_the_continue}`; `fabric-journal` `fixtures::the_v3_fixture_holds_what_it_was_made_with` (a child with a program), `a_draft_v3_without_the_program_column_is_refused` |
+| Protocol 4 carries the launch path (owner A) | `fabric-net` `tests/launch_fixtures.rs::{the_manifest_is_the_pinned_one, every_case_builds_and_round_trips_in_a_control_frame, a_case_marked_reject_is_refused_where_it_says}`; `wire::tests` property round trips widened to the four messages |
+| The authority dispatches and fences (owner A) | `fabricd` `report::tests::{a_report_at_an_older_generation_is_refused_and_recorded, a_report_from_another_node_than_the_grant_is_refused, a_report_whose_token_and_observation_differ_is_refused_before_the_journal, a_heartbeat_names_each_grant_live_stale_or_unknown}`; `dispatch::tests::{a_granted_remote_attempt_is_launched_once_per_process, an_already_launched_answer_is_not_a_failure, a_refused_launch_fails_the_attempt_and_frees_the_task, a_continue_with_a_live_attempt_asks_for_its_cut_then_places_from_it, a_checkpoint_and_a_cancel_are_instructed_to_the_live_node, a_spawn_is_instructed_and_settled_by_the_answer}`; `package::tests::a_package_is_built_from_the_journal_at_the_cut`; `crash_tests::a_launch_killed_after_the_node_accepted_is_not_launched_twice` |
+| The node runs, heartbeats, cuts and reports (owner B) | `fabricd` `runner::tests::{a_launch_is_idempotent_by_attempt, a_launch_of_a_superseded_generation_is_refused, a_stale_or_unknown_heartbeat_verdict_stops_the_attempt, a_checkpoint_instruction_cuts_then_resumes_or_ends, a_stop_instruction_reports_every_task_interrupted_then_cancelled, a_report_refused_stale_stops_the_attempt, a_preparation_failure_is_reported_blocked_then_failed, an_unallowed_fidelity_starts_nothing, reports_leave_in_order_and_wait_for_the_link}`; `executor::tests::an_adopted_harness_process_is_in_its_own_group_and_recorded`; `capturer::tests::{a_harness_checkpoint_goes_through_the_suspend_path, a_capture_honours_the_export_allowlist}` |
+| The client surfaces (owner B) | `fabric-client` `contract.rs` and the TypeScript `contract.test.ts` over the three new fixtures; `fabric-client` `facade_fixtures.rs` and `facade_fixtures.test.ts` over `events_launch_path` and `inspection_continued` (the pins moved in this contract's commit); `fabric` CLI test `managed::e2e_the_cli_registers_a_test_task_with_its_program` |
+| The provider read surface (owner B, carried from M4) | `fabricd` `facade::tests::an_inspection_lists_every_provider_status`; e2e `managed::e2e_the_cli_inspects_provider_operations_blockers_and_residuals` |
+| M5 acceptance end to end (both owners, two daemons on one host) | `placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it` (the attempt half: `Started` on the chosen node, the inspection's attempt `running`); `continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved` (a registered test task with a program `sleep`, continued under the fake agent with the package: the test recorded `interrupted`, `achieved: new_native_session_with_package`, the package digest in the inspection); `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout`; `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log`; `managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted`; `managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on` |
+| Counters, not time | launches taken, reports sent and refused, heartbeats and stale verdicts (the runner's counters); one commit per report; one probe round per placement as before. Time is the Perf step's alone |
+
+#### Owners and files, the launch path
+
+Two owners, disjoint files. Owner A lands the fabric-net messages first; owner B's first commit that uses them merges `m5` after that commit. Merge commits only. The shared types are in `fabric-core` since this contract's commit; a change to them is owner A's, announced in the commit.
+
+| Owner | Scope | Files |
+| --- | --- | --- |
+| A | the program rules and the Spawn effect; protocol 4's four messages; the authority side: launch planning and sending, the dispatch of Checkpoint, Continue, CancelJob, CancelTask and Spawn, the package build, report and heartbeat acceptance with the fence; the journal's `program` column and the v3 fixture | `crates/fabric-core/src/managed/{launch,model,transition,frame}.rs`, `crates/fabric-core/tests/managed_rules.rs`; `crates/fabric-net/*` (new `tests/launch_fixtures.rs`); `crates/fabric-journal/*`; `crates/fabricd/src/{dispatch,authority}.rs`, `authority/*`, new `{launch,package,report}.rs`, `faults.rs`, `managed.rs`; `protocol/net/v4/*`; this subsection's "as built" for A and docs/net.md |
+| B | the runner loop, the real `Capturer`, `Executor::adopt`, the four `Service` methods; `managed_register` on the client API, the CLI and the TypeScript SDK; the provider read-surface tests; the e2e acceptance tests | `crates/fabricd/src/{executor,service,node,ops,managed_ops,control,error,facade,harnesses}.rs`, new `{runner,capturer}.rs`; `crates/fabric-harness/*`; `crates/fabric-store/*`; `crates/fabric-client/*`; `sdk/typescript/*`; `crates/fabric/*`; `protocol/fixtures/*`, `protocol/required.txt`, `protocol/facade/v1/*`; docs/facade-protocol.md and this subsection's "as built" for B |
+
+`crates/fabricd/src/lib.rs` gains the five `mod` lines (`launch`, `package`, `report` by A; `runner`, `capturer` by B); each owner adds its own and the merge keeps both. A file not listed is touched by neither without a note in the commit saying why.
 
 ### Owners and files
 
