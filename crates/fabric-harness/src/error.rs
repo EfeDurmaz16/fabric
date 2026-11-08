@@ -287,6 +287,16 @@ pub enum HarnessError {
         /// One-based line number.
         line: usize,
     },
+    /// An adapter of PR 5 whose owner has not built this step yet: the
+    /// kind is named, detected and configured, and refuses the rest. The
+    /// variant goes when the last adapter is built.
+    #[error("the {program} adapter does not {step} yet; docs/harness-adapters.md names its owner")]
+    NotBuilt {
+        /// The harness program.
+        program: String,
+        /// The step asked for: `capture`, `restore` or `launch`.
+        step: &'static str,
+    },
     /// A protocol agent was asked to run in a terminal, which it cannot do.
     #[error("{program} speaks a protocol on its stdio; it has no terminal mode, attach a client")]
     NeedsClient {
@@ -423,6 +433,8 @@ pub enum Input {
     StatePath,
     /// A workspace path that a manifest or a harness setting cannot hold.
     WorkspacePath,
+    /// The JSON `opencode export` printed for one session.
+    SessionExport,
 }
 
 impl std::fmt::Display for Input {
@@ -435,6 +447,7 @@ impl std::fmt::Display for Input {
             Input::ConfigJson => "config json",
             Input::StatePath => "state path",
             Input::WorkspacePath => "workspace path",
+            Input::SessionExport => "session export",
         })
     }
 }

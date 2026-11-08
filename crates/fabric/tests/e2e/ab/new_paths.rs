@@ -193,7 +193,7 @@ impl Fixture {
             "placed by the bench",
             "--harness",
             "codex",
-            "--key",
+            "--operation-key",
             &key,
         ]);
         let started = Instant::now();
@@ -210,7 +210,7 @@ impl Fixture {
 
         let key = format!("ab-continue-{run}");
         let mut args = self.facade("continue");
-        args.extend([job.as_str(), "--key", &key]);
+        args.extend([job.as_str(), "--operation-key", &key]);
         let started = Instant::now();
         let accepted = answer(&self.b.ok(&args)?)?;
         let cont = started.elapsed();

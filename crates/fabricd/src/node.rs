@@ -104,6 +104,8 @@ pub struct Node {
     client_env: Mutex<Option<ClientEnv>>,
     /// The managed authority, the one writer of the managed journal (ADR 0020).
     pub(crate) authority: crate::authority::Authority,
+    /// The attempts this node runs for an authority (the launch path).
+    pub(crate) runner: Arc<crate::runner::Runner>,
     _lock: File,
 }
 
@@ -161,6 +163,22 @@ impl Node {
         // or with the first managed command; it makes no journal.
         let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
             .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
+        // The launch path's runner: its executor's launch records, and the
+        // records of the launches taken, live under the state directory.
+        let runs = cfg.state.root().join("runs");
+        let capturer = Arc::new(crate::capturer::NodeCapturer::new(
+            store.handle(),
+            identity.node_id(),
+            runs.join("harness-states"),
+            Arc::new(crate::runner::AdapterSuspend::new(std::sync::Weak::new())),
+            Arc::new(crate::runner::NodeFactsNow::new(std::sync::Weak::new())),
+        ));
+        let executor = Arc::new(crate::executor::Executor::new(
+            runs.join("records"),
+            crate::secrets::LocalResolver::open(cfg.state.root()),
+            capturer.clone(),
+        ));
+        let runner = Arc::new(crate::runner::Runner::new(executor, runs.join("taken")));
         let node = Arc::new(Self {
             id: identity.node_id(),
             cfg,
@@ -181,8 +199,17 @@ impl Node {
             waiting_catch_up: Mutex::new(BTreeSet::new()),
             client_env: Mutex::new(client_env),
             authority,
+            runner,
             _lock: lock_file,
         });
+        capturer.bind(
+            Arc::new(crate::runner::AdapterSuspend::new(Arc::downgrade(&node))),
+            Arc::new(crate::runner::NodeFactsNow::new(Arc::downgrade(&node))),
+        );
+        node.runner.bind(Arc::new(crate::runner::NodeHost::new(
+            Arc::downgrade(&node),
+            capturer,
+        )));
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
         Ok(node)
     }
@@ -211,6 +238,24 @@ impl Node {
         let control = lock(&self.control)
             .take()
             .ok_or_else(|| NodeError::Task("the node is already running".to_owned()))?;
+        // What a crashed runner left running is stopped before anything new
+        // is launched (the launch path, failure mode 5).
+        let records = self.cfg.state.root().join("runs").join("records");
+        match crate::executor::Executor::recover(
+            &records,
+            fabric_core::managed::DrainBudget::default(),
+        )
+        .await
+        {
+            Ok(found) if !found.is_empty() => {
+                tracing::info!(
+                    stopped = found.len(),
+                    "stopped the tasks a crashed runner left"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "the runner's launch records do not read"),
+        }
         tokio::spawn(Arc::clone(&self).recover());
         // The authority's clock (ADR 0028): a tick every heartbeat
         // interval; nothing runs while no managed job exists.

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
+use fabric_core::managed::launch::Heartbeat;
 use fabric_core::managed::{
     AttemptStatus, CheckpointAck, Command, CutDigest, DomainError, Envelope, FenceVerdict,
     Generation, GrantToken, Intent, JobPolicy, Observation, OperationKey, OperationMark,
@@ -17,7 +18,6 @@ use fabric_core::managed::{
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::Answer;
-use fabric_net::wire::Heartbeat;
 
 use super::*;
 
@@ -422,7 +422,9 @@ async fn running_on_runner(authority: &Authority, recovery: RecoveryPolicy) -> (
 }
 
 fn beat(token: GrantToken) -> Heartbeat {
-    Heartbeat::new(vec![token]).unwrap()
+    Heartbeat {
+        attempts: vec![token],
+    }
 }
 
 async fn status(authority: &Authority, token: GrantToken) -> AttemptStatus {

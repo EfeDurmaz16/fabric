@@ -1,89 +1,115 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
-     Running tests/e2e/main.rs (/tmp/m5proof.X1jvPW/target/debug/deps/e2e-5aad294b239a4019)
+   Compiling fabric-client v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-client)
+   Compiling fabricd v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabricd)
+   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.10s
+     Running tests/e2e/main.rs ($CARGO_TARGET_DIR/debug/deps/e2e-2d136496c85c375d)
 
-running 81 tests
+running 104 tests
 test ab::analyze ... ignored, reads the samples of an A/B run; scripts/bench-ab.sh runs it
+test ab::new_paths::run ... ignored, benchmark of the candidate's M5 paths; scripts/bench-ab.sh runs it
 test ab::paired ... ignored, benchmark of two builds; scripts/bench-ab.sh runs it
 test bench::m2_paths ... ignored, benchmark; scripts/bench-m2.sh runs it
 test budget::hot_paths ... ignored, takes minutes; CI runs it in a step of its own
 test budget::a_named_platform_replaces_this_machines ... ok
-test ab::a_spawn_line_reads_as_its_command ... ok
 test budget::ci_enforces_the_budget ... ok
+test ab::a_spawn_line_reads_as_its_command ... ok
 test ab::a_counter_page_reads_back ... ok
 test budget::the_budget_file_holds_every_op ... ok
-test budget::every_op_has_a_baseline_on_linux_and_macos ... ok
 test budget::the_verdicts_follow_the_rules ... ok
+test budget::every_op_has_a_baseline_on_linux_and_macos ... ok
 test budget::the_budget_names_the_programs_it_counts ... ok
 test ab::a_run_reports_the_daemons_physical_footprint ... ok
 test ab::a_counted_run_reports_the_daemons_resident_size ... ok
 test ab::the_bootstrap_interval_holds_the_median_and_repeats ... ok
 test budget::the_counter_counts_a_fake_and_puts_it_back ... ok
-test client::e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read ... ok
 test client::e2e_a_daemon_whose_own_environment_is_not_utf8_starts ... ok
+test client::e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read ... ok
 test client::e2e_a_refusal_from_a_node_arrives_with_its_reason ... ok
 test client::e2e_doctor_measures_in_the_clis_environment_not_the_nodes ... ok
 test client::e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status ... ok
 test acp_cli::e2e_a_failed_acp_turn_fails_the_run ... ok
 test acp_cli::e2e_a_headless_acp_run_prints_the_answer ... ok
-test e2e_a_claude_job_launches_and_warns_while_another_claude_runs ... ok
 test client::e2e_a_client_makes_reads_decides_and_suspends_a_job_with_typed_answers ... ok
-test e2e_a_headless_run_killed_before_its_harness_is_recorded_leaves_nothing_running ... ok
+test e2e_a_claude_job_launches_and_warns_while_another_claude_runs ... ok
+test continuity::e2e_a_continue_on_a_node_with_another_layout_starts_a_new_session_with_the_package ... ok
 test e2e_a_daemon_started_right_after_a_stop_serves ... ok
+test continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout ... ok
+test e2e_a_headless_run_killed_before_its_harness_is_recorded_leaves_nothing_running ... ok
+test continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved ... ok
+test cursor::e2e_a_cursor_job_moves_as_its_workspace_and_a_new_chat_answers_from_it ... ok
 test e2e_a_run_ended_before_its_harness_is_recorded_stops_it ... ok
-test e2e_a_job_with_no_session_says_so_before_it_moves ... ok
-test e2e_a_run_whose_output_closes_still_supervises_its_harness ... ok
 test e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork ... ok
+test e2e_a_job_with_no_session_says_so_before_it_moves ... ok
+test e2e_a_hand_edit_after_a_suspend_moves_with_the_job ... ok
+test e2e_a_run_whose_output_closes_still_supervises_its_harness ... ok
+test e2e_a_job_moves_and_resumes_over_quic ... ok
+test e2e_a_run_during_the_transfer_stops_the_move ... ok
+test e2e_a_job_moves_and_resumes_over_tcp_tls ... ok
+test e2e_a_job_on_master_moves_and_resumes ... ok
 test e2e_an_acp_run_killed_before_its_agent_is_recorded_leaves_nothing_running ... ok
 test e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness ... ok
-test e2e_a_hand_edit_after_a_suspend_moves_with_the_job ... ok
-test e2e_a_job_moves_and_resumes_over_quic ... ok
-test e2e_a_steal_needs_force_and_fences_the_sleeping_owner ... ok
-test e2e_a_job_moves_and_resumes_over_tcp_tls ... ok
-test e2e_a_run_during_the_transfer_stops_the_move ... ok
-test e2e_a_job_on_master_moves_and_resumes ... ok
 test e2e_a_move_stops_the_harness_running_on_its_source ... ok
 test e2e_an_owner_that_stayed_up_through_a_steal_refuses_to_run ... ok
+test e2e_a_steal_needs_force_and_fences_the_sleeping_owner ... ok
 test facade::e2e_a_socket_only_op_on_a_managed_job_is_refused_as_managed_job ... ok
+test facade::e2e_a_watch_cursor_holds_across_an_authority_restart ... ok
+test facade::e2e_a_token_out_of_scope_is_refused_before_the_authority_is_asked ... ok
 test e2e_refusals_exit_with_their_documented_codes ... ok
 test e2e_puller_killed_before_import ... ok
-test facade::e2e_a_token_out_of_scope_is_refused_before_the_authority_is_asked ... ok
-test facade::e2e_a_watch_cursor_holds_across_an_authority_restart ... ok
 test e2e_holder_killed_after_departing_write_in_a_pull ... ok
-test headless::e2e_a_headless_run_needs_a_prompt ... ok
+test e2e_a_dropped_import_answer_converges_on_the_same_record ... ok
 test facade::e2e_the_same_job_is_observed_after_a_reconnect_from_another_node ... ok
 test e2e_a_duplicated_import_answer_changes_nothing ... ok
-test e2e_a_dropped_import_answer_converges_on_the_same_record ... ok
-test headless::e2e_a_headless_claude_turn_prints_its_answer_and_is_captured ... ok
-test headless::e2e_a_codex_the_workspace_pinned_is_remembered_after_it_ran ... ok
-test headless::e2e_a_headless_run_tells_the_node_before_it_prints_the_turn ... ok
-test legacy::e2e_make_legacy_fixture ... ignored, makes the legacy fixture; run by hand on the commit the fixture names
-test headless::e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture ... ok
+test headless::e2e_a_headless_run_needs_a_prompt ... ok
 test headless::e2e_a_headless_run_whose_output_is_gone_still_records_the_exit ... ok
 test headless::e2e_a_headless_run_forwards_standard_error_to_its_end ... ok
+test headless::e2e_a_codex_the_workspace_pinned_is_remembered_after_it_ran ... ok
+test headless::e2e_a_headless_run_tells_the_node_before_it_prints_the_turn ... ok
 test headless::e2e_a_signal_before_the_harness_starts_ends_a_headless_run ... ok
+test headless::e2e_a_headless_claude_turn_prints_its_answer_and_is_captured ... ok
+test headless::e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture ... ok
+test legacy::e2e_make_legacy_fixture ... ignored, makes the legacy fixture; run by hand on the commit the fixture names
 test headless::e2e_ctrl_c_on_a_headless_acp_run_reaches_the_agent ... ok
-test managed::e2e_a_managed_job_keeps_identity_and_progress_across_a_daemon_kill ... ok
 test headless::e2e_ctrl_c_on_a_headless_run_reaches_the_harness ... ok
-test managed::e2e_the_cli_makes_reads_and_cancels_managed_jobs_under_their_keys ... ok
-test managed::e2e_managed_refusals_are_kept_and_modes_stay_apart ... ok
 test legacy::e2e_a_state_directory_from_main_loads_lists_and_resumes ... ok
-test placement::e2e_a_create_accepted_before_a_crash_is_placed_once_after_the_restart ... ok
-test preflight::e2e_a_push_refuses_a_target_without_the_jobs_acp_agent ... ok
+test launch::e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b ... ok
+test managed::e2e_a_managed_job_keeps_identity_and_progress_across_a_daemon_kill ... ok
+test managed::e2e_the_cli_inspects_provider_operations_blockers_and_residuals ... ok
 test e2e_source_killed_after_departing_write ... ok
-test placement::e2e_a_submit_names_no_machine_and_the_decision_is_recorded ... ok
-test e2e_source_killed_after_quiesce ... ok
-test terminal::e2e_a_harness_without_a_terminal_starts_without_a_hand_over ... ok
-test terminal::e2e_a_terminal_harness_owns_the_terminal_before_it_starts ... ok
+test managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted ... ok
+test managed::e2e_managed_refusals_are_kept_and_modes_stay_apart ... ok
+test managed::e2e_the_cli_makes_reads_and_cancels_managed_jobs_under_their_keys ... ok
+test managed::e2e_the_cli_registers_a_test_task_with_its_program ... ok
+test managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on ... ok
+test gemini::e2e_an_older_gemini_is_refused_a_session_a_newer_one_continued ... ok
 test headless::e2e_a_pull_asks_the_guards_version_while_the_node_places_the_session ... ok
 test headless::e2e_the_preflight_names_the_codex_a_pinned_workspace_ran_when_the_target_is_older ... ok
-test e2e_source_killed_mid_transfer ... ok
 test e2e_source_killed_after_snapshot_publish ... ok
-test world::a_killed_command_whose_child_keeps_its_pipes_fails_in_time ... ok
+test e2e_source_killed_after_quiesce ... ok
+test e2e_source_killed_mid_transfer ... ok
 test headless::e2e_an_older_codex_is_refused_a_thread_a_newer_one_continued ... ok
+test gemini::e2e_a_gemini_session_found_by_its_short_id_moves_and_answers_about_its_first_turn ... ok
+test placement::e2e_a_create_accepted_before_a_crash_is_placed_once_after_the_restart ... ok
+test launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package ... ok
+test preflight::e2e_a_push_refuses_a_target_without_the_jobs_acp_agent ... ok
+test opencode::e2e_an_opencode_session_that_holds_a_secret_is_refused ... ok
+test placement::e2e_a_submit_names_no_machine_and_the_decision_is_recorded ... ok
+test pi::e2e_a_pi_session_that_holds_a_secret_is_refused ... ok
+test placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it ... ok
+test terminal::e2e_a_terminal_harness_owns_the_terminal_before_it_starts ... ok
+test terminal::e2e_a_harness_without_a_terminal_starts_without_a_hand_over ... ok
+test pi::e2e_a_pi_session_moves_and_resumes_as_the_same_file ... ok
+test opencode::e2e_an_opencode_import_that_mints_an_id_is_recorded_as_a_new_session ... ok
+test opencode::e2e_an_opencode_job_moves_and_resumes_without_its_database ... ok
+test psf::e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back ... ok
+test opencode::e2e_an_older_opencode_is_refused_a_session_a_newer_one_continued ... ok
+test secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log ... ok
+test streams::e2e_every_answer_keeps_its_streams_in_words_and_as_json ... ok
 test client::e2e_a_node_measures_for_its_peers_in_the_environment_its_cli_sent ... ok
+test world::a_killed_command_whose_child_keeps_its_pipes_fails_in_time ... ok
 test e2e_target_killed_mid_transfer ... ok
 test e2e_target_killed_after_import_receipt has been running for over 60 seconds
 test e2e_target_killed_after_import_receipt ... ok
 
-test result: ok. 76 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 90.22s
+test result: ok. 98 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 91.03s
 

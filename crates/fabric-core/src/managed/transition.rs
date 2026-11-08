@@ -474,20 +474,48 @@ fn command_events(
                 return Err(DomainError::BadParent { task: *parent });
             }
             open_task(state, *parent)?;
-            // The program rules (required for a build or test task, refused
-            // for the others, checked, and the Spawn effect while the
-            // parent's attempt runs) are the launch path's, owner A.
-            (
-                false,
-                vec![ManagedEvent::TaskRegistered {
-                    task: ids.task,
-                    parent: Some(*parent),
-                    kind: kind.clone(),
-                    restart: *restart,
-                    class: *class,
-                    program: program.clone(),
-                }],
-            )
+            // A build or test task runs a program; a harness or opaque one
+            // is started by its harness or not at all (the launch path).
+            match (class, program) {
+                (TaskClass::Build | TaskClass::Test, None) => {
+                    return Err(DomainError::ProgramRequired { class: *class });
+                }
+                (TaskClass::Harness | TaskClass::Opaque, Some(_)) => {
+                    return Err(DomainError::ProgramNotAllowed { class: *class });
+                }
+                (_, Some(program)) => program
+                    .check()
+                    .map_err(|error| DomainError::BadProgram { error })?,
+                (_, None) => {}
+            }
+            let registered = ManagedEvent::TaskRegistered {
+                task: ids.task,
+                parent: Some(*parent),
+                kind: kind.clone(),
+                restart: *restart,
+                class: *class,
+                program: program.clone(),
+            };
+            // A program registered while its parent's attempt runs is
+            // spawned there; with none live it rides the next launch.
+            let live = state.attempts.iter().any(|a| {
+                a.task == *parent
+                    && matches!(a.status, AttemptStatus::Granted | AttemptStatus::Running)
+            });
+            if program.is_some() && live {
+                (
+                    true,
+                    vec![
+                        registered,
+                        ManagedEvent::EffectRequested {
+                            operation: ids.operation,
+                            request: EffectRequest::Spawn { task: ids.task },
+                        },
+                    ],
+                )
+            } else {
+                (false, vec![registered])
+            }
         }
         Command::FinishTask { task, outcome } => {
             open_task(state, *task)?;
@@ -913,6 +941,22 @@ pub fn apply_observation(
     if status != AttemptStatus::Lost {
         events.extend(grant_succeeded(job, attempt));
     }
+    // A continue's grant that ends before `Continued` fails the continue:
+    // the target offered no allowed fidelity or could not start, and the
+    // task stays open for another one.
+    if matches!(observation, Observation::Exited { .. })
+        && let Some(grant) = job.operation(attempt.granted_by)
+        && grant.kind == CommandKind::Continue
+        && matches!(
+            grant.status,
+            OperationStatus::Dispatched | OperationStatus::Unknown
+        )
+    {
+        events.push(ManagedEvent::OperationMarked {
+            operation: grant.id,
+            status: OperationMark::Failed,
+        });
+    }
     // An attempt that ended before its checkpoint command was cut fails
     // the command, so it never waits on, or claims, another attempt's cut.
     if !status.may_run()
@@ -923,9 +967,12 @@ pub fn apply_observation(
             status: OperationMark::Failed,
         });
     }
-    // A cancel that stopped the attempt now ends the job or the task.
-    if status == AttemptStatus::Cancelled {
-        if let Some(op) = job.in_flight(CommandKind::CancelJob)
+    // A cancel in flight is settled by the attempt's end, whatever ended
+    // it: the cancel's stop, the harness exiting on its own first, or a
+    // start that failed before the stop was taken. Nothing of the attempt
+    // runs any more, so the job or the task ends as the cancel asked.
+    if matches!(observation, Observation::Exited { .. }) {
+        if let Some(op) = cancel_in_flight(job, CommandKind::CancelJob)
             && let Some(EffectRequest::CancelJob { reason }) = job.request(op.id)
         {
             events.push(ManagedEvent::JobCancelled {
@@ -935,7 +982,7 @@ pub fn apply_observation(
                 operation: op.id,
                 status: OperationMark::Succeeded,
             });
-        } else if let Some(op) = job.in_flight(CommandKind::CancelTask)
+        } else if let Some(op) = cancel_in_flight(job, CommandKind::CancelTask)
             && let Some(EffectRequest::CancelTask { task, .. }) = job.request(op.id)
             && *task == attempt.task
         {
@@ -950,6 +997,18 @@ pub fn apply_observation(
         }
     }
     transition(events)
+}
+
+/// The cancel of `kind` whose stop was sent: dispatched, or of unknown
+/// outcome (its node was not reached, or a restart came between).
+fn cancel_in_flight(job: &ManagedState, kind: CommandKind) -> Option<&OperationProgress> {
+    job.operations.iter().find(|o| {
+        o.kind == kind
+            && matches!(
+                o.status,
+                OperationStatus::Dispatched | OperationStatus::Unknown
+            )
+    })
 }
 
 /// The events of a `Placed` observation: the decision, and the grant on

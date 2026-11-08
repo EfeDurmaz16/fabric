@@ -1,39 +1,12 @@
-    Checking rustix v1.1.5
-    Checking tokio v1.54.1
-   Compiling autocfg v1.5.1
-    Checking rand_xorshift v0.5.0
-    Checking core_detect v1.0.0
-    Checking unarray v0.1.4
-    Checking lazy_static v1.5.1
-    Checking nix v0.31.3
-    Checking thread_local v1.1.10
-    Checking sharded-slab v0.1.7
-    Checking utf8parse v0.2.2
-    Checking anstyle-parse v1.0.0
-    Checking colorchoice v1.0.5
-   Compiling num-traits v0.2.19
-    Checking anstyle-query v1.1.5
-    Checking tracing-subscriber v0.3.23
-    Checking anstyle v1.0.14
-    Checking is_terminal_polyfill v1.70.2
-    Checking anstream v1.0.0
-    Checking strsim v0.11.1
-    Checking clap_lex v1.1.1
-    Checking anyhow v1.0.104
-    Checking clap_builder v4.6.7
-    Checking tempfile v3.27.0
+    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
+    Checking fabric-client v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-client)
+    Checking fabric-journal v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-journal)
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
     Checking fabric-env v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-env)
     Checking fabric-store v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-store)
-    Checking proptest v1.12.0
-    Checking clap v4.6.7
-    Checking fabric-journal v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-journal)
-    Checking fabric-client v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-client)
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
-    Checking tokio-rustls v0.26.6
-    Checking quinn v0.11.12
-    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
+    Checking fabric-psf v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-psf)
     Checking fabric-net v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-net)
     Checking fabric-bridge v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-bridge)
     Checking fabricd v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabricd)
     Checking fabric v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.80s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.89s

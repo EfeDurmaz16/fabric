@@ -14,8 +14,11 @@ import { z } from "zod";
 
 import { EnvError } from "./errors.ts";
 
-/** The version of the client API this SDK speaks; a node answers only the same number. */
-export const API_VERSION = 1;
+/**
+ * The version of the client API this SDK speaks; a node answers only the same number. 2 since PR 5
+ * (2026-11-08): the closed set of harness kinds grew by `opencode`, `pi`, `gemini_cli` and `cursor_agent`.
+ */
+export const API_VERSION = 2;
 
 /** Every op of this api version, in the order of `Op::ALL` in the Rust crate. */
 export const OPS = [
@@ -53,6 +56,8 @@ export const OPS = [
   "facade_mint",
   "facade_revoke",
   "facade_call",
+  "managed_register",
+  "job_export_psf",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -221,6 +226,19 @@ function optional<T extends z.ZodType>(schema: T) {
   return nullAsAbsent(schema.optional());
 }
 
+/**
+ * What a build or test task runs (the launch path): the command and its
+ * arguments, the directory under the attempt's root, and the variables of
+ * the node's environment it may see. The node checks it again before
+ * anything is recorded.
+ */
+export const Program = z.object({
+  argv: z.array(UnicodeText).min(1),
+  cwd: optional(UnicodeText),
+  env_allowlist: optional(z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "not an environment variable name"))),
+});
+export type Program = z.infer<typeof Program>;
+
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -318,6 +336,10 @@ export const Harness = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("claude_code") }),
   z.strictObject({ kind: z.literal("codex") }),
   z.strictObject({ kind: z.literal("acp"), program: ProgramName, args: z.array(UnicodeText) }),
+  z.strictObject({ kind: z.literal("opencode") }),
+  z.strictObject({ kind: z.literal("pi") }),
+  z.strictObject({ kind: z.literal("gemini_cli") }),
+  z.strictObject({ kind: z.literal("cursor_agent") }),
 ]);
 export type Harness = z.infer<typeof Harness>;
 
@@ -993,6 +1015,10 @@ export const ProviderOperation = z.object({
   status: UnicodeText,
   locator: optional(UnicodeText),
   cleans: optional(OperationId),
+  purpose: optional(UnicodeText),
+  target: optional(UnicodeText),
+  searched: optional(UnicodeText),
+  abandon_reason: optional(UnicodeText),
 });
 export type ProviderOperation = z.infer<typeof ProviderOperation>;
 
@@ -1001,7 +1027,12 @@ export const Blocker = z.object({ kind: UnicodeText, operation: OperationId, sta
 export type Blocker = z.infer<typeof Blocker>;
 
 /** A provider resource that may still exist (ADR 0022). */
-export const Residual = z.object({ creating: OperationId, status: UnicodeText, locator: optional(UnicodeText) });
+export const Residual = z.object({
+  creating: OperationId,
+  status: UnicodeText,
+  locator: optional(UnicodeText),
+  searched: optional(UnicodeText),
+});
 export type Residual = z.infer<typeof Residual>;
 
 /** The fields of an inspection (M5): the body of `managed_inspect` and of the facade's `inspection`. */
@@ -1150,6 +1181,17 @@ export const Request = z.discriminatedUnion("op", [
   }),
   z.object({ op: z.literal("facade_revoke"), token_id: UnicodeText }),
   z.object({ op: z.literal("facade_call"), authority: NodeId, message: FacadeJson }),
+  z.object({
+    op: z.literal("managed_register"),
+    operation_key: OperationKey,
+    job: JobId,
+    expected_revision: optional(Counter),
+    parent: TaskId,
+    label: UnicodeText,
+    class: z.enum(["build", "test"]),
+    program: Program,
+  }),
+  z.object({ op: z.literal("job_export_psf"), job: JobId, dir: SystemPath }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -1213,6 +1255,7 @@ export const ManagedTask = z.object({
   state: UnicodeText,
   class: optional(UnicodeText),
   receipt: optional(Receipt),
+  program: optional(Program),
 });
 export type ManagedTask = z.infer<typeof ManagedTask>;
 
@@ -1331,6 +1374,17 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("facade_mint"), token_id: UnicodeText, bearer: z.string().regex(HEX_32, "not 64 lowercase hex") }),
   z.object({ kind: z.literal("facade_revoke"), revoked: z.boolean() }),
   z.object({ kind: z.literal("facade_call"), message: FacadeJson }),
+  z.object({ kind: z.literal("managed_register"), ...managedOperation }),
+  /** A Portable Session Format container the node wrote (ADR 0029). */
+  z.object({
+    kind: z.literal("job_export_psf"),
+    dir: Path,
+    digest: UnicodeText,
+    fidelity: UnicodeText,
+    snapshot: SnapshotId,
+    attachments: z.array(UnicodeText),
+    left_behind: z.array(UnicodeText),
+  }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -1349,7 +1403,13 @@ export type Lease = ReplyTo<"job_move" | "job_steal">;
 export type Registered = ReplyTo<"harness_started">;
 export type SessionRecorded = ReplyTo<"harness_session">;
 export type ManagedOperation = ReplyTo<
-  "managed_create" | "managed_cancel" | "managed_note" | "managed_checkpoint" | "managed_continue" | "managed_submit"
+    | "managed_create"
+  | "managed_cancel"
+  | "managed_note"
+  | "managed_register"
+  | "managed_checkpoint"
+  | "managed_continue"
+  | "managed_submit"
 >;
 export type ManagedInspection = ReplyTo<"managed_inspect">;
 export type Imported = ReplyTo<"managed_import">;
@@ -1359,6 +1419,7 @@ export type ManagedStatus = ReplyTo<"managed_status">;
 export type ManagedJobs = ReplyTo<"managed_list">;
 export type Repaired = ReplyTo<"job_repair">;
 export type Exported = ReplyTo<"job_export">;
+export type PsfExported = ReplyTo<"job_export_psf">;
 
 // The exchange.
 

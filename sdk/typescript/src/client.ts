@@ -46,6 +46,7 @@ import {
   isReplyTo,
   type JobCreated,
   type JobId,
+  type TaskId,
   type JobList,
   type JobLog,
   type JobStatus,
@@ -60,10 +61,12 @@ import {
   type ManagedStatus,
   type Minted,
   type Note,
+  type Program,
   type ResourceScope,
   type Revoked,
   type Repaired,
   type Exported,
+  type PsfExported,
   type Counter,
   type NodeId,
   OperationKey,
@@ -384,6 +387,26 @@ export class FabricClient {
     return this.call({ op: "managed_note", operation_key, job, expected_revision, note }, options);
   }
 
+  /**
+   * Registers a build or test task with the program it runs under `parent`
+   * (the launch path); the key as for `managedCreate`. With a live attempt
+   * of the parent its node is asked to spawn the task.
+   */
+  managedRegister(
+    operation_key: OperationKey,
+    job: JobId,
+    registration: { parent: TaskId; label: string; class: "build" | "test"; program: Program },
+    expectedRevision?: Counter,
+    options?: CallOptions,
+  ): Promise<ManagedOperation> {
+    const expected_revision = expectedRevision;
+    const { parent, label, class: taskClass, program } = registration;
+    return this.call(
+      { op: "managed_register", operation_key, job, expected_revision, parent, label, class: taskClass, program },
+      options,
+    );
+  }
+
   /** Takes a checkpoint cut of a managed job's live attempt (M5). */
   managedCheckpoint(
     operation_key: OperationKey,
@@ -456,6 +479,14 @@ export class FabricClient {
     options: CallOptions & { readonly path?: SystemPath; readonly env?: ClientEnv } = {},
   ): Promise<Exported> {
     return this.call({ op: "job_export", job, path: options.path, env: options.env }, options);
+  }
+
+  /**
+   * Writes the job's latest snapshot as a Portable Session Format container
+   * at `dir`, which must not exist (ADR 0029); read it with `readContainer`.
+   */
+  jobExportPsf(job: JobId, dir: SystemPath, options?: CallOptions): Promise<PsfExported> {
+    return this.call({ op: "job_export_psf", job, dir }, options);
   }
 
   /**

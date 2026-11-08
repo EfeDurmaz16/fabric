@@ -1,8 +1,32 @@
 # Fabric
 
-Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped. The workspace goes with it: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Untracked secret-shaped files such as `.env` stay behind. A secret that is tracked or stashed in git is already in the repository's history, so it travels with the git state, and suspend names it instead of refusing. The session is redacted by pattern, which removes common key shapes, not every secret.
+Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped.
 
-The idea underneath is that the job, not the machine, is the unit of development work. Where a job's state is stored, which machine runs it, which toolchain it needs and which agent drives it are separate questions, and Fabric keeps them separate, so a job started under Claude Code on one machine can be suspended, resumed on another machine with its dependencies, and continued by a different agent.
+## What moves, what does not
+
+<!-- matrix:begin -->
+| On the source | On the target after a move | Why |
+|---|---|---|
+| Commits, branches, staged and unstaged changes, untracked files, the job's stashes | The same, byte for byte | Carried as a git bundle plus two private commits (index and working tree); your own index and refs are not touched |
+| Dependency caches: `node_modules`, `.venv`, Rust `target/` | Carried when the target's toolchain matches the recorded key, else made again by the setup step | The key is exact strings: Node major and package manager, `rustc -vV` and `CARGO_HOME`, Python version and home. A cache with no lockfile always travels |
+| Build output: `dist`, `.next`, `build`, `out`, `.turbo` | Carried under its ecosystem's key, else dropped for the next build | Output made for another OS or CPU is left behind |
+| `.env` and other secret-shaped untracked or ignored files | Stay on the source | `.env.example` travels. A secret that is tracked or stashed is in git history already, so it travels and suspend names it |
+| Claude Code session | Continues with `claude --resume`, the transcript's model | Transcript, sidecars, project memory and file history, redacted by pattern |
+| Codex session | Continues the same thread, with its model, provider, effort and sandbox | The thread's rollouts, byte for byte; a secret shape in them refuses the capture |
+| ACP agent session | Continues with `session/resume` or `session/load` | The files named for the session in the agent's declared state directory |
+| Logins, keychains, `~/.ssh`, `~/.aws`, `auth.json`, `~/.claude.json`, `~/.fabric` | Stay on the source | A hard-coded denylist, checked before every copy |
+| A harness that is still running | Nothing moves | Capture refuses while the session may be written; suspend stops the harness first |
+
+Both nodes need the same user name and the same home path, and `git` on the `PATH`: nothing rewrites paths (ADR 0011). One harness moves to the same harness; Claude to Codex is not supported. A Codex job moved between two real Macs on 2026-10-21, on the binary of that day, before M2 to M4 merged. That run's log is not in this repository; the README keeps its timings, and it has not been run again on `main` (gate G1 is pending). Claude Code has never been moved between two machines (gate G2 is pending). The end-to-end test, two nodes on one machine with fake harnesses, moves a job with uncommitted work, `.env`, `dist` and `node_modules` and checks each of them; the crates' own tests cover the other rows against fixtures.
+<!-- matrix:end -->
+
+Each row in detail is in [docs/start/what-moves.md](docs/start/what-moves.md). The docs, from install to the ADRs, start at [docs/README.md](docs/README.md) and are built into a site by `scripts/docs/build.sh`.
+
+## In more words
+
+A move carries the workspace: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Untracked secret-shaped files such as `.env` stay behind. A secret that is tracked or stashed in git is already in the repository's history, so it travels with the git state, and suspend names it instead of refusing. The session is redacted by pattern, which removes common key shapes, not every secret.
+
+The idea underneath is that the job, not the machine, is the unit of development work. Where a job's state is stored, which machine runs it, which toolchain it needs and which agent drives it are separate questions, and Fabric keeps them separate, so a job started under Claude Code on one machine can be suspended and resumed on another machine with its dependencies. Continuing it under a different agent is the same separation taken one step further; ADR 0006 lists it as an experiment, and it is not built.
 
 Fabric is a working name. It collides with Microsoft Fabric and others, and may change; see [ADR 0010](docs/adr/0010-name-and-scope-boundaries.md).
 
@@ -10,7 +34,7 @@ Fabric is a working name. It collides with Microsoft Fabric and others, and may 
 
 A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names.
 
-On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn.
+On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn. That ran on the binary of that day, before M2 to M4 merged; its log is not in this repository, and the walk has not been run again on `main` ([gate G1](docs/evidence/two-mac-gate-pending.md) is pending).
 
 | Step | Measured |
 |---|---|
@@ -28,14 +52,16 @@ That run found that the resumed agent used the other Mac's model setting instead
 | `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests, the environment spec and the secret policy. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants; the secret staging contract is tested against real `git`. |
 | `crates/fabric-store` | Content-addressed objects (blake3, zstd, FastCDC above 8 MiB), the SQLite catalog with refcounts and a graced gc, workspace capture (git state as two private commits and a bundle, ignored files by class, secrets denied) and restore into an empty directory through a staging rename. Crash-tested with `SIGKILL` at every publish and restore checkpoint. Capture still applies its own secret list, not `fabric_core::secret` (ADR 0004). |
 | `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports on one port behind one endpoint, framed and typed RPC with deadlines, paged ledger records, verified zstd chunk transfer, the facts doctor compares, the peer book. See [docs/net.md](docs/net.md). |
-| `crates/fabric-harness` | The `Harness` trait and three adapters: Claude Code, Codex and any Agent Client Protocol agent. Captures a session into a redacted state tree with a manifest, restores it all or nothing under the same workspace path and home, never over state that would lose bytes, launches the harness in a new process group with typed flags and without the markers of a Claude Code or Codex session Fabric runs under, holding an interactive one stopped before its exec until its group owns the terminal (gate finding F5), and reads the answer and session a headless Claude or Codex turn prints. Pre-seeds Claude's workspace trust under the key Claude reads for project settings (the main checkout of the repository, or the workspace) only when that key is not already set, and leaves it to Claude while one runs or when `~/.claude.json` is missing or a symlink, saying when a trusted ancestor still skips the dialog but leaves the project settings off. A hard-coded denylist keeps credentials and host state out of the tree. Crash-tested with `SIGKILL` after every staged and placed Claude file, after a pending departure record, and in a Codex restore. |
+| `crates/fabric-harness` | The `Harness` trait and seven built adapters: Claude Code, Codex, any Agent Client Protocol agent, OpenCode, pi, Gemini CLI and Cursor Agent CLI, each behind its own feature, with the contract in [docs/harness-adapters.md](docs/harness-adapters.md) and the fidelity each declares below. Captures a session into a redacted state tree with a manifest, restores it all or nothing under the same workspace path and home, never over state that would lose bytes, launches the harness in a new process group with typed flags and without the markers of a Claude Code or Codex session Fabric runs under, holding an interactive one stopped before its exec until its group owns the terminal (gate finding F5), and reads the answer and session a headless Claude, Codex, OpenCode, pi, Gemini CLI or Cursor Agent CLI turn prints. Pre-seeds Claude's workspace trust under the key Claude reads for project settings (the main checkout of the repository, or the workspace) only when that key is not already set, and leaves it to Claude while one runs or when `~/.claude.json` is missing or a symlink, saying when a trusted ancestor still skips the dialog but leaves the project settings off. A hard-coded denylist keeps credentials and host state out of the tree. Crash-tested with `SIGKILL` after every staged and placed Claude file, after a pending departure record, and in a Codex restore. |
 | `crates/fabric-env` | `EnvSpec` detection from the files a workspace already has and from `.fabric/env.toml`, and the materializer that runs setup steps only when a cache is missing or torn, with a dry run. Tested against fixture workspaces, real setup processes and `SIGKILL`. |
 | `crates/fabric-journal` | The managed journal (ADR 0020, [docs/managed-jobs.md](docs/managed-jobs.md)): one SQLite file under `<state>/managed/`, made by the first managed command, holding every managed job's events, the operations with the bytes each key was answered with (so a repeated key gets the same answer and a changed body under the same key is refused), attempts, and since schema version 2 the provider operations of the bridge. Replay equals the projection after every test; crash-tested with `SIGKILL` at each fault point; a frozen schema fixture per version. `fabric managed create`, `status`, `cancel` and `ls` are its commands. |
 | `crates/fabricd` | The node: one process per state directory holding the store, one ledger file per job, the network service and the control socket. Suspend, the push move, the pull resume, the steal behind `--force`, doctor, and recovery after a restart. See [ADR 0016](docs/adr/0016-node-and-cli-as-built.md). |
+| `crates/fabric-sync` | The `fabric-sync` command: push and pull a working tree to a directory or over SSH with the store's capture and restore, no node. Only missing objects are sent, a head moves by compare and swap, and a pull is crash-tested with `SIGKILL` while copying, before and between its renames. See [docs/guides/sync-alone.md](docs/guides/sync-alone.md). |
 | `crates/fabric-client` | The client API of a node (ADR 0018): typed requests, replies, progress events and refusals as length-prefixed JSON on the control socket after a version handshake, and a Rust client. `protocol/fixtures` holds one example of every message; the Rust and TypeScript clients both test against it. |
 | `sdk/typescript` | The TypeScript client of the same API for Node 22 and Bun, built to JavaScript with declarations in `dist/`: zod schemas at the boundary, the same trust checks and handshake as the Rust client, and the same contract test against `protocol/fixtures`, plus an end-to-end test against a real node and a test that imports the packed package with plain Node from `node_modules`. |
+| `crates/fabric-psf` | The Portable Session Format v1 (ADR 0029, [docs/portable-session-format.md](docs/portable-session-format.md)): reads, checks and writes the canonical manifest and its container of blobs, and packs the harness state attachment. `protocol/psf/v1` holds the pinned fixtures; the crate, a standard-library Python reader (`scripts/psf_check.py`) and the TypeScript SDK reader must give the same verdict on every fixture and on generated documents. |
 | `crates/fabric-bridge` | The Fabric side of the provider bridge (ADR 0021, [docs/bridge-protocol.md](docs/bridge-protocol.md)): protocol v1 messages and frames, and a client that runs one provider worker over stdio, records each effect in the journal before it writes the request, and records `unknown`, never cancelled or failed, when a deadline passes or the worker is lost. Tested against every fixture in `protocol/bridge/v1`, which Capsule's worker tests against too, against a Rust test double worker, and against the real Capsule worker over its stdio (ignored by default; CI builds the worker from a pinned Capsule commit). |
-| `crates/fabric` | The `fabric` command, and the end-to-end test: two daemons over loopback on QUIC and on TCP+TLS, a job moved and back, the move broken at five named points by `SIGKILL` of either node or a lost or repeated answer. |
+| `crates/fabric` | The `fabric` command, and the end-to-end test: two daemons over loopback on QUIC and on TCP+TLS, a job moved and back, the move and the node broken at every named fault point ([Ledger](docs/concepts/ledger.md) lists them) by `SIGKILL` of either node or a lost or repeated answer. |
 | CI | fmt, clippy, test, the end-to-end test, doc, `cargo deny`, the hygiene script, and the TypeScript SDK's typecheck, build, contract, package and end-to-end tests, on macOS and Ubuntu |
 
 ## How a move works
@@ -54,9 +80,46 @@ sequenceDiagram
 - **One live copy.** Every job has an append-only, hash-chained ledger. A move is a short protocol over that ledger, so at most one machine can run the job at a time, even when a machine is killed in the middle of a move.
 - **Content-addressed snapshots.** The workspace is stored as blake3 chunks in a local store with a SQLite catalog. A move sends only the chunks the other machine lacks. Git state goes as a bundle plus the index and the working tree.
 - **Carry or rebuild.** Dependency caches and build output travel when the other machine can use them, and are made again there by their setup step or the next build when it cannot. Untracked secret-shaped files stay on the machine; tracked and stashed ones travel inside the git state and are named, not hidden (ADR 0014).
-- **Harness adapters.** Claude Code, Codex and any Agent Client Protocol agent. Each adapter captures the agent's session files and restores them on the other machine.
+- **Harness adapters.** Claude Code, Codex, any Agent Client Protocol agent, OpenCode, pi, Gemini CLI and Cursor Agent CLI (PR 5). Each adapter captures the agent's session files and restores them on the other machine, and declares how faithfully the conversation continues there (the table under Harness fidelity).
 - **Pinned peers.** Machines pair by ed25519 node id and talk over QUIC with TLS pinned to that id, or TCP with TLS when UDP is blocked. No central server.
 - **Client API.** A versioned JSON API on the node's local socket, with a Rust client crate and a TypeScript SDK checked against the same message fixtures.
+
+## Install
+
+There is no release yet. From the first tag on (`v0.1.0`, [docs/release.md](docs/release.md)), every release ships unsigned `fabric` and `fabric-sync` binaries for macOS on Apple silicon, macOS on Intel and Linux on x86_64 (glibc 2.35 or newer), with sha256 checksums, a CycloneDX SBOM and a GitHub build attestation for each archive.
+
+With Homebrew, on a Mac or on Linux:
+
+```sh
+brew install EfeDurmaz16/tap/fabric-node
+fabric --version
+brew install EfeDurmaz16/tap/fabric-sync   # optional: the store alone, see Sync alone
+```
+
+Or download the archive for your platform from [GitHub Releases](https://github.com/EfeDurmaz16/fabric/releases), check it and put the binary on your `PATH`:
+
+```sh
+tag=v0.1.0                    # the release to install
+target=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
+base=https://github.com/EfeDurmaz16/fabric/releases/download/$tag
+curl -LO "$base/fabric-$target.tar.gz" -LO "$base/fabric-$target.tar.gz.sha256"
+shasum -a 256 -c "fabric-$target.tar.gz.sha256"
+# Optional: built by this repository's release workflow from that tag.
+gh attestation verify "fabric-$target.tar.gz" -R EfeDurmaz16/fabric \
+  --signer-workflow EfeDurmaz16/fabric/.github/workflows/release.yml --source-ref "refs/tags/$tag"
+tar -xzf "fabric-$target.tar.gz"
+mkdir -p ~/.local/bin && cp "fabric-$target/fabric" ~/.local/bin/
+```
+
+**macOS Gatekeeper.** The binaries are not signed by an Apple Developer ID or notarized. Homebrew and `curl` do not mark what they download as quarantined, so both ways above run without a prompt. A file downloaded with a web browser is quarantined, and macOS refuses to open it with a message that Apple could not verify it. Clear the attribute on the extracted binary and run it again:
+
+```sh
+xattr -d com.apple.quarantine fabric-aarch64-apple-darwin/fabric
+```
+
+Before a release is published, the release smoke (`scripts/release-smoke.sh`) checks on both macOS targets that an archive fetched with `curl` carries no quarantine attribute, and that the command above removes one, after which the binary runs. It does not launch a quarantined copy, so the Gatekeeper refusal itself is macOS behaviour, not something the smoke tests.
+
+To build from source instead, with Rust from [rustup.rs](https://rustup.rs): `cargo build --release -p fabric --locked`, then copy `target/release/fabric` to your `PATH` ([docs/start/install.md](docs/start/install.md)).
 
 ## One Mac, first run
 
@@ -75,13 +138,15 @@ In another terminal, with the same `FABRIC_HOME`:
 ```sh
 fabric node id
 fabric doctor            # the facts: harness versions, claude.login, codex.login, toolchains
-fabric job new --repo <a git repository> --goal "say hello and name one file" --harness codex
+fabric job new --repo <a git repository> --goal "say hello and name one file" --harness codex   # or claude, opencode, pi, gemini, cursor, acp:<program>
 fabric job run <job> --headless --prompt "Say hello and name one file here."
 fabric job suspend <job>
 fabric job resume <job> --headless --prompt "Which file did you name before?"
 fabric job status <job>
 fabric job log <job>
 ```
+
+Every command prints its answer on standard output and everything else (progress, notes, hints, errors) on standard error, so `job=$(fabric job new ...)` holds the job id alone; `--json` prints one JSON document instead, and a failure as one JSON line on standard error. [docs/cli-contract.md](docs/cli-contract.md) has the rules and the exit codes, and [docs/reference/cli.md](docs/reference/cli.md) the help of every command.
 
 The headless turn prints the answer and a last line `codex session <thread>` (or `claude-code session <id>`); the resume continues that session, and the `continuing ... session` line names the model, effort and sandbox it carried. Pick the harness `doctor` says is logged in. `claude.login` is what `claude` itself answers when the node asks it, so a node started from a shell whose `claude` login has lapsed, or over SSH, where the Keychain is closed to it, says `no`, and a headless Claude turn then fails with Claude's own `Failed to authenticate` message; log `claude` in from that shell, or start the node from the desktop session, and run it again.
 
@@ -166,6 +231,34 @@ To bring it back, on the Pro, `fabric job resume <job>` pulls it from the Air. `
 On the gate as measured, the Macs run different Claude Code versions, which doctor refuses for a Claude job; `fabric job move ... --force` (and `fabric job resume ... --force` for a pull) waives that row and prints it. Close every `claude` on the Air before a resume there: restoring a Claude session refuses while any `claude` runs on a Claude older than 2.1.294, because its session registry is too old to tell which sessions run (ADR 0015). This is about the session state the resume writes, not trust, and the Pro, on 2.1.294, has no such rule.
 
 A resume continues with the settings the session ran with, not the ones the other Mac has configured: Codex gets the thread's model with the provider that served it, effort and sandbox, and in a terminal its approval policy and approvals reviewer, except a `never` policy, which `codex exec` records for the turns it runs, and the reviewer that goes with a policy it leaves out (a headless `codex exec` sets its own policy and restores the reviewer itself), and Claude gets the transcript's model, and `fabric` prints them on the `continuing ... session` line, with one line for any recorded value it does not carry and why. A resume refuses to start a harness older than the newest one that wrote the session, because an older Codex left a moved session that the newer one refused afterwards (gate finding F10). Codex records its version only when it creates a thread, so the job also carries the version of the newest Codex that ran it under Fabric, the one a version manager pins in the workspace included; `--force` on the move does not change that, so update the harness on that Mac and resume again (ADR 0006).
+
+## Harness fidelity
+
+How faithfully a job's conversation continues on the other machine, per harness, in the four words the managed continuation and the Portable Session Format use: `native_session` (the same session, continued under its own id), `new_native_session_with_package` (a new session of the harness handed the captured conversation), `workspace_only` (the files travel, the conversation does not), `unsupported`. The declared value is what the adapter reaches before any refusal (`Harness::fidelity`); a restore reports what it reached. [docs/harness-adapters.md](docs/harness-adapters.md) has the mechanism and the refusals per adapter.
+
+| Harness | Declared fidelity | Travels | Never travels | Checked on | Evidence |
+|---|---|---|---|---|---|
+| Claude Code | `native_session` | `~/.claude/projects/*/<sid>.jsonl` and `<sid>/`, the workspace's memory, `file-history/<sid>/`, `tasks/session-<sid8>/`, `uploads/<sid>/`, the named plans; redacted, signed blocks dropped whole when they hold a secret | `~/.claude.json`, credentials, the session registry, host state | 2.1.294, 2026-10-20 | Fixtures and a fake `claude` in the roundtrip, crash and end-to-end tests; one node beside a running `claude`. Not yet run across two Macs. |
+| Codex | `native_session` | The thread's rollout lineage under `sessions/` and `archived_sessions/`, byte for byte under Codex's writer lock; model, provider, effort, sandbox carried as `-c` overrides | `auth.json`, the SQLite state, the locks, `config.toml` | writer lock read at 0.155.1; 0.163.0 installed, 2026-11-08 | Moved between two real Macs on 2026-10-21 and answered a question about its first turn there, on the binary of that day, before M2 to M4 merged; not run again on `main` (gate G1 is pending). |
+| ACP agent (`acp:<program>`) | `native_session` | The files under the declared `state_dir` named for the session, byte for byte, refused on a secret shape; continued by `session/resume` or `session/load` | Everything else; an undeclared `state_dir` cannot be captured | ACP schema v1.26.0 | The fake ACP agent moved between two loopback nodes in every end-to-end run, on QUIC and TCP+TLS. |
+| OpenCode | `native_session`, or `new_native_session_with_package` when `opencode import` mints a new id | The JSON of `opencode export <id>`, refused on a secret shape, imported on the target only over a prefix of itself; model, agent and variant of the last turn | `opencode.db` (holds the login tokens), `auth.json`, snapshots | 1.18.34, 2026-11-08 (`export` and `import` checked against the installed binary in a scratch home with a synthetic export; import keeps the id) | A fake `opencode` with the real data layout in the roundtrip and end-to-end tests, moved between two loopback nodes on one Mac and asked about its first turn there. No turn with a real login yet; not yet run across two Macs. |
+| pi | `native_session` | The session's one JSONL file under its path key, byte for byte, refused on a secret shape; provider, model and thinking level of its last change entries | `auth.json`, `settings.json`, `trust.json` | 0.80.3, 2026-11-08 | A fake `pi` with the real session layout in the roundtrip and end-to-end tests, moved between two loopback nodes on one Mac and asked about its first turn there. No turn of the real `pi` yet; not yet run across two Macs. |
+| Gemini CLI | `native_session` | The chat file found by its 8-character id prefix and the full id of its first record, its subagent files and the `<sid>/` plans, tracker and tasks, byte for byte, refused on a secret shape; the model of the last answer; the target gets the `.project_root` marker its registry finds the slug by | `projects.json` (it names every project), `oauth_creds.json`, `google_accounts.json`, `settings.json`, `.env` | v0.67.0 source and docs, 2026-11-08 (not installed; fake only) | Synthetic fixture in the roundtrip test; a fake `gemini` moved between two loopback nodes on one Mac and answered about its first turn there, and an older `gemini` refused a session a newer one continued. Never run against a real Gemini CLI; not yet run across two Macs. |
+| Cursor Agent CLI | `workspace_only` | The workspace; a resume elsewhere starts a new chat in it and says the old one stayed behind, and `--resume` continues the chat only on the node that holds it | The encrypted `store.db` with its key beside it, `cli-config.json`; an ACP session has no local transcript to carry | 2026.10.01-e373342, 2026-11-08 | A fake `cursor-agent` moved between two loopback nodes on one Mac, answered about its first turn from the workspace, and a suspend was refused while it held the chat open. No turn with a real login yet; not yet run across two Macs. Opaque carry waits on Cursor documenting the format. |
+| GitHub Copilot CLI | not declared | `session-state/<id>/`, or the id alone where the account sync holds | `~/.copilot` config and tokens | docs only, 2026-11-08 | Left out of PR 5: not installed on the owner's Mac, and an id-only resume through the account sync cannot be shown without two signed-in nodes. A contributor task after PR 13. |
+| Aider | `new_native_session_with_package` (planned) | Nothing beyond the workspace snapshot: `.aider.chat.history.md` is inside it and replayed with `--restore-chat-history` | `.env`, API keys | docs, 2026-11-08 | After PR 5. |
+| Warp agent | `unsupported` | Nothing | Everything: no documented local session | 2026-11-08 | Not planned. |
+
+## Sync alone
+
+`fabric-sync` is the store on its own: no node, no pairing, no job. It pushes a working tree, with its staged and unstaged changes, its untracked files and its caches such as `node_modules`, to a directory or over SSH, and pulls it onto another machine. `.env` and every other secret-shaped untracked or ignored file stays behind, by the same policy a suspend uses, `.fabric/env.toml`'s secret patterns and declared caches included.
+
+```sh
+fabric-sync push box:sync                                  # on the first machine, in the tree
+fabric-sync pull box:sync --name app --tree ~/code/app     # on the second
+```
+
+A second push sends only the objects the target lacks: in the bench tree, 2 of 2,012 objects after ten files changed. A push over a head this tree has not seen is refused, a pull never writes over a tree with content without `--replace` (the old tree is kept beside it), and a pull killed at any point leaves the old tree or the whole new one. v1 has directory and SSH targets only, not the node link. See [docs/guides/sync-alone.md](docs/guides/sync-alone.md).
 
 ## Known limits
 

@@ -7,18 +7,20 @@
 //! Invariant: every message from a node names its grant with a
 //! [`GrantToken`], and the authority acts on it only while that token is
 //! the job's live grant. A report at another generation is refused
-//! `StaleGeneration` and recorded, never applied (replay rule 7); a
-//! heartbeat at another generation is answered `Stale`, and the node
-//! stops what it reported. M6 widens [`GrantVerdict`] with its fence and
-//! adds `Captured` to the observations a report may carry; nothing here
-//! moves for it.
+//! `StaleGeneration` and recorded, never applied (replay rule 7). A
+//! heartbeat is answered with the fence's own verdict for each grant
+//! ([`FenceVerdict`], ADR 0028), the one verdict type a node obeys: a
+//! verdict that ends the grant ([`FenceVerdict::ends_grant`]) stops what
+//! the node runs under it. A report the fence refuses is answered with the refusal
+//! that names the same verdict ([`ReportRefusal::fenced`]).
 
 use serde::{Deserialize, Serialize};
 
+use super::fence::FenceVerdict;
 use super::ids::{AttemptId, Generation, TaskId, WorkRevision};
 use super::lifecycle::TaskClass;
-use super::model::{Intent, JobPolicy, Observation, SourceBinding};
-use super::package::{AllowedFidelity, WorkPackage};
+use super::model::{AttemptStatus, Intent, JobPolicy, Observation, SourceBinding};
+use super::package::{AllowedFidelity, PACKAGE_MAX_BYTES, WorkPackage};
 use super::secret_ref::SecretName;
 use crate::env::EnvVarName;
 use crate::harness::HarnessKind;
@@ -201,6 +203,62 @@ pub struct LaunchRequest {
     /// The work package of a planned handoff, built by the authority from
     /// the journal; `Some` exactly when `continuation` is.
     pub package: Option<WorkPackage>,
+}
+
+impl LaunchRequest {
+    /// Refuses a launch the node must not take as sent: more than
+    /// `MAX_TASK_LAUNCHES` tasks, a task's program failing its check, a
+    /// checkpoint without the node that holds it, a package without a
+    /// continuation or the reverse, a package past `PACKAGE_MAX_BYTES`,
+    /// or one for another job. Pure; the receiving side runs it before
+    /// it serves anything, since it trusts no bound it did not check.
+    pub fn check(&self) -> Result<(), LaunchRefusal> {
+        if self.tasks.len() > MAX_TASK_LAUNCHES {
+            return Err(LaunchRefusal::Inconsistent {
+                reason: format!(
+                    "{} tasks, above the {MAX_TASK_LAUNCHES} bound",
+                    self.tasks.len()
+                ),
+            });
+        }
+        for launch in &self.tasks {
+            launch
+                .program
+                .check()
+                .map_err(|error| LaunchRefusal::BadProgram {
+                    task: launch.task,
+                    error,
+                })?;
+        }
+        if self.initial_checkpoint.is_some() && self.snapshot_at.is_none() {
+            return Err(LaunchRefusal::Inconsistent {
+                reason: "an initial checkpoint names no node that holds it".to_owned(),
+            });
+        }
+        match (&self.continuation, &self.package) {
+            (Some(_), None) => Err(LaunchRefusal::Inconsistent {
+                reason: "a continuation carries no package".to_owned(),
+            }),
+            (None, Some(_)) => Err(LaunchRefusal::Inconsistent {
+                reason: "a package without a continuation".to_owned(),
+            }),
+            (Some(_), Some(package)) => {
+                if package.job != self.token.job {
+                    return Err(LaunchRefusal::Inconsistent {
+                        reason: "the package is another job's".to_owned(),
+                    });
+                }
+                let bytes = package.canonical_json().len();
+                if bytes > PACKAGE_MAX_BYTES {
+                    return Err(LaunchRefusal::Inconsistent {
+                        reason: format!("the package is {bytes} bytes, above {PACKAGE_MAX_BYTES}"),
+                    });
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 /// The node's answer to a launch, at once: whether it took the grant.
@@ -389,6 +447,19 @@ pub enum ReportRefusal {
     /// The reporting peer is not the node the attempt was granted to.
     #[error("the attempt was granted to another node")]
     WrongNode,
+    /// The attempt's grant was taken (ADR 0028); `by` is the generation
+    /// granted in its place, `None` when nothing was granted yet.
+    #[error("the grant was superseded")]
+    Superseded {
+        /// The generation granted in its place, if one was.
+        by: Option<Generation>,
+    },
+    /// The attempt is the job's but may not write: `unknown`, or ended.
+    #[error("the attempt may not write: it is {status:?}")]
+    NotWritable {
+        /// Its status.
+        status: AttemptStatus,
+    },
     /// The observation names another attempt or generation than the token.
     #[error("the observation does not match the token")]
     TokenMismatch,
@@ -405,6 +476,49 @@ pub enum ReportRefusal {
     /// The authority is not open; the node tries again after its next heartbeat.
     #[error("the authority is unavailable")]
     Unavailable,
+}
+
+impl ReportRefusal {
+    /// The refusal that names a fence verdict, `None` for `Live`: the
+    /// report path and the heartbeat path refuse a grant for the same
+    /// reasons (ADR 0028).
+    #[must_use]
+    pub fn fenced(verdict: &FenceVerdict) -> Option<Self> {
+        Some(match verdict {
+            FenceVerdict::Live => return None,
+            FenceVerdict::Stale { current } => ReportRefusal::StaleGeneration { current: *current },
+            FenceVerdict::Superseded { by } => ReportRefusal::Superseded { by: *by },
+            FenceVerdict::NotWritable { status } => ReportRefusal::NotWritable {
+                status: status.clone(),
+            },
+            FenceVerdict::WrongNode { .. } => ReportRefusal::WrongNode,
+            FenceVerdict::UnknownAttempt => ReportRefusal::UnknownAttempt,
+            FenceVerdict::UnknownJob => ReportRefusal::UnknownJob,
+        })
+    }
+
+    /// Whether the refusal ends the grant the report was sent under: every
+    /// refusal the fence makes whose verdict ends it
+    /// ([`FenceVerdict::ends_grant`]). The node stops the attempt and
+    /// reports nothing more under it. `NotWritable { Unknown }` waits (the
+    /// next heartbeat from the grant's node brings it back), and
+    /// `TokenMismatch`, `NotReportable`, `Domain` and `Unavailable` say
+    /// nothing of the grant.
+    #[must_use]
+    pub fn ends_grant(&self) -> bool {
+        match self {
+            ReportRefusal::StaleGeneration { .. }
+            | ReportRefusal::UnknownJob
+            | ReportRefusal::UnknownAttempt
+            | ReportRefusal::WrongNode
+            | ReportRefusal::Superseded { .. } => true,
+            ReportRefusal::NotWritable { status } => *status != AttemptStatus::Unknown,
+            ReportRefusal::TokenMismatch
+            | ReportRefusal::NotReportable
+            | ReportRefusal::Domain { .. }
+            | ReportRefusal::Unavailable => false,
+        }
+    }
 }
 
 impl Report {
@@ -478,29 +592,19 @@ pub struct Heartbeat {
     pub attempts: Vec<GrantToken>,
 }
 
-/// How often a node heartbeats while it runs an attempt.
-pub const HEARTBEAT_MS: u64 = 2_000;
+/// How often a node heartbeats while it runs an attempt: the interval
+/// the authority's presence counts silence in (ADR 0028), one constant.
+pub const HEARTBEAT_MS: u64 = super::model::HEARTBEAT_INTERVAL_MS;
 
-/// The authority's answer: one verdict per token, in the order asked.
+/// The authority's answer: the fence's verdict on each token, in the
+/// order asked (ADR 0028). A verdict that ends the grant
+/// ([`FenceVerdict::ends_grant`]) stops the attempt on the node, which
+/// reports nothing more under it. A token the authority could not judge
+/// (its journal is closed) gets no verdict, which says nothing of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatAnswer {
     /// The verdicts.
-    pub verdicts: Vec<(AttemptId, GrantVerdict)>,
-}
-
-/// What the authority says of a grant a node heartbeats. M6 widens it
-/// with its fence (`Superseded`, `NotWritable`, `WrongNode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GrantVerdict {
-    /// The job's live grant; carry on.
-    Live,
-    /// The job moved to a later generation; the node stops the attempt.
-    Stale {
-        /// The job's generation.
-        current: Generation,
-    },
-    /// No such job or attempt here; the node stops the attempt.
-    Unknown,
+    pub verdicts: Vec<(AttemptId, FenceVerdict)>,
 }
 
 #[cfg(test)]

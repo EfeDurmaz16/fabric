@@ -1,0 +1,18 @@
+[package]
+name = "fabric-psf"
+version.workspace = true
+description = "The Portable Session Format v1: read, check, write and project a coding-agent job as a container any program can read"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fabric-core = { path = "../fabric-core" }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

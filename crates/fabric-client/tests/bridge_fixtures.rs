@@ -6,81 +6,24 @@
 //! one pinned below, which Capsule's `scripts/bridge-fixtures.test.mjs`
 //! pins too. It also checks the framed fixtures against the framing caps
 //! of `fabric_client::frame`, so the bridge and the client API cannot
-//! drift apart on the bytes of a frame.
-//!
-//! sha256 is written out in `support` because the workspace has no sha2
-//! crate and a test does not justify one; the known-answer test below
-//! guards it, and the facade fixture test shares it.
+//! drift apart on the bytes of a frame. The sha256 and the manifest walk
+//! are shared with `psf_fixtures.rs` in `common`.
 
-use std::collections::BTreeMap;
-use std::error::Error;
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use common::{Fallible, sha256};
 use fabric_client::frame::{MAX_FRAME, MAX_REQUEST};
 use serde_json::Value;
-
-mod support;
-use support::sha256;
 
 /// The sha256 of `protocol/bridge/v1/manifest.sha256`. Change it only with
 /// the same change in Capsule's copy (docs/bridge-protocol.md, Fixtures).
 const MANIFEST_SHA256: &str = "40f6490fd8c54fec1f138946386f8b7793f4b8b4b88bb4eb330f828cb5900601";
 
-type Fallible<T> = Result<T, Box<dyn Error>>;
-
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/bridge/v1")
-}
-
-fn unhex(text: &str) -> Fallible<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return Err(format!("odd hex length {}", text.len()).into());
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| Ok(u8::from_str_radix(&text[i..i + 2], 16)?))
-        .collect()
-}
-
-/// Every file under `dir`, as a path relative to `base` with `/` separators.
-fn files(base: &Path, dir: &Path, out: &mut Vec<String>) -> Fallible<()> {
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            files(base, &path, out)?;
-        } else {
-            let relative = path.strip_prefix(base)?;
-            let parts: Vec<String> = relative
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            out.push(parts.join("/"));
-        }
-    }
-    Ok(())
-}
-
-fn manifest() -> Fallible<BTreeMap<String, String>> {
-    let text = fs::read_to_string(root().join("manifest.sha256"))?;
-    let mut entries = BTreeMap::new();
-    let mut previous = String::new();
-    for line in text.lines() {
-        let (digest, path) = line
-            .split_once("  ")
-            .ok_or_else(|| format!("manifest line without two spaces: {line}"))?;
-        assert_eq!(digest.len(), 64, "{line}");
-        assert!(
-            digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "{line}"
-        );
-        assert!(previous.as_str() < path, "manifest not sorted at {path}");
-        path.clone_into(&mut previous);
-        entries.insert(path.to_owned(), digest.to_owned());
-    }
-    Ok(entries)
 }
 
 #[test]
@@ -112,27 +55,17 @@ fn the_manifest_is_the_pinned_one() -> Fallible<()> {
 
 #[test]
 fn every_fixture_matches_the_manifest_and_none_is_missing_or_extra() -> Fallible<()> {
-    let listed = manifest()?;
-    let mut found = Vec::new();
-    files(&root(), &root(), &mut found)?;
-    found.retain(|path| path != "manifest.sha256");
-    found.sort();
-    let listed_paths: Vec<&String> = listed.keys().collect();
-    let found_paths: Vec<&String> = found.iter().collect();
-    assert_eq!(found_paths, listed_paths, "files and manifest differ");
-    for (path, digest) in &listed {
-        let bytes = fs::read(root().join(path))?;
-        assert_eq!(
-            &sha256(&bytes),
-            digest,
-            "{path} does not match the manifest"
-        );
-        assert!(
-            !bytes.contains(&b'\r'),
-            "{path} has a carriage return; fixtures are LF only"
-        );
+    common::check_tree_against_manifest(&root())
+}
+
+fn unhex(text: &str) -> Fallible<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return Err(format!("odd hex length {}", text.len()).into());
     }
-    Ok(())
+    (0..text.len())
+        .step_by(2)
+        .map(|i| Ok(u8::from_str_radix(&text[i..i + 2], 16)?))
+        .collect()
 }
 
 /// The cap a reader on the receiving side of `direction` applies in `phase`.

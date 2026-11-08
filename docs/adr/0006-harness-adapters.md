@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+Amended 2026-11-08 (PR 5 of the 2026-11-08 roadmap): four more adapters, OpenCode, pi, Gemini CLI and Cursor Agent CLI, each a cargo feature and a `HarnessKind` of its own, with GitHub Copilot CLI conditional; what each carries, never carries and reaches is in `docs/harness-adapters.md`, which also records the two decisions that bound them: Cursor's encrypted chat store is not carried (`workspace_only`), and an OpenCode import that mints a new id is reported as `new_native_session_with_package`, never as the same session.
+
 Amended 2026-10-21 after gate finding F10 (a Codex job moved to a node with an older Codex and another configured model failed with a 400, and the older Codex then left the session unusable for the newer one): a resume takes the model and the other settings from the session itself, and a harness older than the newest one that wrote the session is refused before it starts, under "Settings travel with the session", with dated amendments in place under "Claude Code and Codex adapters first".
 
 Amended 2026-10-21 after a third review of the F10 fix: a Codex resume reads a settings change made after the last turn, every reasoning effort Codex names travels with the model, and a Claude workspace whose project key Claude cuts resumes, under "Settings travel with the session".

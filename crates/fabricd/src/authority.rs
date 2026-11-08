@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use fabric_core::id::{JobId, NodeId};
+use fabric_core::managed::launch::{Heartbeat, HeartbeatAnswer};
 use fabric_core::managed::{
     AttemptId, AttemptStatus, CheckpointAck, Command, CommandKind, CoveredPath, DomainError,
     Envelope, FenceVerdict, GrantToken, HEARTBEAT_INTERVAL_MS, ManagedEvent, ManagedState, NewIds,
@@ -44,7 +45,6 @@ use fabric_core::managed::{
 use fabric_journal::{
     Answer, Blocker, CommitError, FILE_NAME, Journal, KeyedRequest, Liveness, OpenError,
 };
-use fabric_net::wire::{Heartbeat, HeartbeatAnswer};
 use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
 
@@ -117,13 +117,6 @@ enum Call {
     Observe(JobId, Observation, Reply<Transition>),
     Mark(JobId, OperationId, OperationMark, Reply<Transition>),
     /// An executor's report behind the fence (ADR 0028).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the M5 executor reports through it at the restack"
-        )
-    )]
     Report(
         GrantToken,
         Option<NodeId>,
@@ -493,11 +486,9 @@ impl Authority {
     }
 
     /// Marks an operation on the authority's own behalf, `Dispatched`
-    /// right before its effect is asked for.
-    #[allow(
-        dead_code,
-        reason = "a launch's dispatch marks through it; no launch is dispatched by the node in M5, so only the tests call it"
-    )]
+    /// right before its effect is asked for, then its outcome when the
+    /// answer settles it (the dispatch). No fence runs: no runner
+    /// presents a grant.
     pub(crate) async fn mark_authority(
         &self,
         job: JobId,
@@ -514,13 +505,6 @@ impl Authority {
     /// report from the node an `unknown` attempt was granted to is
     /// presence: the attempt is observed reachable first. With no managed
     /// journal the verdict is `UnknownJob`, as a heartbeat gets.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the M5 executor reports through it at the restack"
-        )
-    )]
     pub(crate) async fn report(
         &self,
         token: GrantToken,
@@ -600,7 +584,7 @@ impl Authority {
     ) -> Result<HeartbeatAnswer, AuthorityError> {
         if self.idle() {
             let verdicts = beat
-                .attempts()
+                .attempts
                 .iter()
                 .map(|t| (t.attempt, FenceVerdict::UnknownJob))
                 .collect();
@@ -1130,7 +1114,7 @@ fn heartbeat(
         Holder::Open(journal) => journal,
         Holder::Absent => {
             let verdicts = beat
-                .attempts()
+                .attempts
                 .iter()
                 .map(|t| (t.attempt, FenceVerdict::UnknownJob))
                 .collect();
@@ -1138,8 +1122,8 @@ fn heartbeat(
         }
         Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
     };
-    let mut verdicts = Vec::with_capacity(beat.attempts().len());
-    for token in beat.attempts() {
+    let mut verdicts = Vec::with_capacity(beat.attempts.len());
+    for token in &beat.attempts {
         *wrote |= presence_of(place, journal, presence, from, token);
         let state = journal.job(token.job)?;
         verdicts.push((token.attempt, fence(state.as_ref(), token, Some(from))));

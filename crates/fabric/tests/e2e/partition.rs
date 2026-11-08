@@ -253,7 +253,7 @@ fn block_policy_waits_with_the_state_visible() -> Fallible {
         "wait for an operator",
         "--harness",
         "codex",
-        "--key",
+        "--operation-key",
         "m6-block",
         "--pin",
         &runner,

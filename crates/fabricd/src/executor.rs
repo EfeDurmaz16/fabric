@@ -5,10 +5,15 @@
 //! registered in a durable record before it is launched and completed
 //! after, so a restart finds every group this node started and stops what
 //! it cannot account for. An interrupted build or test is `Interrupted`,
-//! never passed and never failed; a harness task is never killed by a
-//! quiescence but checkpointed by the suspend path, or the handoff is
-//! blocked with the capture's reason; an opaque task blocks. A secret
-//! reaches a task's environment at spawn and is held nowhere else.
+//! never passed and never failed; a harness task is checkpointed by the
+//! suspend path, or the handoff is blocked with the capture's reason; an
+//! opaque task blocks. A harness's own state is captured only once the
+//! harness has stopped, as `job suspend` stops it first: a running Claude
+//! or Codex holds its session, and its adapter refuses a capture then. So
+//! a cut that ends the attempt stops the harness before the capture, once
+//! nothing else blocks it, and a cut that resumes leaves the harness
+//! running and captures the workspace alone. A secret reaches a task's
+//! environment at spawn and is held nowhere else.
 //!
 //! What the executor counts: spawns, signals and captures. It flushes
 //! nothing beyond the record it writes per launch and the capture's own
@@ -24,6 +29,7 @@ use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::id::{JobId, SnapshotId};
+use fabric_core::managed::launch::AfterCut;
 use fabric_core::managed::secret_ref::AttemptScope;
 use fabric_core::managed::{
     AttemptId, CheckpointCut, DrainBudget, EvidenceKind, EvidenceRef, Generation, HandoffBlocker,
@@ -74,6 +80,13 @@ pub enum ExecutorError {
     /// The durable record of a launch could not be written or read.
     #[error(transparent)]
     Record(#[from] local::LocalError),
+    /// A process offered for adoption does not lead a process group of
+    /// its own, so a stop of its group would reach what is not the task's.
+    #[error("pid {pid} does not lead a process group of its own")]
+    NotAGroupLeader {
+        /// The pid.
+        pid: u32,
+    },
 }
 
 /// What a spawn made.
@@ -107,19 +120,36 @@ pub struct Counters {
     pub captures: u64,
 }
 
+/// Whether the harness a checkpoint captures has stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessRun {
+    /// Stopped before the capture: nothing holds its state, which its
+    /// adapter captures whole.
+    Stopped,
+    /// Still running, as under a cut that resumes: it holds its state, so
+    /// only the workspace is captured.
+    Running,
+}
+
 /// The capture side of the executor: the suspend path for a harness task
 /// and the snapshot capture for a cut. The node wires the real one; the
 /// tests a fake.
 pub trait Capturer: Send + Sync {
-    /// Checkpoints a harness task through its adapter's suspend path and
-    /// returns the snapshot, or the capture's reason.
+    /// Checkpoints a harness task and returns the snapshot, or the
+    /// capture's reason: through its adapter's suspend path when `run` is
+    /// `Stopped`, the workspace alone when it is `Running`.
     fn checkpoint_harness(
         &self,
         attempt: AttemptId,
         task: TaskId,
+        run: HarnessRun,
     ) -> BoxFuture<'_, Result<SnapshotId, String>>;
     /// Captures the attempt's workspace into a snapshot.
     fn capture(&self, attempt: AttemptId) -> BoxFuture<'_, Result<SnapshotId, String>>;
+    /// Tells the harness's adapter that the cut holding its state is
+    /// recorded, so its departure record counts at the next restore on
+    /// this node (ADR 0015). Nothing to confirm is not an error.
+    fn confirm_departure(&self, attempt: AttemptId) -> BoxFuture<'_, Result<(), String>>;
     /// The node's facts for the job, sorted by name.
     fn facts(&self) -> Vec<(String, String)>;
 }
@@ -140,15 +170,30 @@ pub struct LaunchRecord {
     pub started: Option<String>,
 }
 
+/// How the executor holds a task's process.
+enum Handle {
+    /// A process the executor spawned and reaps.
+    Child(tokio::process::Child),
+    /// A harness process its adapter spawned (`Executor::adopt`): its
+    /// parent, the runner, reaps it, so the executor learns it ended when
+    /// nothing of its group is left.
+    Adopted,
+}
+
 /// One running task.
 struct Running {
     task: TaskId,
     class: TaskClass,
     pid: NonZeroU32,
     started: Option<String>,
-    child: tokio::process::Child,
+    handle: Handle,
     /// The exit status, once reaped.
     exit: Option<std::process::ExitStatus>,
+    /// True once the task is known to have ended, its status known or not.
+    gone: bool,
+    /// True once a quiescence or a stop signalled it: it ended interrupted,
+    /// whatever its status says, and every later receipt says so.
+    interrupted: bool,
 }
 
 /// One attempt this node runs.
@@ -299,6 +344,57 @@ impl Executor {
         Ok(())
     }
 
+    /// The job's secrets for a process of `attempt`, by name; a secret
+    /// scoped to the current attempt only while `is_current`.
+    fn resolve_secrets(
+        &self,
+        run: &AttemptRun,
+        attempt: AttemptId,
+        is_current: bool,
+    ) -> Result<Vec<(String, String)>, ExecutorError> {
+        let mut env = Vec::new();
+        for secret in &run.secrets {
+            if secret.scope.attempt == AttemptScope::Current && !is_current {
+                continue;
+            }
+            let value = self.resolver.resolve(run.job, attempt, secret)?;
+            env.push((
+                secret.name.as_str().to_owned(),
+                String::from_utf8_lossy(value.expose()).into_owned(),
+            ));
+        }
+        Ok(env)
+    }
+
+    /// The secrets a process of `attempt` that its adapter spawns gets in
+    /// its environment, under their names, resolved now, as
+    /// [`Executor::spawn`] resolves them: the harness task's (the launch
+    /// path, step 4). The caller hands them to the adapter and keeps none.
+    pub async fn secret_env(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<Vec<(String, String)>, ExecutorError> {
+        let run = self.run(attempt).await?;
+        let run = run.lock().await;
+        let is_current = self
+            .current
+            .lock()
+            .await
+            .get(&run.job)
+            .is_none_or(|current| *current <= run.generation);
+        self.resolve_secrets(&run, attempt, is_current)
+    }
+
+    /// The job's current generation as this node knows it, if it knows one.
+    pub async fn current(&self, job: JobId) -> Option<Generation> {
+        self.current.lock().await.get(&job).copied()
+    }
+
+    /// The secrets of `refs` that do not resolve on this node.
+    pub fn unresolved(&self, refs: &[SecretRef]) -> Vec<fabric_core::managed::SecretName> {
+        self.resolver.unresolved(refs)
+    }
+
     fn record_path(&self, attempt: AttemptId, task: TaskId) -> PathBuf {
         self.records
             .join(attempt.to_string())
@@ -333,17 +429,7 @@ impl Executor {
             .is_none_or(|current| *current <= run.generation);
         // Secrets are resolved now, never earlier and never kept: a
         // missing one refuses the launch before any process exists.
-        let mut env = Vec::new();
-        for secret in &run.secrets {
-            if secret.scope.attempt == AttemptScope::Current && !is_current {
-                continue;
-            }
-            let value = self.resolver.resolve(run.job, attempt, secret)?;
-            env.push((
-                secret.name.as_str().to_owned(),
-                String::from_utf8_lossy(value.expose()).into_owned(),
-            ));
-        }
+        let env = self.resolve_secrets(&run, attempt, is_current)?;
         let path = self.record_path(attempt, task);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| local::LocalError::Io {
@@ -362,7 +448,12 @@ impl Executor {
         // is durable and no process exists; a crash here leaves a record
         // with no pid, which recovery clears.
         local::write(&path, &record)?;
-        command.process_group(0).current_dir(run.root.as_str());
+        // A program names its directory under the root (the launch path);
+        // every other task runs in the root.
+        if command.get_current_dir().is_none() {
+            command.current_dir(run.root.as_str());
+        }
+        command.process_group(0);
         scrub_secrets(&mut command);
         for (key, value) in &env {
             command.env(key, value);
@@ -402,8 +493,74 @@ impl Executor {
             class,
             pid,
             started,
-            child,
+            handle: Handle::Child(child),
             exit: None,
+            gone: false,
+            interrupted: false,
+        });
+        Ok(Spawned {
+            pid: pid.get(),
+            group: pid.get(),
+            task,
+        })
+    }
+
+    /// Registers a harness process its adapter spawned, in a group it
+    /// leads, as the attempt's task `task` of class `Harness`: the launch
+    /// record is written as for [`Executor::spawn`], so a restart stops
+    /// it, and a quiescence checkpoints it through the suspend path, never
+    /// kills it. `started` is its start time as `ps` prints it; read now
+    /// when `None`. Refused while the attempt is frozen, and for a pid
+    /// that leads no group of its own. The caller, which holds the
+    /// process, reaps it; the executor sees it ended when its group is gone.
+    pub async fn adopt(
+        &self,
+        attempt: AttemptId,
+        task: TaskId,
+        pid: u32,
+        started: Option<String>,
+    ) -> Result<Spawned, ExecutorError> {
+        let run = self.run(attempt).await?;
+        let mut run = run.lock().await;
+        if run.frozen {
+            return Err(ExecutorError::Frozen { attempt });
+        }
+        let leader = NonZeroU32::new(pid)
+            .and_then(pid_of)
+            .ok_or(ExecutorError::NotAGroupLeader { pid })?;
+        match rustix::process::getpgid(Some(leader)) {
+            Ok(group) if group == leader => {}
+            _ => return Err(ExecutorError::NotAGroupLeader { pid }),
+        }
+        let pid = NonZeroU32::new(pid).ok_or(ExecutorError::NotAGroupLeader { pid })?;
+        let started = match started {
+            Some(started) => Some(started),
+            None => local::process_started(pid).await,
+        };
+        let path = self.record_path(attempt, task);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| local::LocalError::Io {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        let record = LaunchRecord {
+            attempt,
+            task,
+            class: TaskClass::Harness,
+            pid: Some(pid.get()),
+            started: started.clone(),
+        };
+        local::write(&path, &record)?;
+        run.tasks.push(Running {
+            task,
+            class: TaskClass::Harness,
+            pid,
+            started,
+            handle: Handle::Adopted,
+            exit: None,
+            gone: false,
+            interrupted: false,
         });
         Ok(Spawned {
             pid: pid.get(),
@@ -473,64 +630,44 @@ impl Executor {
 
     /// Freezes spawning for the attempt, settles leaves before parents
     /// under each task's policy within `budget`, and reports receipts and
-    /// blockers. Never kills a harness task: it goes through the suspend
-    /// path and comes back `Checkpointed` or `CheckpointFailed`.
+    /// blockers. A running harness task goes through the suspend path and
+    /// comes back `Checkpointed` or `CheckpointFailed`: under
+    /// `AfterCut::End` it is stopped first, and only when nothing else
+    /// blocks the handoff, so a blocked handoff leaves it running; under
+    /// `AfterCut::Resume` it is never signalled and its own state is not
+    /// captured.
     pub async fn quiesce(
         &self,
         attempt: AttemptId,
         budget: DrainBudget,
+        then: AfterCut,
     ) -> Result<Quiescence, ExecutorError> {
+        let deadline = tokio::time::Instant::now() + budget.duration();
         let run = self.run(attempt).await?;
         let mut run = run.lock().await;
         run.frozen = true;
         let root = run.root.clone();
-        let mut receipts = Vec::new();
+        let mut receipts: Vec<Option<TaskReceipt>> = run.tasks.iter().map(|_| None).collect();
         let mut blockers = Vec::new();
+        // Running harness tasks, settled once the rest is.
+        let mut harnesses = Vec::new();
         // Leaves before parents: a child is spawned after its parent, so
         // the newest task settles first.
-        for running in run.tasks.iter_mut().rev() {
+        for (at, running) in run.tasks.iter_mut().enumerate().rev() {
             let receipt = match running.class.outcome_policy() {
                 OutcomePolicy::CancelAndRestart => {
                     settle_or_interrupt(running, budget, &self.signals).await
                 }
                 OutcomePolicy::Checkpoint => {
-                    if reap(running).is_some() {
+                    if reap(running).await {
                         exited(running)
                     } else {
-                        self.captures.fetch_add(1, Ordering::Relaxed);
-                        match self
-                            .capturer
-                            .checkpoint_harness(attempt, running.task)
-                            .await
-                        {
-                            Ok(snapshot) => TaskReceipt {
-                                task: running.task,
-                                class: running.class,
-                                status: ReceiptStatus::Checkpointed { snapshot },
-                                exit: None,
-                                // The turn was cut: the harness was mid-turn.
-                                interrupted: true,
-                                workspace: None,
-                            },
-                            Err(reason) => {
-                                blockers.push(HandoffBlocker::CheckpointFailed {
-                                    task: running.task,
-                                    reason: reason.clone(),
-                                });
-                                TaskReceipt {
-                                    task: running.task,
-                                    class: running.class,
-                                    status: ReceiptStatus::Blocked { reason },
-                                    exit: None,
-                                    interrupted: false,
-                                    workspace: None,
-                                }
-                            }
-                        }
+                        harnesses.push(at);
+                        continue;
                     }
                 }
                 OutcomePolicy::Block => {
-                    if reap(running).is_some() {
+                    if reap(running).await {
                         exited(running)
                     } else {
                         blockers.push(HandoffBlocker::Opaque { task: running.task });
@@ -547,14 +684,98 @@ impl Executor {
                     }
                 }
             };
-            receipts.push(receipt);
+            receipts[at] = Some(receipt);
         }
-        receipts.reverse();
         let registered: Vec<u32> = run.tasks.iter().map(|t| t.pid.get()).collect();
-        let groups: Vec<u32> = registered.clone();
+        blockers.extend(group_blockers(&registered, &registered, &root).await);
+        let harness_run = match then {
+            AfterCut::End => HarnessRun::Stopped,
+            AfterCut::Resume => HarnessRun::Running,
+        };
+        let blocked = !blockers.is_empty();
+        for at in harnesses {
+            let running = &mut run.tasks[at];
+            if harness_run == HarnessRun::Stopped {
+                if blocked {
+                    // Stopping it would end an attempt whose handoff is
+                    // refused anyway: it goes on as it was.
+                    receipts[at] = Some(TaskReceipt {
+                        task: running.task,
+                        class: running.class,
+                        status: ReceiptStatus::Blocked {
+                            reason: "not checkpointed: the handoff is blocked".into(),
+                        },
+                        exit: None,
+                        interrupted: false,
+                        workspace: None,
+                    });
+                    continue;
+                }
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let grace = DrainBudget::new(u32::try_from(left.as_millis()).unwrap_or(u32::MAX))
+                    .unwrap_or_else(|_| DrainBudget::new(DrainBudget::MIN_MS).unwrap_or_default());
+                interrupt(running, grace, &self.signals).await;
+            }
+            let (receipt, failed) = self.checkpoint_harness(attempt, running, harness_run).await;
+            blockers.extend(failed);
+            receipts[at] = Some(receipt);
+        }
         drop(run);
-        blockers.extend(group_blockers(&groups, &registered, &root).await);
-        Ok(Quiescence { receipts, blockers })
+        Ok(Quiescence {
+            receipts: receipts.into_iter().flatten().collect(),
+            blockers,
+        })
+    }
+
+    /// The receipt of a harness task's checkpoint through the capturer,
+    /// and the blocker a failed one makes.
+    async fn checkpoint_harness(
+        &self,
+        attempt: AttemptId,
+        running: &Running,
+        run: HarnessRun,
+    ) -> (TaskReceipt, Option<HandoffBlocker>) {
+        self.captures.fetch_add(1, Ordering::Relaxed);
+        match self
+            .capturer
+            .checkpoint_harness(attempt, running.task, run)
+            .await
+        {
+            Ok(snapshot) => (
+                TaskReceipt {
+                    task: running.task,
+                    class: running.class,
+                    status: ReceiptStatus::Checkpointed { snapshot },
+                    exit: None,
+                    // The turn was cut: the harness was mid-turn.
+                    interrupted: true,
+                    workspace: None,
+                },
+                None,
+            ),
+            Err(reason) => (
+                TaskReceipt {
+                    task: running.task,
+                    class: running.class,
+                    status: ReceiptStatus::Blocked {
+                        reason: reason.clone(),
+                    },
+                    exit: None,
+                    interrupted: false,
+                    workspace: None,
+                },
+                Some(HandoffBlocker::CheckpointFailed {
+                    task: running.task,
+                    reason,
+                }),
+            ),
+        }
+    }
+
+    /// Tells the capturer that the cut of `attempt` is recorded, so the
+    /// harness state it holds counts as departed (ADR 0015).
+    pub async fn confirm_departure(&self, attempt: AttemptId) -> Result<(), String> {
+        self.capturer.confirm_departure(attempt).await
     }
 
     /// Stops every group of the attempt: `SIGTERM`, `budget`, `SIGKILL`;
@@ -570,7 +791,7 @@ impl Executor {
         run.frozen = true;
         let mut receipts = Vec::new();
         for running in &mut run.tasks {
-            let exited_before = reap(running).is_some();
+            let exited_before = reap(running).await;
             interrupt(running, budget, &self.signals).await;
             receipts.push(if exited_before {
                 exited(running)
@@ -671,17 +892,39 @@ fn receipt_digest(receipt: &TaskReceipt) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Reaps the task if it exited; its status, once known, is kept.
-fn reap(running: &mut Running) -> Option<std::process::ExitStatus> {
-    if running.exit.is_none()
-        && let Ok(Some(status)) = running.child.try_wait()
-    {
-        running.exit = Some(status);
+/// Whether the task ended: a spawned one is reaped and its status kept;
+/// an adopted one ended once nothing of its group is left alive.
+async fn reap(running: &mut Running) -> bool {
+    if running.gone {
+        return true;
     }
-    running.exit
+    match &mut running.handle {
+        Handle::Child(child) => {
+            if let Ok(Some(status)) = child.try_wait() {
+                running.exit = Some(status);
+                running.gone = true;
+            }
+        }
+        Handle::Adopted => {
+            if group_members(running.pid.get()).await.is_empty() {
+                running.gone = true;
+            }
+        }
+    }
+    running.gone
 }
 
 fn exited(running: &Running) -> TaskReceipt {
+    if running.interrupted {
+        return TaskReceipt {
+            task: running.task,
+            class: running.class,
+            status: ReceiptStatus::Interrupted,
+            exit: None,
+            interrupted: true,
+            workspace: None,
+        };
+    }
     TaskReceipt {
         task: running.task,
         class: running.class,
@@ -701,7 +944,7 @@ async fn settle_or_interrupt(
 ) -> TaskReceipt {
     let deadline = tokio::time::Instant::now() + budget.duration();
     loop {
-        if reap(running).is_some() {
+        if reap(running).await {
             return exited(running);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -733,27 +976,45 @@ async fn interrupt(running: &mut Running, grace: DrainBudget, signals: &AtomicU6
         return;
     };
     if group_members(running.pid.get()).await.is_empty() {
-        let _ = running
-            .child
-            .try_wait()
-            .map(|s| running.exit = s.or(running.exit));
+        if let Handle::Child(child) = &mut running.handle
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            running.exit = Some(status);
+        }
+        running.gone = true;
         return;
     }
-    if running.exit.is_none()
+    let leader_exited = match &mut running.handle {
+        Handle::Child(child) => child.try_wait().ok().flatten().is_some(),
+        Handle::Adopted => false,
+    };
+    // A leader pid that another process now has (it starts at another
+    // time) names a group that is not this task's. A leader that is gone
+    // while its group still has members (an adopted harness the runner
+    // reaped, which left a child behind) is this task's group: a pid is
+    // not reused while a group of that id lives.
+    if !running.gone
+        && !leader_exited
         && let Some(started) = &running.started
-        && local::process_started(running.pid).await.as_ref() != Some(started)
-        && running.child.try_wait().ok().flatten().is_none()
+        && let Some(now) = local::process_started(running.pid).await
+        && &now != started
     {
         return;
     }
     signals.fetch_add(1, Ordering::Relaxed);
+    running.interrupted = !running.gone;
     signal_group(group, Signal::TERM);
     if !wait_group_gone(group, grace.duration()).await {
         signals.fetch_add(1, Ordering::Relaxed);
         signal_group(group, Signal::KILL);
         wait_group_gone(group, KILL_WAIT).await;
     }
-    let _ = running.child.wait().await.map(|s| running.exit = Some(s));
+    if let Handle::Child(child) = &mut running.handle
+        && let Ok(status) = child.wait().await
+    {
+        running.exit = Some(status);
+    }
+    running.gone = true;
 }
 
 fn signal_group(group: Pid, signal: Signal) {
@@ -872,10 +1133,13 @@ mod tests {
 
     use super::*;
 
-    /// A capturer that answers from a script and remembers what it was asked.
+    /// A capturer that answers from a script and remembers what it was
+    /// asked, and whether the process `harness_pid` names was alive then.
     struct FakeCapturer {
         harness: Result<SnapshotId, String>,
         asked: StdMutex<Vec<TaskId>>,
+        runs: StdMutex<Vec<(HarnessRun, Option<bool>)>>,
+        harness_pid: StdMutex<Option<u32>>,
     }
 
     impl Capturer for FakeCapturer {
@@ -883,14 +1147,21 @@ mod tests {
             &self,
             _attempt: AttemptId,
             task: TaskId,
+            run: HarnessRun,
         ) -> BoxFuture<'_, Result<SnapshotId, String>> {
             self.asked.lock().unwrap().push(task);
+            let held = self.harness_pid.lock().unwrap().map(alive);
+            self.runs.lock().unwrap().push((run, held));
             let answer = self.harness.clone();
             Box::pin(async move { answer })
         }
 
         fn capture(&self, attempt: AttemptId) -> BoxFuture<'_, Result<SnapshotId, String>> {
             Box::pin(async move { Ok(SnapshotId::of(&attempt.to_bytes())) })
+        }
+
+        fn confirm_departure(&self, _attempt: AttemptId) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
         }
 
         fn facts(&self) -> Vec<(String, String)> {
@@ -922,6 +1193,8 @@ mod tests {
         let capturer = Arc::new(FakeCapturer {
             harness,
             asked: StdMutex::new(Vec::new()),
+            runs: StdMutex::new(Vec::new()),
+            harness_pid: StdMutex::new(None),
         });
         let resolver = LocalResolver::with_environment(dir.path(), env);
         let executor = Executor::new(dir.path().join("records"), resolver, capturer.clone());
@@ -985,7 +1258,11 @@ mod tests {
             .spawn(b.attempt, task(1), TaskClass::Test, sh("exec sleep 30"))
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert_eq!(q.receipts.len(), 1);
         let r = &q.receipts[0];
         assert_eq!(r.status, ReceiptStatus::Interrupted);
@@ -1003,7 +1280,11 @@ mod tests {
             .spawn(b.attempt, task(2), TaskClass::Test, sh("exit 3"))
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(2_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert!(q.receipts[0].passed());
         assert_eq!(q.receipts[1].exit, Some(3));
         assert!(!q.receipts[1].passed());
@@ -1018,7 +1299,11 @@ mod tests {
             .spawn(b.attempt, task(1), TaskClass::Build, sh("exec sleep 30"))
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert_eq!(q.receipts[0].status, ReceiptStatus::Interrupted);
         assert!(!alive(spawned.pid), "the build's group was stopped");
         // Frozen: nothing more is spawned for the attempt; the next
@@ -1041,7 +1326,11 @@ mod tests {
             .spawn(b.attempt, task(1), TaskClass::Harness, sh("exec sleep 30"))
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert_eq!(
             q.receipts[0].status,
             ReceiptStatus::Checkpointed { snapshot }
@@ -1069,7 +1358,11 @@ mod tests {
             .spawn(b.attempt, task(1), TaskClass::Harness, sh("exec sleep 30"))
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert_eq!(
             q.blockers,
             vec![HandoffBlocker::CheckpointFailed {
@@ -1086,6 +1379,92 @@ mod tests {
         b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
     }
 
+    /// A cut that ends the attempt captures the harness's own state only
+    /// once the harness has stopped, as `job suspend` stops it: a running
+    /// Claude or Codex holds its session and its adapter refuses then.
+    #[tokio::test]
+    async fn a_cut_that_ends_the_attempt_stops_the_harness_before_its_capture() {
+        let snapshot = SnapshotId::of(b"harness");
+        let b = bench(Ok(snapshot)).await;
+        let spawned = b
+            .executor
+            .spawn(b.attempt, task(1), TaskClass::Harness, sh("exec sleep 30"))
+            .await
+            .unwrap();
+        *b.capturer.harness_pid.lock().unwrap() = Some(spawned.pid);
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::End)
+            .await
+            .unwrap();
+        assert!(q.blockers.is_empty(), "{:?}", q.blockers);
+        assert_eq!(
+            q.receipts[0].status,
+            ReceiptStatus::Checkpointed { snapshot }
+        );
+        assert!(q.receipts[0].interrupted, "the turn was cut");
+        assert_eq!(
+            *b.capturer.runs.lock().unwrap(),
+            vec![(HarnessRun::Stopped, Some(false))],
+            "the capture ran once the harness was gone"
+        );
+        assert!(!alive(spawned.pid));
+        b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+    }
+
+    /// A cut that ends the attempt but is blocked by another task leaves
+    /// the harness running and captures nothing of it: the attempt goes on.
+    #[tokio::test]
+    async fn a_blocked_cut_that_would_end_the_attempt_leaves_the_harness_running() {
+        let b = bench(Ok(SnapshotId::of(b"harness"))).await;
+        let spawned = b
+            .executor
+            .spawn(b.attempt, task(1), TaskClass::Harness, sh("exec sleep 30"))
+            .await
+            .unwrap();
+        b.executor
+            .spawn(b.attempt, task(2), TaskClass::Opaque, sh("exec sleep 30"))
+            .await
+            .unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::End)
+            .await
+            .unwrap();
+        assert_eq!(q.blockers, vec![HandoffBlocker::Opaque { task: task(2) }]);
+        assert!(matches!(
+            q.receipts[0].status,
+            ReceiptStatus::Blocked { .. }
+        ));
+        assert!(b.capturer.asked.lock().unwrap().is_empty());
+        assert!(alive(spawned.pid), "the attempt keeps running");
+        assert_eq!(b.executor.counters().signals, 0);
+        b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+    }
+
+    /// A cut that resumes the attempt never signals the harness, and asks
+    /// for the workspace alone, as the harness still holds its state.
+    #[tokio::test]
+    async fn a_cut_that_resumes_leaves_the_harness_running_and_its_state_alone() {
+        let b = bench(Ok(SnapshotId::of(b"harness"))).await;
+        let spawned = b
+            .executor
+            .spawn(b.attempt, task(1), TaskClass::Harness, sh("exec sleep 30"))
+            .await
+            .unwrap();
+        *b.capturer.harness_pid.lock().unwrap() = Some(spawned.pid);
+        b.executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
+        assert_eq!(
+            *b.capturer.runs.lock().unwrap(),
+            vec![(HarnessRun::Running, Some(true))]
+        );
+        assert!(alive(spawned.pid));
+        b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+    }
+
     #[tokio::test]
     async fn an_opaque_task_blocks() {
         let b = bench(Ok(SnapshotId::of(b"x"))).await;
@@ -1093,7 +1472,11 @@ mod tests {
             .spawn(b.attempt, task(1), TaskClass::Opaque, sh("exec sleep 30"))
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert_eq!(q.blockers, vec![HandoffBlocker::Opaque { task: task(1) }]);
         let pids = b.executor.pids(b.attempt).await;
         assert!(alive(pids[0]), "nothing is guessed about an opaque task");
@@ -1116,7 +1499,11 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert!(
             q.receipts[0].passed(),
             "the test itself exited zero: {:?}",
@@ -1184,7 +1571,11 @@ mod tests {
             .spawn(b.attempt, task(2), TaskClass::Test, sh("sleep 0.2; exit 0"))
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(2_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert_eq!(q.receipts[0].task, task(1));
         assert_eq!(q.receipts[1].task, task(2));
         assert!(q.receipts[1].passed(), "the leaf had its budget first");
@@ -1200,7 +1591,11 @@ mod tests {
             .await
             .unwrap();
         let started = tokio::time::Instant::now();
-        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
         // An opaque task is not waited for at all, and never cut: the
         // budget bounds the wait, the task runs on.
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1215,7 +1610,7 @@ mod tests {
             .unwrap();
         let started = tokio::time::Instant::now();
         b2.executor
-            .quiesce(b2.attempt, budget(1_000))
+            .quiesce(b2.attempt, budget(1_000), AfterCut::Resume)
             .await
             .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(900));
@@ -1246,7 +1641,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(2_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert!(q.receipts[0].passed());
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "hunter2");
         // Nothing the executor keeps or writes holds the value.
@@ -1297,7 +1696,11 @@ mod tests {
             .spawn(b.attempt, task(1), TaskClass::Test, command)
             .await
             .unwrap();
-        let q = b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(2_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert!(q.receipts[0].passed());
         let env = std::fs::read_to_string(&out).unwrap();
         assert!(env.lines().any(|l| l == "GITHUB_TOKEN=declared"), "{env}");
@@ -1328,7 +1731,11 @@ mod tests {
         let draining = {
             let executor = Arc::clone(&executor);
             let attempt = b.attempt;
-            tokio::spawn(async move { executor.quiesce(attempt, budget(3_000)).await })
+            tokio::spawn(async move {
+                executor
+                    .quiesce(attempt, budget(3_000), AfterCut::Resume)
+                    .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(200)).await;
         let started = tokio::time::Instant::now();
@@ -1389,7 +1796,10 @@ mod tests {
             .spawn(b.attempt, task(2), TaskClass::Test, print("after"))
             .await
             .unwrap();
-        b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        b.executor
+            .quiesce(b.attempt, budget(2_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(seen("before")).unwrap(),
             "cache|deploy"
@@ -1406,7 +1816,10 @@ mod tests {
             .spawn(b.attempt, task(1), TaskClass::Test, sh("exit 0"))
             .await
             .unwrap();
-        b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        b.executor
+            .quiesce(b.attempt, budget(2_000), AfterCut::Resume)
+            .await
+            .unwrap();
         assert!(matches!(
             b.executor
                 .spawn(b.attempt, task(2), TaskClass::Test, sh("exit 0"))
@@ -1506,6 +1919,8 @@ mod tests {
             let capturer = Arc::new(FakeCapturer {
                 harness: Ok(SnapshotId::of(b"x")),
                 asked: StdMutex::new(Vec::new()),
+                runs: StdMutex::new(Vec::new()),
+                harness_pid: StdMutex::new(None),
             });
             let executor =
                 Executor::new(records.clone(), LocalResolver::open(dir.path()), capturer);
@@ -1560,5 +1975,161 @@ mod tests {
         .unwrap();
         Executor::recover(&records, budget(1_000)).await.unwrap();
         assert!(walkdir(&records).is_empty());
+    }
+
+    /// A harness process its adapter spawned is registered as the
+    /// attempt's harness task (the launch path, step 4): it must lead a
+    /// group of its own, its launch record names its pid and start time
+    /// so a restart stops it, a quiescence checkpoints it through the
+    /// suspend path and never signals it, a frozen attempt adopts nothing,
+    /// and a stop ends its group.
+    #[tokio::test]
+    async fn an_adopted_harness_process_is_in_its_own_group_and_recorded() {
+        let snapshot = SnapshotId::of(b"adopted");
+        let b = bench(Ok(snapshot)).await;
+        // Not a group leader: a process in the test's own group.
+        let mut stray = sh("exec sleep 30");
+        let mut stray = stray.spawn().unwrap();
+        assert!(matches!(
+            b.executor.adopt(b.attempt, task(1), stray.id(), None).await,
+            Err(ExecutorError::NotAGroupLeader { .. })
+        ));
+        stray.kill().unwrap();
+        stray.wait().unwrap();
+
+        let mut harness = sh("exec sleep 30");
+        harness.process_group(0);
+        let mut harness = harness.spawn().unwrap();
+        let pid = harness.id();
+        let adopted = b
+            .executor
+            .adopt(b.attempt, task(1), pid, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (adopted.pid, adopted.group, adopted.task),
+            (pid, pid, task(1))
+        );
+        assert_eq!(b.executor.pids(b.attempt).await, vec![pid]);
+        let record: LaunchRecord = local::read(
+            &b.dir
+                .path()
+                .join("records")
+                .join(b.attempt.to_string())
+                .join(format!("{}.json", task(1))),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.class, TaskClass::Harness);
+        assert_eq!(record.pid, Some(pid));
+        assert!(
+            record.started.is_some(),
+            "the start time tells a reused pid"
+        );
+        assert_eq!(
+            b.executor.counters().spawns,
+            0,
+            "nothing was spawned by the executor"
+        );
+
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
+        assert_eq!(
+            q.receipts[0].status,
+            ReceiptStatus::Checkpointed { snapshot }
+        );
+        assert_eq!(*b.capturer.asked.lock().unwrap(), vec![task(1)]);
+        assert!(alive(pid), "a quiescence never kills the harness");
+        assert_eq!(b.executor.counters().signals, 0);
+        assert!(matches!(
+            b.executor.adopt(b.attempt, task(2), pid, None).await,
+            Err(ExecutorError::Frozen { .. })
+        ));
+
+        let stopped = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(stopped[0].status, ReceiptStatus::Interrupted);
+        // The caller holds the process and reaps it.
+        harness.wait().unwrap();
+        assert!(!alive(pid), "the stop ended the harness's group");
+    }
+
+    /// A test a checkpoint's quiescence interrupted is still interrupted at
+    /// the next cut of the same attempt, never read as exited: its group
+    /// is gone by then, and the signal that ended it was the executor's.
+    #[tokio::test]
+    async fn an_interrupted_test_stays_interrupted_at_the_next_cut() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        b.executor
+            .spawn(b.attempt, task(1), TaskClass::Test, sh("exec sleep 30"))
+            .await
+            .unwrap();
+        let q = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
+        assert_eq!(q.receipts[0].status, ReceiptStatus::Interrupted);
+        b.executor.resume(b.attempt).await.unwrap();
+        let again = b
+            .executor
+            .quiesce(b.attempt, budget(1_000), AfterCut::Resume)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.receipts[0].status,
+            ReceiptStatus::Interrupted,
+            "{again:?}"
+        );
+        assert!(again.receipts[0].interrupted);
+        assert!(!again.receipts[0].passed());
+        let stopped = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(stopped[0].status, ReceiptStatus::Interrupted);
+    }
+
+    /// An adopted harness that exited on its own (the runner reaped it,
+    /// step 8) and left a child in its group: a stop of the attempt ends
+    /// that group too, so nothing of the attempt outlives its report.
+    #[tokio::test]
+    async fn a_stop_ends_the_group_an_exited_adopted_harness_left() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-pid");
+        let mut harness = sh(&format!(
+            "sleep 30 & echo $! > {}; exit 0",
+            marker.display()
+        ));
+        harness.process_group(0);
+        let mut harness = harness.spawn().unwrap();
+        let pid = harness.id();
+        b.executor
+            .adopt(b.attempt, task(1), pid, None)
+            .await
+            .unwrap();
+        harness.wait().unwrap();
+        let child: u32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && let Ok(p) = text.trim().parse()
+            {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(alive(child), "the background child runs");
+        let receipts = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let still = alive(child);
+        if still {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child).unwrap()).unwrap(),
+                rustix::process::Signal::KILL,
+            );
+        }
+        assert!(
+            !still,
+            "the harness's child outlived the stop: {receipts:?}"
+        );
     }
 }

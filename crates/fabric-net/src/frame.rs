@@ -96,6 +96,7 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     let mut header = [0u8; LENGTH_LEN + 1];
     header[..LENGTH_LEN].copy_from_slice(&length.to_le_bytes());
     header[LENGTH_LEN] = FRAME_VERSION;
+    crate::tap::record(payload);
     writer.write_all(&header).await.map_err(FrameError::Io)?;
     writer.write_all(payload).await.map_err(FrameError::Io)?;
     writer.flush().await.map_err(FrameError::Io)

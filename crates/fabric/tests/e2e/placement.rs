@@ -64,7 +64,7 @@ fn submit(from: &Node, a: &Node, token: &str, key: &str, policy: &[&str]) -> Fal
         "place me where I can run",
         "--harness",
         "codex",
-        "--key",
+        "--operation-key",
         key,
     ];
     args.extend_from_slice(policy);
@@ -156,7 +156,13 @@ fn e2e_a_submit_names_no_machine_and_the_decision_is_recorded() -> Fallible {
     );
     let attempts = inspection["job"]["attempts"].as_array().ok_or("attempts")?;
     assert_eq!(attempts.len(), 1, "{inspection}");
-    assert_eq!(attempts[0]["status"], "granted", "{inspection}");
+    // Granted, and launched on the chosen node at once since the launch
+    // path: the attempt half is e2e_a_submit_runs_on_the_eligible_node_without_naming_it.
+    assert!(
+        ["granted", "running", "succeeded", "failed"]
+            .contains(&attempts[0]["status"].as_str().unwrap_or_default()),
+        "{inspection}"
+    );
     let events = answer(&b.ok(&[
         "facade",
         "watch",
@@ -242,6 +248,106 @@ fn e2e_a_submit_names_no_machine_and_the_decision_is_recorded() -> Fallible {
             "{placement}"
         );
     }
+    Ok(())
+}
+
+/// The inspection from `from` once the job's newest attempt is `status`.
+fn attempt_is(from: &Node, a: &Node, token: &str, job: &str, status: &str) -> Fallible<Value> {
+    let started = Instant::now();
+    loop {
+        let inspection = answer(&from.ok(&[
+            "facade",
+            "inspect",
+            "--authority",
+            &a.id,
+            "--token",
+            token,
+            job,
+        ])?)?;
+        let now = inspection["job"]["attempts"]
+            .as_array()
+            .and_then(|a| a.last())
+            .map(|a| a["status"].clone());
+        if now.as_ref().and_then(Value::as_str) == Some(status) {
+            return Ok(inspection);
+        }
+        if started.elapsed() > PLACED_WITHIN {
+            return Err(format!(
+                "the attempt is not {status} within {PLACED_WITHIN:?}: {inspection}\n{}",
+                a.log()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The launch path's half of M5 placement: a job submitted from `b`
+/// names no machine, the authority `a` places it, and the attempt starts
+/// on the chosen node: `running` in the inspection, its harness process
+/// recorded by that node's executor and alive, and nothing of it on the
+/// other node.
+#[test]
+fn e2e_a_submit_runs_on_the_eligible_node_without_naming_it() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let mut a = Node::new(&env, "a", Wire::TcpTls)?;
+    let mut b = Node::new(&env, "b", Wire::TcpTls)?;
+    // The fake harness keeps its turn open, as a real one works for a while.
+    a.daemon_env("FAKE_CODEX_WAIT", OsString::from("1"));
+    b.daemon_env("FAKE_CODEX_WAIT", OsString::from("1"));
+    a.start(None)?;
+    b.start(None)?;
+    pair(&b, &a)?;
+    let token = bearer(&a.ok(&["facade", "mint", "--actor", "e2e", "--ttl-ms", "600000"])?)?;
+    let job = submit(&b, &a, &token, "submit-run", &[])?;
+    let inspection = attempt_is(&b, &a, &token, &job, "running")?;
+    let chosen = inspection["placements"][0]["chosen"]
+        .as_str()
+        .ok_or("none chosen")?
+        .to_owned();
+    let attempt = inspection["job"]["attempts"][0]["attempt"]
+        .as_str()
+        .ok_or("no attempt")?
+        .to_owned();
+    let (runs_on, other) = if chosen == a.id { (&a, &b) } else { (&b, &a) };
+    let records = runs_on.state().join("runs").join("records").join(&attempt);
+    let record = std::fs::read_dir(&records)
+        .map_err(|e| format!("{}: {e}\n{}", records.display(), runs_on.log()))?
+        .flatten()
+        .next()
+        .ok_or("no launch record on the chosen node")?;
+    let record: Value = serde_json::from_slice(&std::fs::read(record.path())?)?;
+    assert_eq!(record["class"], "Harness", "{record}");
+    let pid = record["pid"].as_u64().ok_or("the record names no pid")?;
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()?
+        .success();
+    assert!(alive, "the harness runs on the chosen node");
+    assert!(
+        !other
+            .state()
+            .join("runs")
+            .join("records")
+            .join(&attempt)
+            .exists(),
+        "nothing of the attempt runs on the other node"
+    );
+    // Cancelled from the other node: the live attempt is stopped.
+    let cancelled = answer(&b.ok(&[
+        "facade",
+        "cancel",
+        "--authority",
+        &a.id,
+        "--token",
+        &token,
+        &job,
+        "--operation-key",
+        "cancel-run",
+    ])?)?;
+    assert_eq!(cancelled["type"], "accepted", "{cancelled}");
+    attempt_is(&b, &a, &token, &job, "cancelled")?;
     Ok(())
 }
 

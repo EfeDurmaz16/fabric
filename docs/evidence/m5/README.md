@@ -34,20 +34,83 @@ cargo test -j 6 --locked -p fabric --test e2e -- --exact \
 
 Counters for that run: daemons started 10 (2, 3, 2, 3), `SIGKILL`s 2, placement probe rounds 8, each over both nodes (one per create: the 6 facade submits and the 2 `managed create --empty` the facade tests make on `a`). Each placement test fails with the dispatch removed (the mutation run timed out waiting for a placement in both tests, `0 passed; 2 failed`).
 
-## Blocked
+## The launch path, proved
 
-The third acceptance row, "a planned handoff with child-task outcomes and actual fidelity", and the work package carried to the second node, are not run end to end, because a granted attempt is never launched. What is missing in the code, as found on 2026-11-08:
+The rows that were blocked on 2026-11-08 because no granted attempt was ever launched. The launch path (option (a), selected 2026-11-08 under Efe's delegation of 2026-11-02 and not approved by Efe; the contract is docs/managed-jobs.md, "Launch path (M5, as built)") landed with owners A and B and was merged at `305e65b`. This step ran it across two daemons, found two defects, and fixed them:
 
-1. No node runs a grant. fabric-net protocol 4 carries `Advertise`/`Advert` and the facade, and no message that asks the chosen node to start a granted attempt (with its generation and initial checkpoint) or carries the attempt's observations (`Started`, `Exited`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`) back to the authority. The authority's `observe` has callers only in its tests and in the placement dispatch.
-2. A build or test task names nothing to run. `RegisterTask` carries a label, a restart policy and a class; the executor spawns a `std::process::Command` and the model has no field for it, and no surface (client API, facade, harness) registers a child.
-3. The node has no `Capturer` (the executor's harness checkpoint and workspace capture): only the executor tests' fake implements it. No `WorkPackage` is built or sent by `fabricd`.
+| Item | Result |
+|---|---|
+| A continue's pin was dropped | `managed continue --pin` and the facade's `continue` carried the pin in the effect request and `dispatch::place_handoff` placed with the job's policy, so the work could not be moved to a named node. `ffe8a2b` places the handoff with the continue's pin; `dispatch::tests::a_continue_s_pin_places_the_handoff_where_it_names` failed first (`left: [None]`) |
+| A continuation could not start on a node new to the job | the two daemons of every earlier test shared one home, so the job root's parents (`<home>/fabric/jobs/<job>`) already existed on the target. With a home per daemon, as on two hosts, the restore staged beside a root whose parent did not exist and the launch ended `blocked` with no such file. `69e9c3d` makes the parents first; `sources::tests::a_snapshot_restores_where_no_parent_of_the_root_exists` failed first |
+| No capture of the link | `c2fd4e1` adds `FABRIC_NET_TAP` behind the `tap` feature of fabric-net, which only fabricd's `faults` feature turns on: a node appends every frame payload it writes and every chunk it takes, decompressed, before TLS. No build without the feature can write a frame anywhere |
 
-The executor's per-kind outcome rules (an interrupted test or build is `interrupted`, a harness task checkpoints or blocks, an opaque task blocks, escaped children and uncontrolled writers block) and the domain's continue transitions are proven by the unit and crash tests that owners A and B recorded in docs/managed-jobs.md; none of them runs across two daemons.
+`acceptance/launch-path.log` is the run, `acceptance/launch-path-run.txt` its commit, load, and the `fabric` process count before and after (0 and 0). Command, from the worktree, with a scratch `CARGO_TARGET_DIR`:
 
-The question for Efe: M5's acceptance needs a remote launch path. Should M5 add it as (a) one new node-link request in protocol 4, `Launch { job, attempt, generation, task, initial_checkpoint, package }`, answered at once, with the target reporting observations to the authority by a second request `Report { job, observation }` fenced by generation, and the snapshot fetched with the existing pull transfer, plus a `command` field on `RegisterTask` for build and test children (codec format 2, not shipped); or (b) should M5 ship with placement and the facade only, and the launch, the cut and the carry move to a milestone of their own before M6, whose old-runner wake needs a remote runner too?
+```
+cargo test -j 6 --locked -p fabric --test e2e -- --exact \
+  launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package \
+  launch::e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b \
+  placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it \
+  continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved \
+  secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log \
+  managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted \
+  managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on \
+  continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout \
+  --test-threads 1 --nocapture
+```
 
-Answered 2026-11-08, under Efe's delegation of 2026-11-02 and not approved by Efe: option (a). The selection is recorded in the decisions file as "M5 launch path, selected 2026-11-08" and the contract is docs/managed-jobs.md, "Launch path (M5, as built)": `Launch`, `Instruct`, `Report` and `Heartbeat` on protocol 4, `RegisterTask` with a program for build and test tasks, the runner loop on the node, the work package built by the authority at the cut, and the dispatch of `Checkpoint`, `Continue`, `CancelJob` and `CancelTask` to the live attempt's node. #38 merges only after the launch path is proved end to end and reviewed; M6's five scenarios run against it before M6 merges.
+Output: `test result: ok. 7 passed; 0 failed; 1 ignored`. The `launch` tests run each daemon with a home of its own, so its job roots are its own as on two hosts, and the TCP and TLS link between them.
+
+| Row | Test | What is checked |
+|---|---|---|
+| A job submitted through the facade is placed on the other node and starts there | `launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package` | submitted from `b` to the authority `a`'s facade with `--pin b` and `--secret DEPLOY_KEY`: the placement chooses `b`, `a` launches it there over the link, the attempt is `running`, `b`'s executor records the harness and nothing of it is on `a`. The fake Codex runs its turn |
+| A build task runs its program | the same test | `managed register --class build -- sh -c 'echo <marker> > built.txt && sleep 30'` on `a` is spawned on `b`: `b` records `Build` and the marker is in `b`'s job root |
+| A test task runs, and an interrupted test is recorded interrupted | the same test, and `continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved` | the test runs only with the job's secret (`test -n "$DEPLOY_KEY" && sleep 30`); at the cut its receipt is `interrupted`, `interrupted: true`, never passed |
+| The harness's turn is captured | the same test, and `managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on` | `managed checkpoint`: the harness receipt is `checkpointed` and the same attempt goes on `running` on `b` |
+| Planned handoff of each kind, with its outcome in the cut | the same test, and `launch::e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b` | `managed continue --pin a`: the first attempt ends `checkpointed`; in the cut the harness is `checkpointed` and the build and the test `interrupted`. A harness that left a child outside its group (`FAKE_CODEX_WAIT`) blocks the handoff: `handoff_blocked` in the facade's watch, no continuation, no handoff placement, one attempt, still `running` on `b`. An opaque task has no surface that registers one (the CLI takes `build` or `test`); its blocking rule is proven by the executor's unit tests only |
+| Continue on the other node with the work package and the fidelity achieved | the same test | the handoff placement is `planned_handoff` and chooses `a`; the continuation names the first attempt, `achieved: new_native_session_with_package`, a 64-hex package digest; `a` records the harness, the build and the test of the new attempt, `b` holds nothing of either attempt, and the build's marker is in `a`'s own job root, restored from the cut `a` pulled from `b` |
+| A secret value appears nowhere | the same test, and `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log` | both daemons hold `FABRIC_SECRET_DEPLOY_KEY`; after the run the value is searched for in every file under the test's root: both state roots (journal, store, packages, run records, taken launches, the daemon logs), both homes (job roots and their set-aside copies), and both link captures. It is in none, except the fake harness's own dump of its environment (`codex-env`), which the test requires to hold `DEPLOY_KEY=<value>` on both nodes: the harness got it by name. The captures are checked to have seen the link in the clear: `a`'s holds the launch's secret name, the goal and the build's marker from the pulled chunk |
+| Cancel of a live attempt | `placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it`, `managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted` | a cancel from the other node stops the live attempt, `cancelled`, every task's receipt `interrupted` |
+
+Counters for that run: daemons started 11 (2, 2, 2, 2, 1, 1, 1), link captures 1291 bytes on `a` and 2339 on `b`, `fabric` processes left 0. Mutation: with the pin fix reverted the launch test fails at the handoff's chosen node (`launch.rs:302`); with the root fix reverted it fails `not continued`, the harness receipt `blocked` naming the missing `work.fabric-restoring`.
+
+## Native session continuity, proved
+
+The row blocked on 2026-11-08 because the launch restored the workspace from the cut and not the harness's own state. The selection "M5 native session continue" (made 2026-11-08 by the implementation agent under Efe's delegation of 2026-11-02, not approved by Efe) answers it: M5 restores the harness's state on the target and offers `native_session` when the layout matches. The contract is docs/managed-jobs.md, "Launch path", owner B as built.
+
+| Item | Result |
+|---|---|
+| The cut held no harness state | the harness receipt's snapshot held the state the suspend path captured, and the cut's own snapshot, the one a continuation starts from, held the workspace alone. `f9b3aa6` puts the same quiescence's harness state in the cut, once; `capturer::tests::a_cut_after_a_harness_checkpoint_holds_its_state` failed first (`the cut holds the harness state`) |
+| No native session was offered | `4870441` restores the cut's harness state with the workspace, compares the harness, the physical job root and the home with the captured ones (ADR 0011), restores the state through the adapter as `job resume` does and resumes the captured session; another layout offers the package. `runner::tests::a_native_session_is_restored_only_for_the_same_layout` holds the decision; with the layout comparison removed it fails on the other home |
+
+`acceptance/native-session.log` is the run, `acceptance/native-session-run.txt` its commit, load, and the `fabric` process count before and after (1 and 1: a daemon of another worktree, not of this run). Command, from the worktree, with a scratch `CARGO_TARGET_DIR`:
+
+```
+cargo test -j 4 --locked -p fabric --test e2e -- --exact \
+  continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout \
+  continuity::e2e_a_continue_on_a_node_with_another_layout_starts_a_new_session_with_the_package \
+  continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved \
+  launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package \
+  secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log \
+  managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on --test-threads 1
+```
+
+Output: `test result: ok. 6 passed; 0 failed`.
+
+| Row | Test | What is checked |
+|---|---|---|
+| A native session continues on a node with the same layout | `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout` | two daemons share one home, so the same user, home and job root, as two hosts with the same layout; the fake Codex's first turn runs on `b` (`--pin b`) with the goal as its prompt; `a` is started again held at `before_launch`, a continue pinned to `a` cuts the attempt on `b` and is placed on `a`; while `a` is held the test removes every rollout from the home, so the only copy of the session is the one in the cut. `a` pulls the cut from `b`, restores the harness state and resumes: the fake Codex runs `exec resume <thread>` with the first turn's thread, its rollout holds both turns, and it answers the question about the first turn (its prompt) from the restored session. `achieved: native_session` with no package in the inspection read from the journal and in `fabric managed inspect` |
+| The mirror: another layout starts a new session with the package | `continuity::e2e_a_continue_on_a_node_with_another_layout_starts_a_new_session_with_the_package` | the same script with a home per daemon: `achieved: new_native_session_with_package`, a 64-hex package digest in both reads, no resume, and nothing recalled of the first turn |
+| A restore failure is never a lower fidelity | `runner::tests::a_restore_failure_fails_the_launch_never_a_lower_fidelity`, with `runner::tests::a_preparation_failure_is_reported_blocked_then_failed` for the report | `runner::offer_restoring` over a real Codex capture: with the same layout it offers `native_session` and restores; once this node's copy of the thread grew the adapter refuses (divergence) and the offer is an error, nothing placed; a manifest that does not parse is an error. Mutation: with the restore's error dropped the test fails at the grown thread (the offer came back `Ok` with `native_session`). A preparation that fails reports the harness receipt `Blocked { reason }` then `Exited { Failed }`; the continue fails and the task stays open |
+| The harness's state is captured only once it stopped | `executor::tests::a_cut_that_ends_the_attempt_stops_the_harness_before_its_capture`, `a_blocked_cut_that_would_end_the_attempt_leaves_the_harness_running`, `a_cut_that_resumes_leaves_the_harness_running_and_its_state_alone`; the native row above | the native row first passed only because the fake Codex closed its rollout before it slept, which a real Codex does not: real adapters refuse a capture of a running harness (`HarnessRunning`). With the fake now holding its rollout open as Codex does, the native row failed first (`the continuation's launch never happened`: the handoff was blocked). A cut that ends the attempt now stops the harness before its capture, once nothing else blocks; a cut that resumes captures the workspace alone |
+| A recorded cut confirms its departure | `capturer::tests::a_recorded_cut_confirms_its_departure_so_a_rewritten_session_comes_back` | a Claude Code session leaves by a recorded cut through the real adapter, rewrites `MEMORY.md` on a node with the same layout and comes back: the restore takes the rewrite. Mutation: without the confirmation it fails with `StateDiverged` on `MEMORY.md` |
+
+Changed with it: the planned-handoff test now moves the work to the other node, each daemon with a home of its own (a continue to the same node and home rightly achieves `native_session`), and the secrets test continues with `--allow-fidelity new_native_session_with_package`, the package being what it searches. Mutation: with the adapter's restore skipped, the native row fails waiting for the resumed turn (the thread holds one turn, not two). Before the two commits it failed at `left: "new_native_session_with_package"`.
+
+Not run here: a run on two hosts. Every test above is two processes on one host; a run with the second Mac needs its address paired with `fabric node add`.
 
 ## Gates
 
 `gates/run-gates.sh` ran every gate once, serially, at the commit in `gates/commit.txt`; `gates/summary.txt` has each exit code, time and load, and each gate's log is beside it.
+
+The run at `b3eb72f`, the merge of `main` with the Portable Session Format (#42) and the PR 5 harness adapters (#44), base `origin/main`: every gate passed but two. `test` and `sdk` failed on one check, the welcome fixtures: no fixture listed the merged op list. `ab34b6e` adds `job_export_psf` to `welcome_with_the_launch_path.json`, a fixture main does not have; then `test`, `sdk`, `fixtures` and `hygiene` ran again and passed (`*-rerun.log`).

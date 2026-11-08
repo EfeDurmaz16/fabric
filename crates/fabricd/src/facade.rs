@@ -880,6 +880,16 @@ fn provider_wire(op: &ProviderOperation) -> ProviderOperationWire {
             fabric_journal::Purpose::Effect => None,
             fabric_journal::Purpose::Cleanup { cleans } => Some(cleans),
         },
+        purpose: Some(
+            match op.dispatch.purpose {
+                fabric_journal::Purpose::Effect => "effect",
+                fabric_journal::Purpose::Cleanup { .. } => "cleanup",
+            }
+            .to_owned(),
+        ),
+        target: op.dispatch.target.as_ref().map(|t| t.text.clone()),
+        searched: op.searched.clone(),
+        abandon_reason: op.abandon_reason.clone(),
     }
 }
 
@@ -901,6 +911,7 @@ fn residual_wire(residual: &Residual) -> ResidualWire {
         creating: residual.creating,
         status: residual.status.name().to_owned(),
         locator: residual.locator.as_ref().map(|l| l.text.clone()),
+        searched: residual.searched.clone(),
     }
 }
 
@@ -1793,6 +1804,220 @@ mod tests {
             .await
             .unwrap();
         attempt
+    }
+
+    /// The provider read surface (carried from M4): one operation in each
+    /// status, `unknown` with and without the scope an absent attach
+    /// searched, a blocker of each kind and a residual of each kind, read
+    /// through `managed_inspect` with every value as the journal holds it,
+    /// and the journal unchanged by the read.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "the seed reads best as one script")]
+    async fn an_inspection_lists_every_provider_status() {
+        use fabric_core::managed::{OperationId, RequestDigest};
+        use fabric_journal::{
+            AbandonApproval, Acknowledged, EffectClass, LocatorRecord, ProviderAnswer,
+            ProviderDispatch, ProviderStatus, Purpose, ResourceKey,
+        };
+
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k1", "g").await);
+        let attempt = live_attempt(&node, job, "start-1").await;
+        let locator = LocatorRecord {
+            text: r#"{"kind":"sandbox","native_id":"sb-1","provider":"fixture","scope":{"project":"p-1"}}"#.into(),
+            key: ResourceKey::from_bytes([0x45; 32]),
+        };
+        let searched = r#"{"kind":"sandbox","provider":"fixture","scope":{"project":"p-1"}}"#;
+        let op = |n: u8| OperationId::from_bytes([0x40 + n; 16]);
+        let dispatch = move |n: u8, action: &str, target: Option<LocatorRecord>| ProviderDispatch {
+            operation: op(n),
+            key: OperationKey::parse(&format!("provider-{n}")).unwrap(),
+            digest: RequestDigest::from_bytes([n; 32]),
+            job,
+            task: attempt.task,
+            attempt: attempt.id,
+            generation: attempt.generation,
+            profile: "fixture".into(),
+            action: action.into(),
+            effect: match action {
+                "sandbox.create" => EffectClass::Create,
+                "sandbox.destroy" => EffectClass::Destroy,
+                _ => EffectClass::Mutate,
+            },
+            purpose: Purpose::Effect,
+            target,
+        };
+        let answer = |code: &str| ProviderAnswer {
+            code: Some(code.into()),
+            reason: Some(code.into()),
+            effect: Some("unknown".into()),
+        };
+        let (l, s) = (locator.clone(), searched.to_owned());
+        node.authority
+            .write_journal(false, move |j| {
+                let at = NOW;
+                // The creates first: an unknown one refuses another create.
+                for (n, _) in [
+                    (1, "dispatched"),
+                    (2, "unknown"),
+                    (3, "attached"),
+                    (4, "searched"),
+                ] {
+                    j.provider_begin(&dispatch(n, "sandbox.create", None), None, at)?;
+                }
+                j.provider_record(op(2), ProviderStatus::Unknown, &answer("timeout"), None, at)?;
+                j.provider_record(op(3), ProviderStatus::Unknown, &answer("timeout"), None, at)?;
+                j.provider_record(
+                    op(3),
+                    ProviderStatus::Attached,
+                    &ProviderAnswer::default(),
+                    Some(&l),
+                    at,
+                )?;
+                j.provider_record(op(4), ProviderStatus::Unknown, &answer("timeout"), None, at)?;
+                j.provider_searched(op(4), &answer("not_found"), &s, at)?;
+                let exec = |n: u8| dispatch(n, "sandbox.exec", Some(l.clone()));
+                j.provider_begin(&exec(5), None, at)?;
+                j.provider_record(op(5), ProviderStatus::Unknown, &answer("timeout"), None, at)?;
+                j.provider_record(
+                    op(5),
+                    ProviderStatus::Observed,
+                    &ProviderAnswer::default(),
+                    None,
+                    at,
+                )?;
+                for (n, status) in [
+                    (6, ProviderStatus::Succeeded),
+                    (7, ProviderStatus::Failed),
+                    (8, ProviderStatus::Cancelled),
+                ] {
+                    j.provider_begin(&exec(n), None, at)?;
+                    j.provider_record(op(n), status, &ProviderAnswer::default(), None, at)?;
+                }
+                j.provider_begin(&exec(9), Some(&answer("denied")), at)?;
+                j.provider_begin(&exec(10), None, at)?;
+                j.provider_record(
+                    op(10),
+                    ProviderStatus::Unknown,
+                    &answer("timeout"),
+                    None,
+                    at,
+                )?;
+                j.provider_abandon(
+                    &AbandonApproval {
+                        operation: op(10),
+                        expected: ProviderStatus::Unknown,
+                        acknowledged: Acknowledged::Resource(l.key),
+                        reason: "the provider console shows it ended".into(),
+                    },
+                    at,
+                )?;
+                j.provider_begin(&dispatch(11, "sandbox.destroy", Some(l.clone())), None, at)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before = node
+            .authority
+            .with_journal(false, move |j| {
+                Ok((
+                    j.events(job, None, u32::MAX)?.len(),
+                    j.provider_operations(job)?,
+                ))
+            })
+            .await
+            .unwrap();
+
+        let inspection = node.inspect(job).await.unwrap();
+        let status_of = |n: u8| {
+            inspection
+                .provider_operations
+                .iter()
+                .find(|o| o.operation == op(n))
+                .map(|o| o.status.as_str())
+        };
+        let statuses: std::collections::BTreeSet<&str> = inspection
+            .provider_operations
+            .iter()
+            .map(|o| o.status.as_str())
+            .collect();
+        let every: std::collections::BTreeSet<&str> =
+            ProviderStatus::ALL.iter().map(|s| s.name()).collect();
+        assert_eq!(statuses, every, "each status shown as it is, none folded");
+        assert_eq!(status_of(2), Some("unknown"));
+        assert_eq!(status_of(4), Some("unknown"));
+        let read = |n: u8| {
+            inspection
+                .provider_operations
+                .iter()
+                .find(|o| o.operation == op(n))
+                .unwrap()
+        };
+        assert_eq!(read(2).searched, None, "unknown without a search");
+        assert_eq!(
+            read(4).searched.as_deref(),
+            Some(searched),
+            "unknown with its search"
+        );
+        assert_eq!(read(3).locator.as_deref(), Some(locator.text.as_str()));
+        assert_eq!(read(5).target.as_deref(), Some(locator.text.as_str()));
+        assert_eq!(read(5).effect, "mutate");
+        assert_eq!(read(1).action, "sandbox.create");
+        assert_eq!(read(1).purpose.as_deref(), Some("effect"));
+        assert_eq!(read(1).cleans, None);
+        assert_eq!(
+            read(10).abandon_reason.as_deref(),
+            Some("the provider console shows it ended")
+        );
+        assert_eq!(read(6).abandon_reason, None);
+        let kinds: std::collections::BTreeSet<&str> = inspection
+            .blockers
+            .iter()
+            .map(|b| b.kind.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["create_unresolved", "exec_may_run", "stop_not_confirmed"]
+                .into_iter()
+                .collect()
+        );
+        for blocker in &inspection.blockers {
+            assert_eq!(
+                Some(blocker.status.as_str()),
+                status_of((0..=11).find(|n| op(*n) == blocker.operation).unwrap())
+            );
+        }
+        let with_locator = inspection
+            .residuals
+            .iter()
+            .find(|r| r.creating == op(3))
+            .unwrap();
+        assert_eq!(with_locator.locator.as_deref(), Some(locator.text.as_str()));
+        let searched_only = inspection
+            .residuals
+            .iter()
+            .find(|r| r.creating == op(4))
+            .unwrap();
+        assert_eq!(
+            (
+                searched_only.locator.as_deref(),
+                searched_only.searched.as_deref()
+            ),
+            (None, Some(searched))
+        );
+
+        let after = node
+            .authority
+            .with_journal(false, move |j| {
+                Ok((
+                    j.events(job, None, u32::MAX)?.len(),
+                    j.provider_operations(job)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before, after, "the read wrote nothing");
     }
 
     /// The same checkpoint request under the same key is one operation,

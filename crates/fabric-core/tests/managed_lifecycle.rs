@@ -299,7 +299,11 @@ fn a_continue_cuts_places_grants_and_records_the_fidelity_achieved() {
                 },
                 restart: RestartPolicy::Block,
                 class: TaskClass::Test,
-                program: None,
+                program: Some(fabric_core::managed::Program {
+                    argv: vec!["cargo".into(), "test".into()],
+                    cwd: None,
+                    env_allowlist: Vec::new(),
+                }),
             },
         )
         .unwrap();
@@ -649,6 +653,68 @@ fn a_cancel_with_a_live_attempt_stops_it_first_and_the_receipts_say_interrupted(
     assert_eq!(kept.status(cancel_task), OperationStatus::Succeeded);
 }
 
+/// A cancel whose attempt ends by another way than its stop (the harness
+/// exits on its own first, or the start fails before the stop is taken)
+/// is settled by that end: the job or the task ends as the cancel asked
+/// and the operation succeeds, so it never stays in flight. A cancel whose
+/// outcome went unknown is settled the same way.
+#[test]
+fn a_cancel_is_settled_by_whatever_ends_its_attempt() {
+    for (outcome, unknown) in [
+        (ExitOutcome::Succeeded, false),
+        (ExitOutcome::Failed { code: None }, false),
+        (ExitOutcome::Failed { code: Some(1) }, true),
+    ] {
+        let (mut kept, _) = running();
+        let first = kept.state().attempts[0].clone();
+        let (cancel, _) = kept
+            .submit(
+                "cancel",
+                Command::CancelJob {
+                    reason: "enough".into(),
+                },
+            )
+            .unwrap();
+        kept.mark(cancel, OperationMark::Dispatched).unwrap();
+        if unknown {
+            kept.mark(cancel, OperationMark::Unknown).unwrap();
+        }
+        kept.observe(&Observation::Exited {
+            attempt: first.id,
+            generation: first.generation,
+            outcome,
+        })
+        .unwrap();
+        assert_eq!(kept.state().job.state, JobState::Cancelled, "{outcome:?}");
+        assert_eq!(kept.status(cancel), OperationStatus::Succeeded);
+
+        let (mut kept, _) = running();
+        let primary = kept.state().job.primary;
+        let first = kept.state().attempts[0].clone();
+        let (cancel_task, _) = kept
+            .submit(
+                "cancel-task",
+                Command::CancelTask {
+                    task: primary,
+                    reason: "redo".into(),
+                },
+            )
+            .unwrap();
+        kept.mark(cancel_task, OperationMark::Dispatched).unwrap();
+        kept.observe(&Observation::Exited {
+            attempt: first.id,
+            generation: first.generation,
+            outcome,
+        })
+        .unwrap();
+        assert_eq!(
+            kept.state().task(primary).unwrap().state,
+            TaskState::Cancelled
+        );
+        assert_eq!(kept.status(cancel_task), OperationStatus::Succeeded);
+    }
+}
+
 #[test]
 fn a_parent_waits_for_its_children_and_a_cancelled_task_without_an_attempt_ends_at_commit() {
     let mut kept = Kept::new();
@@ -664,7 +730,11 @@ fn a_parent_waits_for_its_children_and_a_cancelled_task_without_an_attempt_ends_
                 },
                 restart: RestartPolicy::Block,
                 class: TaskClass::Build,
-                program: None,
+                program: Some(fabric_core::managed::Program {
+                    argv: vec!["cargo".into(), "build".into()],
+                    cwd: None,
+                    env_allowlist: Vec::new(),
+                }),
             },
         )
         .unwrap();
@@ -934,7 +1004,11 @@ fn a_cut_that_misses_an_open_task_is_refused() {
                 },
                 restart: RestartPolicy::Block,
                 class: TaskClass::Test,
-                program: None,
+                program: Some(fabric_core::managed::Program {
+                    argv: vec!["cargo".into(), "test".into()],
+                    cwd: None,
+                    env_allowlist: Vec::new(),
+                }),
             },
         )
         .unwrap();

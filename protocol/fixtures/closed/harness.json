@@ -1,5 +1,9 @@
 [
   "acp",
   "claude_code",
-  "codex"
+  "codex",
+  "cursor_agent",
+  "gemini_cli",
+  "opencode",
+  "pi"
 ]

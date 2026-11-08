@@ -29,8 +29,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::text;
 
-/// The version of the client API this crate speaks; a node answers only the same number.
-pub const API_VERSION: u32 = 1;
+/// The version of the client API this crate speaks; a node answers only
+/// the same number. 2 since PR 5 (2026-11-08): the closed set of harness
+/// kinds grew by `opencode`, `pi`, `gemini_cli` and `cursor_agent`.
+pub const API_VERSION: u32 = 2;
 
 /// The client's first frame on a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,11 +159,15 @@ pub enum Op {
     FacadeRevoke,
     /// [`Request::FacadeCall`].
     FacadeCall,
+    /// [`Request::ManagedRegister`].
+    ManagedRegister,
+    /// [`Request::JobExportPsf`].
+    JobExportPsf,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 34] = [
+    pub const ALL: [Op; 36] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -196,6 +202,8 @@ impl Op {
         Op::FacadeMint,
         Op::FacadeRevoke,
         Op::FacadeCall,
+        Op::ManagedRegister,
+        Op::JobExportPsf,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -236,6 +244,8 @@ impl Op {
             Op::FacadeMint => "facade_mint",
             Op::FacadeRevoke => "facade_revoke",
             Op::FacadeCall => "facade_call",
+            Op::ManagedRegister => "managed_register",
+            Op::JobExportPsf => "job_export_psf",
         }
     }
 }
@@ -247,7 +257,9 @@ impl fmt::Display for Op {
 }
 
 /// The harness kinds as the client API writes them: `{ "kind": "claude_code" }`,
-/// `{ "kind": "codex" }` or `{ "kind": "acp", "program": ..., "args": [...] }`.
+/// `{ "kind": "codex" }`, `{ "kind": "acp", "program": ..., "args": [...] }`,
+/// and since api 2 `{ "kind": "opencode" }`, `{ "kind": "pi" }`,
+/// `{ "kind": "gemini_cli" }` and `{ "kind": "cursor_agent" }`.
 ///
 /// A field this client does not know is refused, not skipped: a harness
 /// says what a client launches, and a client that dropped a field would
@@ -269,6 +281,11 @@ pub(crate) enum HarnessDef {
         program: fabric_core::harness::ProgramName,
         args: Vec<String>,
     },
+    #[serde(rename = "opencode")]
+    OpenCode {},
+    Pi {},
+    GeminiCli {},
+    CursorAgent {},
 }
 
 /// Reads a field that has a default, taking `null` as absent: ADR 0018
@@ -723,6 +740,33 @@ pub enum Request {
         /// The note.
         note: NoteWire,
     },
+    /// Registers a build or test task under a task of a managed job, with
+    /// the program it runs (M5, the launch path). With a live attempt of
+    /// the parent the node that runs it is asked to spawn the task; with
+    /// none the task rides in the parent's next launch.
+    ManagedRegister {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+        /// The task it is registered under.
+        #[serde(with = "text")]
+        parent: TaskId,
+        /// The caller's label for it.
+        label: String,
+        /// `build` or `test`.
+        class: RegisterClass,
+        /// What it runs.
+        program: ProgramWire,
+    },
     /// Takes a checkpoint cut of the job's live attempt (M5); the attempt
     /// goes on afterwards.
     ManagedCheckpoint {
@@ -851,6 +895,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<ClientEnv>,
     },
+    /// Writes the job's latest snapshot as a Portable Session Format v1
+    /// container (ADR 0029): the manifest naming the revision, the cache
+    /// rows and what was left behind, and the captured harness state as
+    /// one attachment. No workspace byte and no secret goes into it, and
+    /// nothing in the job changes.
+    JobExportPsf {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The container directory to create; it must not exist.
+        dir: SystemPath,
+    },
 }
 
 /// Every capability a node of this api version lists in its welcome, in
@@ -929,6 +985,7 @@ impl Request {
             | Request::ManagedList
             | Request::ManagedSubmit { .. }
             | Request::ManagedNote { .. }
+            | Request::ManagedRegister { .. }
             | Request::ManagedCheckpoint { .. }
             | Request::ManagedContinue { .. }
             | Request::ManagedInspect { .. }
@@ -936,7 +993,8 @@ impl Request {
             | Request::FacadeMint { .. }
             | Request::FacadeRevoke { .. }
             | Request::FacadeCall { .. }
-            | Request::JobRepair { .. } => None,
+            | Request::JobRepair { .. }
+            | Request::JobExportPsf { .. } => None,
         }
     }
 
@@ -978,6 +1036,8 @@ impl Request {
             Request::FacadeMint { .. } => Op::FacadeMint,
             Request::FacadeRevoke { .. } => Op::FacadeRevoke,
             Request::FacadeCall { .. } => Op::FacadeCall,
+            Request::ManagedRegister { .. } => Op::ManagedRegister,
+            Request::JobExportPsf { .. } => Op::JobExportPsf,
         }
     }
 }
@@ -1365,6 +1425,10 @@ pub enum Reply {
     FacadeRevoke(Revoked),
     /// For [`Request::FacadeCall`].
     FacadeCall(FacadeEnvelope),
+    /// For [`Request::ManagedRegister`].
+    ManagedRegister(Box<ManagedOperation>),
+    /// For [`Request::JobExportPsf`].
+    JobExportPsf(PsfExported),
 }
 
 impl Reply {
@@ -1406,6 +1470,8 @@ impl Reply {
             Reply::FacadeMint(_) => Op::FacadeMint,
             Reply::FacadeRevoke(_) => Op::FacadeRevoke,
             Reply::FacadeCall(_) => Op::FacadeCall,
+            Reply::ManagedRegister(_) => Op::ManagedRegister,
+            Reply::JobExportPsf(_) => Op::JobExportPsf,
         }
     }
 }
@@ -1456,6 +1522,24 @@ pub struct Exported {
     /// It and each bundle base it needs, all pinned.
     #[serde(with = "text::list")]
     pub chain: Vec<SnapshotId>,
+}
+
+/// What a Portable Session Format export wrote (ADR 0029).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PsfExported {
+    /// The container directory.
+    pub dir: PathBuf,
+    /// The document digest: sha256 of `manifest.json`, lowercase hex.
+    pub digest: String,
+    /// The fidelity the document offers, as the format spells it.
+    pub fidelity: String,
+    /// The snapshot the document names as its bundle head.
+    #[serde(with = "text")]
+    pub snapshot: SnapshotId,
+    /// The attachments written, by name.
+    pub attachments: Vec<String>,
+    /// The workspace paths left behind on this node, which the reader must recreate.
+    pub left_behind: Vec<String>,
 }
 
 /// A managed job as the client API shows it (ADR 0019).
@@ -1515,6 +1599,72 @@ pub struct ManagedTask {
     /// The task's last receipt (M5), when an executor reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<ReceiptWire>,
+    /// What a build or test task runs (M5, the launch path); absent for
+    /// a harness task, which runs through its adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<ProgramWire>,
+}
+
+/// The class of a task a client registers: a build or a test (M5, the
+/// launch path). A harness task is the job's own, and an opaque one is
+/// never registered by a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegisterClass {
+    /// A build: an interrupted one is restarted, never resumed.
+    Build,
+    /// A test: an interrupted one is recorded interrupted, never passed.
+    Test,
+}
+
+impl From<RegisterClass> for fabric_core::managed::TaskClass {
+    fn from(class: RegisterClass) -> Self {
+        match class {
+            RegisterClass::Build => fabric_core::managed::TaskClass::Build,
+            RegisterClass::Test => fabric_core::managed::TaskClass::Test,
+        }
+    }
+}
+
+/// What a build or test task runs, as the client API writes it
+/// (docs/facade-protocol.md, "Launch path"): the command and its
+/// arguments, the directory under the attempt's root, and the variables
+/// of the node's environment it may see. The node checks it again
+/// (`Program::check`) before anything is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramWire {
+    /// The command and its arguments; never empty.
+    pub argv: Vec<String>,
+    /// Where it runs, relative to the attempt's root; the root when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<fabric_core::path::RelPath>,
+    /// The variables of the node's environment it may see.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "null_as_default"
+    )]
+    pub env_allowlist: Vec<fabric_core::env::EnvVarName>,
+}
+
+impl From<ProgramWire> for fabric_core::managed::Program {
+    fn from(wire: ProgramWire) -> Self {
+        fabric_core::managed::Program {
+            argv: wire.argv,
+            cwd: wire.cwd,
+            env_allowlist: wire.env_allowlist,
+        }
+    }
+}
+
+impl From<&fabric_core::managed::Program> for ProgramWire {
+    fn from(program: &fabric_core::managed::Program) -> Self {
+        ProgramWire {
+            argv: program.argv.clone(),
+            cwd: program.cwd.clone(),
+            env_allowlist: program.env_allowlist.clone(),
+        }
+    }
 }
 
 /// One attempt of a managed job.
@@ -1921,6 +2071,19 @@ pub struct ProviderOperationWire {
         with = "text::option"
     )]
     pub cleans: Option<OperationId>,
+    /// `effect` or `cleanup` (M5, the provider read surface); absent from
+    /// a node before it, which a reader takes as `effect` unless `cleans` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// The resource Fabric sent the action to, as the bridge names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The scope its last absent answer searched, as canonical JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched: Option<String>,
+    /// Why the owner abandoned it; set exactly when it is `abandoned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandon_reason: Option<String>,
 }
 
 /// One reason no replacement attempt may be granted (ADR 0022).
@@ -1946,6 +2109,9 @@ pub struct ResidualWire {
     /// Where the resource is, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<String>,
+    /// The scope the create's last absent attach searched, when it has no locator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched: Option<String>,
 }
 
 /// Everything the journal holds about one managed job (M5): the body of
@@ -2063,6 +2229,7 @@ impl From<&ManagedState> for ManagedJob {
                     .to_owned(),
                     class: None,
                     receipt: None,
+                    program: task.program.as_ref().map(ProgramWire::from),
                 })
                 .collect(),
             attempts: state

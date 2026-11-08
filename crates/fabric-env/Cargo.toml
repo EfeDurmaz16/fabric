@@ -1,6 +1,6 @@
 [package]
 name = "fabric-env"
-version = "0.1.0"
+version.workspace = true
 description = "Environment of a Fabric job: EnvSpec detection, the override file and materialization"
 edition.workspace = true
 license.workspace = true

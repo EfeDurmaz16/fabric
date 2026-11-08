@@ -11,24 +11,39 @@
 //! through `fabric-client` instead of the CLI. `budget` times the hot
 //! paths against `budget.toml`, `bench` times the paths the durable
 //! job work touches, with no budget, and `ab` compares two builds of
-//! `fabric` op by op on the same fixture. `acp_cli` and `preflight` hold the
+//! `fabric` op by op on the same fixture, and `sync_bench` counts what
+//! `fabric-sync` moves for a dirty tree. `acp_cli` and `preflight` hold the
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
 //! acceptance tests, `facade` the M5 facade and placement acceptance tests,
-//! and `legacy` loads a state directory frozen from main.
+//! `launch` the M5 launch path across two daemons with homes of their own,
+//! `legacy` loads a state directory frozen from main, and `streams` holds
+//! every command's answer to the CLI contract's streams and JSON shape
+//! against a live node. `opencode`, `pi`, `gemini` and `cursor` hold one
+//! row per PR 5 adapter (docs/harness-adapters.md).
 
 mod ab;
 mod acp_cli;
 mod bench;
 mod budget;
 mod client;
+mod continuity;
+mod cursor;
 mod facade;
+mod gemini;
 mod headless;
+mod launch;
 mod legacy;
 mod managed;
+mod opencode;
 mod partition;
+mod pi;
 mod placement;
 mod preflight;
+mod psf;
 mod relay;
+mod secrets;
+mod streams;
+mod sync_bench;
 mod terminal;
 mod world;
 
@@ -681,15 +696,34 @@ fn e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork() -> Fallible {
     let _ = finish(running, GIVE_UP)?;
     assert_eq!(p.a.lease(&job)?.view, "frozen");
 
-    let exported = p.a.ok(&["job", "export", &job])?;
+    // A change prints its bare id on stdout and its sentence on stderr
+    // (docs/cli-contract.md, Streams), and under `--json` one document.
+    let exported = p.a.run(&["job", "export", &job])?;
+    assert!(exported.status.success(), "{}", text(&exported));
+    let snapshot = String::from_utf8(exported.stdout.clone())?;
+    assert_eq!(snapshot.lines().count(), 1, "{snapshot}");
+    let said = String::from_utf8(exported.stderr)?;
     assert!(
-        exported.contains("as snapshot") && exported.contains("the job's head is unchanged"),
-        "{exported}"
+        said.contains(&format!("as snapshot {}", snapshot.trim_end()))
+            && said.contains("the job's head is unchanged"),
+        "{said}"
     );
+    let again = p.a.run(&["job", "export", &job, "--json"])?;
+    assert!(again.status.success(), "{}", text(&again));
+    assert!(again.stderr.is_empty(), "{}", text(&again));
+    let doc: serde_json::Value = serde_json::from_slice(&again.stdout)?;
+    assert_eq!(doc["outcome"], "exported", "{doc}");
+    assert_eq!(doc["snapshot"]["job"], job.as_str(), "{doc}");
     let pins = fs::read_to_string(p.a.state().join("jobs").join(&job).join("pins"))?;
     assert!(pins.contains("Exported"), "{pins}");
 
-    let repaired = p.a.ok(&["job", "repair", &job])?;
+    let repaired = p.a.run(&["job", "repair", &job])?;
+    assert!(repaired.status.success(), "{}", text(&repaired));
+    assert_eq!(
+        String::from_utf8(repaired.stdout.clone())?,
+        format!("{job}\n")
+    );
+    let repaired = String::from_utf8(repaired.stderr)?;
     assert!(
         repaired.contains(&format!(
             "the fork rule picked {}'s chain at epoch 2",
@@ -836,19 +870,25 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
         ],
     )?;
     // The plan's last line names the session; the CLI writes every plan
-    // line before it launches, and nothing more until the node answers the
-    // registration. The pipe closes in that gap.
-    let mut plan = std::io::BufReader::new(running.stdout.take().ok_or("no stdout")?);
-    loop {
-        let mut line = String::new();
-        if plan.read_line(&mut line)? == 0 {
-            return Err("the CLI printed no session line".into());
+    // line, on standard error, before it launches, and nothing more until
+    // the node answers the registration. Standard output, where the turn
+    // prints, closes in that gap. Standard error stays open, read to its
+    // end, because the harness inherits it.
+    let out = running.stdout.take().ok_or("no stdout")?;
+    let err = running.stderr.take().ok_or("no stderr")?;
+    let (seen, plan) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(err).lines();
+        let mut told = false;
+        while let Some(Ok(line)) = lines.next() {
+            if !told && (line.starts_with("continuing ") || line.starts_with("starting a new ")) {
+                told = seen.send(()).is_ok();
+            }
         }
-        if line.starts_with("continuing ") || line.starts_with("starting a new ") {
-            break;
-        }
-    }
-    drop(plan);
+    });
+    plan.recv_timeout(GIVE_UP)
+        .map_err(|_| "the CLI printed no session line")?;
+    drop(out);
     wait_for(&pid_file, "the harness launch")?;
     let started = std::time::Instant::now();
     while !p

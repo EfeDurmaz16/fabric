@@ -32,7 +32,10 @@ use fabric_core::BoxFuture;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
-use fabric_core::managed::GrantToken;
+use fabric_core::managed::launch::{
+    GrantToken, Heartbeat, HeartbeatAnswer, InstructAnswer, Instruction, LaunchAnswer,
+    LaunchRequest, Report, ReportAnswer,
+};
 use fabric_core::moves::MoveOffer;
 use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -49,10 +52,10 @@ use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
     AdvertWire, Appended, BoundedList, ChunkBatch, FacadeAnswer, FacadeMessage, Facts, Fault,
-    FaultText, Fenced, Heartbeat, HeartbeatAnswer, Hello, JobAnswer, JobRequest, JobResponse,
-    KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled,
-    RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody,
-    SecretNameText, Tools, VersionText, WireError, decode, encode, wall_clock_ms,
+    FaultText, Fenced, Hello, JobAnswer, JobRequest, JobResponse, KnownWriter, ManifestChunks,
+    MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled, RecordBytes, RecordPage, Request,
+    RequestBody, RequestId, Response, ResponseBody, SecretNameText, Tools, VersionText, WireError,
+    decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -314,20 +317,6 @@ pub trait Service: Send + Sync {
             )))
         })
     }
-    /// Answers a `Heartbeat` from `peer` with the verdict of each grant it
-    /// named (ADR 0028). The default serves no managed job.
-    fn heartbeat(
-        &self,
-        peer: NodeId,
-        beat: Heartbeat,
-    ) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>> {
-        let _ = (peer, beat);
-        Box::pin(async {
-            Err(Fault::BadRequest(FaultText::truncated(
-                "this node serves no managed job",
-            )))
-        })
-    }
     /// Answers `Advertise`: what this node offers for the placement of a
     /// job (ADR 0026), measured now. The default refuses: a node that
     /// does not advertise is no candidate, and the asking node records
@@ -352,6 +341,61 @@ pub trait Service: Send + Sync {
         Box::pin(async {
             Err(Fault::BadRequest(FaultText::truncated(
                 "this node serves no facade",
+            )))
+        })
+    }
+    /// Answers `Launch`: the authority asks this node to run an attempt
+    /// it granted it (docs/managed-jobs.md, "Launch path"). The answer
+    /// says whether the node took the grant, never what came of it. The
+    /// default refuses: a node that runs no attempts is asked none.
+    fn launch(
+        &self,
+        peer: NodeId,
+        request: LaunchRequest,
+    ) -> BoxFuture<'_, Result<LaunchAnswer, Fault>> {
+        let _ = (peer, request);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node runs no attempts",
+            )))
+        })
+    }
+    /// Answers `Instruct`: spawn, cut or stop an attempt this node runs.
+    /// The default refuses.
+    fn instruct(
+        &self,
+        peer: NodeId,
+        token: GrantToken,
+        instruction: Instruction,
+    ) -> BoxFuture<'_, Result<InstructAnswer, Fault>> {
+        let _ = (peer, token, instruction);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node runs no attempts",
+            )))
+        })
+    }
+    /// Answers `Report`: one observation from the node that runs an
+    /// attempt, for this node's authority. The default refuses.
+    fn report(&self, peer: NodeId, report: Report) -> BoxFuture<'_, Result<ReportAnswer, Fault>> {
+        let _ = (peer, report);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node takes no reports",
+            )))
+        })
+    }
+    /// Answers `Heartbeat` from `peer`: the fence's verdict on each grant
+    /// it names (ADR 0028). The default refuses.
+    fn heartbeat(
+        &self,
+        peer: NodeId,
+        beat: Heartbeat,
+    ) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>> {
+        let _ = (peer, beat);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node takes no heartbeats",
             )))
         })
     }
@@ -472,6 +516,9 @@ fn kind_of(body: &ResponseBody) -> &'static str {
         ResponseBody::Facts(_) => "facts",
         ResponseBody::Advert(_) => "advert",
         ResponseBody::Facade(_) => "facade",
+        ResponseBody::Launch(_) => "launch",
+        ResponseBody::Instruct(_) => "instruct",
+        ResponseBody::Report(_) => "report",
         ResponseBody::Heartbeat(_) => "heartbeat",
     }
 }
@@ -784,6 +831,68 @@ impl Session {
         }
     }
 
+    /// Asks the peer to run the attempt `request` grants it, waiting at
+    /// most `deadline` for its answer; the answer says whether it took
+    /// the grant (`Started` comes later, by report).
+    pub async fn launch(
+        &self,
+        request: LaunchRequest,
+        deadline: Duration,
+    ) -> Result<LaunchAnswer, RpcError> {
+        let body = RequestBody::Launch(Box::new(request));
+        body.check_bounds()?;
+        match self.call(body, deadline).await? {
+            ResponseBody::Launch(answer) => Ok(answer),
+            other => Err(unexpected("launch", &other)),
+        }
+    }
+
+    /// Sends one instruction for the attempt `token` names to the peer
+    /// that runs it, waiting at most `deadline` for its answer.
+    pub async fn instruct(
+        &self,
+        token: GrantToken,
+        instruction: Instruction,
+        deadline: Duration,
+    ) -> Result<InstructAnswer, RpcError> {
+        let body = RequestBody::Instruct { token, instruction };
+        match self.call(body, deadline).await? {
+            ResponseBody::Instruct(answer) => Ok(answer),
+            other => Err(unexpected("instruct", &other)),
+        }
+    }
+
+    /// Reports one observation to the peer's authority, waiting at most
+    /// `deadline` for its answer.
+    pub async fn report(
+        &self,
+        report: Report,
+        deadline: Duration,
+    ) -> Result<ReportAnswer, RpcError> {
+        match self
+            .call(RequestBody::Report(Box::new(report)), deadline)
+            .await?
+        {
+            ResponseBody::Report(answer) => Ok(answer),
+            other => Err(unexpected("report", &other)),
+        }
+    }
+
+    /// Names every grant this node runs to the peer's authority, waiting
+    /// at most `deadline` for the fence's verdict on each (ADR 0028).
+    pub async fn heartbeat(
+        &self,
+        beat: Heartbeat,
+        deadline: Duration,
+    ) -> Result<HeartbeatAnswer, RpcError> {
+        let body = RequestBody::Heartbeat(beat);
+        body.check_bounds()?;
+        match self.call(body, deadline).await? {
+            ResponseBody::Heartbeat(answer) => Ok(answer),
+            other => Err(unexpected("heartbeat", &other)),
+        }
+    }
+
     /// Asks for the records after `after`, or from the first record when it is `None`, under `token`, waiting at most `deadline`.
     pub async fn pull(
         &self,
@@ -837,19 +946,6 @@ impl Session {
                 Ok(fenced)
             }
             other => Err(unexpected(Appended::KIND, &other)),
-        }
-    }
-
-    /// Sends the grants this node holds and reads the verdict of each,
-    /// waiting at most `deadline` (ADR 0028).
-    pub async fn heartbeat(
-        &self,
-        beat: Heartbeat,
-        deadline: Duration,
-    ) -> Result<HeartbeatAnswer, RpcError> {
-        match self.call(RequestBody::Heartbeat(beat), deadline).await? {
-            ResponseBody::Heartbeat(answer) => Ok(answer),
-            other => Err(unexpected("heartbeat", &other)),
         }
     }
 
@@ -1046,6 +1142,7 @@ impl VerifiedChunk {
             Err(_) => return None,
         };
         let bytes = zstd::bulk::decompress(&stored, capacity).ok()?;
+        crate::tap::record(&bytes);
         (ChunkId::of(&bytes) == id).then_some(Self { id, stored, bytes })
     }
 
@@ -1292,10 +1389,6 @@ async fn handle(
             })
             .await
         }
-        RequestBody::Heartbeat(beat) => timeout(budget, service.heartbeat(peer, beat))
-            .await
-            .unwrap_or(Err(Fault::Deadline))
-            .map_or_else(ResponseBody::Fault, ResponseBody::Heartbeat),
         RequestBody::WantSnapshot { snapshot } => timeout(budget, service.manifest(peer, snapshot))
             .await
             .unwrap_or(Err(Fault::Deadline))
@@ -1328,6 +1421,12 @@ async fn handle(
                 .await
                 .unwrap_or(Err(Fault::Deadline))
                 .map_or_else(ResponseBody::Fault, |a| ResponseBody::Advert(Box::new(a)))
+        }
+        body @ (RequestBody::Launch(_)
+        | RequestBody::Instruct { .. }
+        | RequestBody::Report(_)
+        | RequestBody::Heartbeat(_)) => {
+            answer_launch_path(peer, body, service, limits, held, budget).await
         }
         RequestBody::Facade(message) => {
             let body = answer_facade(peer, message, service, limits, held, budget).await;
@@ -1430,6 +1529,61 @@ async fn answer_facade(
     }
 }
 
+/// Serves one launch path message under the per-peer job work cap, as a
+/// facade message is: a report writes the journal, so its work runs to
+/// its end even after the budget ran out; only the answer races it.
+async fn answer_launch_path(
+    peer: NodeId,
+    body: RequestBody,
+    service: Arc<dyn Service>,
+    limits: &Limits,
+    held: OwnedSemaphorePermit,
+    budget: Duration,
+) -> ResponseBody {
+    let job_work = Arc::clone(&limits.job_work);
+    let work = async move {
+        let Ok(permit) = job_work.acquire_owned().await else {
+            return Err(Fault::Internal(FaultText::truncated(
+                "the session takes no more job requests",
+            )));
+        };
+        tokio::spawn(async move {
+            let _held = (permit, held);
+            match body {
+                RequestBody::Launch(request) => service
+                    .launch(peer, *request)
+                    .await
+                    .map(ResponseBody::Launch),
+                RequestBody::Instruct { token, instruction } => service
+                    .instruct(peer, token, instruction)
+                    .await
+                    .map(ResponseBody::Instruct),
+                RequestBody::Report(report) => service
+                    .report(peer, *report)
+                    .await
+                    .map(ResponseBody::Report),
+                RequestBody::Heartbeat(beat) => service
+                    .heartbeat(peer, beat)
+                    .await
+                    .map(ResponseBody::Heartbeat),
+                _ => Err(Fault::Internal(FaultText::truncated(
+                    "not a launch path message",
+                ))),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Fault::Internal(FaultText::truncated(
+                "the launch path request failed",
+            )))
+        })
+    };
+    match timeout(budget, work).await {
+        Ok(answer) => answer.unwrap_or_else(ResponseBody::Fault),
+        Err(_) => ResponseBody::Fault(Fault::Deadline),
+    }
+}
+
 /// Reads one request from a stream the peer opened, counting its payload's
 /// length against the peer's `room` from before the payload is read, and
 /// returns it with the permit that keeps it counted (M2-15). The frame's
@@ -1449,7 +1603,7 @@ async fn read_request(
         .await
         .map_err(|_| FrameError::Io(io::Error::other("the peer's request room is closed")))?;
     let payload = read_payload(recv, len, Room::Held).await?;
-    Ok((decode(&payload)?, held))
+    Ok((Request::from_control_payload(&payload)?, held))
 }
 
 /// Hands one per-job message to the service method for its kind and puts the answer on the wire.

@@ -95,13 +95,24 @@ impl FenceVerdict {
         matches!(self, FenceVerdict::Live)
     }
 
-    /// `Stale` and `Superseded`: the executor stops the attempt's group.
+    /// Whether the verdict ends the grant it was given for: every verdict
+    /// but `Live` and `NotWritable { Unknown }`. The runner stops the
+    /// attempt's groups and reports nothing more under the grant (ADR
+    /// 0028): a grant the fence refuses for good writes nothing, so
+    /// nothing it runs can count. `unknown` is the authority not knowing,
+    /// not a decision: the next heartbeat from the grant's node brings the
+    /// attempt back, so the runner keeps it and waits.
     #[must_use]
-    pub fn is_obsolete(&self) -> bool {
-        matches!(
-            self,
-            FenceVerdict::Stale { .. } | FenceVerdict::Superseded { .. }
-        )
+    pub fn ends_grant(&self) -> bool {
+        match self {
+            FenceVerdict::Live => false,
+            FenceVerdict::NotWritable { status } => *status != AttemptStatus::Unknown,
+            FenceVerdict::Stale { .. }
+            | FenceVerdict::Superseded { .. }
+            | FenceVerdict::WrongNode { .. }
+            | FenceVerdict::UnknownAttempt
+            | FenceVerdict::UnknownJob => true,
+        }
     }
 
     /// The name the evidence uses.
@@ -198,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn only_live_allows_and_only_stale_and_superseded_are_obsolete() {
+    fn only_live_allows_and_all_but_live_and_unknown_end_the_grant() {
         let verdicts = [
             FenceVerdict::Live,
             FenceVerdict::Stale {
@@ -217,8 +228,12 @@ mod tests {
         ];
         let allowed: Vec<_> = verdicts.iter().map(FenceVerdict::allows).collect();
         assert_eq!(allowed, [true, false, false, false, false, false, false]);
-        let obsolete: Vec<_> = verdicts.iter().map(FenceVerdict::is_obsolete).collect();
-        assert_eq!(obsolete, [false, true, true, false, false, false, false]);
+        let ends: Vec<_> = verdicts.iter().map(FenceVerdict::ends_grant).collect();
+        assert_eq!(ends, [false, true, true, false, true, true, true]);
+        let ended = FenceVerdict::NotWritable {
+            status: AttemptStatus::Lost,
+        };
+        assert!(ended.ends_grant());
     }
 
     #[test]

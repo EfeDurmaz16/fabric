@@ -32,15 +32,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use fabric_core::id::{JobId, NodeId};
+use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::Command;
 use fabric_core::managed::{
     AcceptedOperation, Attempt, AttemptId, AttemptStatus, CheckpointAck, CommandKind, CoveredPath,
-    DomainError, Envelope, EventFrame, EventSeq, FenceVerdict, Fidelity, GrantToken, ManagedEvent,
-    ManagedState, NewIds, Note, Observation, Operation, OperationId, OperationKey, OperationMark,
-    OperationStatus, PackageDigest, PlacementDecision, RecoveryBlock, RequestDigest, StoredResult,
-    TaskReceipt, Transition, WorkRevision, acknowledge, apply_observation, fence, mark_operation,
-    record_recovery_block, replay, request_digest,
+    CutDigest, DomainError, Envelope, EventDigest, EventFrame, EventSeq, FenceVerdict, Fidelity,
+    GrantToken, ManagedEvent, ManagedState, NewIds, Note, Observation, Operation, OperationId,
+    OperationKey, OperationMark, OperationStatus, PackageDigest, PlacementDecision, RecoveryBlock,
+    RequestDigest, StoredResult, TaskReceipt, Transition, WorkRevision, acknowledge,
+    apply_observation, fence, mark_operation, record_recovery_block, replay, request_digest,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -425,6 +425,12 @@ impl Journal {
         // journal an unreleased build made has the draft table.
         if conn.prepare(schema::V2_COMPLETE).is_err() {
             return Err(OpenError::DraftSchema { version: 2 });
+        }
+        // Version 3 was amended in place before any release (the launch
+        // path's `tasks.program`): a journal an unreleased build made
+        // lacks the column, and is refused as M6 refuses its own draft.
+        if conn.prepare(schema::V3_COMPLETE).is_err() {
+            return Err(OpenError::DraftSchema { version: 3 });
         }
         Ok(Journal {
             conn,
@@ -1227,6 +1233,40 @@ impl Journal {
             }
         }
         Ok(Vec::new())
+    }
+
+    /// The digest of `job`'s newest event, the head its next event links
+    /// to; `None` for a job with none.
+    pub fn head(&self, job: JobId) -> Result<Option<EventDigest>, CommitError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT digest FROM events WHERE job_id = ?1 ORDER BY seq DESC LIMIT 1",
+        )?;
+        let digest = stmt
+            .query_row([job.to_bytes()], |r| r.get::<_, [u8; 32]>(0))
+            .optional()?;
+        Ok(digest.map(EventDigest::from_bytes))
+    }
+
+    /// The newest cut recorded for `job`'s `attempt`: its snapshot and its
+    /// digest; `None` when the attempt was never cut.
+    pub fn last_cut(
+        &self,
+        job: JobId,
+        attempt: AttemptId,
+    ) -> Result<Option<(SnapshotId, CutDigest)>, CommitError> {
+        Ok(self
+            .frames_of_kind(job, "checkpoint_cut_recorded")?
+            .into_iter()
+            .rev()
+            .find_map(|frame| match frame.event {
+                ManagedEvent::CheckpointCutRecorded {
+                    attempt: a,
+                    snapshot,
+                    cut,
+                    ..
+                } if a == attempt => Some((snapshot, cut)),
+                _ => None,
+            }))
     }
 
     fn frames_of_kind(&self, job: JobId, kind: &str) -> Result<Vec<EventFrame>, CommitError> {

@@ -121,6 +121,19 @@ sha256 as of this contract's commit is
 pin test carries the same constant, and it moves only with the fixtures,
 in the same commit.
 
+As built: the four messages are `RequestBody::{Launch, Instruct, Report,
+Heartbeat}`, answered by the `ResponseBody` of the same name, and served
+under the per-peer job work cap like a facade message: the work runs to
+its end, only the answer races the budget. The list bounds
+(`MAX_TASK_LAUNCHES` tasks in a launch, `MAX_HEARTBEAT_ATTEMPTS` grants in
+a heartbeat) are `RequestBody::check_bounds`, run when a request is
+parsed (`Request::from_control_payload`) and before `Session::launch` or
+`Session::heartbeat` sends one. The checks that answer a refusal rather
+than a fault are the receiver's: `LaunchRequest::check` (programs,
+`snapshot_at` with a checkpoint, a package exactly with a continuation,
+the package's job and size) and `Report::check`. `Service::{launch,
+instruct, report, heartbeat}` refuse by default with `Fault::BadRequest`.
+
 ```sh
 cd protocol/net/v4
 find . -type f ! -name manifest.sha256 | sed 's|^\./||' | LC_ALL=C sort | xargs shasum -a 256 > manifest.sha256

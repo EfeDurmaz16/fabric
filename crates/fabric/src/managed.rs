@@ -7,10 +7,13 @@
 //! caller's name for the command: the node answers a key it has seen with
 //! the answer it gave the first time and never runs the command twice, so a
 //! script that lost an answer runs the same command again with the same
-//! key. Without `--operation-key` the CLI makes a fresh ULID and prints the
-//! key it used, for such a retry. A facade command carries its key the same
-//! way, and its answer is printed as the JSON the authority wrote, since
-//! that JSON is the contract (docs/facade-protocol.md).
+//! key. Without `--operation-key` the CLI makes a fresh ULID and names the
+//! key it used, for such a retry: before the request in words, in the
+//! answer's operation under `--json`, and in every failure's
+//! `data.operation_key`, with the retry as the `next` command when the
+//! answer was lost (`contract::Keyed`). A facade command carries its key the same
+//! way, and its answer is the JSON the authority wrote, since that JSON
+//! is the contract (docs/facade-protocol.md).
 
 use std::path::PathBuf;
 
@@ -18,37 +21,72 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use fabric_client::Client;
 use fabric_client::api::{
-    AnyWord, FidelityName, JobScopeWire, ManagedPolicy, ManagedSource, NoteWire, Reply, Request,
-    ResourceScopeWire, SecretRefWire,
+    AnyWord, FidelityName, JobScopeWire, ManagedPolicy, ManagedSource, NoteWire, ProgramWire,
+    RegisterClass, Reply, Request, ResourceScopeWire, SecretRefWire,
 };
 use fabric_client::facade::{Bearer, ClientMessage, Submit};
+use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{EventSeq, OperationKey, TaskId, WorkRevision};
+use fabric_core::path::RelPath;
 
-use crate::{Notes, ask, harness_arg, repository, system_path};
+use crate::{Notes, ask, contract, harness_arg, repository, system_path};
 
 /// The source flags a create and a facade submit share.
 #[derive(Debug, Args, Clone)]
+#[group(required = true, multiple = true)]
 pub(crate) struct SourceArgs {
     /// A repository on this node to clone into the job's workspace.
-    #[arg(long, conflicts_with_all = ["git", "snapshot", "empty", "import"])]
+    #[arg(long, conflicts_with_all = ["git", "snapshot", "empty", "import"], value_name = "PATH")]
     repo: Option<PathBuf>,
     /// A git URI (https, ssh, git+ssh or file) to clone; needs --commit.
-    #[arg(long, requires = "commit", conflicts_with_all = ["snapshot", "empty", "import"])]
+    #[arg(long, requires = "commit", conflicts_with_all = ["snapshot", "empty", "import"], value_name = "URI")]
     git: Option<String>,
     /// The exact commit, 40 or 64 lowercase hex characters.
-    #[arg(long, requires = "git")]
+    #[arg(long, requires = "git", value_name = "COMMIT")]
     commit: Option<String>,
     /// A published snapshot to start from.
-    #[arg(long, conflicts_with_all = ["empty", "import"])]
+    #[arg(long, conflicts_with_all = ["empty", "import"], value_name = "SNAPSHOT")]
     snapshot: Option<SnapshotId>,
     /// Start from nothing.
     #[arg(long, conflicts_with = "import")]
     empty: bool,
     /// A directory on this node the node imports into a snapshot first, untouched.
-    #[arg(long)]
+    #[arg(long, value_name = "PATH")]
     import: Option<PathBuf>,
+}
+
+/// The source flags of a facade submit: only what names the same thing on
+/// every node, since a path is a path on one node.
+#[derive(Debug, Args, Clone)]
+#[group(required = true, multiple = true)]
+pub(crate) struct FacadeSourceArgs {
+    /// Start from nothing.
+    #[arg(long, conflicts_with_all = ["git", "snapshot"])]
+    empty: bool,
+    /// A published snapshot to start from.
+    #[arg(long, conflicts_with = "git", value_name = "SNAPSHOT")]
+    snapshot: Option<SnapshotId>,
+    /// A git URI (https, ssh, git+ssh or file) to clone; needs --commit.
+    #[arg(long, requires = "commit", value_name = "URI")]
+    git: Option<String>,
+    /// The exact commit, 40 or 64 lowercase hex characters.
+    #[arg(long, requires = "git", value_name = "COMMIT")]
+    commit: Option<String>,
+}
+
+impl From<FacadeSourceArgs> for SourceArgs {
+    fn from(args: FacadeSourceArgs) -> Self {
+        SourceArgs {
+            repo: None,
+            git: args.git,
+            commit: args.commit,
+            snapshot: args.snapshot,
+            empty: args.empty,
+            import: None,
+        }
+    }
 }
 
 /// The policy flags.
@@ -60,7 +98,7 @@ pub(crate) struct PolicyArgs {
     /// How long a quiescence may take, in milliseconds (1000 to 600000).
     #[arg(long)]
     drain_budget: Option<u32>,
-    /// A continuation fidelity to allow, by its name on the fidelity ladder (ADR 0024); repeatable.
+    /// A continuation fidelity to allow, by its name on the fidelity ladder; repeatable.
     #[arg(long = "allow-fidelity", value_parser = fidelity_arg)]
     allow_fidelity: Vec<FidelityName>,
     /// A secret the tasks need by name ([A-Z0-9_]); repeatable.
@@ -118,15 +156,15 @@ pub(crate) enum ManagedCommand {
         #[command(flatten)]
         source: SourceArgs,
         /// The goal in your words.
-        #[arg(long)]
+        #[arg(long, value_name = "TEXT")]
         goal: String,
-        /// The harness: claude, codex or acp:<program>.
-        #[arg(long, default_value = "claude", value_parser = harness_arg)]
+        /// The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
+        #[arg(long, default_value = "claude", value_parser = harness_arg, value_name = "HARNESS")]
         harness: HarnessKind,
         #[command(flatten)]
         policy: PolicyArgs,
         /// The command's key; the same key and arguments again give the same job.
-        #[arg(long, value_parser = operation_key_arg)]
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
         operation_key: Option<OperationKey>,
     },
     /// Cancel a managed job, or one task of it; a live attempt is stopped first.
@@ -137,16 +175,17 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         task: Option<TaskId>,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
         /// Why, for the journal.
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", value_name = "TEXT")]
         reason: String,
         /// The command's key; the same key and arguments again give the same answer.
-        #[arg(long, value_parser = operation_key_arg)]
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
         operation_key: Option<OperationKey>,
     },
     /// Record a decision with its reason, a question, or an answer on a job's history.
+    #[command(group(clap::ArgGroup::new("note").required(true).args(["question", "decision", "answer"])))]
     Note {
         /// The job.
         job: JobId,
@@ -160,27 +199,56 @@ pub(crate) enum ManagedCommand {
         #[arg(long, conflicts_with = "answer")]
         question: Option<String>,
         /// The revision of the question this answers; needs --text.
-        #[arg(long, requires = "text", value_parser = revision_arg)]
+        #[arg(long, requires = "text", value_parser = revision_arg, value_name = "REVISION")]
         answer: Option<WorkRevision>,
         /// The answer's text.
         #[arg(long)]
         text: Option<String>,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
-        /// The command's key.
-        #[arg(long, value_parser = operation_key_arg)]
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
         operation_key: Option<OperationKey>,
+    },
+    /// Register a build or test task with the program it runs under a task of a job.
+    Register {
+        /// The job.
+        job: JobId,
+        /// The task it is registered under.
+        #[arg(long)]
+        parent: TaskId,
+        /// Your label for it.
+        #[arg(long)]
+        label: String,
+        /// build or test.
+        #[arg(long, value_parser = class_arg)]
+        class: RegisterClass,
+        /// Where it runs, relative to the attempt's root; the root without it.
+        #[arg(long, value_parser = rel_path_arg)]
+        cwd: Option<RelPath>,
+        /// A variable of the node's environment it may see, by name; repeatable.
+        #[arg(long = "env", value_parser = env_name_arg)]
+        env: Vec<EnvVarName>,
+        /// Refuse unless the job is at this revision.
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
+        expected_revision: Option<WorkRevision>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true, num_args = 1..)]
+        argv: Vec<String>,
     },
     /// Take a checkpoint cut of the job's live attempt; the attempt goes on.
     Checkpoint {
         /// The job.
         job: JobId,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
-        /// The command's key.
-        #[arg(long, value_parser = operation_key_arg)]
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
         operation_key: Option<OperationKey>,
     },
     /// Continue the job on a newly placed attempt: a quiescence, a cut, a placement.
@@ -194,10 +262,10 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         pin: Option<NodeId>,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
-        /// The command's key.
-        #[arg(long, value_parser = operation_key_arg)]
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
         operation_key: Option<OperationKey>,
     },
     /// Everything the journal holds about a job: placements, continuations, notes, provider operations.
@@ -231,6 +299,7 @@ pub(crate) enum ManagedCommand {
 )]
 pub(crate) enum FacadeCommand {
     /// Mint a token on this node's authority; the bearer is printed once.
+    #[command(group(clap::ArgGroup::new("expiry").required(true).args(["ttl_ms", "expires_ms"])))]
     Mint {
         /// Who acts under the token: 1 to 64 characters of [A-Za-z0-9._-].
         #[arg(long)]
@@ -258,18 +327,18 @@ pub(crate) enum FacadeCommand {
         #[command(flatten)]
         to: Authority,
         #[command(flatten)]
-        source: SourceArgs,
+        source: FacadeSourceArgs,
         /// The goal in your words.
-        #[arg(long)]
+        #[arg(long, value_name = "TEXT")]
         goal: String,
         /// The harness: claude, codex or acp:<program>.
-        #[arg(long, default_value = "claude", value_parser = harness_arg)]
+        #[arg(long, default_value = "claude", value_parser = harness_arg, value_name = "HARNESS")]
         harness: HarnessKind,
         #[command(flatten)]
         policy: PolicyArgs,
-        /// The command's key.
-        #[arg(long, value_parser = operation_key_arg)]
-        key: Option<OperationKey>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
     },
     /// Inspect a job at its authority.
     Inspect {
@@ -301,14 +370,14 @@ pub(crate) enum FacadeCommand {
         #[arg(long)]
         task: Option<TaskId>,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
         /// Why.
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", value_name = "TEXT")]
         reason: String,
-        /// The command's key.
-        #[arg(long, value_parser = operation_key_arg)]
-        key: Option<OperationKey>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
     },
     /// Checkpoint a job at its authority.
     Checkpoint {
@@ -317,11 +386,11 @@ pub(crate) enum FacadeCommand {
         /// The job.
         job: JobId,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
-        /// The command's key.
-        #[arg(long, value_parser = operation_key_arg)]
-        key: Option<OperationKey>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
     },
     /// Continue a job at its authority.
     Continue {
@@ -336,11 +405,11 @@ pub(crate) enum FacadeCommand {
         #[arg(long)]
         pin: Option<NodeId>,
         /// Refuse unless the job is at this revision.
-        #[arg(long, value_parser = revision_arg)]
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
-        /// The command's key.
-        #[arg(long, value_parser = operation_key_arg)]
-        key: Option<OperationKey>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
     },
 }
 
@@ -364,6 +433,22 @@ fn revision_arg(text: &str) -> Result<WorkRevision, String> {
         .ok()
         .and_then(WorkRevision::new)
         .ok_or_else(|| format!("a revision is a whole number of at least 1, not {text:?}"))
+}
+
+fn class_arg(text: &str) -> Result<RegisterClass, String> {
+    match text {
+        "build" => Ok(RegisterClass::Build),
+        "test" => Ok(RegisterClass::Test),
+        other => Err(format!("a registered task is build or test, not {other:?}")),
+    }
+}
+
+fn rel_path_arg(text: &str) -> Result<RelPath, String> {
+    RelPath::parse(text).map_err(|e| format!("{text:?}: {e}"))
+}
+
+fn env_name_arg(text: &str) -> Result<EnvVarName, String> {
+    EnvVarName::parse(text).map_err(|e| format!("{text:?}: {e}"))
 }
 
 fn seq_arg(text: &str) -> Result<EventSeq, String> {
@@ -394,16 +479,22 @@ fn bearer_arg(text: &str) -> Result<Bearer, String> {
 }
 
 /// The key a changing command runs under: the caller's, or a fresh one,
-/// printed so a retry can name it.
-fn key_for(given: Option<OperationKey>) -> Result<OperationKey> {
+/// printed so a retry can name it and kept in `minted` for its failure.
+fn key_for(
+    given: Option<OperationKey>,
+    notes: Notes,
+    minted: &mut Option<OperationKey>,
+) -> Result<OperationKey> {
     if let Some(key) = given {
         return Ok(key);
     }
     let key = fabricd::clock::operation_key()
         .map_err(|e| anyhow!("no operation key could be made: {e}"))?;
-    Notes::Stderr.print(&[format!(
+    // Under `--json` the key is in the answer's operation, or in the failure's data.
+    notes.print(&[format!(
         "operation key {key}; run the command again with --operation-key {key} after a lost answer"
     )])?;
+    *minted = Some(key.clone());
     Ok(key)
 }
 
@@ -459,9 +550,14 @@ fn note_of(
     }
 }
 
-/// The request `command` sends.
-fn request(command: ManagedCommand) -> Result<Request> {
-    Ok(match command {
+/// The request `command` sends, and the key the CLI made for it, if it made one.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per command, so the whole mapping reads in one place"
+)]
+fn request(command: ManagedCommand, notes: Notes) -> Result<(Request, Option<OperationKey>)> {
+    let mut minted = None;
+    let request = match command {
         ManagedCommand::Create {
             source,
             goal,
@@ -469,7 +565,7 @@ fn request(command: ManagedCommand) -> Result<Request> {
             policy,
             operation_key,
         } => {
-            let operation_key = key_for(operation_key)?;
+            let operation_key = key_for(operation_key, notes, &mut minted)?;
             let acceptance = policy.acceptance.clone();
             let policy = policy.policy();
             match source_of(&source)? {
@@ -498,7 +594,7 @@ fn request(command: ManagedCommand) -> Result<Request> {
             reason,
             operation_key,
         } => Request::ManagedCancel {
-            operation_key: key_for(operation_key)?,
+            operation_key: key_for(operation_key, notes, &mut minted)?,
             job,
             expected_revision,
             reason,
@@ -514,17 +610,40 @@ fn request(command: ManagedCommand) -> Result<Request> {
             expected_revision,
             operation_key,
         } => Request::ManagedNote {
-            operation_key: key_for(operation_key)?,
+            operation_key: key_for(operation_key, notes, &mut minted)?,
             job,
             expected_revision,
             note: note_of(decision, reason, question, answer, text)?,
+        },
+        ManagedCommand::Register {
+            job,
+            parent,
+            label,
+            class,
+            cwd,
+            env,
+            expected_revision,
+            operation_key,
+            argv,
+        } => Request::ManagedRegister {
+            operation_key: key_for(operation_key, notes, &mut minted)?,
+            job,
+            expected_revision,
+            parent,
+            label,
+            class,
+            program: ProgramWire {
+                argv,
+                cwd,
+                env_allowlist: env,
+            },
         },
         ManagedCommand::Checkpoint {
             job,
             expected_revision,
             operation_key,
         } => Request::ManagedCheckpoint {
-            operation_key: key_for(operation_key)?,
+            operation_key: key_for(operation_key, notes, &mut minted)?,
             job,
             expected_revision,
         },
@@ -535,7 +654,7 @@ fn request(command: ManagedCommand) -> Result<Request> {
             expected_revision,
             operation_key,
         } => Request::ManagedContinue {
-            operation_key: key_for(operation_key)?,
+            operation_key: key_for(operation_key, notes, &mut minted)?,
             job,
             expected_revision,
             fidelity: (!allow_fidelity.is_empty()).then_some(allow_fidelity),
@@ -548,26 +667,43 @@ fn request(command: ManagedCommand) -> Result<Request> {
         },
         ManagedCommand::Status { job } => Request::ManagedStatus { job },
         ManagedCommand::Ls => Request::ManagedList,
-    })
+    };
+    Ok((request, minted))
 }
 
-/// Runs `command` against the node `client` speaks to and prints its answer.
-pub(crate) async fn run(client: &Client, command: ManagedCommand) -> Result<Reply> {
-    ask(client, &request(command)?, Notes::Stdout).await
+/// Runs `command` against the node `client` speaks to and returns its answer.
+pub(crate) async fn run(
+    client: &Client,
+    command: ManagedCommand,
+    run: &contract::Run,
+) -> Result<Reply> {
+    let (request, minted) = request(command, run.notes())?;
+    ask(client, &request, run.notes())
+        .await
+        .map_err(|error| match minted {
+            Some(key) => contract::Keyed {
+                key: key.as_str().to_owned(),
+                error,
+            }
+            .into(),
+            None => error,
+        })
 }
 
 /// The request a facade command sends: a mint or a revoke to this node,
-/// or a facade message for an authority.
+/// or a facade message for an authority; and the key the CLI made for it,
+/// if it made one.
 #[expect(
     clippy::too_many_lines,
     reason = "one arm per facade command, so the whole mapping reads in one place"
 )]
-fn facade_request(command: FacadeCommand) -> Result<Request> {
+fn facade_request(command: FacadeCommand, notes: Notes) -> Result<(Request, Option<OperationKey>)> {
+    let mut minted = None;
     let message = |to: Authority, message: ClientMessage| Request::FacadeCall {
         authority: to.authority,
         message: message.to_json(),
     };
-    Ok(match command {
+    let request = match command {
         FacadeCommand::Mint {
             actor,
             jobs,
@@ -605,23 +741,15 @@ fn facade_request(command: FacadeCommand) -> Result<Request> {
             goal,
             harness,
             policy,
-            key,
+            operation_key,
         } => {
-            let source = source_of(&source)?;
-            if matches!(
-                source,
-                ManagedSource::Repository { .. } | ManagedSource::Directory { .. }
-            ) {
-                return Err(anyhow!(
-                    "the facade takes --git, --snapshot or --empty; a repository or a directory is a path on one node (use `fabric managed create` there)"
-                ));
-            }
+            let source = source_of(&source.into())?;
             let token = to.token.clone();
             message(
                 to,
                 ClientMessage::Submit {
                     token,
-                    key: key_for(key)?,
+                    key: key_for(operation_key, notes, &mut minted)?,
                     submit: Submit {
                         goal,
                         harness,
@@ -659,14 +787,14 @@ fn facade_request(command: FacadeCommand) -> Result<Request> {
             task,
             expected_revision,
             reason,
-            key,
+            operation_key,
         } => {
             let token = to.token.clone();
             message(
                 to,
                 ClientMessage::Cancel {
                     token,
-                    key: key_for(key)?,
+                    key: key_for(operation_key, notes, &mut minted)?,
                     job,
                     expected_revision,
                     task,
@@ -678,14 +806,14 @@ fn facade_request(command: FacadeCommand) -> Result<Request> {
             to,
             job,
             expected_revision,
-            key,
+            operation_key,
         } => {
             let token = to.token.clone();
             message(
                 to,
                 ClientMessage::Checkpoint {
                     token,
-                    key: key_for(key)?,
+                    key: key_for(operation_key, notes, &mut minted)?,
                     job,
                     expected_revision,
                 },
@@ -697,14 +825,14 @@ fn facade_request(command: FacadeCommand) -> Result<Request> {
             allow_fidelity,
             pin,
             expected_revision,
-            key,
+            operation_key,
         } => {
             let token = to.token.clone();
             message(
                 to,
                 ClientMessage::Continue {
                     token,
-                    key: key_for(key)?,
+                    key: key_for(operation_key, notes, &mut minted)?,
                     job,
                     expected_revision,
                     fidelity: (!allow_fidelity.is_empty()).then_some(allow_fidelity),
@@ -712,13 +840,27 @@ fn facade_request(command: FacadeCommand) -> Result<Request> {
                 },
             )
         }
-    })
+    };
+    Ok((request, minted))
 }
 
-/// Runs a facade command and prints its answer; a `refused` answer from
+/// Runs a facade command and returns its answer; a `refused` answer from
 /// the authority is an error, since the command did not happen.
-pub(crate) async fn run_facade(client: &Client, command: FacadeCommand) -> Result<Reply> {
-    let reply = ask(client, &facade_request(command)?, Notes::Stdout).await?;
+pub(crate) async fn run_facade(
+    client: &Client,
+    command: FacadeCommand,
+    run: &contract::Run,
+) -> Result<Reply> {
+    let (request, minted) = facade_request(command, run.notes())?;
+    let keyed = |error: anyhow::Error| match &minted {
+        Some(key) => contract::Keyed {
+            key: key.as_str().to_owned(),
+            error,
+        }
+        .into(),
+        None => error,
+    };
+    let reply = ask(client, &request, run.notes()).await.map_err(keyed)?;
     if let Reply::FacadeCall(envelope) = &reply
         && envelope
             .message
@@ -728,7 +870,7 @@ pub(crate) async fn run_facade(client: &Client, command: FacadeCommand) -> Resul
     {
         let code = envelope.message["code"].as_str().unwrap_or("refused");
         let reason = envelope.message["reason"].as_str().unwrap_or("");
-        return Err(anyhow!("the authority refused: {code}/{reason}"));
+        return Err(keyed(anyhow!("the authority refused: {code}/{reason}")));
     }
     Ok(reply)
 }
@@ -766,7 +908,7 @@ mod tests {
             expected_revision,
             task,
             ..
-        } = request(given).unwrap()
+        } = request(given, Notes::Silent).unwrap().0
         else {
             panic!("not a cancel");
         };
@@ -776,8 +918,11 @@ mod tests {
 
         let fresh = || {
             let command = parsed(&["fabric", "managed", "cancel", "01JABCDEFGHJKMNPQRSTVWXYZ0"]);
-            match request(command).unwrap() {
-                Request::ManagedCancel { operation_key, .. } => operation_key,
+            match request(command, Notes::Silent).unwrap() {
+                (Request::ManagedCancel { operation_key, .. }, Some(minted)) => {
+                    assert_eq!(operation_key, minted, "the key sent is the key kept");
+                    operation_key
+                }
                 other => panic!("{other:?}"),
             }
         };
@@ -844,7 +989,7 @@ mod tests {
             acceptance,
             policy,
             ..
-        } = request(command).unwrap()
+        } = request(command, Notes::Silent).unwrap().0
         else {
             panic!("not a submit");
         };
@@ -870,7 +1015,7 @@ mod tests {
             "k2",
         ]);
         assert!(matches!(
-            request(empty).unwrap(),
+            request(empty, Notes::Silent).unwrap().0,
             Request::ManagedSubmit {
                 source: ManagedSource::Empty,
                 policy: None,
@@ -905,8 +1050,32 @@ mod tests {
             .is_err(),
             "not a fidelity"
         );
-        let none = parsed(&["fabric", "managed", "create", "--goal", "g"]);
-        assert!(request(none).is_err(), "no source named");
+        assert!(
+            Cli::try_parse_from(["fabric", "managed", "create", "--goal", "g"]).is_err(),
+            "no source named"
+        );
+    }
+
+    /// A facade submit takes only a source that names the same thing on every node.
+    #[test]
+    fn a_facade_submit_takes_no_path() {
+        assert!(
+            Cli::try_parse_from([
+                "fabric",
+                "facade",
+                "submit",
+                "--authority",
+                "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+                "--token",
+                &"ab".repeat(32),
+                "--repo",
+                ".",
+                "--goal",
+                "g"
+            ])
+            .is_err(),
+            "a path is not a facade source"
+        );
     }
 
     /// A facade command builds the message docs/facade-protocol.md gives
@@ -932,7 +1101,8 @@ mod tests {
             Command::Facade(command) => command,
             other => panic!("{other:?}"),
         };
-        let Request::FacadeCall { message, .. } = facade_request(command).unwrap() else {
+        let Request::FacadeCall { message, .. } = facade_request(command, Notes::Silent).unwrap().0
+        else {
             panic!("not a facade call");
         };
         assert_eq!(message["type"], "watch");

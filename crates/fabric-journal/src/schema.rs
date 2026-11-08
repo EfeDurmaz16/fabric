@@ -190,6 +190,7 @@ CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
 const V3: &str = "
 ALTER TABLE tasks ADD COLUMN class TEXT NOT NULL DEFAULT 'harness'
   CHECK (class IN ('build','test','harness','opaque'));
+ALTER TABLE tasks ADD COLUMN program BLOB;
 
 CREATE TABLE operations_v3 (
   operation_id      BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
@@ -328,6 +329,11 @@ CREATE TRIGGER evidence_append_only_delete BEFORE DELETE ON evidence
 /// a draft version 2 journal, made by an unreleased build, lacks these.
 pub(crate) const V2_COMPLETE: &str = "SELECT profile, effect_class, purpose, cleans, target_key,
   locator_key, searched, abandon_reason FROM provider_operations LIMIT 0";
+
+/// A query that prepares only on the version 3 tables the launch path
+/// completed (`tasks.program`): a draft version 3 journal, made by an
+/// unreleased build, lacks the column.
+pub(crate) const V3_COMPLETE: &str = "SELECT program FROM tasks LIMIT 0";
 
 /// `MIGRATIONS[n - 1]` takes a journal from version `n` to `n + 1`; a new
 /// journal is `V1` and then every migration. Each new version adds one

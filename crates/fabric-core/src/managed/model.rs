@@ -476,6 +476,7 @@ impl CommandKind {
                 | CommandKind::Checkpoint
                 | CommandKind::Continue
                 | CommandKind::Recover
+                | CommandKind::RegisterTask
         )
     }
 

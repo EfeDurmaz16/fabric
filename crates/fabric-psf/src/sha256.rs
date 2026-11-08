@@ -1,7 +1,8 @@
-//! Shared by the fixture pin tests of this crate (`bridge_fixtures.rs`,
-//! `facade_fixtures.rs`): SHA-256 written out, because the workspace has no
-//! sha2 crate and a test does not justify one. `bridge_fixtures.rs` holds
-//! the FIPS known-answer test that guards it.
+//! SHA-256, the identity of a document and of a blob (section 4, rule 7).
+//!
+//! It is written out here because the workspace has no sha2 crate and the
+//! format's other readers use their standard library's; the known-answer
+//! tests below guard it.
 
 use std::fmt::Write;
 
@@ -72,12 +73,12 @@ const K: [u32; 64] = [
     0xc671_78f2,
 ];
 
-/// FIPS 180-4 SHA-256 of `data`, as lowercase hex.
+/// FIPS 180-4 SHA-256 of `data`.
 #[expect(
     clippy::many_single_char_names,
     reason = "the working variables keep their FIPS 180-4 names"
 )]
-pub fn sha256(data: &[u8]) -> String {
+pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
         0x6a09_e667,
         0xbb67_ae85,
@@ -133,8 +134,41 @@ pub fn sha256(data: &[u8]) -> String {
             *slot = slot.wrapping_add(value);
         }
     }
-    h.iter().fold(String::with_capacity(64), |mut hex, word| {
-        let _ = write!(hex, "{word:08x}");
-        hex
-    })
+    let mut out = [0u8; 32];
+    for (chunk, word) in out.chunks_exact_mut(4).zip(h) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Lowercase hex of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_answers() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let long = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        assert_eq!(
+            hex(&sha256(long)),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
 }
