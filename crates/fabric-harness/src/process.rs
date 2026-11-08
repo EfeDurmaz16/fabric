@@ -1091,6 +1091,57 @@ pub(crate) async fn running_binary(binary: &Path) -> Result<Vec<u32>, HarnessErr
     Ok(pids)
 }
 
+/// The working directory of each of `pids` that `lsof` can see, as
+/// `(pid, directory)`. `lsof` exits 1 with nothing on its error output
+/// when some pid has gone or is another user's; anything else on that
+/// output, or any other exit, is an error, never "none".
+#[cfg(feature = "cursor")]
+pub(crate) fn working_dirs(pids: &[u32]) -> Result<Vec<(u32, PathBuf)>, HarnessError> {
+    if pids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = std::process::Command::new(system_tool("lsof", LSOF)?)
+        .args(["-a", "-d", "cwd", "-Fpn", "-p", &list])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|source| HarnessError::Spawn {
+            program: "lsof".to_owned(),
+            source,
+        })?;
+    if !matches!(output.status.code(), Some(0 | 1)) || !output.stderr.trim_ascii().is_empty() {
+        return Err(HarnessError::ProcessQuery {
+            program: "lsof",
+            reason: format!(
+                "exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    let mut dirs = Vec::new();
+    let mut pid = None;
+    for line in output.stdout.split(|b| *b == b'\n') {
+        match line.split_first() {
+            Some((b'p', rest)) => pid = std::str::from_utf8(rest).ok().and_then(|p| p.parse().ok()),
+            Some((b'n', rest)) => {
+                if let Some(pid) = pid {
+                    use std::os::unix::ffi::OsStrExt;
+                    dirs.push((pid, PathBuf::from(OsStr::from_bytes(rest))));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(dirs)
+}
+
 /// True when a process with this id exists, asked of `ps`. `ps` exits 0
 /// and prints the pid for a live process, and exits 1 with no output for
 /// none; any other answer is an error, never "dead".

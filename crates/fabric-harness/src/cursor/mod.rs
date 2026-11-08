@@ -21,7 +21,9 @@
 //! version guard applies: the manifest records the installed version, and
 //! a chat continued with `--resume` is only ever the one this node's own
 //! `cursor-agent` wrote. A capture refuses while a process holds the
-//! chat's store open, since the session then still runs on this node.
+//! chat's store open, since the session then still runs on this node, and
+//! while a `cursor-agent` works in the workspace, which covers a chat the
+//! job does not name, as one started here after a move.
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -132,6 +134,32 @@ impl CursorAgent {
         }
     }
 
+    /// Refuses while a `cursor-agent` runs with its working directory in
+    /// the workspace `root`, whichever chat it runs: one the job's chat
+    /// store does not show, as a chat started here after a move, still
+    /// edits the workspace the capture takes. `pids` are the running
+    /// processes of the program; one working elsewhere, as the editor's
+    /// own workers do, is left alone.
+    fn refuse_in_workspace(root: &AbsPath, pids: &[u32]) -> Result<(), HarnessError> {
+        let root = pipeline::fs_path(root);
+        let inside: Vec<u32> = process::working_dirs(pids)?
+            .into_iter()
+            .filter(|(_, dir)| {
+                let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+                dir.starts_with(root)
+            })
+            .map(|(pid, _)| pid)
+            .collect();
+        if inside.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::HarnessRunning {
+                program: PROGRAM.to_owned(),
+                pids: inside,
+            })
+        }
+    }
+
     /// True when this node holds the chat `session` as its own: a chat
     /// directory with a `store.db`.
     fn holds_chat(&self, session: &SessionId) -> bool {
@@ -154,12 +182,14 @@ impl CursorAgent {
             PROGRAM,
         )
         .await;
+        let running = process::running_pids(PROGRAM, self.binary.as_deref()).await?;
         let home = self.home.clone();
         let session = session.clone();
         let out = out.to_path_buf();
         let adapter = self.clone();
         pipeline::blocking(move || {
             adapter.refuse_open_chat(&session)?;
+            Self::refuse_in_workspace(&root, &running)?;
             let mut counts = RedactionCounts::new();
             counts.insert(NOT_CARRIED, 1);
             let capturer = Capturer {

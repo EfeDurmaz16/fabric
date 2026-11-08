@@ -238,6 +238,69 @@ async fn a_cursor_agent_that_holds_the_chat_open_refuses_the_capture() {
     );
 }
 
+/// A fake `cursor-agent` holding a file open, killed when dropped.
+struct Linger(std::process::Child);
+
+impl Drop for Linger {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts the fake `cursor-agent` in `cwd` holding `file` open, and waits
+/// until it does.
+fn linger_in(f: &Fixture, cwd: &Path, file: &Path) -> Linger {
+    std::fs::create_dir_all(cwd).unwrap();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, "SQLite format 3\n").unwrap();
+    let linger = Linger(
+        std::process::Command::new("/bin/sh")
+            .arg(Path::new(&f.bin).join("cursor-agent"))
+            .arg("linger")
+            .arg(file)
+            .current_dir(cwd)
+            .spawn()
+            .unwrap(),
+    );
+    let held = PathBuf::from(format!("{}.held", file.display()));
+    for _ in 0..200 {
+        if held.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(held.exists(), "the fake never opened {}", file.display());
+    linger
+}
+
+/// A node that never held the job's chat has no store to judge by, as
+/// after a move with an interactive resume that started another chat; a
+/// `cursor-agent` running in the workspace still edits it, so the capture
+/// is refused. One running elsewhere, as the editor's workers do, is not.
+#[tokio::test]
+async fn a_cursor_agent_in_the_workspace_refuses_the_capture_of_a_chat_not_held_here() {
+    let f = build();
+    std::fs::remove_dir_all(&f.chat).unwrap();
+    let other = f
+        .chat
+        .with_file_name("0b7d2e4c-1f3a-4c5d-8e9f-a0b1c2d3e4f5");
+    let elsewhere = linger_in(
+        &f,
+        &f.home().join("editor"),
+        &f.home().join("editor/store.db"),
+    );
+    let away = f.adapter().capture(&f.work, &session(), &f.state()).await;
+    assert!(away.is_ok(), "{away:?}");
+    let here = linger_in(&f, &f.work.join("src"), &other.join("store.db"));
+    let err = f.adapter().capture(&f.work, &session(), &f.state()).await;
+    drop((elsewhere, here));
+    assert!(
+        matches!(err, Err(HarnessError::HarnessRunning { .. })),
+        "{err:?}"
+    );
+}
+
 /// On the node that wrote the chat, a resume continues it.
 #[tokio::test]
 async fn a_resume_where_the_chat_lives_continues_it() {
