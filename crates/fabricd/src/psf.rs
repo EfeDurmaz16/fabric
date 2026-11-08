@@ -192,12 +192,26 @@ fn harness_of(kind: &HarnessKind) -> Harness {
             args: Vec::new(),
             version: None,
         },
+        HarnessKind::OpenCode => named("opencode"),
+        HarnessKind::Pi => named("pi"),
+        HarnessKind::GeminiCli => named("gemini_cli"),
+        HarnessKind::CursorAgent => named("cursor_agent"),
         HarnessKind::Acp { program, args } => Harness {
             kind: "acp".to_owned(),
             program: Some(program.as_str().to_owned()),
             args: args.clone(),
             version: None,
         },
+    }
+}
+
+/// A harness with no program or arguments of its own, by its kind name.
+fn named(kind: &str) -> Harness {
+    Harness {
+        kind: kind.to_owned(),
+        program: None,
+        args: Vec::new(),
+        version: None,
     }
 }
 

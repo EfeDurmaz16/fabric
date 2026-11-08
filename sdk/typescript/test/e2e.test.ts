@@ -12,6 +12,7 @@ import { createConnection, createServer } from "node:net";
 import { delimiter, join } from "node:path";
 
 import {
+  API_VERSION,
   ClientEnv,
   createFrameDecoder,
   type DoctorReport,
@@ -335,6 +336,6 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
       socket.on("close", () => reject(new Error("the node closed before it answered the hello")));
     });
     socket.destroy();
-    expect(HelloAnswer.parse(decodeJson(body))).toMatchObject({ type: "incompatible", api: 1 });
+    expect(HelloAnswer.parse(decodeJson(body))).toMatchObject({ type: "incompatible", api: API_VERSION });
   });
 });

@@ -17,9 +17,12 @@
 //! rewrites in place is replaced only when this node left it untouched.
 //! Until every file passes, nothing is written.
 //!
-//! The crate is organised around one trait, [`Harness`], and three
-//! adapters behind cargo features: [`acp`], [`claude`] and [`codex`].
-//! [`manifest::StateManifest`] is the file that travels between the two.
+//! The crate is organised around one trait, [`Harness`], and one adapter
+//! per cargo feature: [`acp`], [`claude`] and [`codex`], and the adapters
+//! of PR 5, [`opencode`], [`pi`], [`gemini`] and [`cursor`], whose contract
+//! is `docs/harness-adapters.md`. Each declares the fidelity it reaches
+//! ([`Fidelity`]). [`manifest::StateManifest`] is the file that travels
+//! between the two.
 
 mod crashpoint;
 pub mod denylist;
@@ -32,7 +35,15 @@ mod harness;
 pub(crate) mod jsontext;
 pub mod manifest;
 pub(crate) mod markers;
-#[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "acp",
+    feature = "claude",
+    feature = "codex",
+    feature = "cursor",
+    feature = "gemini",
+    feature = "opencode",
+    feature = "pi"
+))]
 pub(crate) mod pipeline;
 pub(crate) mod place;
 pub(crate) mod process;
@@ -46,10 +57,18 @@ pub mod acp;
 pub mod claude;
 #[cfg(feature = "codex")]
 pub mod codex;
+#[cfg(feature = "cursor")]
+pub mod cursor;
+#[cfg(feature = "gemini")]
+pub mod gemini;
+#[cfg(feature = "opencode")]
+pub mod opencode;
+#[cfg(feature = "pi")]
+pub mod pi;
 
 pub use error::{BadRule, HarnessError, Input, IoOp};
 pub use harness::{
-    Harness, Installed, Launch, LaunchSettings, MAX_ANSWER, MAX_MODEL_NAME_LEN, ModelName,
-    ModelNameError, NotCarried, Origin, PassedSetting, Restored, Running, SettingName, TurnEvent,
-    TurnFeed, TurnReport,
+    Fidelity, Harness, Installed, Launch, LaunchSettings, MAX_ANSWER, MAX_MODEL_NAME_LEN,
+    ModelName, ModelNameError, NotCarried, Origin, PassedSetting, Restored, Running, SettingName,
+    TurnEvent, TurnFeed, TurnReport,
 };

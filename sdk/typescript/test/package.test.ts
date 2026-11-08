@@ -98,7 +98,7 @@ describe("the package", () => {
     expect(seen.node).toBeGreaterThanOrEqual(NODE_FLOOR);
     expect(seen).toMatchObject({
       entry: "node_modules/@fabric/client/dist/index.js",
-      hello: { api: 1, client: "node" },
+      hello: { api: 2, client: "node" },
       sdk: "0.1.0",
       noDaemon: true,
     });
@@ -110,7 +110,7 @@ describe("the package", () => {
       [
         `import { API_VERSION, FabricClient, type Welcome } from "@fabric/client";`,
         `const client: FabricClient = new FabricClient({ socketPath: "/nowhere/fabric.sock" });`,
-        `export const api: 1 = API_VERSION;`,
+        `export const api: 2 = API_VERSION;`,
         `export const welcome: Promise<Welcome> = client.hello();`,
         `// @ts-expect-error A socket path is a string; with no declarations the import would be any and this would pass.`,
         `new FabricClient({ socketPath: 42 });`,

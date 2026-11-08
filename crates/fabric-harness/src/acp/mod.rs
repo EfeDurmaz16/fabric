@@ -38,7 +38,8 @@ use tracing::{info, warn};
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::HarnessError;
 use crate::harness::{
-    Harness, Installed, Launch, MAX_ANSWER, Restored, Running, TurnEvent, TurnFeed, TurnReport,
+    Fidelity, Harness, Installed, Launch, MAX_ANSWER, Restored, Running, TurnEvent, TurnFeed,
+    TurnReport,
 };
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
@@ -669,6 +670,11 @@ impl Harness for AcpHarness {
             program: self.program.clone(),
             args: self.args.clone(),
         }
+    }
+
+    /// `session/load` or `session/resume` continues the same id.
+    fn fidelity(&self) -> Fidelity {
+        Fidelity::NativeSession
     }
 
     fn detect(&self) -> BoxFuture<'_, Result<Option<Installed>, HarnessError>> {

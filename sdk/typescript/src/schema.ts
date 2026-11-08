@@ -14,8 +14,11 @@ import { z } from "zod";
 
 import { EnvError } from "./errors.ts";
 
-/** The version of the client API this SDK speaks; a node answers only the same number. */
-export const API_VERSION = 1;
+/**
+ * The version of the client API this SDK speaks; a node answers only the same number. 2 since PR 5
+ * (2026-11-08): the closed set of harness kinds grew by `opencode`, `pi`, `gemini_cli` and `cursor_agent`.
+ */
+export const API_VERSION = 2;
 
 /** Every op of this api version, in the order of `Op::ALL` in the Rust crate. */
 export const OPS = [
@@ -310,6 +313,10 @@ export const Harness = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("claude_code") }),
   z.strictObject({ kind: z.literal("codex") }),
   z.strictObject({ kind: z.literal("acp"), program: ProgramName, args: z.array(UnicodeText) }),
+  z.strictObject({ kind: z.literal("opencode") }),
+  z.strictObject({ kind: z.literal("pi") }),
+  z.strictObject({ kind: z.literal("gemini_cli") }),
+  z.strictObject({ kind: z.literal("cursor_agent") }),
 ]);
 export type Harness = z.infer<typeof Harness>;
 

@@ -145,6 +145,11 @@ pub enum SettingName {
     Approval,
     /// Who answers what the harness asks: the user, or a reviewer model.
     Reviewer,
+    /// The agent profile the session runs as, such as OpenCode's `build`.
+    Agent,
+    /// The conversation itself, which a harness whose store cannot travel
+    /// (Cursor) leaves on the node that wrote it.
+    Chat,
 }
 
 impl std::fmt::Display for SettingName {
@@ -158,6 +163,8 @@ impl std::fmt::Display for SettingName {
             SettingName::NetworkAccess => "network access",
             SettingName::Approval => "approval",
             SettingName::Reviewer => "approvals reviewer",
+            SettingName::Agent => "agent",
+            SettingName::Chat => "chat",
         })
     }
 }
@@ -183,7 +190,14 @@ pub struct PassedSetting {
 }
 
 /// The most characters of a recorded value a report shows.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "cursor",
+    feature = "gemini",
+    feature = "opencode",
+    feature = "pi"
+))]
 const SHOWN_VALUE_LEN: usize = 64;
 
 /// A setting the session records, or the adapter was configured with
@@ -205,7 +219,14 @@ pub struct NotCarried {
 /// after a cut, and every control character replaced by `?`. Text that
 /// comes from a file that travelled goes through this before an error or
 /// a note prints it.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "cursor",
+    feature = "gemini",
+    feature = "opencode",
+    feature = "pi"
+))]
 pub(crate) fn shown(text: &str) -> String {
     let mut shown: String = text
         .chars()
@@ -220,7 +241,14 @@ pub(crate) fn shown(text: &str) -> String {
 
 impl NotCarried {
     /// A setting left out, with its recorded value made safe to print.
-    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "claude",
+        feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     pub(crate) fn new(name: SettingName, value: &str, reason: impl Into<String>) -> Self {
         NotCarried {
             name,
@@ -352,7 +380,15 @@ impl Drop for Running {
 impl Running {
     /// Wraps a child that `process::spawn` started held in a new process
     /// group.
-    #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "acp",
+        feature = "claude",
+        feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     pub(crate) fn new(session: Option<SessionId>, spawned: crate::process::Spawned) -> Self {
         Running {
             pid: spawned.pid,
@@ -383,7 +419,16 @@ impl Running {
 
     /// Waits until a trampoline held by a stop has stopped or its hold
     /// failed; at once for any other.
-    #[cfg(all(test, any(feature = "acp", feature = "claude", feature = "codex")))]
+    #[cfg(all(
+        test,
+        any(
+            feature = "acp",
+            feature = "claude",
+            feature = "codex",
+            feature = "opencode",
+            feature = "pi"
+        )
+    ))]
     pub(crate) async fn hold_settled(&self) {
         self.hold.settled().await;
     }
@@ -395,7 +440,7 @@ impl Running {
     }
 
     /// Records the version the launch asked of the binary it started.
-    #[cfg(feature = "codex")]
+    #[cfg(any(feature = "codex", feature = "gemini", feature = "opencode"))]
     pub(crate) fn with_version(mut self, version: Option<crate::version::HarnessVersion>) -> Self {
         self.version = version;
         self
@@ -413,7 +458,14 @@ impl Running {
     }
 
     /// Records what the launch passed and left out.
-    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "claude",
+        feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     pub(crate) fn with_settings(mut self, settings: LaunchSettings) -> Self {
         self.settings = settings;
         self
@@ -521,7 +573,14 @@ impl TurnReport {
     /// Takes `text` as the session the turn ran in. Returns true when it
     /// names a valid session other than the one already held; an id that
     /// does not parse is logged and left out.
-    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "claude",
+        feature = "codex",
+        feature = "cursor",
+        feature = "gemini",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     pub(crate) fn note_session(&mut self, text: Option<&str>) -> bool {
         let Some(text) = text else {
             return false;
@@ -540,6 +599,50 @@ impl TurnReport {
     }
 }
 
+/// How faithfully a continuation carries a session on, from highest. The
+/// four names are the stored names of the managed continuation's
+/// `Fidelity` (`fabric_core::managed::package` on the M5 branch, ADR 0024)
+/// and of the Portable Session Format (ADR 0029); this crate declares what
+/// an adapter can reach (`Harness::fidelity`) and what a restore reached
+/// (`Restored::fidelity`) in the same words, so nobody keeps two
+/// vocabularies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Fidelity {
+    /// The adapter restores the captured session and the harness continues
+    /// it under the same session id.
+    NativeSession,
+    /// The harness continues the captured conversation in a new session of
+    /// its own: the state was imported, or replayed, and the id changed.
+    /// `Restored::session` names the new one.
+    NewNativeSessionWithPackage,
+    /// Only the workspace is restored; the harness starts a new session
+    /// with no transcript, because its store cannot be carried.
+    WorkspaceOnly,
+    /// The harness cannot be carried at all; the adapter refuses with a
+    /// reason. Never a declared ceiling of an adapter that exists.
+    Unsupported,
+}
+
+impl Fidelity {
+    /// The stored name: `native_session`, `new_native_session_with_package`,
+    /// `workspace_only` or `unsupported`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Fidelity::NativeSession => "native_session",
+            Fidelity::NewNativeSessionWithPackage => "new_native_session_with_package",
+            Fidelity::WorkspaceOnly => "workspace_only",
+            Fidelity::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl std::fmt::Display for Fidelity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// What a restore placed on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restored {
@@ -547,6 +650,16 @@ pub struct Restored {
     pub manifest: StateManifest,
     /// Every file that was placed or found already equal, in order.
     pub placed: Vec<PathBuf>,
+    /// The session the harness continues on this node: the manifest's,
+    /// unless the harness minted a new id when the adapter handed it the
+    /// state (OpenCode's `import`), in which case the node records this
+    /// one and the next capture takes it.
+    pub session: SessionId,
+    /// What this restore reached: `NativeSession` when `session` is the
+    /// manifest's and the harness reads the placed files as its own;
+    /// `NewNativeSessionWithPackage` when the id changed. Never above the
+    /// adapter's `Harness::fidelity`.
+    pub fidelity: Fidelity,
 }
 
 /// An agent that can be captured, restored and started (ADR 0006).
@@ -559,6 +672,13 @@ pub struct Restored {
 pub trait Harness: Send + Sync {
     /// Which harness this is.
     fn kind(&self) -> HarnessKind;
+
+    /// The highest fidelity this adapter reaches for a session it captures
+    /// and restores, declared once per adapter and true before any
+    /// refusal: the node, the README table and a client can say it without
+    /// running anything. A restore reports what it actually reached in
+    /// `Restored::fidelity`, which is never above this.
+    fn fidelity(&self) -> Fidelity;
 
     /// Finds the binary and its version; `None` when it is not installed.
     fn detect(&self) -> BoxFuture<'_, Result<Option<Installed>, HarnessError>>;
@@ -628,7 +748,12 @@ mod tests {
     /// A recorded value is printed to the user's terminal, and it comes
     /// from a file that travelled, so an escape sequence in it must not
     /// reach the terminal and a long one is cut.
-    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "claude",
+        feature = "codex",
+        feature = "opencode",
+        feature = "pi"
+    ))]
     #[test]
     fn a_value_left_out_is_shown_without_control_characters_and_cut() {
         let left = NotCarried::new(SettingName::Model, "a\u{1b}[2Jb\nc", "why");
