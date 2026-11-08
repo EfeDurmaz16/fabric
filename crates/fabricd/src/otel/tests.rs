@@ -131,6 +131,10 @@ fn an_endpoint_is_plain_http_and_gets_the_traces_path() {
             "http://collector/otlp",
             "http://collector:80/otlp/v1/traces",
         ),
+        (
+            "http://h:1/a-b_c.d~e/%2F/x:y@z!$&'()*+,;=",
+            "http://h:1/a-b_c.d~e/%2F/x:y@z!$&'()*+,;=/v1/traces",
+        ),
         ("http://[::1]:4318", "http://[::1]:4318/v1/traces"),
     ] {
         assert_eq!(text.parse::<OtlpEndpoint>().unwrap().to_string(), shown);
@@ -145,6 +149,11 @@ fn an_endpoint_is_plain_http_and_gets_the_traces_path() {
         "http://",
         "http://a b",
         "http://u@h:1",
+        "http://127.0.0.1:4318/otel collector",
+        "http://127.0.0.1:4318/otlp\n",
+        "http://127.0.0.1:4318/a\r\nX-Injected: 1",
+        "http://h/%zz",
+        "http://h/caf\u{e9}",
     ] {
         assert_eq!(
             text.parse::<OtlpEndpoint>(),

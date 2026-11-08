@@ -53,6 +53,30 @@ pub enum OtlpEndpointError {
     Port,
 }
 
+/// Whether `base` is a URL path (RFC 3986 `pchar`s and `/`, each `%`
+/// followed by two hex digits): it goes into the request line verbatim, so
+/// a space, a control byte or a non-ASCII byte is refused here, not left
+/// to fail every post.
+fn is_path(base: &str) -> bool {
+    let bytes = base.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%' {
+            let hex = |at: usize| bytes.get(at).is_some_and(u8::is_ascii_hexdigit);
+            if !(hex(i + 1) && hex(i + 2)) {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if !(b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&b)) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 impl FromStr for OtlpEndpoint {
     type Err = OtlpEndpointError;
 
@@ -64,7 +88,7 @@ impl FromStr for OtlpEndpoint {
             .strip_prefix("http://")
             .ok_or(OtlpEndpointError::NotHttp)?;
         let (authority, base) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
-        if base.contains(['?', '#']) {
+        if !is_path(base) {
             return Err(OtlpEndpointError::NotHttp);
         }
         let port = |text: &str| {
