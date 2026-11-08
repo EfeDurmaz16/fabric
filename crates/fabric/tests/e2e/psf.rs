@@ -2,12 +2,39 @@
 //! --psf` on a real node (ADR 0029): the container names the revision and
 //! carries no workspace byte, so a secret planted in the workspace never
 //! enters it, and the node it came from reads it back as its own job.
+//! Each keeps the CLI contract's streams (docs/cli-contract.md): the
+//! export prints the document digest alone, a read prints its data, the
+//! sentences and hints go to standard error, and `--json` is one document.
 
 use std::fs;
 use std::path::Path;
 
+use serde_json::Value;
+
 use crate::GIVE_UP;
-use crate::world::{Fallible, Wire, finish, text};
+use crate::world::{Fallible, Node, Wire, finish, text};
+
+/// `fabric args...` on `node`, which must succeed: its standard output and standard error.
+fn streams(node: &Node, args: &[&str]) -> Fallible<(String, String)> {
+    let output = node.run(args)?;
+    if !output.status.success() {
+        return Err(format!("`fabric {}` failed:\n{}", args.join(" "), text(&output)).into());
+    }
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+    ))
+}
+
+/// `fabric args... --json` on `node`: standard error empty, one document on one line.
+fn document(node: &Node, args: &[&str]) -> Fallible<Value> {
+    let mut args = args.to_vec();
+    args.push("--json");
+    let (out, err) = streams(node, &args)?;
+    assert_eq!(err, "", "`fabric {}`", args.join(" "));
+    assert_eq!(out.lines().count(), 1, "`fabric {}`: {out}", args.join(" "));
+    Ok(serde_json::from_str(&out)?)
+}
 
 /// Every file under `dir`, with its bytes.
 fn files(dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Fallible {
@@ -35,7 +62,12 @@ fn e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back() -> Falli
 
     let dir = p.env.root.join("job.psf");
     let dir_text = dir.to_str().ok_or("the test directory is not UTF-8")?;
-    let written = p.a.ok(&["job", "export", &job, "--psf", dir_text])?;
+    let (digest, written) = streams(&p.a, &["job", "export", &job, "--psf", dir_text])?;
+    let digest = digest
+        .strip_suffix('\n')
+        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| format!("not a bare digest on stdout: {digest:?}"))?
+        .to_owned();
     assert!(written.contains("as a portable session"), "{written}");
     assert!(written.contains("left behind on this node"), "{written}");
     assert!(written.contains(".env"), "{written}");
@@ -56,30 +88,55 @@ fn e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back() -> Falli
         "{manifest}"
     );
 
-    let inspected = p.a.ok(&["psf", "inspect", dir_text])?;
+    let (inspected, err) = streams(&p.a, &["psf", "inspect", dir_text])?;
+    assert_eq!(err, "");
     assert!(
-        inspected.contains("digest ") && inspected.contains("offered "),
+        inspected.contains(&format!("digest {digest}\n")) && inspected.contains("offered "),
         "{inspected}"
     );
+    let doc = document(&p.a, &["psf", "inspect", dir_text])?;
+    assert_eq!(doc["container"]["digest"], digest.as_str(), "{doc}");
+    assert!(doc["container"]["offered"].is_string(), "{doc}");
 
-    let imported = p.a.ok(&["job", "import", "--psf", dir_text])?;
+    let (imported, hint) = streams(&p.a, &["job", "import", "--psf", dir_text])?;
     assert!(
         imported.contains(&format!("matches job {job}")),
         "{imported}"
     );
     assert!(
-        imported.contains(&format!("fabric job resume {job}")),
-        "{imported}"
+        hint.contains(&format!("fabric job resume {job}")),
+        "the hint is on standard error: {hint}"
     );
+    let doc = document(&p.a, &["job", "import", "--psf", dir_text])?;
+    assert_eq!(doc["container"]["job"], job.as_str(), "{doc}");
+    assert_eq!(doc["container"]["digest"], digest.as_str(), "{doc}");
+    assert!(doc["container"]["achieved"].is_string(), "{doc}");
+    assert!(
+        doc.get("outcome").is_none(),
+        "an import changes nothing: {doc}"
+    );
+
+    let json_dir = p.env.root.join("json.psf");
+    let json_text = json_dir.to_str().ok_or("the test directory is not UTF-8")?;
+    let doc = document(&p.a, &["job", "export", &job, "--psf", json_text])?;
+    assert_eq!(doc["outcome"], "exported", "{doc}");
+    assert_eq!(doc["container"]["job"], job.as_str(), "{doc}");
+    // Another export is another document: written at another time, another digest.
+    assert!(doc["container"]["digest"].is_string(), "{doc}");
 
     fs::write(dir.join("stray.txt"), "not named by the manifest")?;
     let refused = p.a.run(&["job", "import", "--psf", dir_text])?;
     assert!(!refused.status.success(), "{}", text(&refused));
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
     assert!(
         text(&refused).contains("blob_unlisted stray.txt"),
         "{}",
         text(&refused)
     );
+    let refused = p.a.run(&["job", "import", "--psf", dir_text, "--json"])?;
+    assert!(refused.stdout.is_empty(), "{}", text(&refused));
+    let doc: Value = serde_json::from_slice(&refused.stderr)?;
+    assert_eq!(doc["reason"], "invalid_container", "{doc}");
 
     let again = p.a.run(&["job", "export", &job, "--psf", dir_text])?;
     assert!(
