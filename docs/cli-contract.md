@@ -47,6 +47,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
 
   The CLI's own reasons: `unknown_option`, `unknown_command`, `missing_argument`, `invalid_arguments` (usage, exit 2), `no_daemon` (exit 80), `untrusted_state`, `incompatible_node`, `unknown_outcome`, `unreadable_record`, `confirmation_required`, `workspace_busy`, `node_error`, and `failed` for any other error (exit 1).
 - `job run` and `job resume` refuse `--json` as a usage error (exit 2), because the harness owns standard output. This is a recorded exception to "every command that reads or changes a resource supports it".
+- `managed create` and `managed cancel` without `--operation-key` run under a key the CLI makes. In words it is on standard error before the request; under `--json` it is the answer's `operation.operation_key`, and every failure carries it as `data.operation_key`. When the answer was lost (`unknown_outcome`) the failure's `next` is the same command with `--operation-key <key>`, which the node answers with its first answer and never runs twice; the same command without it would make a second job.
 - `--version --json` prints `{"version":"0.1.0"}`.
 - Keys are the client API's `snake_case`, not the guide's `camelCase`, because the guide's first JSON rule is to mirror the API and never to rewrite its keys; the SDK and the CLI then read the same names. The error document's own fields (`userActionRequired`) follow the guide.
 

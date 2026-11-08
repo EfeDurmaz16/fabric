@@ -962,8 +962,18 @@ impl Run {
         argv
     }
 
+    /// The same command again with `option` set to `value`.
+    fn again_with_value(&self, option: &str, value: &str) -> Vec<String> {
+        let mut argv = self.again_with(option);
+        argv.push(value.to_owned());
+        argv
+    }
+
     /// The failure an error that ended the command is.
     pub(crate) fn failure(&self, error: &anyhow::Error) -> Failure {
+        if let Some(keyed) = error.downcast_ref::<Keyed>() {
+            return self.keyed(keyed);
+        }
         if let Some(failure) = error.downcast_ref::<Usage>() {
             return Failure {
                 reason: "invalid_arguments".to_owned(),
@@ -1016,6 +1026,36 @@ impl Run {
             }
         }
         path.join(" ")
+    }
+
+    /// A failure under an operation key the CLI made: every such failure
+    /// carries the key, and one whose outcome is unknown offers the same
+    /// command under it, which the node answers without running it twice.
+    fn keyed(&self, keyed: &Keyed) -> Failure {
+        let mut failure = self.failure(&keyed.error);
+        let key = Value::from(keyed.key.as_str());
+        failure.data = Some(match failure.data.take() {
+            Some(Value::Object(mut data)) => {
+                data.insert("operation_key".to_owned(), key);
+                Value::Object(data)
+            }
+            None => json!({ "operation_key": key }),
+            Some(other) => json!({ "operation_key": key, "detail": other }),
+        });
+        failure
+            .rows
+            .push(("Operation key".to_owned(), keyed.key.clone()));
+        if failure.reason == "unknown_outcome" {
+            failure.next = Some(Next {
+                label: "Run it again under the same key".to_owned(),
+                argv: self.again_with_value("--operation-key", &keyed.key),
+                when: Some(
+                    "Safe to repeat: the node answers a key it has seen with its first answer"
+                        .to_owned(),
+                ),
+            });
+        }
+        failure
     }
 
     fn refused(&self, refused: &Refused) -> Failure {
@@ -1136,6 +1176,22 @@ fn client_failure(error: &ClientError) -> Failure {
     }
 }
 
+/// An error of a command that ran under an operation key the CLI made, so
+/// its failure names the key a retry must reuse (`Run::keyed`).
+#[derive(Debug)]
+pub(crate) struct Keyed {
+    pub(crate) key: String,
+    pub(crate) error: anyhow::Error,
+}
+
+impl std::fmt::Display for Keyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for Keyed {}
+
 /// A usage error a command finds after parsing, such as `--json` where the
 /// harness owns standard output; exits 2.
 #[derive(Debug)]
@@ -1199,6 +1255,52 @@ mod tests {
             vec!["fabric job resume x --on <node>"]
         );
         assert!(named_commands("no command here").is_empty());
+    }
+
+    /// A lost answer to a command under a key the CLI made names the key
+    /// and offers the same command under it, so the retry cannot make a
+    /// second job; any other failure under such a key carries it too.
+    #[test]
+    fn a_failure_under_a_made_key_names_the_key_and_the_safe_retry() {
+        let run = Run {
+            modes: Modes::resolve(Globals::default(), &env_of(&[])),
+            argv: [
+                "fabric",
+                "managed",
+                "create",
+                "--repo",
+                "r",
+                "--goal",
+                "make it louder",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            takes: Vec::new(),
+        };
+        let lost = anyhow::Error::from(Keyed {
+            key: "01JABCDEFGHJKMNPQRSTVWXYZ0".to_owned(),
+            error: ClientError::ClosedBeforeAnswer {
+                op: fabric_client::api::Op::ManagedCreate,
+            }
+            .into(),
+        });
+        let doc = run.failure(&lost).document();
+        assert_eq!(doc["reason"], "unknown_outcome");
+        assert_eq!(doc["retryable"], false);
+        assert_eq!(doc["data"]["operation_key"], "01JABCDEFGHJKMNPQRSTVWXYZ0");
+        assert_eq!(
+            doc["next"][0]["command"],
+            "fabric managed create --repo r --goal 'make it louder' --operation-key 01JABCDEFGHJKMNPQRSTVWXYZ0"
+        );
+
+        let refused = anyhow::Error::from(Keyed {
+            key: "k1".to_owned(),
+            error: Usage("bad".to_owned()).into(),
+        });
+        let doc = run.failure(&refused).document();
+        assert_eq!(doc["reason"], "invalid_arguments");
+        assert_eq!(doc["data"]["operation_key"], "k1");
+        assert_eq!(doc["next"][0]["command"], "fabric managed create --help");
     }
 
     #[test]

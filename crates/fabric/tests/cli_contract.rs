@@ -333,6 +333,10 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
         let name = joined(&path);
         let mut args = runnable(&path, &sandbox);
         let harness = runs_a_harness(&path);
+        // A key the CLI makes for a changing command is in its failure, for a retry.
+        let mints_a_key = find(&path)
+            .get_arguments()
+            .any(|arg| arg.get_id() == "operation_key");
 
         // A relative state directory fails every command before it does anything.
         args.push("--json".to_owned());
@@ -363,6 +367,11 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
             assert_eq!(doc["reason"], "no_daemon", "{name}: {doc}");
             assert_eq!(doc["next"][0]["command"], "fabric serve", "{name}: {doc}");
         }
+        assert_eq!(
+            doc["data"]["operation_key"].is_string(),
+            mints_a_key,
+            "{name}: {doc}"
+        );
 
         args.pop();
         let output = sandbox.run(&args);
