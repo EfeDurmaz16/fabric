@@ -1,0 +1,51 @@
+# Release configuration for cargo-dist (https://axodotdev.github.io/cargo-dist/).
+# `dist generate` writes .github/workflows/release.yml from this file; edit
+# here and regenerate, never edit the workflow by hand. docs/release.md says
+# how a release is cut and what it attests.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.34.0"
+ci = "github"
+# No crate ships unless it says so: only crates/fabric opts in, with its one
+# `fabric` binary (crates/fabric/Cargo.toml). The test doubles stay out.
+dist = false
+# The three platforms a node runs on. Linux is gnu, not musl: musl's
+# allocator is measurably slower for a daemon that hashes and copies
+# snapshots, and the time budget is measured on gnu. The build runs on
+# ubuntu-22.04, so the binary needs glibc 2.35 or newer.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+unix-archive = ".tar.gz"
+checksum = "sha256"
+# The product name lives here and in dist/homebrew-tap (the formula name and
+# the tap). A rename changes these two places and the crate name.
+installers = ["homebrew"]
+tap = "EfeDurmaz16/homebrew-tap"
+formula = "fabric"
+# No publish job pushes to the tap: that needs a token with write access to
+# another repository, and this workflow uses GITHUB_TOKEN only. The tap pulls
+# the formula from the release instead (dist/homebrew-tap).
+publish-jobs = []
+# A CycloneDX SBOM per release, made by cargo-cyclonedx from Cargo.lock.
+cargo-cyclonedx = true
+# SLSA build provenance for every built artifact, signed by GitHub through
+# Sigstore; `gh attestation verify` checks it. Nothing is code signed.
+github-attestations = true
+# Every pull request builds all three targets and runs the release smoke on
+# clean runners, so the release path cannot break unnoticed before a tag.
+pr-run-mode = "upload"
+# The built archives are downloaded and run on clean runners before anything
+# is hosted: .github/workflows/release-smoke.yml.
+global-artifacts-jobs = ["./release-smoke"]
+
+# Every action pinned to a commit, as in ci.yml. checkout and rust-cache use
+# the pins ci.yml uses; the others are the newest release of the major
+# version dist 0.34.0 names.
+[dist.github-action-commits]
+"actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+"swatinem/rust-cache" = "6323deb102c322ba6fcbdcafc7e3dddab59af2b6" # v2.9.2
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7.0.2
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8.0.2
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2

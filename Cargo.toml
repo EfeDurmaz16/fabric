@@ -22,6 +22,11 @@ homepage = "https://github.com/EfeDurmaz16/fabric"
 lto = "fat"
 codegen-units = 1
 
+# The profile cargo-dist builds release archives with: the release profile
+# above, unchanged.
+[profile.dist]
+inherits = "release"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"

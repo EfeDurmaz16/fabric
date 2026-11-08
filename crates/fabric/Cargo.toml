@@ -9,6 +9,16 @@ publish.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+# The one crate cargo-dist ships (dist-workspace.toml), with the one binary
+# users install; the fixtures stay out of the archive.
+[package.metadata.dist]
+dist = true
+
+[package.metadata.dist.binaries]
+aarch64-apple-darwin = ["fabric"]
+x86_64-apple-darwin = ["fabric"]
+x86_64-unknown-linux-gnu = ["fabric"]
+
 [features]
 # Named fault points in the node, for the end-to-end test only.
 faults = ["fabricd/faults"]
