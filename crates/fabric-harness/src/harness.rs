@@ -145,6 +145,9 @@ pub enum SettingName {
     Approval,
     /// Who answers what the harness asks: the user, or a reviewer model.
     Reviewer,
+    /// The conversation itself, which a harness whose store cannot travel
+    /// (Cursor) leaves on the node that wrote it.
+    Chat,
 }
 
 impl std::fmt::Display for SettingName {
@@ -158,6 +161,7 @@ impl std::fmt::Display for SettingName {
             SettingName::NetworkAccess => "network access",
             SettingName::Approval => "approval",
             SettingName::Reviewer => "approvals reviewer",
+            SettingName::Chat => "chat",
         })
     }
 }
@@ -183,7 +187,12 @@ pub struct PassedSetting {
 }
 
 /// The most characters of a recorded value a report shows.
-#[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "cursor",
+    feature = "gemini"
+))]
 const SHOWN_VALUE_LEN: usize = 64;
 
 /// A setting the session records, or the adapter was configured with
@@ -205,7 +214,12 @@ pub struct NotCarried {
 /// after a cut, and every control character replaced by `?`. Text that
 /// comes from a file that travelled goes through this before an error or
 /// a note prints it.
-#[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
+#[cfg(any(
+    feature = "claude",
+    feature = "codex",
+    feature = "cursor",
+    feature = "gemini"
+))]
 pub(crate) fn shown(text: &str) -> String {
     let mut shown: String = text
         .chars()
@@ -220,7 +234,12 @@ pub(crate) fn shown(text: &str) -> String {
 
 impl NotCarried {
     /// A setting left out, with its recorded value made safe to print.
-    #[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
+    #[cfg(any(
+        feature = "claude",
+        feature = "codex",
+        feature = "cursor",
+        feature = "gemini"
+    ))]
     pub(crate) fn new(name: SettingName, value: &str, reason: impl Into<String>) -> Self {
         NotCarried {
             name,
@@ -356,6 +375,7 @@ impl Running {
         feature = "acp",
         feature = "claude",
         feature = "codex",
+        feature = "cursor",
         feature = "gemini"
     ))]
     pub(crate) fn new(session: Option<SessionId>, spawned: crate::process::Spawned) -> Self {
@@ -418,7 +438,12 @@ impl Running {
     }
 
     /// Records what the launch passed and left out.
-    #[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
+    #[cfg(any(
+        feature = "claude",
+        feature = "codex",
+        feature = "cursor",
+        feature = "gemini"
+    ))]
     pub(crate) fn with_settings(mut self, settings: LaunchSettings) -> Self {
         self.settings = settings;
         self
@@ -526,7 +551,12 @@ impl TurnReport {
     /// Takes `text` as the session the turn ran in. Returns true when it
     /// names a valid session other than the one already held; an id that
     /// does not parse is logged and left out.
-    #[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
+    #[cfg(any(
+        feature = "claude",
+        feature = "codex",
+        feature = "cursor",
+        feature = "gemini"
+    ))]
     pub(crate) fn note_session(&mut self, text: Option<&str>) -> bool {
         let Some(text) = text else {
             return false;

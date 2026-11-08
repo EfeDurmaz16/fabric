@@ -261,6 +261,7 @@ impl StateManifest {
         feature = "acp",
         feature = "claude",
         feature = "codex",
+        feature = "cursor",
         feature = "gemini"
     ))]
     pub(crate) fn new(
@@ -376,6 +377,7 @@ impl StateManifest {
         feature = "acp",
         feature = "claude",
         feature = "codex",
+        feature = "cursor",
         feature = "gemini"
     ))]
     pub(crate) fn digest(&self) -> Result<Digest, HarnessError> {

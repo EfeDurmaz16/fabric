@@ -269,7 +269,10 @@ async fn an_unknown_or_ambiguous_id_is_refused() {
 #[tokio::test]
 async fn a_running_gemini_refuses_the_capture() {
     let f = build();
-    let mut linger = std::process::Command::new(Path::new(&f.bin).join("gemini"))
+    // Through `sh`, so the process is named `sh` and only its command line
+    // names this test's `gemini`: no other test's capture sees it.
+    let mut linger = std::process::Command::new("/bin/sh")
+        .arg(Path::new(&f.bin).join("gemini"))
         .arg("linger")
         .spawn()
         .unwrap();
