@@ -9,6 +9,8 @@
 //! only as its adapter captured it, redacted, the way `job suspend`
 //! captures it; with no session to capture the snapshot holds the
 //! workspace alone, and no native-session continuation is offered from it.
+//! The cut that follows a harness checkpoint holds the same harness state,
+//! so a continuation restores the session from the cut alone.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,6 +72,9 @@ pub(crate) struct NodeCapturer {
     suspend: Mutex<Arc<dyn Suspend>>,
     facts: Mutex<Arc<dyn Facts>>,
     attempts: Mutex<BTreeMap<AttemptId, Attempt>>,
+    /// The harness state each attempt's last harness checkpoint captured,
+    /// held for the cut of the same quiescence.
+    states_for_cut: Mutex<BTreeMap<AttemptId, PathBuf>>,
     /// The facts the last capture measured, which the cut then records.
     measured: Mutex<Vec<(String, String)>>,
 }
@@ -96,6 +101,7 @@ impl NodeCapturer {
             suspend: Mutex::new(suspend),
             facts: Mutex::new(facts),
             attempts: Mutex::new(BTreeMap::new()),
+            states_for_cut: Mutex::new(BTreeMap::new()),
             measured: Mutex::new(Vec::new()),
         }
     }
@@ -109,14 +115,11 @@ impl NodeCapturer {
     /// Names the attempt's root and policy, before anything runs in it;
     /// `None` forgets it once it ended.
     pub(crate) fn set(&self, attempt: AttemptId, what: Option<Attempt>) {
-        let mut attempts = lock(&self.attempts);
-        match what {
-            Some(what) => {
-                attempts.insert(attempt, what);
-            }
-            None => {
-                attempts.remove(&attempt);
-            }
+        if let Some(what) = what {
+            lock(&self.attempts).insert(attempt, what);
+        } else {
+            lock(&self.attempts).remove(&attempt);
+            lock(&self.states_for_cut).remove(&attempt);
         }
     }
 
@@ -190,14 +193,19 @@ impl Capturer for NodeCapturer {
             std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
             let suspend = Arc::clone(&lock(&self.suspend));
             suspend.suspend(&what, &session, &out).await?;
-            self.snapshot(&what, Some(out)).await
+            let snapshot = self.snapshot(&what, Some(out.clone())).await?;
+            lock(&self.states_for_cut).insert(attempt, out);
+            Ok(snapshot)
         })
     }
 
     fn capture(&self, attempt: AttemptId) -> BoxFuture<'_, Result<SnapshotId, String>> {
         Box::pin(async move {
             let what = self.attempt(attempt)?;
-            self.snapshot(&what, None).await
+            // The cut carries the harness state the quiescence before it
+            // captured, once: a later cut without a checkpoint carries none.
+            let state = lock(&self.states_for_cut).remove(&attempt);
+            self.snapshot(&what, state).await
         })
     }
 
@@ -365,6 +373,38 @@ mod tests {
         assert!(
             held.contains(&".env".to_owned()),
             "the job allowed it: {held:?}"
+        );
+    }
+
+    /// The cut of a quiescence that checkpointed the harness holds the
+    /// state that checkpoint captured, so a target with the same layout
+    /// can restore the session from the cut alone; the next cut, with no
+    /// checkpoint before it, holds none of that stale state.
+    #[tokio::test]
+    async fn a_cut_after_a_harness_checkpoint_holds_its_state() {
+        let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let b = bench(Vec::new(), Some(session));
+        let attempt = AttemptId::from_bytes([7; 16]);
+        b.capturer
+            .checkpoint_harness(attempt, TaskId::from_bytes([9; 16]))
+            .await
+            .unwrap();
+        let cut = b.capturer.capture(attempt).await.unwrap();
+        let manifest = b.store.manifest(cut).unwrap();
+        assert!(
+            !manifest.harness_state.entries.is_empty(),
+            "the cut holds the harness state"
+        );
+        assert!(paths(&b.store, cut).contains(&"src/main.rs".to_owned()));
+        let next = b.capturer.capture(attempt).await.unwrap();
+        assert!(
+            b.store
+                .manifest(next)
+                .unwrap()
+                .harness_state
+                .entries
+                .is_empty(),
+            "a state is carried by the one cut it was taken for"
         );
     }
 }
