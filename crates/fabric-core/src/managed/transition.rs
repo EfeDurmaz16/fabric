@@ -780,6 +780,27 @@ pub fn apply_observation(
                 cut: cut.digest(),
                 receipts: cut.receipts.clone(),
             };
+            // The cut is the job's captured checkpoint (ADR 0028): the
+            // snapshot under the cut's own digest, the one the verifier
+            // acknowledges once the authority holds the snapshot's bytes.
+            // Recorded once per snapshot; a cut of a snapshot already
+            // captured by another attempt or under another digest is the
+            // `Captured` rule's refusal.
+            let capture = match job.checkpoint(*snapshot) {
+                Some(known) if known.attempt == *attempt && known.cut == cut.digest() => None,
+                Some(_) => {
+                    return Err(DomainError::UnknownCheckpoint {
+                        attempt: *attempt,
+                        snapshot: *snapshot,
+                    });
+                }
+                None => Some(ManagedEvent::CheckpointCaptured {
+                    attempt: *attempt,
+                    generation: *generation,
+                    snapshot: *snapshot,
+                    cut: cut.digest(),
+                }),
+            };
             if let Some(command) = checkpoint_of(job, *attempt) {
                 // This attempt's checkpoint command: the cut is recorded,
                 // the attempt goes on.
@@ -787,13 +808,13 @@ pub fn apply_observation(
                     return Err(DomainError::AttemptEnded { attempt: *attempt });
                 }
                 cut_covers(job, found, cut)?;
-                return transition(vec![
-                    recorded,
-                    ManagedEvent::OperationMarked {
-                        operation: command.id,
-                        status: OperationMark::Succeeded,
-                    },
-                ]);
+                let mut events = vec![recorded];
+                events.extend(capture);
+                events.push(ManagedEvent::OperationMarked {
+                    operation: command.id,
+                    status: OperationMark::Succeeded,
+                });
+                return transition(events);
             }
             let ended = AttemptStatus::Checkpointed {
                 snapshot: *snapshot,
@@ -805,14 +826,14 @@ pub fn apply_observation(
                 return Err(DomainError::AttemptEnded { attempt: *attempt });
             }
             cut_covers(job, found, cut)?;
-            let mut events = vec![
-                ManagedEvent::AttemptObserved {
-                    attempt: *attempt,
-                    generation: *generation,
-                    status: ended,
-                },
-                recorded,
-            ];
+            // Captured while the attempt may still capture, then ended at the cut.
+            let mut events: Vec<ManagedEvent> = capture.into_iter().collect();
+            events.push(ManagedEvent::AttemptObserved {
+                attempt: *attempt,
+                generation: *generation,
+                status: ended,
+            });
+            events.push(recorded);
             events.extend(grant_succeeded(job, found));
             return transition(events);
         }

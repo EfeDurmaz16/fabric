@@ -106,6 +106,8 @@ pub struct Node {
     pub(crate) authority: crate::authority::Authority,
     /// The attempts this node runs for an authority (the launch path).
     pub(crate) runner: Arc<crate::runner::Runner>,
+    /// The verifier of the captures this node's authority records (ADR 0028).
+    pub(crate) verifier: crate::recovery::Verifier,
     _lock: File,
 }
 
@@ -200,8 +202,10 @@ impl Node {
             client_env: Mutex::new(client_env),
             authority,
             runner,
+            verifier: crate::recovery::Verifier::default(),
             _lock: lock_file,
         });
+        node.verifier.bind(Arc::downgrade(&node));
         capturer.bind(
             Arc::new(crate::runner::AdapterSuspend::new(Arc::downgrade(&node))),
             Arc::new(crate::runner::NodeFactsNow::new(Arc::downgrade(&node))),

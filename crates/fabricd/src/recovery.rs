@@ -2,27 +2,31 @@
 //! does between a runner's `Captured` report and the `CheckpointAcknowledged`
 //! it commits.
 //!
-//! Invariant: an acknowledgement is made from bytes this node fetched
-//! through the store transfer and verified by content (`fetch_snapshot`
-//! keeps a chunk only when it hashes to its id and publishes a manifest
-//! only after every object it names is on disk, ADR 0014), never from the
-//! runner's word. The cut the runner reported must equal the cut this node
-//! computes over the published head manifest; anything else is refused and
-//! the checkpoint stays captured, a restart point for nothing. The fetch
-//! runs on a tokio task, never on the authority's writer thread; only the
-//! commit goes through `Authority::acknowledge`.
-//!
-//! Until the M5 checkpoint cut (ADR 0024) lands at the restack, the cut
-//! of a snapshot is the blake3 digest of its head manifest's canonical
-//! bytes, computed the same way by the runner and the authority.
+//! Invariant: an acknowledgement is made from bytes this node holds,
+//! fetched through the store transfer and verified by content
+//! (`fetch_snapshot` keeps a chunk only when it hashes to its id and
+//! publishes a manifest only after every object it names is on disk, ADR
+//! 0014), never from the runner's word; the head manifest read back must
+//! hash to the snapshot's id. The job's checkpoint is the snapshot under
+//! the M5 cut's digest (`CheckpointCut::digest`, ADR 0024), recorded with
+//! the fenced `Checkpointed` report as `CheckpointCaptured`: the cut binds
+//! the snapshot id with the receipts, facts and evidence, and the
+//! snapshot id binds the bytes, so the acknowledgement names that digest
+//! and the domain refuses any other (`acknowledge`). A capture that does
+//! not verify stays captured, a restart point for nothing. The fetch runs
+//! on a tokio task, never on the authority's writer thread; only the
+//! commit goes through `Authority::acknowledge`. The decision of which
+//! digest is the job's checkpoint was selected by the implementation
+//! agent under Efe's delegation of 2026-11-02.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use fabric_core::id::{NodeId, SnapshotId};
-use fabric_core::managed::{Attempt, CheckpointAck, CutDigest, ResourceRef};
+use fabric_core::id::{JobId, NodeId, SnapshotId};
+use fabric_core::managed::{Attempt, AttemptId, CheckpointAck, CutDigest, ResourceRef};
 use fabric_store::store::Store;
 
-use crate::node::Node;
+use crate::node::{Node, lock};
 use crate::transfer::{fetch_snapshot, with_store};
 
 /// What the fetch brought: the counts for the acknowledgement and the
@@ -58,49 +62,40 @@ pub(crate) enum VerifyError {
         /// What the fetch refused.
         reason: String,
     },
-    /// The cut the runner reported is not the cut of the bytes fetched.
-    #[error("the runner reported cut {reported}, the fetched bytes give {verified}")]
-    CutMismatch {
-        /// What the runner reported.
-        reported: CutDigest,
-        /// What this node computed.
-        verified: CutDigest,
+    /// The head manifest read back does not hash to the snapshot's id.
+    #[error("the head manifest of {snapshot} hashes to {got}")]
+    WrongHead {
+        /// The snapshot.
+        snapshot: SnapshotId,
+        /// What the bytes hash to.
+        got: SnapshotId,
     },
     /// The store failed.
     #[error("store: {0}")]
-    #[allow(
-        dead_code,
-        reason = "made by the fetch path, driven by the M5 executor at the restack"
-    )]
     Store(String),
 }
 
-/// The cut of a snapshot: the digest of its head manifest's canonical bytes.
-#[must_use]
-pub(crate) fn cut_of(head_manifest: &[u8]) -> CutDigest {
-    CutDigest::from_bytes(*blake3::hash(head_manifest).as_bytes())
-}
-
 /// The pure decision: the acknowledgement to commit for `snapshot` of
-/// `attempt`, given what the fetch brought, or why none is made. A fetch
-/// that failed acknowledges nothing, whatever the runner reported.
+/// `attempt` under the captured cut `cut`, given what the fetch brought,
+/// or why none is made. A fetch that failed acknowledges nothing, and
+/// neither does a head manifest that is not the snapshot's.
 pub(crate) fn acknowledgement(
     attempt: &Attempt,
     snapshot: SnapshotId,
-    reported: CutDigest,
+    cut: CutDigest,
     fetched: Result<Fetched, VerifyError>,
 ) -> Result<CheckpointAck, VerifyError> {
     let fetched = fetched?;
-    let verified = cut_of(&fetched.head);
-    if verified != reported {
-        return Err(VerifyError::CutMismatch { reported, verified });
+    let got = SnapshotId::of(&fetched.head);
+    if got != snapshot {
+        return Err(VerifyError::WrongHead { snapshot, got });
     }
     let ResourceRef::Node { node } = attempt.resource;
     Ok(CheckpointAck {
         attempt: attempt.id,
         generation: attempt.generation,
         snapshot,
-        cut: verified,
+        cut,
         manifests: fetched.manifests,
         chunks: fetched.chunks,
         bytes: fetched.bytes,
@@ -109,10 +104,6 @@ pub(crate) fn acknowledgement(
 }
 
 /// Walks the published chain of `snapshot` in `store` and counts it.
-#[allow(
-    dead_code,
-    reason = "driven by the M5 executor's Captured reports at the restack"
-)]
 fn count_chain(store: &mut Store, snapshot: SnapshotId) -> Result<Fetched, VerifyError> {
     let failed = |e: &dyn std::fmt::Display| VerifyError::Store(e.to_string());
     let mut fetched = Fetched {
@@ -138,22 +129,23 @@ fn count_chain(store: &mut Store, snapshot: SnapshotId) -> Result<Fetched, Verif
     Ok(fetched)
 }
 
-/// For a `Captured` the authority committed: opens a session to the
-/// attempt's node, runs `fetch_snapshot` for the chain, reads the head
-/// manifest, recomputes the cut, and returns the acknowledgement to
-/// commit, or why it cannot.
-#[allow(
-    dead_code,
-    reason = "driven by the M5 executor's Captured reports at the restack"
-)]
+/// For a capture the authority committed: opens a session to the
+/// attempt's node, runs `fetch_snapshot` for the chain (a capture on this
+/// node is in its own store already), reads the head manifest back, and
+/// returns the acknowledgement to commit, or why it cannot.
 pub(crate) async fn verify(
     node: &Arc<Node>,
     attempt: &Attempt,
     snapshot: SnapshotId,
-    reported: CutDigest,
+    cut: CutDigest,
 ) -> Result<CheckpointAck, VerifyError> {
     let ResourceRef::Node { node: runner } = attempt.resource;
     let fetched = async {
+        if runner == node.id {
+            return with_store(&node.store, move |store| Ok(count_chain(store, snapshot)))
+                .await
+                .map_err(|e| VerifyError::Store(e.to_string()))?;
+        }
         let session = node
             .session(runner)
             .await
@@ -169,7 +161,74 @@ pub(crate) async fn verify(
             .map_err(|e| VerifyError::Store(e.to_string()))?
     }
     .await;
-    acknowledgement(attempt, snapshot, reported, fetched)
+    acknowledgement(attempt, snapshot, cut, fetched)
+}
+
+/// The verifier on the authority's node: one fetch at a time per captured
+/// checkpoint, started when a report recorded a capture and again on each
+/// live heartbeat from the attempt's node while the capture is not yet
+/// acknowledged, so an unreachable runner is retried without a timer.
+#[derive(Debug, Default)]
+pub(crate) struct Verifier {
+    node: OnceLock<Weak<Node>>,
+    in_flight: Mutex<HashSet<(AttemptId, SnapshotId)>>,
+}
+
+impl Verifier {
+    /// Binds the node; a second bind changes nothing.
+    pub(crate) fn bind(&self, node: Weak<Node>) {
+        let _ = self.node.set(node);
+    }
+
+    /// Starts a verification of every capture of `job` not acknowledged
+    /// and not being verified now. Returns at once.
+    pub(crate) fn check(&self, job: JobId) {
+        let Some(node) = self.node.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        tokio::spawn(async move {
+            let state = match node.authority.job(job).await {
+                Ok(Some(state)) => state,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!(%job, error = %e, "the captures were not read");
+                    return;
+                }
+            };
+            for (attempt, _, snapshot) in state.captured_only() {
+                let (Some(found), Some(held)) =
+                    (state.attempt(attempt), state.checkpoint(snapshot))
+                else {
+                    continue;
+                };
+                if !lock(&node.verifier.in_flight).insert((attempt, snapshot)) {
+                    continue;
+                }
+                let (found, cut) = (found.clone(), held.cut);
+                let verifying = Arc::clone(&node);
+                tokio::spawn(async move {
+                    let outcome = verify(&verifying, &found, snapshot, cut).await;
+                    match outcome {
+                        Ok(ack) => match verifying.authority.acknowledge(job, ack).await {
+                            Ok(_) => {
+                                tracing::info!(%job, %attempt, %snapshot, "acknowledged a checkpoint")
+                            }
+                            Err(e) => {
+                                tracing::info!(%job, %attempt, %snapshot, error = %e, "a verified checkpoint was not acknowledged")
+                            }
+                        },
+                        Err(VerifyError::Unreachable { node }) => {
+                            tracing::info!(%job, %attempt, %node, "the capture's node did not answer; retried on its next heartbeat");
+                        }
+                        Err(e) => {
+                            tracing::warn!(%job, %attempt, %snapshot, error = %e, "a capture did not verify; it stays captured")
+                        }
+                    }
+                    lock(&verifying.verifier.in_flight).remove(&(attempt, snapshot));
+                });
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -207,15 +266,16 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_chunk_is_never_acknowledged() {
-        let snapshot = SnapshotId::of(b"manifest");
-        let reported = cut_of(b"manifest bytes");
-        // The fetch refused a chunk: nothing is acknowledged, whatever the
-        // runner reported, and the reason names the snapshot.
+    fn a_corrupt_chunk_or_a_wrong_head_is_never_acknowledged() {
+        let head = b"manifest bytes".to_vec();
+        let snapshot = SnapshotId::of(&head);
+        let cut = CutDigest::from_bytes([9; 32]);
+        // The fetch refused a chunk: nothing is acknowledged, and the
+        // reason names the snapshot.
         let refused = acknowledgement(
             &attempt(),
             snapshot,
-            reported,
+            cut,
             Err(VerifyError::Corrupt {
                 snapshot,
                 reason: "chunk did not hash to its id".into(),
@@ -227,38 +287,32 @@ mod tests {
         let unreachable = acknowledgement(
             &attempt(),
             snapshot,
-            reported,
+            cut,
             Err(VerifyError::Unreachable { node: RUNNER }),
         )
         .unwrap_err();
         assert_eq!(unreachable, VerifyError::Unreachable { node: RUNNER });
-        // Bytes that verified but give another cut: a mismatch, recorded
-        // with both digests.
-        let mismatch = acknowledgement(&attempt(), snapshot, reported, Ok(fetched(b"other bytes")))
-            .unwrap_err();
+        // Bytes that are not the snapshot's head manifest: refused with
+        // what they hash to.
+        let wrong =
+            acknowledgement(&attempt(), snapshot, cut, Ok(fetched(b"other bytes"))).unwrap_err();
         assert_eq!(
-            mismatch,
-            VerifyError::CutMismatch {
-                reported,
-                verified: cut_of(b"other bytes"),
+            wrong,
+            VerifyError::WrongHead {
+                snapshot,
+                got: SnapshotId::of(b"other bytes"),
             }
         );
-        // The same cut: the acknowledgement names what was fetched and
-        // the node it came from.
-        let ack = acknowledgement(
-            &attempt(),
-            snapshot,
-            reported,
-            Ok(fetched(b"manifest bytes")),
-        )
-        .unwrap();
+        // The snapshot's own head: the acknowledgement names the captured
+        // cut, what was fetched and the node it came from.
+        let ack = acknowledgement(&attempt(), snapshot, cut, Ok(fetched(&head))).unwrap();
         assert_eq!(
             ack,
             CheckpointAck {
                 attempt: attempt().id,
                 generation: Generation::FIRST,
                 snapshot,
-                cut: reported,
+                cut,
                 manifests: 2,
                 chunks: 5,
                 bytes: 1_024,

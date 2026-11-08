@@ -16,10 +16,10 @@
 //! verdict per grant and writes nothing else.
 
 use fabric_core::id::NodeId;
-use fabric_core::managed::DomainError;
 use fabric_core::managed::launch::{
     Heartbeat, HeartbeatAnswer, MAX_HEARTBEAT_ATTEMPTS, Report, ReportAnswer, ReportRefusal,
 };
+use fabric_core::managed::{DomainError, Observation};
 use fabric_journal::CommitError;
 
 use crate::authority::{Authority, AuthorityError};
@@ -99,18 +99,46 @@ pub(crate) async fn heartbeat(
 }
 
 impl Node {
-    /// `accept` for a report from `from` (`None` is this node).
+    /// `accept` for a report from `from` (`None` is this node). A recorded
+    /// cut or capture starts its verification (ADR 0028).
     pub(crate) async fn accept_report(&self, from: Option<NodeId>, report: Report) -> ReportAnswer {
-        accept(&self.authority, from, report).await
+        let job = report.token.job;
+        let captures = matches!(
+            report.observation,
+            Observation::Checkpointed { .. } | Observation::Captured { .. }
+        );
+        let answer = accept(&self.authority, from, report).await;
+        if captures && matches!(answer, ReportAnswer::Recorded { .. }) {
+            self.verifier.check(job);
+        }
+        answer
     }
 
-    /// `heartbeat` for a heartbeat from `from` (`None` is this node).
+    /// `heartbeat` for a heartbeat from `from` (`None` is this node). Each
+    /// live grant's job has its unacknowledged captures verified again, so
+    /// a fetch that found the runner unreachable is retried once it is back.
     pub(crate) async fn accept_heartbeat(
         &self,
         from: Option<NodeId>,
         beat: &Heartbeat,
     ) -> HeartbeatAnswer {
-        heartbeat(&self.authority, self.id, from, beat).await
+        let answer = heartbeat(&self.authority, self.id, from, beat).await;
+        let mut jobs: Vec<_> = beat
+            .attempts
+            .iter()
+            .filter(|t| {
+                answer
+                    .verdicts
+                    .iter()
+                    .any(|(a, v)| *a == t.attempt && v.allows())
+            })
+            .map(|t| t.job)
+            .collect();
+        jobs.dedup();
+        for job in jobs {
+            self.verifier.check(job);
+        }
+        answer
     }
 }
 

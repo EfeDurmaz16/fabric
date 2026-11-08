@@ -380,12 +380,13 @@ fn a_continue_cuts_places_grants_and_records_the_fidelity_achieved() {
     assert!(matches!(
         &t.events[..],
         [
+            ManagedEvent::CheckpointCaptured { cut: captured, .. },
             ManagedEvent::AttemptObserved {
                 status: AttemptStatus::Checkpointed { .. },
                 ..
             },
             ManagedEvent::CheckpointCutRecorded { cut, receipts: r, .. },
-        ] if *cut == digest && *r == receipts
+        ] if *cut == digest && *captured == digest && *r == receipts
     ));
     assert_eq!(kept.status(cont), OperationStatus::Dispatched);
     // Placed as a planned handoff: the next generation starts from the cut.
@@ -523,16 +524,22 @@ fn a_checkpoint_leaves_the_attempt_running_and_a_blocked_one_fails_the_command()
             cut: cut(snapshot, vec![harness_receipt(first.task, snapshot)]),
         })
         .unwrap();
+    // The cut is the job's captured checkpoint under the cut's own digest
+    // (ADR 0028), the one the verifier acknowledges.
     assert!(matches!(
         &t.events[..],
         [
-            ManagedEvent::CheckpointCutRecorded { .. },
+            ManagedEvent::CheckpointCutRecorded { cut: recorded, .. },
+            ManagedEvent::CheckpointCaptured { snapshot: s, cut: captured, .. },
             ManagedEvent::OperationMarked {
                 status: OperationMark::Succeeded,
                 ..
             }
-        ]
+        ] if recorded == captured && *s == snapshot
     ));
+    let held = kept.state().checkpoint(snapshot).expect("captured");
+    assert_eq!(held.attempt, first.id);
+    assert!(held.ack.is_none(), "captured is not acknowledged");
     assert_eq!(kept.state().attempts[0].status, AttemptStatus::Running);
     assert_eq!(kept.status(cp), OperationStatus::Succeeded);
     // A second checkpoint converges: the same observation shape, a new cut.

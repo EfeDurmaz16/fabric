@@ -428,8 +428,9 @@ fn events_and_evidence_are_append_only_and_tampering_is_found() {
             2_000,
         )
         .unwrap();
-    // The snapshot's evidence row and the cut's.
-    assert_eq!(count(&f.path(), "evidence"), 2);
+    // The snapshot's evidence row, the cut's, and the capture the cut is
+    // (ADR 0028).
+    assert_eq!(count(&f.path(), "evidence"), 3);
 
     let conn = Connection::open(f.path()).unwrap();
     assert!(conn.execute("UPDATE events SET at_ms = 0", []).is_err());
