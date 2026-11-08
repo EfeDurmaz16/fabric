@@ -9,7 +9,9 @@
 //! The client reaches its log through a [`Recorder`], never by calling a
 //! log from async code: [`LogThread`] runs a log that blocks, such as the
 //! journal with its `SQLite` transactions and fsyncs, on a thread of its
-//! own, and [`MemoryLog`], which only touches memory, records in place. A
+//! own, [`MemoryLog`], which only touches memory, records in place, and a
+//! [`Hand`] reaches a log another component already owns on a thread of
+//! its own, such as the node's managed authority, one call per turn. A
 //! call is queued whole when it is made, after room for it was found, so
 //! a caller that stops waiting either queued nothing or queued a call
 //! that runs to its end.
@@ -145,6 +147,8 @@ enum Place<'a, L> {
     Here(&'a mut L),
     /// A place in a log thread's queue.
     Queue(mpsc::Permit<'a, Message<L>>),
+    /// Room on the queue of a thread something else owns the log on.
+    Hand(Box<dyn Hand<L> + 'a>),
 }
 
 impl<L> std::fmt::Debug for Place<'_, L> {
@@ -152,8 +156,41 @@ impl<L> std::fmt::Debug for Place<'_, L> {
         f.write_str(match self {
             Place::Here(_) => "Here",
             Place::Queue(_) => "Queue",
+            Place::Hand(_) => "Hand",
         })
     }
+}
+
+/// A call handed to the thread that owns a log, given the log or why it
+/// cannot be reached.
+pub type Handed<L> = Box<dyn FnOnce(Result<&mut L, LogError>) + Send>;
+
+/// Room for one call on the queue of a thread that owns a log and serves
+/// other work too: the node's managed authority, the one writer of the
+/// journal (ADR 0020). The room is taken before the slot is made, so
+/// [`Hand::hand`] queues the call whole and never waits. Each call is one
+/// turn of that thread: between two calls, while the worker acts, the
+/// thread serves its other work.
+pub trait Hand<L>: Send {
+    /// Queues `call`; the owner runs it once, with the log or the reason
+    /// it has none. An owner that stopped drops it unrun.
+    fn hand(self: Box<Self>, call: Handed<L>);
+}
+
+impl<'a, L> Slot<'a, L> {
+    /// A slot on the queue `hand` holds room on, for a [`Recorder`] whose
+    /// log another component owns on its own thread.
+    #[must_use]
+    pub fn handed(hand: Box<dyn Hand<L> + 'a>) -> Slot<'a, L> {
+        Slot(Place::Hand(hand))
+    }
+}
+
+/// What a slot's call waits on.
+enum Waiting<T> {
+    Ready(T),
+    Queue(oneshot::Receiver<T>),
+    Hand(oneshot::Receiver<Result<T, LogError>>),
 }
 
 impl<L: OperationLog + Send + 'static> Slot<'_, L> {
@@ -167,7 +204,7 @@ impl<L: OperationLog + Send + 'static> Slot<'_, L> {
         F: FnOnce(&mut L) -> T + Send + 'static,
     {
         let queued = match self.0 {
-            Place::Here(log) => Ok(call(log)),
+            Place::Here(log) => Waiting::Ready(call(log)),
             Place::Queue(permit) => {
                 let (reply, result) = oneshot::channel();
                 permit.send(Message::Run(Box::new(move |log, served| {
@@ -178,13 +215,22 @@ impl<L: OperationLog + Send + 'static> Slot<'_, L> {
                     // A caller that stopped waiting has nothing to hear.
                     let _ = reply.send(value);
                 })));
-                Err(result)
+                Waiting::Queue(result)
+            }
+            Place::Hand(hand) => {
+                let (reply, result) = oneshot::channel();
+                hand.hand(Box::new(move |log| {
+                    // A caller that stopped waiting has nothing to hear.
+                    let _ = reply.send(log.map(call));
+                }));
+                Waiting::Hand(result)
             }
         };
         async move {
             match queued {
-                Ok(value) => Ok(value),
-                Err(result) => result.await.map_err(|_| stopped()),
+                Waiting::Ready(value) => Ok(value),
+                Waiting::Queue(result) => result.await.map_err(|_| stopped()),
+                Waiting::Hand(result) => result.await.map_err(|_| stopped())?,
             }
         }
     }
