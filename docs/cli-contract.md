@@ -8,13 +8,14 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
 
 [Give each stream one job; Principles: stdout is the answer]
 
-- Standard output carries only the answer. A read prints its data: `job status`, `job log`, `job ls`, `node ls`, `doctor`. A change prints the bare identifier of what it changed or made, one line, so `id=$(fabric job new --repo . --goal "...")` holds the job id and nothing else:
+- Standard output carries only the answer. A read prints its data: `job status`, `job log`, `job ls`, `node ls`, `doctor`, `job import --psf` and `psf inspect`. A change prints the bare identifier of what it changed or made, one line, so `id=$(fabric job new --repo . --goal "...")` holds the job id and nothing else:
 
   | Command | Standard output |
   |---|---|
   | `job new`, `managed create`, `managed cancel` | the job id |
   | `job suspend`, `move`, `steal`, `approve`, `reject`, `repair` | the job id |
   | `job export` | the snapshot id |
+  | `job export --psf` | the document digest of the container it wrote |
   | `node add` | the node id |
   | `node id` | this node's id |
 
@@ -22,6 +23,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
 - An empty list is success: exit 0, nothing on standard output, a first-use hint on standard error [Tables, details & empty results].
 - `job run` and `job resume` hand standard output to the harness [Streams & other protocols: Child process]. A headless turn prints the harness's answer and a last line naming the session there, as before; `fabric`'s own lines are on standard error.
 - `serve` runs until stopped; the node id and address it listens on are context, on standard error.
+- `psf inspect` and `psf verdicts` read only files and never ask a node, so no node is missing for them; their failure is input that does not read.
 
 ## JSON
 
@@ -45,7 +47,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
   | `retryable` | `true` only when running the same command again is safe; `false` for a refusal and for a lost connection whose outcome is unknown |
   | `userActionRequired` | `true` when a human must approve: `--force` over a preflight, `--yes` for setup steps |
 
-  The CLI's own reasons: `unknown_option`, `unexpected_argument` (a stray word no argument takes), `unknown_command`, `missing_argument`, `invalid_arguments` (usage, exit 2), `no_daemon` (exit 80), `untrusted_state`, `incompatible_node`, `unknown_outcome`, `unreadable_record`, `confirmation_required`, `workspace_busy`, `node_error`, and `failed` for any other error (exit 1).
+  The CLI's own reasons: `unknown_option`, `unexpected_argument` (a stray word no argument takes), `unknown_command`, `missing_argument`, `invalid_arguments` (usage, exit 2), `no_daemon` (exit 80), `untrusted_state`, `incompatible_node`, `unknown_outcome`, `unreadable_record`, `invalid_container` (a Portable Session Format container, manifest or fixture set that does not read), `stale_container` (exit 85: this node's head for the job is not the revision a container names), `confirmation_required`, `workspace_busy`, `node_error`, and `failed` for any other error (exit 1).
 - `job run` and `job resume` refuse `--json` as a usage error (exit 2), because the harness owns standard output. This is a recorded exception to "every command that reads or changes a resource supports it".
 - Help is text under `--json` too: `fabric help --json`, `fabric job --help --json` and a bare group with `--json` print the help and exit 0. Help as JSON waits for the rename (below).
 - `managed create` and `managed cancel` without `--operation-key` run under a key the CLI makes. In words it is on standard error before the request; under `--json` it is the answer's `operation.operation_key`, and every failure carries it as `data.operation_key`. When the answer was lost (`unknown_outcome`) the failure's `next` is the same command with `--operation-key <key>`, which the node answers with its first answer and never runs twice; the same command without it would make a second job.
