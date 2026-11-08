@@ -1,0 +1,17 @@
+   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.84s
+     Running tests/e2e/main.rs (/var/folders/7x/672w195d6vqbvcnwq1hm7tkc0000gn/T/tmp.VZ5tnLUXAc/debug/deps/e2e-6dc48f9637c0464f)
+
+running 8 tests
+test continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout ... ignored, blocked: the launch does not restore the harness's state, so no native session is offered
+test continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved ... ok
+test launch::e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b ... ok
+test launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package ... counters: captured bytes a=1291 b=2339
+ok
+test managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted ... ok
+test managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on ... ok
+test placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it ... ok
+test secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log ... ok
+
+test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 84 filtered out; finished in 16.51s
+

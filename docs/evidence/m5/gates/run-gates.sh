@@ -12,7 +12,7 @@ echo "load at start: $(sysctl -n vm.loadavg)" >> $OUT/summary.txt
 run() { name=$1; shift; start=$(date +%s); "$@" > $OUT/$name.log 2>&1; rc=$?; end=$(date +%s); echo "$name: exit $rc ($((end-start)) s) load $(sysctl -n vm.loadavg)" >> $OUT/summary.txt; }
 run fmt cargo fmt --all --check
 run clippy cargo clippy --workspace --all-targets --locked -- -D warnings
-run clippy-features bash -c 'set -e; for f in "" acp claude codex; do echo "== fabric-harness features [$f]"; cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features "$f" -- -D warnings; done; echo "== fabricd features [faults]"; cargo clippy -p fabricd --all-targets --locked --features faults -- -D warnings'
+run clippy-features bash -c 'set -e; for f in "" acp claude codex; do echo "== fabric-harness features [$f]"; cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features "$f" -- -D warnings; done; echo "== fabric-net features [tap]"; cargo clippy -p fabric-net --all-targets --locked --features tap -- -D warnings; echo "== fabricd features [faults]"; cargo clippy -p fabricd --all-targets --locked --features faults -- -D warnings'
 run test cargo test --workspace --locked -- --skip e2e_
 run e2e cargo test -p fabric --test e2e --locked
 run doc env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked

@@ -34,19 +34,51 @@ cargo test -j 6 --locked -p fabric --test e2e -- --exact \
 
 Counters for that run: daemons started 10 (2, 3, 2, 3), `SIGKILL`s 2, placement probe rounds 8, each over both nodes (one per create: the 6 facade submits and the 2 `managed create --empty` the facade tests make on `a`). Each placement test fails with the dispatch removed (the mutation run timed out waiting for a placement in both tests, `0 passed; 2 failed`).
 
+## The launch path, proved
+
+The rows that were blocked on 2026-11-08 because no granted attempt was ever launched. The launch path (option (a), selected 2026-11-08 under Efe's delegation of 2026-11-02 and not approved by Efe; the contract is docs/managed-jobs.md, "Launch path (M5, as built)") landed with owners A and B and was merged at `305e65b`. This step ran it across two daemons, found two defects, and fixed them:
+
+| Item | Result |
+|---|---|
+| A continue's pin was dropped | `managed continue --pin` and the facade's `continue` carried the pin in the effect request and `dispatch::place_handoff` placed with the job's policy, so the work could not be moved to a named node. `ffe8a2b` places the handoff with the continue's pin; `dispatch::tests::a_continue_s_pin_places_the_handoff_where_it_names` failed first (`left: [None]`) |
+| A continuation could not start on a node new to the job | the two daemons of every earlier test shared one home, so the job root's parents (`<home>/fabric/jobs/<job>`) already existed on the target. With a home per daemon, as on two hosts, the restore staged beside a root whose parent did not exist and the launch ended `blocked` with no such file. `69e9c3d` makes the parents first; `sources::tests::a_snapshot_restores_where_no_parent_of_the_root_exists` failed first |
+| No capture of the link | `c2fd4e1` adds `FABRIC_NET_TAP` behind the `tap` feature of fabric-net, which only fabricd's `faults` feature turns on: a node appends every frame payload it writes and every chunk it takes, decompressed, before TLS. No build without the feature can write a frame anywhere |
+
+`acceptance/launch-path.log` is the run, `acceptance/launch-path-run.txt` its commit, load, and the `fabric` process count before and after (0 and 0). Command, from the worktree, with a scratch `CARGO_TARGET_DIR`:
+
+```
+cargo test -j 6 --locked -p fabric --test e2e -- --exact \
+  launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package \
+  launch::e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b \
+  placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it \
+  continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved \
+  secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log \
+  managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted \
+  managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on \
+  continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout \
+  --test-threads 1 --nocapture
+```
+
+Output: `test result: ok. 7 passed; 0 failed; 1 ignored`. The `launch` tests run each daemon with a home of its own, so its job roots are its own as on two hosts, and the TCP and TLS link between them.
+
+| Row | Test | What is checked |
+|---|---|---|
+| A job submitted through the facade is placed on the other node and starts there | `launch::e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package` | submitted from `b` to the authority `a`'s facade with `--pin b` and `--secret DEPLOY_KEY`: the placement chooses `b`, `a` launches it there over the link, the attempt is `running`, `b`'s executor records the harness and nothing of it is on `a`. The fake Codex runs its turn |
+| A build task runs its program | the same test | `managed register --class build -- sh -c 'echo <marker> > built.txt && sleep 30'` on `a` is spawned on `b`: `b` records `Build` and the marker is in `b`'s job root |
+| A test task runs, and an interrupted test is recorded interrupted | the same test, and `continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved` | the test runs only with the job's secret (`test -n "$DEPLOY_KEY" && sleep 30`); at the cut its receipt is `interrupted`, `interrupted: true`, never passed |
+| The harness's turn is captured | the same test, and `managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on` | `managed checkpoint`: the harness receipt is `checkpointed` and the same attempt goes on `running` on `b` |
+| Planned handoff of each kind, with its outcome in the cut | the same test, and `launch::e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b` | `managed continue --pin a`: the first attempt ends `checkpointed`; in the cut the harness is `checkpointed` and the build and the test `interrupted`. A harness that left a child outside its group (`FAKE_CODEX_WAIT`) blocks the handoff: `handoff_blocked` in the facade's watch, no continuation, no handoff placement, one attempt, still `running` on `b`. An opaque task has no surface that registers one (the CLI takes `build` or `test`); its blocking rule is proven by the executor's unit tests only |
+| Continue on the other node with the work package and the fidelity achieved | the same test | the handoff placement is `planned_handoff` and chooses `a`; the continuation names the first attempt, `achieved: new_native_session_with_package`, a 64-hex package digest; `a` records the harness, the build and the test of the new attempt, `b` holds nothing of either attempt, and the build's marker is in `a`'s own job root, restored from the cut `a` pulled from `b` |
+| A secret value appears nowhere | the same test, and `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log` | both daemons hold `FABRIC_SECRET_DEPLOY_KEY`; after the run the value is searched for in every file under the test's root: both state roots (journal, store, packages, run records, taken launches, the daemon logs), both homes (job roots and their set-aside copies), and both link captures. It is in none, except the fake harness's own dump of its environment (`codex-env`), which the test requires to hold `DEPLOY_KEY=<value>` on both nodes: the harness got it by name. The captures are checked to have seen the link in the clear: `a`'s holds the launch's secret name, the goal and the build's marker from the pulled chunk |
+| Cancel of a live attempt | `placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it`, `managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted` | a cancel from the other node stops the live attempt, `cancelled`, every task's receipt `interrupted` |
+
+Counters for that run: daemons started 11 (2, 2, 2, 2, 1, 1, 1), link captures 1291 bytes on `a` and 2339 on `b`, `fabric` processes left 0. Mutation: with the pin fix reverted the launch test fails at the handoff's chosen node (`launch.rs:302`); with the root fix reverted it fails `not continued`, the harness receipt `blocked` naming the missing `work.fabric-restoring`.
+
 ## Blocked
 
-The third acceptance row, "a planned handoff with child-task outcomes and actual fidelity", and the work package carried to the second node, are not run end to end, because a granted attempt is never launched. What is missing in the code, as found on 2026-11-08:
+A native-session continuation. `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout` stays ignored: the launch restores the workspace from the cut and not the harness's own state, so `offered_fidelity` is asked with the layout never the same and no node offers `native_session` (docs/managed-jobs.md, "Launch path", owner B as built). The question for Efe: should M5 restore the harness's state on the target (the capturer already captures it through the adapter's suspend path) and offer `native_session` when the layout matches, or should M5 ship with `new_native_session_with_package` as the best fidelity and the native session move to M6 or later?
 
-1. No node runs a grant. fabric-net protocol 4 carries `Advertise`/`Advert` and the facade, and no message that asks the chosen node to start a granted attempt (with its generation and initial checkpoint) or carries the attempt's observations (`Started`, `Exited`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`) back to the authority. The authority's `observe` has callers only in its tests and in the placement dispatch.
-2. A build or test task names nothing to run. `RegisterTask` carries a label, a restart policy and a class; the executor spawns a `std::process::Command` and the model has no field for it, and no surface (client API, facade, harness) registers a child.
-3. The node has no `Capturer` (the executor's harness checkpoint and workspace capture): only the executor tests' fake implements it. No `WorkPackage` is built or sent by `fabricd`.
-
-The executor's per-kind outcome rules (an interrupted test or build is `interrupted`, a harness task checkpoints or blocks, an opaque task blocks, escaped children and uncontrolled writers block) and the domain's continue transitions are proven by the unit and crash tests that owners A and B recorded in docs/managed-jobs.md; none of them runs across two daemons.
-
-The question for Efe: M5's acceptance needs a remote launch path. Should M5 add it as (a) one new node-link request in protocol 4, `Launch { job, attempt, generation, task, initial_checkpoint, package }`, answered at once, with the target reporting observations to the authority by a second request `Report { job, observation }` fenced by generation, and the snapshot fetched with the existing pull transfer, plus a `command` field on `RegisterTask` for build and test children (codec format 2, not shipped); or (b) should M5 ship with placement and the facade only, and the launch, the cut and the carry move to a milestone of their own before M6, whose old-runner wake needs a remote runner too?
-
-Answered 2026-11-08, under Efe's delegation of 2026-11-02 and not approved by Efe: option (a). The selection is recorded in the decisions file as "M5 launch path, selected 2026-11-08" and the contract is docs/managed-jobs.md, "Launch path (M5, as built)": `Launch`, `Instruct`, `Report` and `Heartbeat` on protocol 4, `RegisterTask` with a program for build and test tasks, the runner loop on the node, the work package built by the authority at the cut, and the dispatch of `Checkpoint`, `Continue`, `CancelJob` and `CancelTask` to the live attempt's node. #38 merges only after the launch path is proved end to end and reviewed; M6's five scenarios run against it before M6 merges.
+Not run here: a run on two hosts. Every test above is two processes on one host; a run with the second Mac needs its address paired with `fabric node add`.
 
 ## Gates
 

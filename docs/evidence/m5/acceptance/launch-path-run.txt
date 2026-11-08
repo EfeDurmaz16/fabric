@@ -1,0 +1,5 @@
+commit: 355132e5c2de846b1aaf216fd0969ed5e52d89fb
+fabric processes before: 0 (pgrep -x fabric)
+load before: { 12.05 11.88 13.03 }
+load after: { 12.29 11.97 13.04 }
+fabric processes after: 0
