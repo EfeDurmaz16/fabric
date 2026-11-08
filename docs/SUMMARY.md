@@ -36,6 +36,7 @@
   - [Network protocol](net.md)
   - [Managed jobs and the journal](managed-jobs.md)
   - [Provider bridge](bridge-protocol.md)
+  - [Portable Session Format](portable-session-format.md)
 - [Evidence](reference/evidence.md)
 
 # Decisions
