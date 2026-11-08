@@ -28,6 +28,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The anchor, passed to bench-ab.sh so the cache key and the build
+  # measured name the same commit. scripts/test-check-budget.sh fails when
+  # it differs from the anchor of bench-ab.sh and check-budget.sh.
   ANCHOR: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
 
 jobs:
@@ -76,7 +79,7 @@ jobs:
         env:
           CANDIDATE: ${{ inputs.candidate }}
         run: |
-          scripts/bench-ab.sh --release --pairs 15 --counted 5 \
+          scripts/bench-ab.sh --release --pairs 15 --counted 5 --anchor "$ANCHOR" \
             ${CANDIDATE:+--candidate "$CANDIDATE"} "$RUNNER_TEMP/perf"
 
       # Saved even when the A/B or the gate fails, so a failing pull
@@ -93,20 +96,17 @@ jobs:
       # A run that fails is confirmed by a second run of both builds, with
       # the candidate's fixture started first this time, and a check fails
       # only when it fails in both: on a shared runner one run of two equal
-      # builds can fail an op on noise, or a daemon's size on the order the
-      # fixtures started in (docs/evidence/perf-ab/README.md, CI section).
+      # builds can fail an op on noise (docs/evidence/perf-ab/README.md, CI
+      # section). scripts/perf-gate.sh does both, with the first run's
+      # flags, and heads the verdict "no verdict" when the confirmation
+      # does not finish.
       - name: Gate, and confirm a failure
         env:
           CANDIDATE: ${{ inputs.candidate }}
         run: |
-          out=$RUNNER_TEMP/perf
-          status=0
-          scripts/bench-ab.sh --release --gate "$out" || status=$?
-          [ "$status" -eq 1 ] || exit "$status"
-          echo "::notice::the first run fails the gate; both builds run again to confirm"
-          scripts/bench-ab.sh --release --pairs 15 --counted 5 --candidate-first \
-            ${CANDIDATE:+--candidate "$CANDIDATE"} "$out/confirm"
-          scripts/bench-ab.sh --release --gate --confirm "$out/confirm" "$out"
+          scripts/perf-gate.sh "$RUNNER_TEMP/perf" \
+            --release --pairs 15 --counted 5 --anchor "$ANCHOR" \
+            ${CANDIDATE:+--candidate "$CANDIDATE"}
 
       - name: Job summary
         if: always()
@@ -159,7 +159,11 @@ jobs:
     permissions:
       pull-requests: write
     steps:
+      # A run that stopped before bench-ab.sh made its output directory
+      # (the anchor's build failed, say) uploads nothing; the comment then
+      # says there is no verdict instead of this job failing too.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
         with:
           name: perf-ab-${{ github.sha }}-${{ github.run_attempt }}
           path: perf

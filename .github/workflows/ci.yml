@@ -76,6 +76,9 @@ jobs:
       - name: Prove the budget check fires
         run: scripts/test-check-budget.sh
 
+      - name: Prove the perf gate confirms a failure
+        run: scripts/test-perf-gate.sh
+
       # The time budget changes only with a new [[change]] entry that says
       # why, and never loosens: baselines and process counts only go down,
       # but for baselines timed again from the anchor in the CI runs the

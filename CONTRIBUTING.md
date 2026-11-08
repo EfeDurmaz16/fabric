@@ -93,7 +93,8 @@ CI measures it, on every pull request and every push to `main`: the
 `perf` job of `.github/workflows/perf.yml` runs on `macos-15`, builds the
 anchor (cached by commit) and the candidate in release on the same runner,
 and runs `scripts/bench-ab.sh --release --pairs 15 --counted 5`, then
-`scripts/bench-ab.sh --gate`. The job fails when a check breaks the rule:
+`scripts/perf-gate.sh`, which runs `scripts/bench-ab.sh --gate` and
+confirms a failure (below). The job fails when a check breaks the rule:
 
 - an op whose time ratio, candidate over anchor, has a family interval
   above 1: the 95% bootstrap interval across all timed ops at once
