@@ -686,7 +686,9 @@ fn order(run: usize) -> [usize; 2] {
 /// Says how far the bench got, on standard error.
 fn progress(line: &str) -> Fallible {
     use std::io::Write as _;
-    writeln!(std::io::stderr(), "ab: {line}")?;
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let elapsed = STARTED.get_or_init(Instant::now).elapsed().as_secs();
+    writeln!(std::io::stderr(), "ab: [{elapsed} s] {line}")?;
     Ok(())
 }
 
@@ -1395,8 +1397,12 @@ fn counted_size_pairs(samples: &[Sample], metric: &str) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// The memory rows of the gate: each daemon's sizes after the timed runs
-/// and after the counted ops, and the CLI's peak sizes per counted op.
+/// The memory rows of the gate: each daemon's sizes after the timed runs,
+/// and the CLI's peak sizes per counted op. The daemons' sizes after the
+/// counted ops stay in the report only: each side has one daemon per node,
+/// read again after every op, so those pairs are not independent, and two
+/// equal builds read 0.971 to 1.075 there on the runner (perf-ab README,
+/// CI section).
 fn memory_series(samples: &[Sample]) -> Vec<Series> {
     let mut memory: Vec<Series> = Vec::new();
     for (metric, _, title, _) in DAEMON_SIZES {
@@ -1409,20 +1415,6 @@ fn memory_series(samples: &[Sample]) -> Vec<Series> {
             let found = pairs(samples, "timed", daemon, metric);
             memory.push((
                 format!("{title}, {daemon}, KiB after each timed run"),
-                found,
-            ));
-        }
-    }
-    for (_, prefix, title, _) in DAEMON_SIZES {
-        let daemons: BTreeSet<&str> = samples
-            .iter()
-            .filter(|sample| sample.phase == "counted")
-            .filter_map(|sample| sample.metric.strip_prefix(prefix))
-            .collect();
-        for daemon in daemons {
-            let found = counted_size_pairs(samples, &format!("{prefix}{daemon}"));
-            memory.push((
-                format!("{title}, daemon {daemon}, KiB per counted op"),
                 found,
             ));
         }
@@ -1561,13 +1553,66 @@ fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
     Ok((head + &out, failed))
 }
 
+/// The verdict of a run, or of a run and its confirmation: a second run of
+/// both builds that CI makes when the first fails. With a confirmation a
+/// check breaks the rule only when it fails in both runs. A shared runner's
+/// times are noisy enough that one run of two equal builds failed one op in
+/// two A/A runs (`acp new`, family interval 1.001 to 1.708); a real
+/// regression fails again, noise rarely does.
+fn confirmed_verdict(first: &str, again: Option<&str>) -> Fallible<(String, Vec<String>)> {
+    let (first_verdict, first_failed) = judge_run(first)?;
+    let Some(again) = again else {
+        return Ok((first_verdict, first_failed));
+    };
+    let (again_verdict, again_failed) = judge_run(again)?;
+    let failed: Vec<String> = first_failed
+        .iter()
+        .filter(|row| again_failed.contains(row))
+        .cloned()
+        .collect();
+    let list = |rows: &[String]| {
+        if rows.is_empty() {
+            "none".to_owned()
+        } else {
+            rows.join("; ")
+        }
+    };
+    let mut out = format!(
+        "### Perf gate: {}\n\n\
+         The first run failed {}, so CI ran both builds again; the confirmation \
+         failed {}. A check fails only when it fails in both runs: {}.\n",
+        if failed.is_empty() { "pass" } else { "fail" },
+        list(&first_failed),
+        list(&again_failed),
+        list(&failed)
+    );
+    for (title, verdict) in [
+        ("First run", first_verdict),
+        ("Confirmation run", again_verdict),
+    ] {
+        let _ = write!(
+            out,
+            "
+{}",
+            verdict.replacen("### Perf gate:", &format!("### {title}:"), 1)
+        );
+    }
+    Ok((out, failed))
+}
+
 /// Judges the samples in `FABRIC_AB_OUT` against the performance rule,
-/// writes `verdict.md` there and fails when a check breaks the rule.
+/// with the confirmation run in `FABRIC_AB_CONFIRM` when it is set, writes
+/// `verdict.md` in `FABRIC_AB_OUT` and fails when a check breaks the rule.
 #[test]
 #[ignore = "judges the samples of an A/B run; scripts/bench-ab.sh --gate runs it"]
 fn gate() -> Fallible {
     let out = path_var("FABRIC_AB_OUT")?;
-    let (verdict, failed) = judge_run(&fs::read_to_string(out.join("samples.tsv"))?)?;
+    let first = fs::read_to_string(out.join("samples.tsv"))?;
+    let again = match std::env::var_os("FABRIC_AB_CONFIRM") {
+        Some(dir) => Some(fs::read_to_string(Path::new(&dir).join("samples.tsv"))?),
+        None => None,
+    };
+    let (verdict, failed) = confirmed_verdict(&first, again.as_deref())?;
     fs::write(out.join("verdict.md"), &verdict)?;
     println!("{verdict}");
     if failed.is_empty() {
@@ -1798,5 +1843,19 @@ fn the_gate_fails_a_slower_op_a_larger_daemon_and_one_more_process() -> Fallible
     let (verdict, failed) = judge_run(&gate_samples(1.0, 1.0, 1))?;
     assert_eq!(failed, ["acp new: more process starts"], "{verdict}");
     assert!(verdict.starts_with("### Perf gate: fail"), "{verdict}");
+    Ok(())
+}
+
+/// With a confirmation run, a check fails only when it fails in both runs.
+#[test]
+fn a_confirmed_gate_fails_only_what_fails_twice() -> Fallible {
+    let noisy = gate_samples(1.05, 1.0, 0);
+    let quiet = gate_samples(1.0, 1.0, 0);
+    let (verdict, failed) = confirmed_verdict(&noisy, Some(&quiet))?;
+    assert!(failed.is_empty(), "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: pass"), "{verdict}");
+    assert!(verdict.contains("### First run: fail"), "{verdict}");
+    let (verdict, failed) = confirmed_verdict(&noisy, Some(&noisy))?;
+    assert_eq!(failed, ["cli ls"], "{verdict}");
     Ok(())
 }

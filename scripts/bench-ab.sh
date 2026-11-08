@@ -31,7 +31,7 @@
 # Usage:
 #   scripts/bench-ab.sh [options] <output-dir>
 #   scripts/bench-ab.sh --analyze <output-dir>
-#   scripts/bench-ab.sh --gate <output-dir>
+#   scripts/bench-ab.sh --gate [--confirm <second-output-dir>] <output-dir>
 # Options:
 #   --anchor <commit>     the anchor (default 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5)
 #   --candidate <commit>  a commit instead of the working tree
@@ -45,7 +45,9 @@
 # overwritten. --analyze writes report.md again from its samples.tsv.
 # --gate judges its samples.tsv against the performance rule, writes
 # verdict.md and exits 1 when a check breaks the rule
-# (crates/fabric/tests/e2e/ab.rs, judge_run, says which checks).
+# (crates/fabric/tests/e2e/ab.rs, judge_run, says which checks). With
+# --confirm, naming a second run of the same builds, a check fails only
+# when it fails in both runs; CI makes that second run when the first fails.
 set -eu
 
 anchor=176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
@@ -55,11 +57,12 @@ counted=3
 release=
 analyze=
 gate=
+confirm=
 
 usage() {
   echo "usage: scripts/bench-ab.sh [--anchor <commit>] [--candidate <commit>] [--pairs <n>] [--counted <n>] [--release] <output-dir>" >&2
   echo "       scripts/bench-ab.sh --analyze <output-dir>" >&2
-  echo "       scripts/bench-ab.sh --gate <output-dir>" >&2
+  echo "       scripts/bench-ab.sh --gate [--confirm <second-output-dir>] <output-dir>" >&2
   exit 2
 }
 
@@ -72,6 +75,7 @@ while [ "$#" -gt 1 ]; do
     --release) release=--release; shift ;;
     --analyze) analyze=1; shift ;;
     --gate) gate=1; shift ;;
+    --confirm) confirm=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -105,9 +109,13 @@ fi
 
 if [ -n "$gate" ]; then
   [ -f "$out/samples.tsv" ] || { echo "bench-ab: no $out/samples.tsv" >&2; exit 2; }
+  if [ -n "$confirm" ]; then
+    [ -f "$confirm/samples.tsv" ] || { echo "bench-ab: no $confirm/samples.tsv" >&2; exit 2; }
+    confirm=$(cd "$confirm" && pwd)
+  fi
   e2e=$(driver)
   out=$(cd "$out" && pwd)
-  if FABRIC_AB_OUT=$out "$e2e" --ignored --exact ab::gate --nocapture --test-threads=1 >"$out/gate.log" 2>&1; then
+  if env FABRIC_AB_OUT="$out" ${confirm:+FABRIC_AB_CONFIRM="$confirm"} "$e2e" --ignored --exact ab::gate --nocapture --test-threads=1 >"$out/gate.log" 2>&1; then
     echo "bench-ab: the gate passes; see $out/verdict.md" >&2
     exit 0
   fi
