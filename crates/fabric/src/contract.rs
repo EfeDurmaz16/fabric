@@ -452,7 +452,7 @@ fn parsing_command(argv: &[OsString]) -> Command {
     }
     let root = Cli::command()
         .disable_version_flag(true)
-        .subcommand(Command::new("help").arg(Arg::new("command").num_args(0..)));
+        .subcommand(Command::new("help").defer(|help| help.arg(Arg::new("command").num_args(0..))));
     named(root, argv.get(1..).unwrap_or_default())
 }
 
@@ -1569,6 +1569,40 @@ mod tests {
                     Globals::from_matches(&matches)
                 )
             }
+        }
+    }
+
+    /// The tree a run parses with builds the arguments of the commands the
+    /// words name and of no other: every command off that path is a name
+    /// and a summary, so a `Subcommand` enum that drops
+    /// `#[command(defer = true)]` fails here, whichever enum it is.
+    #[test]
+    fn the_parsing_tree_builds_only_the_named_path() {
+        fn unbuilt(cmd: &Command, path: &[&str], at: &mut Vec<String>, out: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                at.push(sub.get_name().to_owned());
+                let named = path.first() == Some(&sub.get_name());
+                if !named && sub.get_arguments().next().is_some() {
+                    out.push(at.join(" "));
+                }
+                let below = if named { &path[1..] } else { &[][..] };
+                unbuilt(sub, below, at, out);
+                at.pop();
+            }
+        }
+        for line in [&["fabric", "--version"][..], &["fabric", "job", "ls"]] {
+            let argv: Vec<OsString> = line.iter().map(OsString::from).collect();
+            let mut built = Vec::new();
+            unbuilt(
+                &parsing_command(&argv),
+                &line[1..],
+                &mut Vec::new(),
+                &mut built,
+            );
+            assert!(
+                built.is_empty(),
+                "{line:?} built the arguments of {built:?}"
+            );
         }
     }
 
