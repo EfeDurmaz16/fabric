@@ -684,3 +684,17 @@ What these set:
 ## Main against the anchor on the runner
 
 All six A/B runs (five jobs and one confirmation) pass. 19 to 22 of the 26 ops are faster with intervals below 1, and no op is slower. In `42507362258/1-head`: `new` 0.24 to 0.29 of the anchor, `resume` 0.40 to 0.46, `pull` 0.54 to 0.60, `move` 0.64 to 0.75, `suspend` 0.67 to 0.94, `restart` 0.49, `cold start` 0.61; `claude launch` (1.184, 0.769 to 1.475) and `codex launch` (1.036, 0.711 to 1.403) hold 1, as they do in every run, with medians between 0.90 and 1.18. Daemon a's resident size is 0.852 to 0.857 of the anchor's in every run and its footprint 0.890 to 0.915; daemon b's resident size 0.869 to 0.901 and its footprint 0.924 to 1.020, the 1.020 (family interval 0.985 to 1.044) in the one run whose confirmation read 0.960; the CLI's peak resident size 0.913 to 0.919 and its footprint 0.956 to 0.964. Every process start and full flush count is at or below the anchor's on every op.
+
+## Main after the CLI contract: the CLI's footprint fails
+
+Run 42515525454, this pull request's first `pull_request` run, measured the merge of the branch into `main` at `3b757c7`; the branch changes tests, scripts and docs only, so the candidate's product code is `main`'s. The gate failed one check in the first run and again in the confirmation: the CLI's peak physical footprint, 1.075 of the anchor's (family interval 1.068 to 1.082), then 1.073 (1.067 to 1.080). Every other check passed in both runs, times and counters included.
+
+It is a regression of `main`, not noise and not the job. All 26 ops are larger, by 170 to 370 KiB, so the cost is in every CLI process: `cli version` 1.139 (2657 -> 3025 KiB), `acp approve` 1.104, `restart` 1.092, `cli ls` 1.086. The counters say the same: `cli version` makes 2408 allocations of 971 KB against 244 of 106 KB in `42507362258/1-head`, which ran `14c7b0b` and read the CLI's footprint at 0.956 to 0.964 of the anchor's. Between the two, `main` merged #40 (docs), #41 (the CLI contract) and #42 (the portable session format). A local release build of each on an M5 Pro, `/usr/bin/time -l`, median of five:
+
+| main at | merges | `fabric --version` peak footprint | `fabric job ls` peak footprint |
+|---|---|---:|---:|
+| `54fe1c0` | #40 | 1616 KiB | 1776 KiB |
+| `2fa4c72` | #41 | 2352 KiB | 2560 KiB |
+| `3b757c7` | #42 | 2336 KiB | 2560 KiB |
+
+So #41 adds about 740 KiB to every command, and #42 nothing. Its `contract::parse` builds the whole decorated command tree on every run (help templates and examples for every subcommand, and `Cli::command()` a second time for the root help), clones it twice and parses the arguments twice. The job keeps failing on `main` until a separate pull request brings the CLI back under the anchor; the threshold stays. Since this run the verdict names the ops behind a failing CLI row: how many are larger, the five largest with their medians, and a table of every op.
