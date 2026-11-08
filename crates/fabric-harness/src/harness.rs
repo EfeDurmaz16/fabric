@@ -540,6 +540,50 @@ impl TurnReport {
     }
 }
 
+/// How faithfully a continuation carries a session on, from highest. The
+/// four names are the stored names of the managed continuation's
+/// `Fidelity` (`fabric_core::managed::package` on the M5 branch, ADR 0024)
+/// and of the Portable Session Format (ADR 0029); this crate declares what
+/// an adapter can reach (`Harness::fidelity`) and what a restore reached
+/// (`Restored::fidelity`) in the same words, so nobody keeps two
+/// vocabularies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Fidelity {
+    /// The adapter restores the captured session and the harness continues
+    /// it under the same session id.
+    NativeSession,
+    /// The harness continues the captured conversation in a new session of
+    /// its own: the state was imported, or replayed, and the id changed.
+    /// `Restored::session` names the new one.
+    NewNativeSessionWithPackage,
+    /// Only the workspace is restored; the harness starts a new session
+    /// with no transcript, because its store cannot be carried.
+    WorkspaceOnly,
+    /// The harness cannot be carried at all; the adapter refuses with a
+    /// reason. Never a declared ceiling of an adapter that exists.
+    Unsupported,
+}
+
+impl Fidelity {
+    /// The stored name: `native_session`, `new_native_session_with_package`,
+    /// `workspace_only` or `unsupported`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Fidelity::NativeSession => "native_session",
+            Fidelity::NewNativeSessionWithPackage => "new_native_session_with_package",
+            Fidelity::WorkspaceOnly => "workspace_only",
+            Fidelity::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl std::fmt::Display for Fidelity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// What a restore placed on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restored {
@@ -547,6 +591,16 @@ pub struct Restored {
     pub manifest: StateManifest,
     /// Every file that was placed or found already equal, in order.
     pub placed: Vec<PathBuf>,
+    /// The session the harness continues on this node: the manifest's,
+    /// unless the harness minted a new id when the adapter handed it the
+    /// state (OpenCode's `import`), in which case the node records this
+    /// one and the next capture takes it.
+    pub session: SessionId,
+    /// What this restore reached: `NativeSession` when `session` is the
+    /// manifest's and the harness reads the placed files as its own;
+    /// `NewNativeSessionWithPackage` when the id changed. Never above the
+    /// adapter's `Harness::fidelity`.
+    pub fidelity: Fidelity,
 }
 
 /// An agent that can be captured, restored and started (ADR 0006).
@@ -559,6 +613,13 @@ pub struct Restored {
 pub trait Harness: Send + Sync {
     /// Which harness this is.
     fn kind(&self) -> HarnessKind;
+
+    /// The highest fidelity this adapter reaches for a session it captures
+    /// and restores, declared once per adapter and true before any
+    /// refusal: the node, the README table and a client can say it without
+    /// running anything. A restore reports what it actually reached in
+    /// `Restored::fidelity`, which is never above this.
+    fn fidelity(&self) -> Fidelity;
 
     /// Finds the binary and its version; `None` when it is not installed.
     fn detect(&self) -> BoxFuture<'_, Result<Option<Installed>, HarnessError>>;

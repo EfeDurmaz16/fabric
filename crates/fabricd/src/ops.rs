@@ -2858,19 +2858,33 @@ impl Node {
         };
         session_ahead(Some(continued), launching, root, out);
         let harness = adapter_with_installed(state.kind(), &self.harness_env(env)?, None, ahead)?;
-        harness.restore(root, &state_dir).await?;
+        let restored = harness.restore(root, &state_dir).await?;
+        // The session the harness continues here is the captured one unless
+        // the harness minted another when the adapter handed it the state
+        // (`Restored::session`); the job records the one it will run, so
+        // the next capture takes that session and not a stale id.
+        let session = restored.session;
+        if session != *state.session() {
+            tracing::info!(
+                harness = %state.kind(),
+                captured = %state.session(),
+                continues = %session,
+                fidelity = %restored.fidelity,
+                "the harness continues the restored state under a new session id"
+            );
+        }
         let previous = job
             .session()?
             .filter(|record| record.harness == *state.kind() && record.session == *state.session())
             .and_then(|record| record.known_writer);
         job.set_session(&SessionRecord {
             harness: state.kind().clone(),
-            session: state.session().clone(),
+            session: session.clone(),
             known_writer: writer_after(previous, &state),
         })?;
         out.emit(Event::SessionRestored {
             harness: state.kind().clone(),
-            session: state.session().clone(),
+            session,
         });
         Ok(())
     }

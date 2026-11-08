@@ -49,7 +49,7 @@ pub mod codex;
 
 pub use error::{BadRule, HarnessError, Input, IoOp};
 pub use harness::{
-    Harness, Installed, Launch, LaunchSettings, MAX_ANSWER, MAX_MODEL_NAME_LEN, ModelName,
-    ModelNameError, NotCarried, Origin, PassedSetting, Restored, Running, SettingName, TurnEvent,
-    TurnFeed, TurnReport,
+    Fidelity, Harness, Installed, Launch, LaunchSettings, MAX_ANSWER, MAX_MODEL_NAME_LEN,
+    ModelName, ModelNameError, NotCarried, Origin, PassedSetting, Restored, Running, SettingName,
+    TurnEvent, TurnFeed, TurnReport,
 };
