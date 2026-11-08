@@ -24,9 +24,11 @@ use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::id::{JobId, SnapshotId};
+use fabric_core::managed::secret_ref::AttemptScope;
 use fabric_core::managed::{
-    AttemptId, CheckpointCut, DrainBudget, EvidenceKind, EvidenceRef, HandoffBlocker,
-    OutcomePolicy, ReceiptStatus, SecretRef, SourceError, TaskClass, TaskId, TaskReceipt,
+    AttemptId, CheckpointCut, DrainBudget, EvidenceKind, EvidenceRef, Generation, HandoffBlocker,
+    OutcomePolicy, ReceiptStatus, SECRET_ENV_PREFIX, SecretRef, SourceError, TaskClass, TaskId,
+    TaskReceipt,
 };
 use fabric_core::path::{AbsPath, RelPath};
 use rustix::process::{Pid, Signal};
@@ -152,6 +154,7 @@ struct Running {
 /// One attempt this node runs.
 struct AttemptRun {
     job: JobId,
+    generation: Generation,
     root: AbsPath,
     secrets: Vec<SecretRef>,
     frozen: bool,
@@ -159,14 +162,25 @@ struct AttemptRun {
 }
 
 /// The attempts this node runs, their groups and registered children.
+///
+/// Each attempt has a lock of its own: a quiescence or a stop that waits
+/// out one attempt's drain budget holds that attempt alone, and the map
+/// is locked only to find or change an entry, never across a wait.
 pub struct Executor {
     records: PathBuf,
     resolver: LocalResolver,
     capturer: Arc<dyn Capturer>,
-    attempts: Mutex<BTreeMap<AttemptId, AttemptRun>>,
+    attempts: Mutex<BTreeMap<AttemptId, Arc<Mutex<AttemptRun>>>>,
+    /// The job's current generation as this node knows it: the newest
+    /// attempt begun here, or what the authority reported since.
+    current: Mutex<BTreeMap<JobId, Generation>>,
     spawns: AtomicU64,
     signals: AtomicU64,
     captures: AtomicU64,
+    /// Fails the launch record's completion once, for the test of a
+    /// spawn that fails after its process exists.
+    #[cfg(test)]
+    fail_completion: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Executor {
@@ -188,9 +202,35 @@ impl Executor {
             resolver,
             capturer,
             attempts: Mutex::new(BTreeMap::new()),
+            current: Mutex::new(BTreeMap::new()),
             spawns: AtomicU64::new(0),
             signals: AtomicU64::new(0),
             captures: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_completion: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The attempt's run, or `NotRunning`; the map's lock is released
+    /// before the caller locks the run.
+    async fn run(&self, attempt: AttemptId) -> Result<Arc<Mutex<AttemptRun>>, ExecutorError> {
+        self.attempts
+            .lock()
+            .await
+            .get(&attempt)
+            .cloned()
+            .ok_or(ExecutorError::NotRunning { attempt })
+    }
+
+    /// Records that `job`'s current grant is at `generation` (the
+    /// authority's word, or a newer attempt begun here), so an older
+    /// attempt of the job no longer receives a secret scoped to the
+    /// current attempt. A lower generation than known changes nothing.
+    pub async fn supersede(&self, job: JobId, generation: Generation) {
+        let mut current = self.current.lock().await;
+        let known = current.entry(job).or_insert(generation);
+        if generation > *known {
+            *known = generation;
         }
     }
 
@@ -203,25 +243,38 @@ impl Executor {
         }
     }
 
-    /// Opens an attempt on this node: its job, the root its tasks run in
-    /// and the secrets its tasks may need. Nothing is spawned.
+    /// Opens an attempt on this node: its job and generation, the root
+    /// its tasks run in and the secrets its tasks may need. Nothing is
+    /// spawned. A newer generation of the job supersedes the older
+    /// attempts this node runs (see [`Executor::supersede`]).
     pub async fn begin(
         &self,
         attempt: AttemptId,
         job: JobId,
+        generation: Generation,
         root: AbsPath,
         secrets: Vec<SecretRef>,
     ) {
+        self.supersede(job, generation).await;
         self.attempts.lock().await.insert(
             attempt,
-            AttemptRun {
+            Arc::new(Mutex::new(AttemptRun {
                 job,
+                generation,
                 root,
                 secrets,
                 frozen: false,
                 tasks: Vec::new(),
-            },
+            })),
         );
+    }
+
+    /// Lets a quiesced attempt spawn again: a checkpoint command's cut
+    /// leaves the attempt running (ADR 0023), and its next build or test
+    /// starts anew, since the quiescence ended the ones it interrupted.
+    pub async fn resume(&self, attempt: AttemptId) -> Result<(), ExecutorError> {
+        self.run(attempt).await?.lock().await.frozen = false;
+        Ok(())
     }
 
     /// Forgets an attempt whose tasks all ended; its records are removed.
@@ -264,17 +317,27 @@ impl Executor {
         class: TaskClass,
         mut command: std::process::Command,
     ) -> Result<Spawned, ExecutorError> {
-        let mut attempts = self.attempts.lock().await;
-        let run = attempts
-            .get_mut(&attempt)
-            .ok_or(ExecutorError::NotRunning { attempt })?;
+        let run = self.run(attempt).await?;
+        let mut run = run.lock().await;
         if run.frozen {
             return Err(ExecutorError::Frozen { attempt });
         }
+        // An attempt is the job's current grant until a newer generation
+        // of the job is known here; a secret scoped to the current
+        // attempt reaches only that one (ADR 0025).
+        let is_current = self
+            .current
+            .lock()
+            .await
+            .get(&run.job)
+            .is_none_or(|current| *current <= run.generation);
         // Secrets are resolved now, never earlier and never kept: a
         // missing one refuses the launch before any process exists.
         let mut env = Vec::new();
         for secret in &run.secrets {
+            if secret.scope.attempt == AttemptScope::Current && !is_current {
+                continue;
+            }
             let value = self.resolver.resolve(run.job, attempt, secret)?;
             env.push((
                 secret.name.as_str().to_owned(),
@@ -300,6 +363,7 @@ impl Executor {
         // with no pid, which recovery clears.
         local::write(&path, &record)?;
         command.process_group(0).current_dir(run.root.as_str());
+        scrub_secrets(&mut command);
         for (key, value) in &env {
             command.env(key, value);
         }
@@ -316,7 +380,20 @@ impl Executor {
         let started = local::process_started(pid).await;
         record.pid = Some(pid.get());
         record.started.clone_from(&started);
-        local::write(&path, &record)?;
+        if let Err(e) = self.complete_record(&path, &record) {
+            // The process exists and no record names it: it is stopped
+            // now, so nothing runs that no receipt, blocker or recovery
+            // accounts for. The intent record (no pid) is what recovery
+            // then clears.
+            let mut child = child;
+            if let Some(group) = pid_of(pid) {
+                self.signals.fetch_add(1, Ordering::Relaxed);
+                signal_group(group, Signal::KILL);
+                wait_group_gone(group, KILL_WAIT).await;
+            }
+            let _ = child.wait().await;
+            return Err(e.into());
+        }
         // Launch boundary two (`managed_launch.after_record`): the process
         // runs and its record names it; a crash here leaves a group that
         // recovery stops by its recorded pid and start time.
@@ -333,6 +410,18 @@ impl Executor {
             group: pid.get(),
             task,
         })
+    }
+
+    /// Completes a launch record with its pid.
+    fn complete_record(&self, path: &Path, record: &LaunchRecord) -> Result<(), local::LocalError> {
+        #[cfg(test)]
+        if self.fail_completion.swap(false, Ordering::Relaxed) {
+            return Err(local::LocalError::Io {
+                path: path.to_owned(),
+                source: std::io::Error::other("the test failed the record's completion"),
+            });
+        }
+        local::write(path, record)
     }
 
     /// Stops every group a crashed executor left recorded under `records`
@@ -384,10 +473,8 @@ impl Executor {
         attempt: AttemptId,
         budget: DrainBudget,
     ) -> Result<Quiescence, ExecutorError> {
-        let mut attempts = self.attempts.lock().await;
-        let run = attempts
-            .get_mut(&attempt)
-            .ok_or(ExecutorError::NotRunning { attempt })?;
+        let run = self.run(attempt).await?;
+        let mut run = run.lock().await;
         run.frozen = true;
         let root = run.root.clone();
         let mut receipts = Vec::new();
@@ -458,7 +545,7 @@ impl Executor {
         receipts.reverse();
         let registered: Vec<u32> = run.tasks.iter().map(|t| t.pid.get()).collect();
         let groups: Vec<u32> = registered.clone();
-        drop(attempts);
+        drop(run);
         blockers.extend(group_blockers(&groups, &registered, &root).await);
         Ok(Quiescence { receipts, blockers })
     }
@@ -471,10 +558,8 @@ impl Executor {
         attempt: AttemptId,
         budget: DrainBudget,
     ) -> Result<Vec<TaskReceipt>, ExecutorError> {
-        let mut attempts = self.attempts.lock().await;
-        let run = attempts
-            .get_mut(&attempt)
-            .ok_or(ExecutorError::NotRunning { attempt })?;
+        let run = self.run(attempt).await?;
+        let mut run = run.lock().await;
         run.frozen = true;
         let mut receipts = Vec::new();
         for running in &mut run.tasks {
@@ -501,10 +586,10 @@ impl Executor {
     /// facts found it). Empty for an attempt this node does not run.
     pub async fn blockers(&self, attempt: AttemptId, root: &AbsPath) -> Vec<HandoffBlocker> {
         let (groups, registered) = {
-            let attempts = self.attempts.lock().await;
-            let Some(run) = attempts.get(&attempt) else {
+            let Ok(run) = self.run(attempt).await else {
                 return Vec::new();
             };
+            let run = run.lock().await;
             let pids: Vec<u32> = run.tasks.iter().map(|t| t.pid.get()).collect();
             (pids.clone(), pids)
         };
@@ -547,12 +632,27 @@ impl Executor {
 
     /// The pids of the attempt's registered tasks, for the tests and the inspect surface.
     pub async fn pids(&self, attempt: AttemptId) -> Vec<u32> {
-        self.attempts
-            .lock()
-            .await
-            .get(&attempt)
-            .map(|run| run.tasks.iter().map(|t| t.pid.get()).collect())
-            .unwrap_or_default()
+        match self.run(attempt).await {
+            Ok(run) => run.lock().await.tasks.iter().map(|t| t.pid.get()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// Removes every `FABRIC_SECRET_*` variable from what `command` would
+/// give its process: the ones it inherits from the daemon, which holds
+/// the node's secrets there (ADR 0025), and the ones set on it. Only the
+/// job's declared secrets reach a task, under their bare names.
+fn scrub_secrets(command: &mut std::process::Command) {
+    let explicit: Vec<std::ffi::OsString> =
+        command.get_envs().map(|(key, _)| key.to_owned()).collect();
+    for key in std::env::vars_os().map(|(key, _)| key).chain(explicit) {
+        if key
+            .as_encoded_bytes()
+            .starts_with(SECRET_ENV_PREFIX.as_bytes())
+        {
+            command.env_remove(&key);
+        }
     }
 }
 
@@ -820,7 +920,13 @@ mod tests {
         let executor = Executor::new(dir.path().join("records"), resolver, capturer.clone());
         let attempt = AttemptId::from_bytes([7; 16]);
         executor
-            .begin(attempt, JobId::from_bytes([1; 16]), root.clone(), secrets)
+            .begin(
+                attempt,
+                JobId::from_bytes([1; 16]),
+                Generation::FIRST,
+                root.clone(),
+                secrets,
+            )
             .await;
         Bench {
             dir,
@@ -1155,6 +1261,187 @@ mod tests {
         assert!(b.executor.pids(b.attempt).await.is_empty());
     }
 
+    /// No `FABRIC_SECRET_*` variable reaches a task but the job's own
+    /// secrets under their bare names: not one the daemon's environment
+    /// holds, not one set on the command, declared or not.
+    #[tokio::test]
+    async fn no_node_secret_reaches_a_task_but_its_declared_ones() {
+        let secret = SecretRef {
+            name: SecretName::parse("GITHUB_TOKEN").unwrap(),
+            scope: fabric_core::managed::SecretScope::node_any(),
+        };
+        let b = bench_with(
+            Ok(SnapshotId::of(b"x")),
+            vec![secret],
+            vec![
+                ("FABRIC_SECRET_GITHUB_TOKEN".into(), "declared".into()),
+                ("FABRIC_SECRET_NPM_TOKEN".into(), "undeclared".into()),
+            ],
+        )
+        .await;
+        let out = Path::new(b.root.as_str()).join("env");
+        let mut command = sh(&format!("env > {}", out.display()));
+        command.env("FABRIC_SECRET_NPM_TOKEN", "undeclared");
+        b.executor
+            .spawn(b.attempt, task(1), TaskClass::Test, command)
+            .await
+            .unwrap();
+        let q = b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        assert!(q.receipts[0].passed());
+        let env = std::fs::read_to_string(&out).unwrap();
+        assert!(env.lines().any(|l| l == "GITHUB_TOKEN=declared"), "{env}");
+        assert!(!env.contains("FABRIC_SECRET_"), "{env}");
+        assert!(!env.contains("undeclared"), "{env}");
+    }
+
+    /// A quiescence that drains one attempt for its whole budget does not
+    /// hold up another attempt on the node: its spawn and stop go on.
+    #[tokio::test]
+    async fn one_attempts_drain_does_not_stall_another() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        let other = AttemptId::from_bytes([8; 16]);
+        b.executor
+            .begin(
+                other,
+                JobId::from_bytes([2; 16]),
+                Generation::FIRST,
+                b.root.clone(),
+                Vec::new(),
+            )
+            .await;
+        b.executor
+            .spawn(b.attempt, task(1), TaskClass::Test, sh("sleep 30"))
+            .await
+            .unwrap();
+        let executor = Arc::new(b.executor);
+        let draining = {
+            let executor = Arc::clone(&executor);
+            let attempt = b.attempt;
+            tokio::spawn(async move { executor.quiesce(attempt, budget(3_000)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = tokio::time::Instant::now();
+        executor
+            .spawn(other, task(2), TaskClass::Test, sh("exit 0"))
+            .await
+            .unwrap();
+        executor.stop(other, budget(1_000)).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "the other attempt waited {:?}",
+            started.elapsed()
+        );
+        draining.await.unwrap().unwrap();
+    }
+
+    /// A secret scoped to the current attempt reaches a task of the job's
+    /// current grant only: once a newer generation of the job is known,
+    /// the older attempt's tasks get its `any` secrets and not that one.
+    #[tokio::test]
+    async fn a_current_scoped_secret_reaches_only_the_current_attempt() {
+        let any = SecretRef {
+            name: SecretName::parse("CACHE_TOKEN").unwrap(),
+            scope: fabric_core::managed::SecretScope::node_any(),
+        };
+        let current = SecretRef {
+            name: SecretName::parse("DEPLOY_KEY").unwrap(),
+            scope: fabric_core::managed::SecretScope {
+                attempt: AttemptScope::Current,
+                ..fabric_core::managed::SecretScope::node_any()
+            },
+        };
+        let b = bench_with(
+            Ok(SnapshotId::of(b"x")),
+            vec![any, current],
+            vec![
+                ("FABRIC_SECRET_CACHE_TOKEN".into(), "cache".into()),
+                ("FABRIC_SECRET_DEPLOY_KEY".into(), "deploy".into()),
+            ],
+        )
+        .await;
+        let job = JobId::from_bytes([1; 16]);
+        let seen = |name: &str| Path::new(b.root.as_str()).join(name);
+        let print = |name: &str| {
+            sh(&format!(
+                "printf '%s|%s' \"$CACHE_TOKEN\" \"$DEPLOY_KEY\" > {}",
+                seen(name).display()
+            ))
+        };
+        b.executor
+            .spawn(b.attempt, task(1), TaskClass::Test, print("before"))
+            .await
+            .unwrap();
+        b.executor
+            .supersede(job, Generation::FIRST.next().unwrap())
+            .await;
+        b.executor
+            .spawn(b.attempt, task(2), TaskClass::Test, print("after"))
+            .await
+            .unwrap();
+        b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(seen("before")).unwrap(),
+            "cache|deploy"
+        );
+        assert_eq!(std::fs::read_to_string(seen("after")).unwrap(), "cache|");
+    }
+
+    /// A checkpoint command's quiescence leaves the attempt running: once
+    /// resumed it spawns again (ADR 0023).
+    #[tokio::test]
+    async fn a_resumed_attempt_spawns_again_after_its_cut() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        b.executor
+            .spawn(b.attempt, task(1), TaskClass::Test, sh("exit 0"))
+            .await
+            .unwrap();
+        b.executor.quiesce(b.attempt, budget(2_000)).await.unwrap();
+        assert!(matches!(
+            b.executor
+                .spawn(b.attempt, task(2), TaskClass::Test, sh("exit 0"))
+                .await,
+            Err(ExecutorError::Frozen { .. })
+        ));
+        b.executor.resume(b.attempt).await.unwrap();
+        b.executor
+            .spawn(b.attempt, task(2), TaskClass::Test, sh("exit 0"))
+            .await
+            .unwrap();
+        b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+    }
+
+    /// A spawn whose launch record cannot be completed after the process
+    /// exists stops that process: nothing runs that no record names.
+    #[tokio::test]
+    async fn a_spawn_that_fails_after_the_process_exists_leaves_nothing_running() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        let marker = Path::new(b.root.as_str()).join("pid");
+        b.executor
+            .fail_completion
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let spawned = b
+            .executor
+            .spawn(
+                b.attempt,
+                task(1),
+                TaskClass::Test,
+                sh(&format!("echo $$ > {}; exec sleep 30", marker.display())),
+            )
+            .await;
+        assert!(
+            matches!(spawned, Err(ExecutorError::Record(_))),
+            "{spawned:?}"
+        );
+        assert!(b.executor.pids(b.attempt).await.is_empty());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Ok(pid) = std::fs::read_to_string(&marker) {
+            assert!(
+                !alive(pid.trim().parse().unwrap()),
+                "the process was stopped"
+            );
+        }
+    }
+
     fn walkdir(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1212,7 +1499,13 @@ mod tests {
             let executor =
                 Executor::new(records.clone(), LocalResolver::open(dir.path()), capturer);
             executor
-                .begin(attempt, JobId::from_bytes([1; 16]), root, Vec::new())
+                .begin(
+                    attempt,
+                    JobId::from_bytes([1; 16]),
+                    Generation::FIRST,
+                    root,
+                    Vec::new(),
+                )
                 .await;
             let spawned = executor
                 .spawn(attempt, task(2), TaskClass::Test, sh("sleep 30"))
