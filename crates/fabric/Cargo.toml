@@ -15,7 +15,7 @@ faults = ["fabricd/faults"]
 counted-tools = ["fabric-harness/counted-tools"]
 # The fake harnesses the end-to-end test launches: the ACP agent and a
 # full-screen harness for the terminal tests.
-fixtures = ["dep:serde_json"]
+fixtures = []
 
 [dependencies]
 anyhow = "1.0"
@@ -28,7 +28,7 @@ fabric-net = { path = "../fabric-net" }
 fabricd = { path = "../fabricd" }
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 rustix = { version = "1.1", features = ["process", "termios"] }
-serde_json = { version = "1.0", optional = true }
+serde_json = "1.0"
 tokio = { version = "1.54", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

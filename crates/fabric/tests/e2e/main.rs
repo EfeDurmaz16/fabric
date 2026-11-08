@@ -831,19 +831,25 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
         ],
     )?;
     // The plan's last line names the session; the CLI writes every plan
-    // line before it launches, and nothing more until the node answers the
-    // registration. The pipe closes in that gap.
-    let mut plan = std::io::BufReader::new(running.stdout.take().ok_or("no stdout")?);
-    loop {
-        let mut line = String::new();
-        if plan.read_line(&mut line)? == 0 {
-            return Err("the CLI printed no session line".into());
+    // line, on standard error, before it launches, and nothing more until
+    // the node answers the registration. Standard output, where the turn
+    // prints, closes in that gap. Standard error stays open, read to its
+    // end, because the harness inherits it.
+    let out = running.stdout.take().ok_or("no stdout")?;
+    let err = running.stderr.take().ok_or("no stderr")?;
+    let (seen, plan) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(err).lines();
+        let mut told = false;
+        while let Some(Ok(line)) = lines.next() {
+            if !told && (line.starts_with("continuing ") || line.starts_with("starting a new ")) {
+                told = seen.send(()).is_ok();
+            }
         }
-        if line.starts_with("continuing ") || line.starts_with("starting a new ") {
-            break;
-        }
-    }
-    drop(plan);
+    });
+    plan.recv_timeout(GIVE_UP)
+        .map_err(|_| "the CLI printed no session line")?;
+    drop(out);
     wait_for(&pid_file, "the harness launch")?;
     let started = std::time::Instant::now();
     while !p
