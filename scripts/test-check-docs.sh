@@ -81,6 +81,11 @@ printf '\nProved on two real Macs.\n' >> "$work/repo/docs/start/install.md"
 expect fail 'a two-Mac claim without its qualifier' python3 scripts/docs/check-claims.py
 
 fresh
+sed 's/cargo install mdbook --version [0-9.]*/cargo install mdbook --version 0.0.1/' "$work/repo/CONTRIBUTING.md" > "$work/repo/x" \
+  && mv "$work/repo/x" "$work/repo/CONTRIBUTING.md"
+expect fail 'an mdBook install command off the pin' python3 scripts/docs/check-claims.py
+
+fresh
 if [ -x "$bin" ]; then
   expect pass 'CLI reference matches the binary' env DOCS_CLI="$bin" scripts/docs/cli-reference.sh --check
   printf '#!/bin/sh\necho "Usage: %s <COMMAND>"\n' "$CLI_BIN" > "$work/fake-cli"

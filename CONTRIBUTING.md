@@ -32,6 +32,9 @@ scripts/check-budget.sh origin/main
 scripts/check-docs.sh
 ```
 
+`scripts/check-docs.sh` needs mdBook at the version CI pins; [Docs](#docs)
+says how to install it.
+
 The TypeScript SDK in `sdk/typescript` needs Bun, and Node 22 with npm on
 `PATH` for its package test. Its end-to-end test runs against a node built
 from your tree:
@@ -346,6 +349,15 @@ tool, it renders the Markdown that GitHub already shows, and the site is
 the same files. It is not a dependency of any crate. CI pins its version
 in `.github/workflows/docs.yml` and publishes the site from `main` to
 GitHub Pages.
+
+`scripts/check-docs.sh` needs mdBook and `python3`. Install the mdBook
+version CI pins (`MDBOOK_VERSION` in `.github/workflows/docs.yml`), or set
+`MDBOOK` to a binary of it; the build script names the version when it
+finds none:
+
+```sh
+cargo install mdbook --version 0.5.4 --locked
+```
 
 ```sh
 cargo build -p fabric --locked

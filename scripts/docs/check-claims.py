@@ -10,6 +10,10 @@ Rules, and when each can go:
   paragraph that names it says it was before M2 to M4, or that it is
   pending or never ran. Drop the rule when gate G1 is recorded on main.
 
+It also fails when a `cargo install mdbook --version X` in a page names
+another version than MDBOOK_VERSION in .github/workflows/docs.yml, the
+one place the pin is written.
+
 Usage: scripts/docs/check-claims.py [file ...]
 Standard library only.
 """
@@ -57,10 +61,18 @@ def main():
             for f in listed
             if f and not f.startswith(("docs/evidence/", "docs/adr/"))
         ]
+    with open(os.path.join(root, ".github/workflows/docs.yml"), encoding="utf-8") as f:
+        pin = re.search(r"^\s*MDBOOK_VERSION:\s*(\S+)", f.read(), re.M)
+    if not pin:
+        sys.exit("error: no MDBOOK_VERSION in .github/workflows/docs.yml")
     bad = 0
     for path in files:
         with open(path, encoding="utf-8") as f:
             text = f.read()
+        for version in re.findall(r"cargo install mdbook --version (\S+)", text):
+            if version != pin.group(1):
+                print("%s: mdBook %s, docs.yml pins %s" % (os.path.relpath(path, root), version, pin.group(1)))
+                bad += 1
         for para in paragraphs(text):
             for phrase, qualifiers in RULES:
                 if phrase.search(para) and not any(q in para for q in qualifiers):
