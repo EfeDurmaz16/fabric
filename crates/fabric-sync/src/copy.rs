@@ -16,8 +16,9 @@ use crate::SyncError;
 use crate::faults;
 use crate::objects::{Counters, MAX_MANIFEST_LEN, Objects};
 
-/// The longest bundle chain followed: sixteen incremental links and the full bundle under them.
-const MAX_CHAIN: usize = 17;
+/// The longest bundle chain followed: the incremental links capture makes
+/// at most and the full bundle under them.
+const MAX_CHAIN: usize = fabric_store::capture::MAX_BUNDLE_CHAIN as usize + 1;
 
 /// How many ids one `missing` question carries.
 const MISSING_BATCH: usize = 1024;
