@@ -1035,3 +1035,187 @@ async fn a_fenced_write_runs_inside_the_authority_s_turn() {
     ticker.await.unwrap().unwrap();
     assert_eq!(*order.lock().unwrap(), ["write", "tick"]);
 }
+
+/// Times the M6 authority paths that have no reference build (neither the
+/// anchor nor the M5 head has a heartbeat, a fence or an acknowledgement):
+/// 20 rounds of `PER_ROUND` calls each, after a warm-up, and the journal
+/// bytes each path writes. `FABRIC_M6_BENCH_OUT` names the file the rows
+/// go to.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a bench; run on demand with FABRIC_M6_BENCH_OUT set, --release --ignored"]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    reason = "one bench reads best as one function; nanoseconds fit an f64"
+)]
+async fn bench_m6_paths() {
+    use std::time::Instant;
+
+    const ROUNDS: usize = 20;
+    const PER_ROUND: u32 = 200;
+
+    fn summary(op: &str, mut rounds: Vec<f64>, bytes: u64, calls: u64) -> String {
+        rounds.sort_by(f64::total_cmp);
+        let median = f64::midpoint(rounds[rounds.len() / 2 - 1], rounds[rounds.len() / 2]);
+        format!(
+            "{op}\t{}\t{median:.0}\t{:.0}\t{:.0}\t{}\n",
+            rounds.len(),
+            rounds[0],
+            rounds[rounds.len() - 1],
+            bytes / calls.max(1),
+        )
+    }
+    let journal_len = |state: &StateDir| std::fs::metadata(journal_path(state)).unwrap().len();
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let mut out = String::from("op\trounds\tmedian_ns\tmin_ns\tmax_ns\tjournal_bytes_per_call\n");
+
+    // A heartbeat from the granted runner of a tracked, reachable attempt.
+    for _ in 0..PER_ROUND {
+        authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    }
+    let before = journal_len(&state);
+    let mut rounds = Vec::new();
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        for _ in 0..PER_ROUND {
+            authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+        }
+        rounds.push(start.elapsed().as_nanos() as f64 / f64::from(PER_ROUND));
+    }
+    let calls = (ROUNDS as u64) * u64::from(PER_ROUND);
+    out.push_str(&summary(
+        "heartbeat live",
+        rounds,
+        journal_len(&state) - before,
+        calls,
+    ));
+
+    // A covered write from the granted runner, run inside the authority's turn.
+    let path = fabric_core::managed::CoveredPath::LedgerAppend;
+    let before = journal_len(&state);
+    let mut rounds = Vec::new();
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        for _ in 0..PER_ROUND {
+            authority
+                .fenced_write(token, path, Some(RUNNER), || ())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        rounds.push(start.elapsed().as_nanos() as f64 / f64::from(PER_ROUND));
+    }
+    out.push_str(&summary(
+        "fenced write",
+        rounds,
+        journal_len(&state) - before,
+        calls,
+    ));
+
+    // A tick with nothing overdue.
+    let before = journal_len(&state);
+    let mut rounds = Vec::new();
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        for _ in 0..PER_ROUND {
+            authority.tick(mono_ms()).await.unwrap();
+        }
+        rounds.push(start.elapsed().as_nanos() as f64 / f64::from(PER_ROUND));
+    }
+    out.push_str(&summary(
+        "tick idle",
+        rounds,
+        journal_len(&state) - before,
+        calls,
+    ));
+
+    // A checkpoint acknowledgement after the runner reported its capture;
+    // only the acknowledgement is timed.
+    let mut n = 0u64;
+    let mut ack_rounds = Vec::new();
+    let mut ack_bytes = 0;
+    let acks_per_round = 20u32;
+    for _ in 0..ROUNDS {
+        let mut elapsed = std::time::Duration::ZERO;
+        for _ in 0..acks_per_round {
+            n += 1;
+            let snapshot = SnapshotId::of(&n.to_le_bytes());
+            let mut cut = [0u8; 32];
+            cut[..8].copy_from_slice(&n.to_le_bytes());
+            let cut = CutDigest::from_bytes(cut);
+            authority
+                .report(
+                    token,
+                    Some(RUNNER),
+                    Observation::Captured {
+                        attempt: token.attempt,
+                        generation: token.generation,
+                        snapshot,
+                        cut,
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let before = journal_len(&state);
+            let start = Instant::now();
+            authority
+                .acknowledge(
+                    job,
+                    CheckpointAck {
+                        attempt: token.attempt,
+                        generation: token.generation,
+                        snapshot,
+                        cut,
+                        manifests: 1,
+                        chunks: 1,
+                        bytes: 1,
+                        fetched_from: RUNNER,
+                    },
+                )
+                .await
+                .unwrap();
+            elapsed += start.elapsed();
+            ack_bytes += journal_len(&state) - before;
+        }
+        ack_rounds.push(elapsed.as_nanos() as f64 / f64::from(acks_per_round));
+    }
+    let acks = (ROUNDS as u64) * u64::from(acks_per_round);
+    out.push_str(&summary(
+        "checkpoint acknowledge",
+        ack_rounds,
+        ack_bytes,
+        acks,
+    ));
+    drop(authority);
+
+    // The first heartbeat after a restart, when the attempt is untracked:
+    // one journal read, and the heal when it is not reachable.
+    let mut rounds = Vec::new();
+    let mut heal_bytes = 0;
+    for _ in 0..ROUNDS {
+        let authority = Authority::start(&state, NODE).unwrap();
+        authority.job(job).await.unwrap().unwrap();
+        let before = journal_len(&state);
+        let start = Instant::now();
+        authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+        rounds.push(start.elapsed().as_nanos() as f64);
+        heal_bytes += journal_len(&state) - before;
+        drop(authority);
+    }
+    out.push_str(&summary(
+        "heartbeat after restart",
+        rounds,
+        heal_bytes,
+        ROUNDS as u64,
+    ));
+
+    eprint!("{out}");
+    if let Ok(file) = std::env::var("FABRIC_M6_BENCH_OUT") {
+        std::fs::write(file, out).unwrap();
+    }
+}
