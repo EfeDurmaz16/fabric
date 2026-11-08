@@ -14,6 +14,7 @@
 //! `fabric` op by op on the same fixture. `acp_cli` and `preflight` hold the
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
 //! acceptance tests, `facade` the M5 facade and placement acceptance tests,
+//! `launch` the M5 launch path across two daemons with homes of their own,
 //! and `legacy` loads a state directory frozen from main.
 
 mod ab;
@@ -24,6 +25,7 @@ mod client;
 mod continuity;
 mod facade;
 mod headless;
+mod launch;
 mod legacy;
 mod managed;
 mod placement;
