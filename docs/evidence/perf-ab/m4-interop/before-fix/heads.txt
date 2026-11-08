@@ -1,0 +1,3 @@
+capsule 4831f8130f9cc7dddc6e8a2e37223aad36a2afa8 fabric f96131c15abc1509a13cf1550a653784e706dcdc
+capsule worktree clean: yes; fabric worktree clean: no
+sea: c6fdedf16f752c18197e398fa1b32e5e6b9bd0da15aa5c36d62d6cd116f0f4cc 143820864 bytes; minimal PATH has none of node nodejs bun pnpm npm npx deno

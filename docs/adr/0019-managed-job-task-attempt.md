@@ -1,6 +1,6 @@
 # ADR 0019: Managed jobs, tasks, attempts and operations
 
-Status: proposed, 2026-10-27
+Status: proposed, 2026-10-27; as built on `main` since 2026-11-03 (PR #31)
 
 Adopts the parts of the external draft P01 ("Durable job, task, attempt and evidence", 2026-10-25) that the M2 campaign needs, with the handoff selections of 2026-10-27. It extends ADR 0001 (job as unit of work) and ADR 0002 (job ledger and record) without changing either: a job made before this ADR, and every job made without asking for a managed one, stays a standalone job under those ADRs, byte for byte. The schema, the states and the replay rules live in [docs/managed-jobs.md](../managed-jobs.md); this ADR records the decisions and why.
 

@@ -567,6 +567,79 @@ slower.
   test profile is tracked, not gated (CONTRIBUTING, ADR 0009). These
   test-profile numbers stay in the record as tracked; they gate nothing.
 
+# M4: the release build against the anchor and the M2 head
+
+Recorded on 2026-11-02 and 2026-11-03 on `m4/reconciliation` at `e747f58` (the product code is `d05a117`; the commits after it change tests, CI and documents only). This is the one measurement of M4: the Perf phase ran alone, each timed run started only once the 1-minute load average was at or below 6 (each run's load before and after is in its `machine.txt` or report header), and no other benchmark, build or image build ran beside a timed run. The host is an Apple M5 Pro, 18 cores, macOS arm64, rustc 1.97.1, Node 22.23.2, OrbStack with Docker 29.4.0.
+
+| Directory | What | Pairs | Counted runs | Load start, end |
+|---|---|---:|---:|---|
+| `m4-release/` | `scripts/bench-ab.sh --release` against the anchor `176622e`, the rule's gate | 20 | 3 | 5.72, 12.41 (the run's own two fixtures) |
+| `m4-vs-m2-release/` | the same against `origin/m2/durable-job-foundations` at `6b0d43a`, a second reference | 20 | 3 | 5.94, 6.99 |
+| `m4-vs-m2-release-recheck/` | the M2 comparison again, for the one row below | 30 | 1 | see its `machine.txt` |
+| `m4-bridge/` | `scripts/bench-bridge.sh` with the Capsule worker and Docker: worker spawn and handshake, request round trip on the in-memory log and through the journal's two committed writes | 50 spawns, 500 and 200 trips; 15 per Capsule path | | see its `machine.txt` |
+| `m4-interop/` | the interop tests against the Capsule worker, run once after the review fixes (not timed) | | | |
+| `m4-gates/` | the gate list on the final commits | | | |
+
+## Against the anchor, release build: no regression
+
+`m4-release/report.md`. 24 of the 26 ops are faster, with intervals below 1; `claude launch` (0.993, 0.959 to 1.023) and `cli version` (0.940, 0.914 to 1.054) have intervals that hold 1. No op is slower. Both daemons are smaller on every measure: resident size after the timed runs 0.873 (a) and 0.881 (b), physical footprint 0.941 and 0.909, and the same in the counted runs; the CLI's peak resident size is 800 to 1100 KiB lower on every op; the release binary is 15480560 bytes against the anchor's 19773920. The counters say why: one process start instead of three for `new`, three full flushes instead of eight, 5 to 8 instead of 15 to 17 for a launch, 7 instead of 15 for a move, 41 instead of 81 for a pull, and the probes of every installed harness (`bun`, `cargo`, `npm`, `pnpm`, `python3`, `rustc`, `uv`, `xcrun`, `yarn`, `sw_vers`, `defaults`) gone from move, pull and the M2 ops; `restart` reads 6 full flushes instead of 38 and 3 job syncs instead of 32.
+
+| op | anchor ms | M4 ms | ratio, 95% interval |
+|---|---:|---:|---|
+| acp, claude, codex new | 140.3, 135.4, 134.1 | 59.2, 54.8, 56.8 | 0.416, 0.394, 0.410, all below 0.47 |
+| acp, claude, codex launch | 71.5, 87.5, 98.8 | 30.8, 87.1, 93.6 | 0.446 (0.423 to 0.472), 0.993 (0.959 to 1.023), 0.941 (0.904 to 0.959) |
+| approve, ledger append | 15.2, 15.3, 14.8, 15.3 | 7.9, 7.6, 7.4, 7.5 | 0.50 to 0.53 |
+| cli version, cli ls | 2.6, 3.5 | 2.6, 3.1 | 0.940 (0.914 to 1.054), 0.860 (0.817 to 0.926) |
+| suspend | 399.7, 451.3, 657.4 | 315.3, 299.0, 478.5 | 0.767, 0.662, 0.746 |
+| move | 164.3, 156.9, 163.9 | 101.2, 100.7, 103.1 | 0.629, 0.644, 0.623 |
+| resume | 728.6, 853.6, 1059.0 | 266.0, 361.2, 516.5 | 0.404, 0.436, 0.563 |
+| pull | 1284.7, 1494.1, 1976.0 | 642.6, 760.3, 1105.6 | 0.538, 0.529, 0.600 |
+| cold start, restart | 54.0, 422.6 | 52.0, 55.3 | 0.968 (0.942 to 0.986), 0.156 (0.129 to 0.182) |
+
+## Against the M2 head, release build
+
+`m4-vs-m2-release/report.md`, the M3 and M4 work on top of M2 (the bridge crate, the journal's provider tables at schema version 2, the create guard, the replacement barrier, cleanup and residuals, and fabricd's use of them). The e2e fixture runs no provider operation, so this is the cost of carrying the code and the schema.
+
+- 25 of the 26 ops have intervals that hold 1. `claude new` reads 1.053 (1.011 to 1.095, 53.5 against 56.7 ms); `acp new` and `codex new`, the same code with another harness name, read 0.970 (0.941 to 1.022) and 0.991 (0.934 to 1.038), and the counters of all three are equal to M2's (1 process, 3 full flushes, 143 or 124 journal bytes, 1056 to 1058 allocations). `m4-vs-m2-release-recheck/` ran the comparison again with 30 pairs (load 5.55 to 4.71): `claude new` reads 1.012 (0.995 to 1.030) and `acp new` and `codex new` 1.005 and 1.002, so the 1.053 did not hold. In that run two other rows cross instead, `acp resume` 1.014 (1.009 to 1.027) and `codex pull` 1.007 (1.001 to 1.014), which the first run had at 0.985 (0.952 to 1.009) and 0.993 (0.969 to 1.030); every other op holds 1 in both runs, and the counters of the crossing rows are equal to M2's in both. No row crosses in both runs: what the two runs agree on is that the M3 and M4 code costs the M2 ops nothing the pairs can separate from noise at 1 to 1.5 percent, while every op stays 0.16 to 0.99 of the anchor.
+- Every counter is equal to M2's except the CLI's peak resident size, 96 to 160 KiB higher on every op (for example `acp approve` 4112 to 4240 KiB) with the binary 36960 bytes larger (15443600 to 15480560): the bridge and journal provider code the CLI links. Against the anchor the same CLI is 800 to 1100 KiB smaller.
+- Daemon memory: resident size 0.990 (a) and 0.988 (b) in the counted runs, 1.005 (1.002 to 1.008) and 0.992 after the timed runs; physical footprint 1.000 and 0.988 in the counted runs, 1.031 (1.026 to 1.040, 3904 to 4016 KiB) and 0.988 after the timed runs. Daemon a, the node that creates the jobs, dirties about 112 KiB more than M2 after a timed run and the same in a counted run; the difference is state, not code (the counted phase loads the same binary), within what the journal's version 2 schema holds open per job. Against the anchor daemon a is 0.941 and daemon b 0.909.
+
+## Bridge paths
+
+`m4-bridge/`: `scripts/bench-bridge.sh` on `386f3b6` (the product code is still `d05a117`) with the Capsule worker at `c7254d8` (code head `ab7f0d3`) through Node 22.23.2 and `debian:bookworm-slim` on OrbStack, load 5.24 before and 5.55 after, both profiles in one script run; every sample is in `m4-bridge/<profile>/*_us.txt` and `<profile>/capsule/*_us.txt`. None of these paths exists on the anchor or on the M2 head, so there is no pair to compute; the reference is the M3 record `../m3-interop/bench` (2026-10-27, load 7 to 12), another day and another load, so the comparison is unpaired and only a change well outside the run-to-run spread would count.
+
+| Path | M3 record, release p50 | M4, release p50 | M4, test p50 |
+|---|---:|---:|---:|
+| Rust double: spawn and handshake | 1.59 ms | 1.35 ms | 2.49 ms |
+| Rust double: create round trip, in-memory log (500) | 46 us | 41 us | 156 us |
+| Rust double: create round trip, journal (200, two committed writes) | 7.91 ms | 7.00 ms | 7.99 ms |
+| Capsule fixture: worker spawned, handshake answered | 29.0 ms | 30.3 ms | 28.8 ms |
+| Capsule fixture: create round trip, in-memory log | 182 us | 145 us | 229 us |
+| Capsule fixture: exec round trip, in-memory log | 159 us | 148 us | 245 us |
+| Capsule fixture: create round trip, journal | 7.98 ms | 7.02 ms | 8.00 ms |
+| Docker: worker spawned, handshake answered | 29.3 ms | 27.3 ms | 28.4 ms |
+| Docker: create round trip (container running) | 192 ms | 203 ms | 208 ms |
+| Docker: exec round trip (`echo`) | 88.7 ms | 84.8 ms | 89.3 ms |
+| Docker: destroy round trip (container gone) | 221 ms | 219 ms | 231 ms |
+
+The journal dispatch path, one request to its answer through the journal's two committed writes, is 7.0 ms in the release build against the double and against the worker alike: the two fsyncs, as in M3. The in-memory round trips are 10 to 20 percent under the M3 record. The two numbers above the record, the fixture worker's spawn (30.3 against 29.0 ms, Node starting and loading a bundle 7 percent larger: 111223 against 103988 bytes of `dist`) and the Docker create (203 against 192 ms, the docker CLI and the engine), are inside the spread the M3 records show between their own runs on this host at different loads (`../m3-interop/bench` at a load of 6.9: fixture spawn 29.0 ms, Docker create 192 ms; `../m3-review/bench` at 12.5: 42.4 ms and 1170 ms; `../m3-review/bench-base` at 17.2: 57.8 ms and 1013 ms). Capsule's own interleaved A/B of the M3 worker head against this worker on the same two paths is in Capsule `benchmarks/ab/m4-bridge-vs-m3-*`.
+
+The first attempt of this run (`run-test.log` of that attempt is kept in the Capsule evidence as the worker's own refusal) lost its first fixture spawn: the M4 worker refuses a seeded sandbox that names `owner_job` without `operation`, which `5e38dfa` fixes in the bench's seed; the bench had not run since the worker's attach by identity landed, since nothing outside the Perf phase times it.
+
+## Interop after the review fixes
+
+`m4-interop/`: Fabric `crates/fabric-bridge/tests/capsule_worker.rs` against the Capsule worker at `4831f81` (its code head is `ab7f0d3`: an approval ref bound to the first operation it resolves for, a container kept when its start timed out), built in its worktree on Node 22.23.2 and as the single executable on Node 26.7.0 (sha256 `c6fdedf16f752c18197e398fa1b32e5e6b9bd0da15aa5c36d62d6cd116f0f4cc`, rebuilt here since the one in `../m4` predates those fixes). `run-interop.sh` is the script; its four runs (`node-docker`, `node-no-image`, `sea-docker`, `sea-no-image`) all pass 13 of 13 with no container left (`summary.txt`, `heads.txt`).
+
+The first run of the four (`before-fix/`) failed `the_docker_profile_on_the_local_engine` under the executable with Docker, 12 of 13, at a load average of 23.7 with the three Docker tests in parallel: the test sent an exec of `sleep 2` under a 500 ms deadline to see it answered `running`, and the worker refused it before any effect (`provider_failed`/`provider_refused`, `r-8`). The deadline also covers the worker's checks before the exec, an inspect through the docker CLI; under that load they took over 500 ms. Alone, the test passed 3 of 3 at a load of 21 to 26 (`before-fix/sea-docker-slow-*.log`); with every docker CLI call slowed by 0.6 s it failed 2 of 2 on the same request (`before-fix/slow-docker-cli-*.log`). `e747f58` makes the exec sleep 6 s under a 3 s deadline; the slowed CLI then passes 2 of 2 (`slow-docker-cli-after-*.log`) and the four runs above pass. `before-fix/sea-docker-rerun-1.log` is a full run that the Perf session script of this run killed at its stray-process sweep (exit 143) while it ran; the two containers it left were removed by id, and `sea-docker-rerun-2.log` passed 13 of 13 at a load of 18.8.
+
+Two lockstep changes the review fixes needed in Fabric's tests, both on the bench and neither on product code: `0979446` gives `capsule_worker_latencies` one destroy grant per destroy, since the worker binds a ref to the first operation it resolves for; `5e38dfa` seeds its fixture sandbox with the create that made it, since the worker's fixture profile refuses `owner_job` without `operation` and exits before `hello` (the first `m4-bridge` attempt lost its first spawn to that). `f96131c` moves both CI pins to Capsule `ab7f0d3`.
+
+## Gates
+
+`m4-gates/run-gates.sh` ran the whole list once on `386f3b6` with this README's M4 section uncommitted beside it, at a load average of 5.2 to 7.2, nothing timed (`m4-gates/summary.txt`, each gate's log beside it): `cargo fmt --all --check`; clippy with `-D warnings` for the workspace and for `fabric-harness` with no features and each of `acp`, `claude`, `codex`; `cargo test --workspace --locked -- --skip e2e_`; `cargo test -p fabric --test e2e --locked`; `cargo doc` with `-D warnings`; `cargo deny check`; the hygiene, budget and fixture scripts and their self-tests against `origin/m3/capsule-bridge`; actionlint on both workflows; `cargo build -p fabric`; the TypeScript SDK install, typecheck, build and `bun test` against the node built here; and `FABRIC_BUDGET=count` `budget::hot_paths`. All 15 passed on the first run. The interop binary, `cargo test -p fabric-bridge --test capsule_worker`, ran with `--ignored` in `m4-interop/`.
+
+A note on the host: at about 00:00 on 2026-11-03, between the second and the third timed run, something outside this session deleted the untracked and most of the tracked files of every worktree under `/tmp/fabric-wt` and `/tmp/capsule-wt` (both `m4` trees among them, with their `.git` link files, `Cargo.toml` and `package.json`); the branch refs and the commits were untouched in the base repositories, the evidence under `docs/` and `benchmarks/` survived, and both trees were restored from their index (`git checkout -- .`) and, for Capsule, reinstalled and rebuilt from the pnpm store before the remaining runs. Nothing here was measured on a tree in that state: the runs that hit it failed at once and were run again.
+
 ## M5, release
 
 Run on 2026-11-08 by `scripts/bench-ab.sh --release --pairs 20 --counted 1`

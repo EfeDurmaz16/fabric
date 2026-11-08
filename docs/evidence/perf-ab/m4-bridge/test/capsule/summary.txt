@@ -1,0 +1,8 @@
+fixture_spawn_handshake: n=15 p50=28807us p90=31225us p99=32285us max=32285us
+fixture_create_memory_log: n=15 p50=229us p90=542us p99=687us max=687us
+fixture_exec_memory_log: n=15 p50=245us p90=389us p99=694us max=694us
+fixture_create_journal: n=15 p50=7995us p90=8126us p99=8849us max=8849us
+docker_spawn_handshake: n=15 p50=28392us p90=30328us p99=32556us max=32556us
+docker_create: n=15 p50=208426us p90=235959us p99=398321us max=398321us
+docker_exec: n=15 p50=89276us p90=94610us p99=140214us max=140214us
+docker_destroy: n=15 p50=231383us p90=268498us p99=298007us max=298007us

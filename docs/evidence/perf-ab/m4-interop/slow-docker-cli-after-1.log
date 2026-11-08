@@ -1,0 +1,8 @@
+
+running 1 test
+docker server 29.4.0, context orbstack, image debian:bookworm-slim
+spawn and handshake: 191.806625ms
+test the_docker_profile_on_the_local_engine ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 50.34s
+

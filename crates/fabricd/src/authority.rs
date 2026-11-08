@@ -182,14 +182,34 @@ enum Writer {
     Idle(StateDir, NodeId),
     /// The thread runs.
     Running {
-        /// The queue it takes calls from.
+        /// The queue it takes calls from. Declared before `thread`, so the
+        /// last handle's drop closes the queue, which ends the thread,
+        /// before it joins it.
         calls: mpsc::Sender<Call>,
         /// The ids it publishes outside the queue.
         ids: watch::Receiver<Ids>,
         /// How many calls have changed the journal; a watcher of the
         /// facade waits on it (M5).
         commits: watch::Receiver<u64>,
+        /// The thread, joined when the last handle drops, so a dropped
+        /// authority has closed its journal: `SQLite` unlinks the WAL and
+        /// shm beside the journal on the last close, and a caller that
+        /// looks at the state directory after the drop must not race it.
+        _thread: JoinOnDrop,
     },
+}
+
+/// A thread joined when dropped.
+#[derive(Debug)]
+struct JoinOnDrop(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for JoinOnDrop {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            // A panic in the thread already failed the call it served.
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Authority {
@@ -232,7 +252,7 @@ impl Authority {
         let (calls, queue) = mpsc::channel(QUEUE);
         let (publish, ids) = watch::channel(Ids::Loading);
         let (committed, commits) = watch::channel(0_u64);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("fabric-authority".into())
             .spawn(move || serve(&place, queue, &publish, &committed))?;
         #[cfg(test)]
@@ -243,6 +263,7 @@ impl Authority {
             calls: calls.clone(),
             ids: ids.clone(),
             commits,
+            _thread: JoinOnDrop(Some(thread)),
         };
         Ok((calls, ids))
     }

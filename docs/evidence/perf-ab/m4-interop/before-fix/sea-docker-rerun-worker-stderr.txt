@@ -1,0 +1,8 @@
+== rerun 1 load { 18.88 17.64 14.11 }
+provider failure: docker create failed: Error response from daemon: No such image: capsule-fabric-missing:13k9x5rj92st3e05g6a9yawvbz
+
+provider failure: fixture provider refused the create
+== rerun 2 load { 18.46 17.60 14.13 }
+provider failure: docker create failed: Error response from daemon: No such image: capsule-fabric-missing:5k189ae7fya0crqysc9emx80qt
+
+provider failure: fixture provider refused the create

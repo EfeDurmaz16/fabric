@@ -1,0 +1,12 @@
+commit: 386f3b618ed5164b26fbeb6e0f0ccd2952732540
+dirty: 2 paths
+uname: Darwin 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:19:08 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6050 arm64
+cpu: Apple M5 Pro 18 cores
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+date: 2026-11-02T21:12:06Z
+capsule worker: /tmp/capsule-wt/m4/packages/bridge-worker/dist/bin.js
+capsule commit: c7254d825407e784674523b12313e8124ec7f061
+node: v22.23.2
+docker image: debian:bookworm-slim
+load before:  0:12  up 50 days, 36 mins, 1 user, load averages: 5.24 7.48 7.72
+load after:  0:12  up 50 days, 37 mins, 1 user, load averages: 5.55 7.38 7.67

@@ -1,6 +1,6 @@
 # Managed jobs: identity, journal v1, operation states and replay
 
-Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; its "As built (M4)" notes record where the code differs. The section "Placement and planned continuity (M5)" was added 2026-11-03 with ADRs 0023 to 0027 as the contract the M5 owners build against; it holds types and signatures only until the code lands.
+Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day; on `main` since 2026-11-03 (PR #31), with schema version 2 (PR #32) beside it. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; it is on `main` since 2026-11-08 (PR #36), and its "As built (M4)" notes record where the code differs. The section "Placement and planned continuity (M5)" was added 2026-11-03 with ADRs 0023 to 0027 and implemented on the M5 branch; its "As built (M5)" notes record where the code differs.
 
 ## Identity
 
@@ -535,7 +535,7 @@ CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
 
 - `profile`, `effect_class` and `purpose` are written once at dispatch, like `target` and `target_key`.
 - `locator` and `locator_key` are the last locator the worker reported, re-encoded canonically by the bridge before it is stored, so two reports of one resource store equal text.
-- `searched` is the canonical JSON of the scope the last `absent` attach searched (`{ "provider", "scope", "kind" }`), kept for the owner and for the abandonment acknowledgement.
+- `searched` is the canonical JSON of the scope the last `absent` answer searched (`{ "provider", "scope", "kind" }`): an attach of a create, or the observe that settled a destroy (2026-11-02). It is kept for the owner and for the abandonment acknowledgement.
 - `abandon_reason` is set exactly when the status is `abandoned`.
 - The `by_status` index serves recovery, the barrier and the create guard (they read the few non-settled rows); the partial `by_target` index serves "a destroy of this resource settled `succeeded`". No other index is added, so an effect without a target writes the same index entries as in M3.
 
@@ -571,12 +571,15 @@ CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
 | `provider_begin` | none | `dispatched`, or `rejected` when Fabric refused it before sending |
 | `result` `completed` / `cancelled` to the request | `dispatched` | `succeeded` / `cancelled` |
 | `error` `provider_failed` | `dispatched` | `failed` |
+| `error` `provider_failed`/`not_found` to a `sandbox.destroy` request | `dispatched` | `unknown`, answer stored: the provider did not find the resource, which does not say it is gone from the scope (2026-11-02, docs/bridge-protocol.md "Absence settles a destroy") |
 | `error` `invalid`, `unsupported`, `denied`, `unavailable` | `dispatched` | `rejected` |
 | `error` `pending`, `result` `accepted` or `running`, `progress` | `dispatched` | `dispatched`, locator and answer stored |
 | `error` `unknown`; no answer by the deadline plus grace; worker lost; the caller dropped the request; `recover` | `dispatched` | `unknown` |
 | observe or attach `result` (an observed terminal state) | `unknown`, `attached`, `observed` | `succeeded` or `cancelled` (`failed` stays reachable from these for an observed terminal failure, as in M3) |
 | attach `error` `pending`; attach `error` `unknown`/`observation_failed` with a locator | `unknown` | `attached`, locator stored |
 | attach `error` `unknown`/`absent` | `unknown` | `unknown`, answer and `searched` stored |
+| observe `error` `unknown`/`absent` of a destroy's resource | `dispatched`, `unknown`, `observed` | `succeeded`, answer and `searched` stored: the resource is absent from the scope the destroy was to remove it from (`provider_absent`, 2026-11-02) |
+| observe `error` `unknown`/`absent` of anything but a destroy | any | unchanged; `searched` stored for an `unknown` operation |
 | observe `error` `pending` | `unknown`, `attached`, `observed` | `observed`, locator stored |
 | observe `error` `pending` | `dispatched` | `dispatched`, locator stored (M3, unchanged) |
 | observe or attach refused, `unknown` without a new locator, worker lost or timed out during the read | any | unchanged: a read that learned nothing changes nothing |
@@ -631,7 +634,7 @@ ReplacementBlocked { operation: OperationId },
 
 Rule: `Journal::submit` evaluates the barrier in the transaction of every `StartAttempt` the domain accepts. When the job has a blocker, the command is stored `rejected` with `ReplacementBlocked` naming the oldest blocker, like any domain refusal: a retry under the same key gets the same refusal, and a new key is needed once the blocker is gone. Matching "the same resource" is equality of `ResourceKey`: an exec's or a destroy's `target_key` against a destroy's `target_key`.
 
-What does not block: a destroy settled `succeeded` or `rejected` (no effect); an exec settled; a create `attached`, `observed`, settled or `abandoned`. What unblocks a stop that failed: a new destroy of the same resource, with its own fresh approval, that settles `succeeded`. Abandoning a destroy or an exec never unblocks.
+What does not block: a destroy settled `succeeded` or `rejected` (no effect); an exec settled; a create `attached`, `observed`, settled or `abandoned`. What unblocks a stop that failed: a new destroy of the same resource, with its own fresh approval, that settles `succeeded`. What unblocks a destroy the provider answered `not_found`, which is `unknown` with that reason on its row: an observe of its resource that answers `absent` with the scope it searched, which settles that destroy `succeeded` with the scope stored (2026-11-02); the `not_found` answer alone keeps the barrier. Abandoning a destroy or an exec never unblocks.
 
 ### Fresh cleanup approval flow
 
@@ -746,6 +749,8 @@ impl Journal {
     pub fn provider_begin(&mut self, dispatch: &ProviderDispatch, refusal: Option<&ProviderAnswer>, at_ms: u64) -> Result<(), CommitError>;
     pub fn provider_record(&mut self, operation: OperationId, status: ProviderStatus, answer: &ProviderAnswer, locator: Option<&LocatorRecord>, at_ms: u64) -> Result<(), CommitError>;
     pub fn provider_searched(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str, at_ms: u64) -> Result<(), CommitError>;
+    /// 2026-11-02: an absent observe of a destroy's resource settles the destroy succeeded with the scope stored.
+    pub fn provider_absent(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str, at_ms: u64) -> Result<(), CommitError>;
     pub fn provider_locate(&mut self, operation: OperationId, locator: &LocatorRecord, at_ms: u64) -> Result<(), CommitError>;
     pub fn provider_abandon(&mut self, approval: &AbandonApproval, at_ms: u64) -> Result<(), CommitError>;
     pub fn provider_operation(&self, operation: OperationId) -> Result<Option<ProviderOperation>, CommitError>;
@@ -758,6 +763,7 @@ pub trait OperationLog {
     fn begin(&mut self, dispatch: &ProviderDispatch, refusal: Option<&ProviderAnswer>) -> Result<(), LogError>;
     fn record(&mut self, operation: OperationId, status: ProviderStatus, answer: &ProviderAnswer, locator: Option<&LocatorRecord>) -> Result<(), LogError>;
     fn searched(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str) -> Result<(), LogError>;
+    fn absent(&mut self, operation: OperationId, answer: &ProviderAnswer, searched: &str) -> Result<(), LogError>;
     fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError>;
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError>;
     fn cleanup_target(&self, creating: OperationId) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError>;
@@ -809,6 +815,7 @@ pub enum BridgeError {
 - `Journal::open` refuses a version 2 journal whose `provider_operations` table is the draft that unreleased M3 builds wrote (`OpenError::DraftSchema`) instead of failing later on a missing column.
 - Locator text is written straight from the locator in key order (`wire::locator_record`), one buffer and one blake3 per locator, so an exec or a destroy costs no extra JSON tree on its hot path. The dispatch stays one committed write and the settle one read and one write (`tests/off_runtime.rs`, unchanged).
 - The test double attaches `fx-<key>` by the operation that made it and keeps what it made in `FABRIC_BRIDGE_DOUBLE_PROVIDER`, so `tests/process.rs` runs a lost create through a worker and an authority restart without Capsule.
+- 2026-11-02: a `sandbox.destroy` answered `provider_failed`/`not_found` is recorded `unknown` with the answer on its row, keeps the barrier and holds a cleanup back; an observe of its resource answered `unknown`/`absent` with `searched` settles it `succeeded` through `OperationLog::absent` and `Journal::provider_absent`, which store the scope searched. An absent observe of anything but a destroy settles nothing, and an absent observe whose `searched` is not the observed resource's provider, scope and kind settles and stores nothing (2026-11-03). The bridge refuses before sending an exec above the profile's `max_timeout_ms` or `max_output_bytes` (`invalid`/`limit`) and a destroy or exec whose target `native_id` is `null` or empty (`invalid`/`missing_field`).
 
 ### M4 acceptance mapped to tests
 
@@ -819,6 +826,7 @@ Each test is written first and fails on the M3 code (an M4 rule that already hol
 | A lost response never triggers a blind duplicate creation | scenarios `attach_after_lost_create`, `attach_absent_stays_unknown`, `attach_then_observe_until_ready` (Fabric scripted run, Capsule fixture run, interop over the worker's stdio); `fabric-journal` `provider::tests::a_create_waits_while_a_create_of_the_job_is_unknown`; interop `a_create_lost_with_its_worker_is_attached_and_never_made_twice` (fixture profile, and the Docker profile on a local engine with an image it already holds); interop `a_create_whose_frame_never_left_stays_unknown_after_an_absent_attach_until_abandoned` (Fabric stopped between the intent and the frame: attached absent, the scope searched kept, no create of the job until the owner abandons it acknowledging that search) |
 | A worker restart never triggers a blind duplicate creation | interop `a_create_lost_with_its_worker_is_attached_and_never_made_twice` kills the worker after the provider made the resource and before the answer, restarts it and attaches; `fabric-journal` `provider::tests::recovery_makes_a_dispatched_create_unknown_and_it_is_attached_not_resent` |
 | Unknown remains explicit | `fabric-journal` `provider::tests::statuses_move_only_along_the_machine` (every pair of the table above), `provider::tests::recovery_leaves_attached_observed_and_abandoned_as_they_are`, `provider::tests::an_abandonment_needs_the_state_the_owner_saw`; scenario `attach_absent_stays_unknown` |
+| A `not_found` destroy keeps the barrier until absence is observed | `fabric-journal` `provider::tests::a_not_found_destroy_stays_unknown_until_an_observe_finds_its_resource_absent`, `provider::tests::an_absent_observe_settles_nothing_but_a_destroy`; `fabric-bridge` `tests/stream.rs` `a_not_found_destroy_is_unknown_until_an_observe_finds_its_resource_absent` (the barrier exit) and `a_not_found_destroy_keeps_the_barrier_while_nothing_finds_its_resource_absent` (no evidence, no exit); `tests/stream.rs` `a_request_above_the_profile_bounds_or_at_no_resource_is_refused_before_sending` and `wire::tests::a_locator_with_a_null_or_empty_native_id_is_a_missing_field` for the two refusals |
 | A stop failure blocks an unsafe replacement | `fabric-journal` `provider::tests::a_failed_or_unknown_destroy_blocks_a_replacement_until_a_destroy_succeeds`, `provider::tests::an_unsettled_exec_blocks_a_replacement_until_its_sandbox_is_destroyed`, `provider::tests::abandoning_a_destroy_or_an_exec_never_unblocks_a_replacement`, `provider::tests::an_attached_or_abandoned_create_does_not_block`; the refusal is stored under its key like any domain refusal; interop `a_destroy_lost_with_its_worker_blocks_a_replacement_until_a_stop_is_confirmed` (the worker killed mid-destroy, Fabric restarted: the replacement is refused while the destroy is unknown, observed and abandoned, and granted once a fresh destroy under its own grant is confirmed gone) and `a_docker_destroy_lost_with_its_worker_blocks_a_replacement_until_no_container_is_left` (the same on the local engine: one container, never two) |
 | Fresh cleanup approval | scenario `cleanup_after_attach_needs_fresh_approval`; `fabric-journal` `provider::tests::a_cleanup_runs_after_the_job_is_cancelled`, `provider::tests::a_cleanup_needs_a_named_resource_of_this_job`, `provider::tests::residuals_list_what_no_cleanup_removed`; `fabric-bridge` `tests/process.rs` `a_cleanup_without_a_named_resource_is_refused_before_anything_is_written` |
 | Attach and observe only where the profile supports them | scenario `attach_unsupported`; cases `attach_*` and `error_*absent*`; `fabric-bridge` `golden` |
