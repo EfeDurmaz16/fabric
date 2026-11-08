@@ -418,6 +418,45 @@ pub fn command() -> Command {
     decorate(root, &[])
 }
 
+/// The command tree a run parses with: the arguments, options and
+/// settings of [`command`] at every depth, so it accepts and refuses
+/// exactly what [`command`] does, without the help text, the templates
+/// and the examples. Each command takes its global options and `--help`
+/// only when clap builds it, which it does for the commands the arguments
+/// name, so a run pays for its own path and not for the whole tree. A run
+/// builds the tree it renders help or an error with only when it renders
+/// one.
+fn parsing_command() -> Command {
+    let root = Cli::command()
+        .disable_version_flag(true)
+        .subcommand(Command::new("help").arg(Arg::new("command").num_args(0..)));
+    parsing_options(root)
+}
+
+/// What [`decorate`] adds that changes what parses: the settings, `--help`
+/// and the global options, here and, deferred, on every command below.
+/// No command of [`Cli`] defers its own arguments (`#[command(defer)]`),
+/// which this deferral would replace.
+fn parsing_options(cmd: Command) -> Command {
+    let mut cmd = cmd
+        .disable_help_subcommand(true)
+        .disable_help_flag(true)
+        .arg(
+            Arg::new("help")
+                .short('h')
+                .long("help")
+                .action(ArgAction::HelpShort),
+        );
+    for &(id, long, short, _) in GLOBALS {
+        let mut arg = Arg::new(id).long(long).action(ArgAction::SetTrue);
+        if let Some(short) = short {
+            arg = arg.short(short);
+        }
+        cmd = cmd.arg(arg);
+    }
+    cmd.mut_subcommands(|sub| sub.defer(parsing_options))
+}
+
 /// Every command path below the root, depth first in help order, the
 /// root as the empty path; `help` is one of them, held to the same rules.
 #[must_use]
@@ -607,8 +646,8 @@ impl Globals {
     /// The options a parse that stops at the first error has seen, so a
     /// usage error still answers in the format and color the run asked for.
     /// Also returns the command path that parse reached, such as `fabric job status`.
-    fn lenient(cmd: &Command, argv: &[OsString]) -> (Self, String) {
-        let parsed = cmd.clone().ignore_errors(true).try_get_matches_from(argv);
+    fn lenient(cmd: Command, argv: &[OsString]) -> (Self, String) {
+        let parsed = cmd.ignore_errors(true).try_get_matches_from(argv);
         let mut path = vec!["fabric".to_owned()];
         if let Ok(matches) = &parsed {
             let mut at = matches;
@@ -617,18 +656,23 @@ impl Globals {
                 at = sub;
             }
         }
-        let mut globals = parsed
+        let globals = parsed
             .map(|matches| Self::from_matches(&matches))
-            .unwrap_or_default();
-        // A parse that stops at an unknown option never reaches the options
-        // after it; for the format of the error alone, `--json` anywhere
-        // before `--` counts.
+            .unwrap_or_default()
+            .or_written(argv);
+        (globals, path.join(" "))
+    }
+
+    /// A parse that stops at an unknown option never reaches the options
+    /// after it; for the format of the error alone, `--json` anywhere
+    /// before `--` counts, and `--no-color` too.
+    fn or_written(mut self, argv: &[OsString]) -> Self {
         let before_end = argv.iter().skip(1).take_while(|arg| *arg != "--");
         for arg in before_end {
-            globals.json |= arg == "--json";
-            globals.no_color |= arg == "--no-color";
+            self.json |= arg == "--json";
+            self.no_color |= arg == "--no-color";
         }
-        (globals, path.join(" "))
+        self
     }
 }
 
@@ -718,21 +762,89 @@ pub(crate) enum Parsed {
 
 /// Parses `argv` under the contract: help and version print and exit 0, a
 /// usage error prints in the run's format and exits 2.
+///
+/// A run that parses, or that asks for the version alone, builds the tree
+/// without its help layout ([`parsing_command`]) and parses once, as a
+/// plain `Cli::parse` does. Help, a usage error or a command that needs
+/// [`command`] starts again on the whole tree ([`parse_and_render`]), which
+/// accepts and refuses the same arguments, so those answer as before.
 pub(crate) fn parse(argv: &[OsString]) -> Parsed {
     use clap::FromArgMatches;
+    let mut cmd = parsing_command();
+    let mut matches = match cmd.try_get_matches_from_mut(argv) {
+        Ok(matches) => matches,
+        // `--version` stands in for the command's missing input; see
+        // `parse_and_render`.
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::MissingRequiredArgument
+                    | ErrorKind::MissingSubcommand
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) =>
+        {
+            let (early, _) = Globals::lenient(cmd, argv);
+            if early.version {
+                return Parsed::Exit(version(Modes::resolve(early, &process_env)));
+            }
+            return parse_and_render(argv);
+        }
+        Err(_) => return parse_and_render(argv),
+    };
+    let globals = Globals::from_matches(&matches);
+    if globals.version {
+        // What `parse_and_render` resolves from its lenient parse, which
+        // sees what this parse saw when it succeeds.
+        let early = globals.or_written(argv);
+        return Parsed::Exit(version(Modes::resolve(early, &process_env)));
+    }
+    if matches.subcommand_name() == Some("help") {
+        return parse_and_render(argv);
+    }
+    let run = run_of(&cmd, &matches, globals, argv);
+    let Ok(cli) = Cli::from_arg_matches_mut(&mut matches) else {
+        return parse_and_render(argv);
+    };
+    Parsed::Run(Box::new(cli), run)
+}
+
+/// What a run that parsed takes from its parse: its modes, its arguments and
+/// the options of the command it runs.
+fn run_of(cmd: &Command, matches: &ArgMatches, globals: Globals, argv: &[OsString]) -> Run {
+    let mut leaf = cmd;
+    let mut at = matches;
+    while let Some((name, sub)) = at.subcommand() {
+        let Some(next) = leaf.find_subcommand(name) else {
+            break;
+        };
+        leaf = next;
+        at = sub;
+    }
+    Run {
+        modes: Modes::resolve(globals, &process_env),
+        argv: argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        takes: leaf
+            .get_arguments()
+            .map(|arg| arg.get_id().to_string())
+            .collect(),
+    }
+}
+
+/// [`parse`] on the whole tree, for a run that prints help or an error.
+fn parse_and_render(argv: &[OsString]) -> Parsed {
+    use clap::FromArgMatches;
     let mut cmd = command();
-    let (early, reached) = Globals::lenient(&cmd, argv);
+    let (early, reached) = Globals::lenient(cmd.clone(), argv);
     let modes = Modes::resolve(early, &process_env);
     if early.no_color || process_env("NO_COLOR").is_some_and(|value| !value.is_empty()) {
         cmd = cmd.color(ColorChoice::Never);
     }
-    let lossy: Vec<String> = argv
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
     let failed =
         |error: clap::Error| -> Parsed { Parsed::Exit(clap_exit(&error, modes, &reached)) };
-    let matches = match cmd.clone().try_get_matches_from(argv) {
+    let matches = match cmd.try_get_matches_from_mut(argv) {
         Ok(matches) => matches,
         // `--version` stands in for the command's missing input, and for
         // nothing else: an unknown option or an invalid value still fails.
@@ -766,27 +878,7 @@ pub(crate) fn parse(argv: &[OsString]) -> Parsed {
         Ok(cli) => cli,
         Err(e) => return failed(e),
     };
-    let mut leaf = &cmd;
-    let mut at = &matches;
-    while let Some((name, sub)) = at.subcommand() {
-        let Some(next) = leaf.find_subcommand(name) else {
-            break;
-        };
-        leaf = next;
-        at = sub;
-    }
-    let takes = leaf
-        .get_arguments()
-        .map(|arg| arg.get_id().to_string())
-        .collect();
-    Parsed::Run(
-        Box::new(cli),
-        Run {
-            modes: Modes::resolve(globals, &process_env),
-            argv: lossy,
-            takes,
-        },
-    )
+    Parsed::Run(Box::new(cli), run_of(&cmd, &matches, globals, argv))
 }
 
 /// `fabric help <path>`: the help of the command at `path`, or a usage
@@ -1397,6 +1489,78 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| OsString::from(value))
         }
+    }
+
+    /// What one tree makes of one command line: the error's kind, or the
+    /// global options, the command path and the options the command takes.
+    fn outcome(mut cmd: Command, argv: &[OsString]) -> String {
+        match cmd.try_get_matches_from_mut(argv) {
+            Err(e) => format!("error {:?}", e.kind()),
+            Ok(matches) => {
+                let run = run_of(&cmd, &matches, Globals::from_matches(&matches), argv);
+                let mut path = Vec::new();
+                let mut at = &matches;
+                while let Some((name, sub)) = at.subcommand() {
+                    path.push(name.to_owned());
+                    at = sub;
+                }
+                let mut takes = run.takes;
+                takes.sort();
+                format!(
+                    "ok {path:?} {:?} {takes:?}",
+                    Globals::from_matches(&matches)
+                )
+            }
+        }
+    }
+
+    /// The tree a run parses with accepts and refuses what the whole tree
+    /// does, at every command, with each global option before and after
+    /// the command, `--help`, an unknown option and a stray word.
+    #[test]
+    fn the_parsing_tree_parses_as_the_whole_tree_does() {
+        let mut lines = 0;
+        for path in paths() {
+            let words: Vec<OsString> = path.iter().map(OsString::from).collect();
+            let mut extras: Vec<Vec<String>> = [
+                &[][..],
+                &["--help"],
+                &["-h"],
+                &["--bogus"],
+                &["stray"],
+                &["--", "--json"],
+                &["--json", "--no-color", "--non-interactive", "--debug"],
+            ]
+            .iter()
+            .map(|words| words.iter().map(|word| (*word).to_owned()).collect())
+            .collect();
+            for &(_, long, short, _) in GLOBALS {
+                extras.push(vec![format!("--{long}")]);
+                if let Some(short) = short {
+                    extras.push(vec![format!("-{short}")]);
+                }
+            }
+            for extra in extras {
+                let extra: Vec<OsString> = extra.iter().map(OsString::from).collect();
+                let after: Vec<OsString> = std::iter::once("fabric".into())
+                    .chain(words.iter().cloned())
+                    .chain(extra.iter().cloned())
+                    .collect();
+                let before: Vec<OsString> = std::iter::once("fabric".into())
+                    .chain(extra.iter().cloned())
+                    .chain(words.iter().cloned())
+                    .collect();
+                for argv in [after, before] {
+                    assert_eq!(
+                        outcome(parsing_command(), &argv),
+                        outcome(command(), &argv),
+                        "{argv:?}"
+                    );
+                    lines += 1;
+                }
+            }
+        }
+        assert!(lines > 100, "{lines} command lines");
     }
 
     /// Color resolves highest first: the option, `NO_COLOR`, `FORCE_COLOR`, the terminal.
