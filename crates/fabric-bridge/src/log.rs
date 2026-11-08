@@ -328,24 +328,6 @@ impl<L: OperationLog + Send + 'static> Recorder for LogThread<L> {
     }
 }
 
-/// A log already on a thread of its own that blocks, reached in place.
-///
-/// The managed authority owns the journal on its thread and is the one
-/// writer of it (ADR 0020); a cleanup it runs there awaits the bridge with
-/// the runtime's handle and records through this, so the journal never
-/// gets a second writer and never runs on the async runtime. Not for a
-/// log used from async code: that is what [`LogThread`] is for.
-#[derive(Debug)]
-pub struct InPlace<'a, L>(pub &'a mut L);
-
-impl<L: OperationLog + Send + 'static> Recorder for InPlace<'_, L> {
-    type Log = L;
-
-    fn reserve(&mut self) -> impl Future<Output = Result<Slot<'_, L>, LogError>> + Send {
-        std::future::ready(Ok(Slot(Place::Here(&mut *self.0))))
-    }
-}
-
 /// The scope a dispatch was recorded for.
 fn scope_of(dispatch: &ProviderDispatch) -> Scope {
     Scope {

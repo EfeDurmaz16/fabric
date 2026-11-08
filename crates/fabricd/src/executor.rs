@@ -170,6 +170,32 @@ pub struct LaunchRecord {
     pub started: Option<String>,
 }
 
+impl LaunchRecord {
+    /// The group the record names, while it runs: its leader's pid still
+    /// starts when the record says, so a pid reused since is never it.
+    pub async fn group(&self) -> Option<NonZeroU32> {
+        let (Some(pid), Some(started)) = (self.pid, &self.started) else {
+            return None;
+        };
+        let pid = NonZeroU32::new(pid)?;
+        (local::process_started(pid).await.as_ref() == Some(started)).then_some(pid)
+    }
+
+    /// Stops the group the record names, when it still runs: `SIGTERM`,
+    /// then `SIGKILL` once `budget` passed. The record stays.
+    pub async fn stop(&self, budget: DrainBudget) {
+        if let Some(pid) = self.group().await
+            && let Some(group) = pid_of(pid)
+        {
+            signal_group(group, Signal::TERM);
+            if !wait_group_gone(group, budget.duration()).await {
+                signal_group(group, Signal::KILL);
+                wait_group_gone(group, KILL_WAIT).await;
+            }
+        }
+    }
+}
+
 /// How the executor holds a task's process.
 enum Handle {
     /// A process the executor spawned and reaps.
@@ -320,6 +346,11 @@ impl Executor {
     pub async fn resume(&self, attempt: AttemptId) -> Result<(), ExecutorError> {
         self.run(attempt).await?.lock().await.frozen = false;
         Ok(())
+    }
+
+    /// The attempts open on this executor, whose records are its own.
+    pub async fn open(&self) -> Vec<AttemptId> {
+        self.attempts.lock().await.keys().copied().collect()
     }
 
     /// Forgets an attempt whose tasks all ended; its records are removed.
@@ -609,17 +640,7 @@ impl Executor {
                 let Some(record) = local::read::<LaunchRecord>(&path)? else {
                     continue;
                 };
-                if let (Some(pid), Some(started)) = (record.pid, &record.started)
-                    && let Some(pid) = NonZeroU32::new(pid)
-                    && local::process_started(pid).await.as_ref() == Some(started)
-                    && let Some(group) = pid_of(pid)
-                {
-                    signal_group(group, Signal::TERM);
-                    if !wait_group_gone(group, budget.duration()).await {
-                        signal_group(group, Signal::KILL);
-                        wait_group_gone(group, KILL_WAIT).await;
-                    }
-                }
+                record.stop(budget).await;
                 local::remove(&path)?;
                 found.push(record);
             }

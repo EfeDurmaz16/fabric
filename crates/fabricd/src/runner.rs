@@ -142,8 +142,8 @@ pub(crate) struct Counters {
 
 /// The durable record of a launch taken, which answers a launch sent again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Taken {
-    token: GrantToken,
+pub(crate) struct Taken {
+    pub(crate) token: GrantToken,
 }
 
 /// Work the attempt's own task does on an instruction.
@@ -257,6 +257,22 @@ impl Runner {
             heartbeats: self.heartbeats.load(Ordering::Relaxed),
             stale_obeyed: self.stale_obeyed.load(Ordering::Relaxed),
         }
+    }
+
+    /// The grants of the attempts this node runs now, and the attempts its
+    /// executor holds open: what `gc` holds live on the launch path (ADR
+    /// 0030). Read under the lock a launch takes before it writes
+    /// anything of the attempt, so an attempt launched after this read
+    /// left nothing a read before it saw.
+    pub(crate) async fn running(&self) -> (Vec<GrantToken>, Vec<AttemptId>) {
+        let tokens = self
+            .attempts
+            .lock()
+            .await
+            .values()
+            .map(|ctl| ctl.token)
+            .collect();
+        (tokens, self.executor.open().await)
     }
 
     fn taken_path(&self, attempt: AttemptId) -> PathBuf {

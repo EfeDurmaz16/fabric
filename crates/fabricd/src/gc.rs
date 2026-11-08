@@ -4,69 +4,194 @@
 //!
 //! Invariant: nothing in the live set is listed or removed. The live set
 //! is the tenures this node owns (a standalone job's epoch, from its
-//! ledger), the managed attempts the journal holds `granted` or `running`
-//! at their job's generation, and every job an operation runs on now. A
-//! job's files are judged and removed under that job's lock, which every
+//! ledger), every job a move holds, every job an operation runs on now,
+//! the managed attempts the journal holds as ones that may still run
+//! (`granted`, `running` and `unknown`, at whatever generation), and the
+//! attempts this node's runner and executor run now. The journal's part
+//! and the provider creates are read in one call on the authority's
+//! thread, so both are of one state. A launch-path file is removed only
+//! when the journal holds its attempt ended, which no later event undoes;
+//! one of an attempt the journal here does not hold is reported and kept.
+//! A job's files are judged and removed under that job's lock, which every
 //! operation that writes them holds, so no operation starts between the
 //! verdict and the removal; a job whose lock is taken is reported busy and
 //! left alone. A residual gc cannot classify is reported and kept. A
 //! provider resource is removed only through `Bridge::cleanup`, with an
 //! approval the caller gave for this call and that one resource; gc
-//! stores none.
+//! stores none, and the cleanup records through the authority one call at
+//! a time, so the authority serves its other calls while the worker acts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fabric_bridge::{Bridge, Cleanup, Config, InPlace};
+use fabric_bridge::{Bridge, Cleanup, Config};
 use fabric_client::api::{
     GcApproval, GcKept, GcLabel, GcLive, GcReport, GcResidual, GcWorker, Reason,
 };
 use fabric_core::id::{Epoch, JobId, NodeId};
-use fabric_core::managed::{AttemptStatus, JobState, OperationId, OperationKey};
+use fabric_core::managed::launch::GrantToken;
+use fabric_core::managed::{AttemptId, DrainBudget, OperationId, OperationKey};
 use fabric_core::moves::LeaseView;
-use fabric_journal::{ProviderStatus, Residual};
+use fabric_journal::{ProviderDispatch, ProviderStatus, Residual};
 use fabric_store::restore::{STAGING_LABEL, open_up, staging_dir};
 
 use crate::error::NodeError;
+use crate::executor::LaunchRecord;
 use crate::job::Job;
 use crate::local::Liveness;
 use crate::node::Node;
 use crate::ops::FENCE_GRACE;
 use crate::paths;
+use crate::runner::Taken;
 
-/// What a residual is. `docs/concepts/residuals.md` lists these from here.
+/// What a residual is. `docs/concepts/residuals.md` is generated from
+/// these docs by `scripts/docs/gen.py`: the first line says what it is,
+/// and the `Where`, `Label`, `Owner` and `Garbage` lines fill the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Kind {
-    /// A harness capture cut short: `<state>/jobs/<job>/harness-state.next`. A capture writes it and renames it into place; outside a capture it is garbage.
+    /// A harness capture cut short.
+    ///
+    /// Where: `<state>/jobs/<job>/harness-state.next`
+    /// Label: the job; the epoch of its marker
+    /// Owner: the suspend or move that captures the job's harness state
+    /// Garbage: always once found under the job's lock: a capture writes it and renames it into place under that lock
     HarnessStateNext,
-    /// The harness state a capture set aside, `<state>/jobs/<job>/harness-state.old`, once a newer one is in place.
+    /// The harness state a capture set aside.
+    ///
+    /// Where: `<state>/jobs/<job>/harness-state.old`
+    /// Label: the job; the epoch of its marker
+    /// Owner: the capture that put a newer state in place
+    /// Garbage: once `harness-state` is in place; kept as `only_copy` when it is the only state the job has
     HarnessStateOld,
-    /// A restore that did not finish: `<target>.fabric-restoring` beside a job root or the harness state, labelled with the job, node and epoch it was for, at an epoch this node no longer owns.
+    /// A restore that did not finish.
+    ///
+    /// Where: `<target>.fabric-restoring` beside a job's root or its harness state
+    /// Label: its `fabric-label` file: the job, the node and the epoch the restore was for
+    /// Owner: the resume of that tenure, which finishes it
+    /// Garbage: when the label names this node and an epoch it no longer owns
     RestoreStaging,
-    /// A harness process group a tenure this node no longer owns left running, named by `<state>/jobs/<job>/harness`.
+    /// A harness process group a standalone tenure left running.
+    ///
+    /// Where: the group named by `<state>/jobs/<job>/harness`
+    /// Label: the job and the epoch the record names
+    /// Owner: the tenure that launched it
+    /// Garbage: when this node no longer owns that epoch; removing it stops the group
     HarnessGroup,
-    /// The record of such a group whose processes are gone.
+    /// The record of a harness group whose processes are gone.
+    ///
+    /// Where: `<state>/jobs/<job>/harness`
+    /// Label: the job and the epoch the record names
+    /// Owner: the tenure that launched the harness
+    /// Garbage: when this node no longer owns that epoch
     HarnessRecord,
-    /// A provider resource a managed attempt made through the bridge, at an attempt that is not live.
+    /// A launch-path task's record whose processes are gone.
+    ///
+    /// Where: `<state>/runs/records/<attempt>/<task>.json`
+    /// Label: the attempt, and its job, task and generation as the journal holds them
+    /// Owner: the executor running the attempt
+    /// Garbage: when the journal holds the attempt ended and no runner here runs it
+    LaunchRecord,
+    /// A launch-path task's process group that still runs.
+    ///
+    /// Where: the group named by `<state>/runs/records/<attempt>/<task>.json`
+    /// Label: as for its record
+    /// Owner: the executor running the attempt
+    /// Garbage: as for its record; removing it stops the group, then the record
+    LaunchGroup,
+    /// A copy of a cut's harness state restored for an attempt.
+    ///
+    /// Where: `<state>/runs/restored/<attempt>`
+    /// Label: the attempt, and its job, task and generation as the journal holds them
+    /// Owner: the launch that prepares the attempt; a failed preparation leaves it
+    /// Garbage: when the journal holds the attempt ended and no runner here runs it
+    RestoredState,
+    /// A harness state an attempt's checkpoint captured.
+    ///
+    /// Where: `<state>/runs/harness-states/<attempt>`
+    /// Label: as for a restored state
+    /// Owner: the checkpoint of the attempt, until its cut is sent
+    /// Garbage: when the journal holds the attempt ended and no runner here runs it
+    CapturedState,
+    /// The work package of a continuation.
+    ///
+    /// Where: `<home>/fabric/jobs/<job>/package-<attempt>.json`
+    /// Label: the job and the attempt, and its task and generation as the journal holds them
+    /// Owner: the attempt the package was written for
+    /// Garbage: when the journal holds the attempt ended and no runner here runs it
+    WorkPackage,
+    /// The runner's record of a launch it took.
+    ///
+    /// Where: `<state>/runs/taken/<attempt>.json`
+    /// Label: the grant it holds: the job, the attempt and the generation
+    /// Owner: the runner: it answers a launch sent again `already_launched`
+    /// Garbage: never: removing it would let a launch sent again run twice; kept as `preserved`
+    TakenRecord,
+    /// A provider resource a managed attempt made through the bridge.
+    ///
+    /// Where: the provider, at the locator the journal holds for its create
+    /// Label: the job, task, attempt and generation the create was dispatched for
+    /// Owner: that attempt
+    /// Garbage: when that attempt may no longer run; removed only through the worker, with a fresh approval for that resource
     ProviderResource,
-    /// A departed copy, `<root parent>/departed/<epoch>`: kept by design (ADR 0003).
+    /// A departed copy.
+    ///
+    /// Where: `<root parent>/departed/<epoch>`
+    /// Label: the job and the epoch in its name
+    /// Owner: the user (ADR 0003)
+    /// Garbage: never by gc: kept as `preserved`
     DepartedCopy,
-    /// An orphan copy, `<root parent>/orphan/<epoch>`: kept by design (ADR 0003).
+    /// An orphan copy.
+    ///
+    /// Where: `<root parent>/orphan/<epoch>`
+    /// Label: the job and the epoch in its name
+    /// Owner: the user (ADR 0003)
+    /// Garbage: never by gc: kept as `preserved`
     OrphanCopy,
     /// Something under a Fabric directory gc cannot name.
+    ///
+    /// Where: under `<state>/jobs` or `<state>/runs`
+    /// Label: none gc can read
+    /// Owner: unknown
+    /// Garbage: never by gc: reported and kept
     Unknown,
 }
 
 impl Kind {
-    fn name(self) -> &'static str {
+    /// Every kind, in the order the inventory lists them.
+    #[cfg(test)]
+    pub(crate) const ALL: [Kind; 15] = [
+        Kind::HarnessStateNext,
+        Kind::HarnessStateOld,
+        Kind::RestoreStaging,
+        Kind::HarnessGroup,
+        Kind::HarnessRecord,
+        Kind::LaunchRecord,
+        Kind::LaunchGroup,
+        Kind::RestoredState,
+        Kind::CapturedState,
+        Kind::WorkPackage,
+        Kind::TakenRecord,
+        Kind::ProviderResource,
+        Kind::DepartedCopy,
+        Kind::OrphanCopy,
+        Kind::Unknown,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Kind::HarnessStateNext => "harness_state_next",
             Kind::HarnessStateOld => "harness_state_old",
             Kind::RestoreStaging => "restore_staging",
             Kind::HarnessGroup => "harness_group",
             Kind::HarnessRecord => "harness_record",
+            Kind::LaunchRecord => "launch_record",
+            Kind::LaunchGroup => "launch_group",
+            Kind::RestoredState => "restored_state",
+            Kind::CapturedState => "captured_state",
+            Kind::WorkPackage => "work_package",
+            Kind::TakenRecord => "taken_record",
             Kind::ProviderResource => "provider_resource",
             Kind::DepartedCopy => "departed_copy",
             Kind::OrphanCopy => "orphan_copy",
@@ -75,10 +200,11 @@ impl Kind {
     }
 }
 
-/// Why gc keeps something it found. `docs/concepts/residuals.md` lists these from here.
+/// Why gc keeps something it found. `docs/concepts/residuals.md` lists
+/// these from here, one line each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Keep {
-    /// Kept by design: a departed or an orphan copy may hold work only the user can judge.
+    /// Kept by design: a departed or an orphan copy may hold work only the user can judge, and a taken record fences a launch sent again.
     Preserved,
     /// An operation runs on the job now; run gc again once it ends.
     Busy,
@@ -92,12 +218,28 @@ pub(crate) enum Keep {
     OtherNode,
     /// A job this node does not hold.
     UnknownJob,
+    /// An attempt the journal on this node does not hold, as one run for another authority: gc cannot tell whether it may still run.
+    UnknownAttempt,
     /// A provider create with no locator: attach it first.
     Unlocated,
 }
 
 impl Keep {
-    fn name(self) -> &'static str {
+    /// Every reason, in the order the inventory lists them.
+    #[cfg(test)]
+    pub(crate) const ALL: [Keep; 9] = [
+        Keep::Preserved,
+        Keep::Busy,
+        Keep::Moving,
+        Keep::OnlyCopy,
+        Keep::Unlabeled,
+        Keep::OtherNode,
+        Keep::UnknownJob,
+        Keep::UnknownAttempt,
+        Keep::Unlocated,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Keep::Preserved => "preserved",
             Keep::Busy => "busy",
@@ -106,6 +248,7 @@ impl Keep {
             Keep::Unlabeled => "unlabeled",
             Keep::OtherNode => "other_node",
             Keep::UnknownJob => "unknown_job",
+            Keep::UnknownAttempt => "unknown_attempt",
             Keep::Unlocated => "unlocated",
         }
     }
@@ -315,6 +458,61 @@ struct Provider {
     profile: String,
 }
 
+/// What gc read of the managed journal, in one call on the authority's
+/// thread, so the live attempts and the provider creates are of one state.
+#[derive(Debug, Default)]
+struct Managed {
+    /// Every attempt the journal holds: whose it is, and whether it may
+    /// still run (`granted`, `running` or `unknown`).
+    attempts: BTreeMap<AttemptId, (GcLabel, bool)>,
+    /// Every create a job's attempts may have left, with its dispatch.
+    creates: Vec<(Residual, ProviderDispatch)>,
+}
+
+/// What the journal and this node's runner say of an attempt.
+enum Verdict {
+    /// It may still run, or runs here now: never touched.
+    Live,
+    /// The journal holds it ended, and nothing here runs it.
+    Ended(GcLabel),
+    /// The journal here does not hold it.
+    Unheld,
+}
+
+/// The launch path's part of the live set: the attempts this node runs now.
+#[derive(Debug, Default)]
+struct Running {
+    tokens: Vec<GrantToken>,
+    open: BTreeSet<AttemptId>,
+}
+
+impl Running {
+    fn runs(&self, attempt: AttemptId) -> bool {
+        self.open.contains(&attempt) || self.tokens.iter().any(|t| t.attempt == attempt)
+    }
+}
+
+fn attempt_label(token: &GrantToken) -> GcLabel {
+    GcLabel {
+        attempt: Some(token.attempt),
+        generation: Some(token.generation),
+        ..label(token.job)
+    }
+}
+
+impl Managed {
+    fn verdict(&self, attempt: AttemptId, running: &Running) -> Verdict {
+        if running.runs(attempt) {
+            return Verdict::Live;
+        }
+        match self.attempts.get(&attempt) {
+            Some((_, true)) => Verdict::Live,
+            Some((label, false)) => Verdict::Ended(label.clone()),
+            None => Verdict::Unheld,
+        }
+    }
+}
+
 /// How long a worker has to answer one cleanup.
 const CLEANUP_DEADLINE_MS: u64 = 60_000;
 
@@ -356,7 +554,19 @@ impl Node {
         // moves a departed copy aside), so gc never races it.
         self.recovered().await;
         let mut found = Found::default();
-        let providers = self.gc_managed(&mut found).await?;
+        // The runner first: an attempt it runs is live whatever the
+        // journal read after says, and one launched after this read wrote
+        // nothing the reads below can see as ended.
+        let (tokens, open) = self.runner.running().await;
+        let running = Running {
+            tokens,
+            open: open.into_iter().collect(),
+        };
+        for token in &running.tokens {
+            found.live("launch", attempt_label(token));
+        }
+        let managed = self.gc_read_journal().await?;
+        let providers = self.gc_providers(&managed, &running, &mut found);
         let mut approved = Vec::new();
         for approval in approvals {
             let Some(at) = providers
@@ -383,6 +593,7 @@ impl Node {
         }
         self.gc_jobs(remove, &mut found).await?;
         self.gc_home(&mut found);
+        self.gc_runs(remove, &managed, &running, &mut found).await;
         let first = found.residuals.len();
         for provider in &providers {
             let entry = found.residual(Kind::ProviderResource, provider.label.clone());
@@ -408,61 +619,71 @@ impl Node {
         Ok(found.into_report(remove))
     }
 
-    /// The live attempts and the provider creates the journal holds, the
-    /// creates of a live attempt left out and those with no locator kept.
-    async fn gc_managed(&self, found: &mut Found) -> Result<Vec<Provider>, NodeError> {
-        let states = self.authority.list().await?;
-        let mut live = BTreeSet::new();
-        for state in &states {
-            if state.job.state != JobState::Active {
-                continue;
-            }
-            for attempt in &state.attempts {
-                let holds = matches!(
-                    attempt.status,
-                    AttemptStatus::Granted | AttemptStatus::Running
-                ) && attempt.generation == state.job.generation;
-                if holds {
-                    live.insert((state.job.id, attempt.id, attempt.generation));
-                    found.live(
-                        "attempt",
-                        GcLabel {
+    /// Every attempt the journal holds and every create its jobs may have
+    /// left, read in one call so the two are of one state: an attempt
+    /// granted after it is in neither, and one granted before it is live
+    /// in both.
+    async fn gc_read_journal(&self) -> Result<Managed, NodeError> {
+        Ok(self
+            .authority
+            .read_journal(|journal| {
+                let mut managed = Managed::default();
+                let Some(journal) = journal else {
+                    return Ok(managed);
+                };
+                for job in journal.jobs()? {
+                    let Some(state) = journal.job(job)? else {
+                        continue;
+                    };
+                    for attempt in &state.attempts {
+                        let named = GcLabel {
                             task: Some(attempt.task),
                             attempt: Some(attempt.id),
                             generation: Some(attempt.generation),
-                            ..label(state.job.id)
-                        },
-                    );
-                }
-            }
-        }
-        let jobs: Vec<JobId> = states.iter().map(|state| state.job.id).collect();
-        let creates = self
-            .authority
-            .with_journal_or_none(move |journal| {
-                let Some(journal) = journal else {
-                    return Ok(Vec::new());
-                };
-                let mut out = Vec::new();
-                for job in jobs {
+                            ..label(job)
+                        };
+                        managed
+                            .attempts
+                            .insert(attempt.id, (named, attempt.status.may_run()));
+                    }
                     for residual in journal.residuals(job)? {
                         if let Some(op) = journal.provider_operation(residual.creating)? {
-                            out.push((residual, op.dispatch));
+                            managed.creates.push((residual, op.dispatch));
                         }
                     }
                 }
-                Ok(out)
+                Ok(managed)
             })
-            .await?;
+            .await?)
+    }
+
+    /// The live attempts, and the provider creates of attempts that may no
+    /// longer run; one with no locator is kept.
+    fn gc_providers(
+        &self,
+        managed: &Managed,
+        running: &Running,
+        found: &mut Found,
+    ) -> Vec<Provider> {
+        for (label, live) in managed.attempts.values() {
+            if *live {
+                found.live("attempt", label.clone());
+            }
+        }
         let mut providers = Vec::new();
-        for (residual, dispatch) in creates {
-            let label = GcLabel {
+        for (residual, dispatch) in &managed.creates {
+            let named = GcLabel {
                 task: Some(dispatch.task),
                 attempt: Some(dispatch.attempt),
                 generation: Some(dispatch.generation),
                 ..label(dispatch.job)
             };
-            if live.contains(&(dispatch.job, dispatch.attempt, dispatch.generation)) {
+            // An attempt the journal does not hold has no verdict here, so
+            // its create is live as well: nothing is removed on a guess.
+            if !matches!(
+                managed.verdict(dispatch.attempt, running),
+                Verdict::Ended(_)
+            ) {
                 continue;
             }
             if residual.locator.is_none() || residual.status == ProviderStatus::Dispatched {
@@ -470,18 +691,18 @@ impl Node {
                     kind: Kind::ProviderResource.name().to_owned(),
                     path: None,
                     operation: Some(residual.creating),
-                    label: Some(label),
+                    label: Some(named),
                     reason: Keep::Unlocated.name().to_owned(),
                 });
                 continue;
             }
             providers.push(Provider {
-                residual,
-                label,
-                profile: dispatch.profile,
+                residual: residual.clone(),
+                label: named,
+                profile: dispatch.profile.clone(),
             });
         }
-        Ok(providers)
+        providers
     }
 
     /// Judges, and with `remove` removes, what each standalone job left.
@@ -771,8 +992,8 @@ impl Node {
     }
 
     /// Removes each approved provider resource through `worker`, one
-    /// cleanup each, recorded by the authority on its own thread; the
-    /// outcome per approval, in order.
+    /// cleanup each, recorded through the authority one call at a time;
+    /// the outcome per approval, in order.
     async fn gc_cleanup(
         &self,
         worker: Worker,
@@ -785,7 +1006,7 @@ impl Node {
             Worker::Ready(bridge) => Ok(bridge),
         };
         let bridge = match bridge {
-            Ok(bridge) => Arc::new(bridge),
+            Ok(bridge) => bridge,
             Err(e) => {
                 let why = format!("the worker did not start: {e}");
                 return approved.iter().map(|_| Err(why.clone())).collect();
@@ -796,15 +1017,16 @@ impl Node {
             let provider = &providers[*at];
             outcomes.push(self.gc_destroy(&bridge, provider, approval.clone()).await);
         }
-        if let Ok(bridge) = Arc::try_unwrap(bridge) {
-            bridge.close().await;
-        }
+        bridge.close().await;
         outcomes
     }
 
+    /// One approved destroy. The bridge awaits the worker on the runtime
+    /// and records each step through the authority's queue, so the
+    /// authority's thread is never held while the worker acts.
     async fn gc_destroy(
         &self,
-        bridge: &Arc<Bridge>,
+        bridge: &Bridge,
         provider: &Provider,
         approval: String,
     ) -> Result<(), String> {
@@ -824,30 +1046,243 @@ impl Node {
             approval,
             deadline_ms: CLEANUP_DEADLINE_MS,
         };
-        let bridge = Arc::clone(bridge);
-        let handle = tokio::runtime::Handle::current();
-        self.authority
-            .with_journal_or_none(move |journal| {
-                let Some(journal) = journal else {
-                    return Ok(Err("the node has no managed journal".to_owned()));
+        let mut log = self.authority.recorder();
+        let outcome = async {
+            let flight = bridge.cleanup(&mut log, cleanup).await?;
+            flight.finish(&mut log).await
+        }
+        .await;
+        match outcome {
+            Ok(outcome) if outcome.status == ProviderStatus::Succeeded => Ok(()),
+            Ok(outcome) => Err(format!(
+                "the destroy is {}; observe it, then run gc again",
+                outcome.status.name()
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Judges, and with `remove` removes, what the launch path left under
+    /// `<state>/runs` and the work packages beside managed roots: only
+    /// what the journal holds an ended attempt for.
+    async fn gc_runs(&self, remove: bool, managed: &Managed, running: &Running, found: &mut Found) {
+        let runs = self.cfg.state.root().join(RUNS);
+        let Ok(entries) = std::fs::read_dir(&runs) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_name().to_str() {
+                Some(RECORDS) => {
+                    self.gc_records(remove, &path, managed, running, found)
+                        .await
+                }
+                Some(RESTORED) => {
+                    gc_attempt_dirs(remove, &path, Kind::RestoredState, managed, running, found);
+                }
+                Some(CAPTURED) => {
+                    gc_attempt_dirs(remove, &path, Kind::CapturedState, managed, running, found);
+                }
+                Some(TAKEN) => gc_taken(&path, managed, found),
+                _ => found.keep(Kind::Unknown, Some(path), None, Keep::Unlabeled),
+            }
+        }
+        self.gc_packages(remove, managed, running, found);
+    }
+
+    /// The executor's launch records: a group that still runs, or a record
+    /// of one that is gone, of an ended attempt.
+    async fn gc_records(
+        &self,
+        remove: bool,
+        dir: &Path,
+        managed: &Managed,
+        running: &Running,
+        found: &mut Found,
+    ) {
+        let Ok(attempts) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for attempt_dir in attempts.flatten() {
+            let path = attempt_dir.path();
+            let Some(attempt) = parse_name::<AttemptId>(&attempt_dir.file_name()) else {
+                found.keep(Kind::Unknown, Some(path), None, Keep::Unlabeled);
+                continue;
+            };
+            let named = match managed.verdict(attempt, running) {
+                Verdict::Live => continue,
+                Verdict::Unheld => {
+                    found.keep(Kind::LaunchRecord, Some(path), None, Keep::UnknownAttempt);
+                    continue;
+                }
+                Verdict::Ended(named) => named,
+            };
+            let Ok(tasks) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for task in tasks.flatten() {
+                let file = task.path();
+                let record = match crate::local::read::<LaunchRecord>(&file) {
+                    Ok(Some(record)) if record.attempt == attempt => record,
+                    _ => {
+                        found.keep(
+                            Kind::LaunchRecord,
+                            Some(file),
+                            Some(named.clone()),
+                            Keep::Unlabeled,
+                        );
+                        continue;
+                    }
                 };
-                // The authority's thread is not a runtime thread: it waits
-                // for the bridge here, and the journal stays on it.
-                let outcome = handle.block_on(async {
-                    let flight = bridge.cleanup(&mut InPlace(&mut *journal), cleanup).await?;
-                    flight.finish(&mut InPlace(&mut *journal)).await
-                });
-                Ok(match outcome {
-                    Ok(outcome) if outcome.status == ProviderStatus::Succeeded => Ok(()),
-                    Ok(outcome) => Err(format!(
-                        "the destroy is {}; observe it, then run gc again",
-                        outcome.status.name()
-                    )),
-                    Err(e) => Err(e.to_string()),
-                })
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
+                let task_label = GcLabel {
+                    task: Some(record.task),
+                    ..named.clone()
+                };
+                match record.group().await {
+                    Some(pid) => {
+                        let entry = found.residual(Kind::LaunchGroup, task_label);
+                        entry.pid = Some(pid);
+                        if remove {
+                            record.stop(DrainBudget::default()).await;
+                            settle(
+                                entry,
+                                crate::local::remove(&file).map_err(|e| e.to_string()),
+                            );
+                        }
+                    }
+                    None => {
+                        let entry = found.residual(Kind::LaunchRecord, task_label);
+                        entry.path = Some(file.clone());
+                        if remove {
+                            settle(
+                                entry,
+                                crate::local::remove(&file).map_err(|e| e.to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+            if remove {
+                // Empty once every record went; one kept keeps it.
+                let _ = std::fs::remove_dir(&path);
+            }
+        }
+    }
+
+    /// The work packages beside managed roots: `<home>/fabric/jobs/<job>/package-<attempt>.json`.
+    fn gc_packages(&self, remove: bool, managed: &Managed, running: &Running, found: &mut Found) {
+        let Ok(jobs) = std::fs::read_dir(paths::home_jobs(&self.cfg.home)) else {
+            return;
+        };
+        for job in jobs.flatten() {
+            let Ok(files) = std::fs::read_dir(job.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let Some(attempt) = file
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(PACKAGE_PREFIX))
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .and_then(|id| id.parse::<AttemptId>().ok())
+                else {
+                    continue;
+                };
+                let path = file.path();
+                match managed.verdict(attempt, running) {
+                    Verdict::Live => {}
+                    Verdict::Unheld => {
+                        found.keep(Kind::WorkPackage, Some(path), None, Keep::UnknownAttempt);
+                    }
+                    Verdict::Ended(named) => {
+                        let entry = found.residual(Kind::WorkPackage, named);
+                        entry.path = Some(path.clone());
+                        if remove {
+                            settle(
+                                entry,
+                                crate::local::remove(&path).map_err(|e| e.to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The launch path's directory under the state directory, and its parts.
+const RUNS: &str = "runs";
+const RECORDS: &str = "records";
+const RESTORED: &str = "restored";
+const CAPTURED: &str = "harness-states";
+const TAKEN: &str = "taken";
+/// The name a work package starts with.
+const PACKAGE_PREFIX: &str = "package-";
+
+fn parse_name<T: std::str::FromStr>(name: &std::ffi::OsStr) -> Option<T> {
+    name.to_str().and_then(|name| name.parse().ok())
+}
+
+/// The per-attempt directories under `dir` (`restored/` or
+/// `harness-states/`) of ended attempts.
+fn gc_attempt_dirs(
+    remove: bool,
+    dir: &Path,
+    kind: Kind,
+    managed: &Managed,
+    running: &Running,
+    found: &mut Found,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(attempt) = parse_name::<AttemptId>(&entry.file_name()) else {
+            found.keep(Kind::Unknown, Some(path), None, Keep::Unlabeled);
+            continue;
+        };
+        if !is_dir(&path) {
+            found.keep(kind, Some(path), None, Keep::Unlabeled);
+            continue;
+        }
+        match managed.verdict(attempt, running) {
+            Verdict::Live => {}
+            Verdict::Unheld => found.keep(kind, Some(path), None, Keep::UnknownAttempt),
+            Verdict::Ended(named) => {
+                let entry = found.residual(kind, named);
+                entry.path = Some(path.clone());
+                if remove {
+                    settle(entry, remove_tree(&path));
+                }
+            }
+        }
+    }
+}
+
+/// The runner's taken records: reported and kept, since each answers a
+/// launch sent again.
+fn gc_taken(dir: &Path, managed: &Managed, found: &mut Found) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let named = match crate::local::read::<Taken>(&path) {
+            Ok(Some(taken)) => Some(
+                managed
+                    .attempts
+                    .get(&taken.token.attempt)
+                    .map_or_else(|| attempt_label(&taken.token), |(named, _)| named.clone()),
+            ),
+            _ => None,
+        };
+        let why = if named.is_some() {
+            Keep::Preserved
+        } else {
+            Keep::Unlabeled
+        };
+        found.keep(Kind::TakenRecord, Some(path), named, why);
     }
 }
 
