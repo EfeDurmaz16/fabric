@@ -838,17 +838,14 @@ impl Node {
     /// while it runs, the record once it is gone.
     async fn gc_harness(&self, job: &Job, owned: Option<Epoch>, remove: bool, found: &mut Found) {
         let (id, dir) = (job.id(), job.dir());
-        let record = match job.harness_record() {
-            Ok(record) => record,
-            Err(_) => {
-                found.keep(
-                    Kind::HarnessRecord,
-                    Some(dir.harness()),
-                    Some(label(id)),
-                    Keep::Unreadable,
-                );
-                return;
-            }
+        let Ok(record) = job.harness_record() else {
+            found.keep(
+                Kind::HarnessRecord,
+                Some(dir.harness()),
+                Some(label(id)),
+                Keep::Unreadable,
+            );
+            return;
         };
         if let Some(record) = record
             && owned != Some(record.epoch)
