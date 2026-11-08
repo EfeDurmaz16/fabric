@@ -35,7 +35,13 @@ mod harness;
 pub(crate) mod jsontext;
 pub mod manifest;
 pub(crate) mod markers;
-#[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+#[cfg(any(
+    feature = "acp",
+    feature = "claude",
+    feature = "codex",
+    feature = "opencode",
+    feature = "pi"
+))]
 pub(crate) mod pipeline;
 pub(crate) mod place;
 pub(crate) mod process;

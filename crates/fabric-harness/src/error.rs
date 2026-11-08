@@ -433,6 +433,8 @@ pub enum Input {
     StatePath,
     /// A workspace path that a manifest or a harness setting cannot hold.
     WorkspacePath,
+    /// The JSON `opencode export` printed for one session.
+    SessionExport,
 }
 
 impl std::fmt::Display for Input {
@@ -445,6 +447,7 @@ impl std::fmt::Display for Input {
             Input::ConfigJson => "config json",
             Input::StatePath => "state path",
             Input::WorkspacePath => "workspace path",
+            Input::SessionExport => "session export",
         })
     }
 }
