@@ -211,17 +211,17 @@ impl Verifier {
                     match outcome {
                         Ok(ack) => match verifying.authority.acknowledge(job, ack).await {
                             Ok(_) => {
-                                tracing::info!(%job, %attempt, %snapshot, "acknowledged a checkpoint")
+                                tracing::info!(%job, %attempt, %snapshot, "acknowledged a checkpoint");
                             }
                             Err(e) => {
-                                tracing::info!(%job, %attempt, %snapshot, error = %e, "a verified checkpoint was not acknowledged")
+                                tracing::info!(%job, %attempt, %snapshot, error = %e, "a verified checkpoint was not acknowledged");
                             }
                         },
                         Err(VerifyError::Unreachable { node }) => {
                             tracing::info!(%job, %attempt, %node, "the capture's node did not answer; retried on its next heartbeat");
                         }
                         Err(e) => {
-                            tracing::warn!(%job, %attempt, %snapshot, error = %e, "a capture did not verify; it stays captured")
+                            tracing::warn!(%job, %attempt, %snapshot, error = %e, "a capture did not verify; it stays captured");
                         }
                     }
                     lock(&verifying.verifier.in_flight).remove(&(attempt, snapshot));

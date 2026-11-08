@@ -129,13 +129,6 @@ enum Call {
     /// `Ok(Ok(()))`, and answers the caller itself.
     Fenced(GrantToken, CoveredPath, Option<NodeId>, Write),
     /// The authority's acceptance of a checkpoint it fetched and verified.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the verifier commits through it once M5 reports Captured"
-        )
-    )]
     Acknowledge(JobId, CheckpointAck, Reply<Transition>),
     /// A heartbeat from an executor node: never a journal write by itself.
     Heartbeat(NodeId, Heartbeat, Reply<HeartbeatAnswer>),
@@ -541,13 +534,6 @@ impl Authority {
     }
 
     /// Commits a checkpoint the authority fetched and verified (ADR 0028).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the verifier commits through it once M5 reports Captured"
-        )
-    )]
     pub(crate) async fn acknowledge(
         &self,
         job: JobId,

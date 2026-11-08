@@ -916,17 +916,16 @@ fn ack_of(kept: &Kept, n: u8) -> CheckpointAck {
 /// The open recover's failover placement chooses `node`.
 fn failover(kept: &mut Kept, node: NodeId) -> Result<Transition, DomainError> {
     let s = kept.state();
-    let op = s
+    let (op, task) = s
         .operations
         .iter()
         .rev()
-        .find(|o| o.kind == CommandKind::Recover && o.status == OperationStatus::Accepted)
-        .expect("an open recover")
-        .id;
-    let task = match s.request(op) {
-        Some(EffectRequest::Recover { task, .. }) => *task,
-        other => panic!("not a recover: {other:?}"),
-    };
+        .filter(|o| o.kind == CommandKind::Recover && o.status == OperationStatus::Accepted)
+        .find_map(|o| match s.request(o.id) {
+            Some(EffectRequest::Recover { task, .. }) => Some((o.id, *task)),
+            _ => None,
+        })
+        .unwrap();
     kept.observe(&Observation::Placed {
         operation: op,
         task,
