@@ -5,8 +5,13 @@ There is no release, no Homebrew formula and no package yet. You build the binar
 ## Needs
 
 - macOS or Linux. Two real Macs are the only pair a move has been proved on; Linux runs in CI.
-- Rust 1.97.1. `rust-toolchain.toml` pins it, so `rustup` installs it on the first build.
-- `git` on the `PATH`. The store captures and restores git state with it.
+- A C compiler and `git`. On a Mac, the Xcode Command Line Tools give both: `xcode-select --install`. The store captures and restores git state with `git`, so it must be on the `PATH`.
+- `rustup`, which installs Rust. `rust-toolchain.toml` pins Rust 1.97.1, and `rustup` fetches that version on the first build. Without `rustup`, install it as [rustup.rs](https://rustup.rs) says, then open a new terminal so `cargo` is on the `PATH`:
+
+  ```sh
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
+
 - To do real work: Claude Code or Codex installed and logged in, or any agent that speaks the Agent Client Protocol.
 
 ## Build
@@ -17,14 +22,23 @@ cd fabric
 cargo build --release -p fabric --locked
 ```
 
-The binary is `target/release/fabric`. Copy it to a directory on your `PATH`:
+The binary is `target/release/fabric`. Copy it to a directory on your `PATH` that you can write without `sudo`, such as `~/.local/bin`:
 
 ```sh
-cp target/release/fabric /usr/local/bin/fabric
+mkdir -p ~/.local/bin
+cp target/release/fabric ~/.local/bin/fabric
 fabric --version
 ```
 
-On the walk of `main` recorded in [the evidence](../evidence/usable-from-main/walk.md), the release build took 1 minute 28 seconds on an Apple silicon Mac with the toolchain already installed.
+If `fabric` is not found, that directory is not on your `PATH` yet. Add it for zsh, the default shell on a Mac, and open a new terminal:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+`/usr/local/bin` works too, but on a Mac without Homebrew it belongs to `root`, so the copy needs `sudo cp`.
+
+On the walks of `main` recorded in [the evidence](../evidence/usable-from-main/walk.md), the release build took 1 minute 28 seconds on 2026-11-03 and 2 minutes 10 seconds on 2026-11-08, on an Apple silicon Mac with the toolchain already installed. A first build also downloads the toolchain and every crate.
 
 ## Check it
 
