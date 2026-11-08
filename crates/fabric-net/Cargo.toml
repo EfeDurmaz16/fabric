@@ -1,6 +1,6 @@
 [package]
 name = "fabric-net"
-version = "0.1.0"
+version.workspace = true
 description = "Node identity, pinned TLS, the QUIC and TCP transports, framing, typed RPC and the peer book of Fabric"
 edition.workspace = true
 license.workspace = true

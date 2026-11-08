@@ -17,6 +17,8 @@ A pull onto another platform warns about each cache with native Node addons (`*.
 
 ## Install
 
+From the first release on, `brew install EfeDurmaz16/tap/fabric-sync`, or the `fabric-sync-<target>.tar.gz` archive from GitHub Releases, checked as the [README](https://github.com/EfeDurmaz16/fabric#install) checks `fabric`'s ([Releases](../release.md)). Until then, build it:
+
 ```sh
 cargo build --release -p fabric-sync --locked
 cp target/release/fabric-sync /usr/local/bin/      # any directory on the PATH
