@@ -21,8 +21,8 @@ use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::placement::{Candidate, Exclusion, Verdict};
 use fabric_core::managed::{
     AllowedFidelity, AttemptId, AttemptStatus, CheckpointCut, Command, CommitId, DomainError,
-    Envelope, ExitOutcome, Fidelity, GitUri, Intent, JobPolicy, JobState, NewIds, Note,
-    Observation, OperationId, OperationKey, OperationMark, OperationStatus, PackageDigest,
+    EffectRequest, Envelope, ExitOutcome, Fidelity, GitUri, Intent, JobPolicy, JobState, NewIds,
+    Note, Observation, OperationId, OperationKey, OperationMark, OperationStatus, PackageDigest,
     PlacementDecision, PlacementKind, ReceiptStatus, ResourceRef, RestartPolicy, SecretName,
     SecretRef, SecretScope, SourceBinding, TaskClass, TaskId, TaskKind, TaskOutcome, TaskReceipt,
     TaskState, WorkRevision,
@@ -622,10 +622,21 @@ fn write_v3_history(journal: &mut Journal) {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
-            program: None,
+            program: Some(fabric_core::managed::Program {
+                argv: vec!["cargo".into(), "test".into()],
+                cwd: None,
+                env_allowlist: Vec::new(),
+            }),
         },
         ids(FIRST, 10),
     );
+    // The first job's grant may still run, so the program asks for a
+    // spawn there: instructed, and the node took it.
+    for mark in [OperationMark::Dispatched, OperationMark::Succeeded] {
+        journal
+            .mark(FIRST, OperationId::from_bytes([10; 16]), mark, at)
+            .unwrap();
+    }
     submit(journal, "create-3", None, m5_create(THIRD), ids(THIRD, 11));
     journal
         .observe(
@@ -786,6 +797,24 @@ fn a_v2_journal_migrates_to_v3_and_takes_the_m5_history() {
     check_v3(&mut journal);
 }
 
+/// `tests/fixtures/v3-draft.sqlite` is the v3 fixture as the unreleased
+/// build before the launch path made it: no `tasks.program`. Version 3 was
+/// amended in place, so such a file is refused, never read without it.
+#[test]
+fn a_draft_v3_without_the_program_column_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE_NAME);
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3-draft.sqlite"),
+        &path,
+    )
+    .unwrap();
+    assert!(matches!(
+        Journal::open(&path),
+        Err(fabric_journal::OpenError::DraftSchema { version: 3 })
+    ));
+}
+
 #[test]
 fn the_v3_fixture_holds_what_it_was_made_with() {
     let dir = tempfile::tempdir().unwrap();
@@ -803,6 +832,22 @@ fn check_v3(journal: &mut Journal) {
     let first = journal.job(FIRST).unwrap().unwrap();
     assert_eq!(first.tasks.len(), 3);
     assert_eq!(first.tasks[2].class, TaskClass::Test);
+    assert!(
+        first
+            .requests
+            .iter()
+            .any(|(_, r)| matches!(r, EffectRequest::Spawn { task } if *task == first.tasks[2].id)),
+        "{:?}",
+        first.requests
+    );
+    assert_eq!(
+        first.tasks[2].program,
+        Some(fabric_core::managed::Program {
+            argv: vec!["cargo".into(), "test".into()],
+            cwd: None,
+            env_allowlist: Vec::new(),
+        })
+    );
 
     let third = journal.job(THIRD).unwrap().unwrap();
     assert!(third.parked());
@@ -873,12 +918,36 @@ fn check_v3(journal: &mut Journal) {
         fourth.operations
     );
     assert_eq!(fourth.requests.len(), 2);
+    check_v3_reads(journal, &fourth);
     let recovery = journal
         .recover(1_760_000_004_000, |_| fabric_journal::Liveness::CannotTell)
         .unwrap();
     assert!(recovery.to_effect.is_empty());
     assert!(recovery.unknown.is_empty());
     journal.verify().unwrap();
+}
+
+/// The reads a work package is built from: the newest cut of an attempt
+/// and the job's head.
+fn check_v3_reads(journal: &Journal, fourth: &fabric_core::managed::ManagedState) {
+    // The newest cut of the first attempt is the handoff's, not the in-place one.
+    let (cut_snapshot, _) = journal
+        .last_cut(FOURTH, fourth.attempts[0].id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cut_snapshot, SnapshotId::of(b"fixture handoff cut"));
+    assert_eq!(
+        journal.last_cut(FOURTH, fourth.attempts[1].id).unwrap(),
+        None
+    );
+    let newest = journal.events(FOURTH, None, 1_000).unwrap();
+    assert!(journal.head(FOURTH).unwrap().is_some());
+    assert_eq!(
+        journal.head(FOURTH).unwrap(),
+        newest
+            .last()
+            .map(|e| fabric_core::managed::EventFrame::digest(&e.frame.encode().unwrap()))
+    );
 }
 
 #[test]

@@ -298,20 +298,48 @@ fn command_events(
                 return Err(DomainError::BadParent { task: *parent });
             }
             open_task(state, *parent)?;
-            // The program rules (required for a build or test task, refused
-            // for the others, checked, and the Spawn effect while the
-            // parent's attempt runs) are the launch path's, owner A.
-            (
-                false,
-                vec![ManagedEvent::TaskRegistered {
-                    task: ids.task,
-                    parent: Some(*parent),
-                    kind: kind.clone(),
-                    restart: *restart,
-                    class: *class,
-                    program: program.clone(),
-                }],
-            )
+            // A build or test task runs a program; a harness or opaque one
+            // is started by its harness or not at all (the launch path).
+            match (class, program) {
+                (TaskClass::Build | TaskClass::Test, None) => {
+                    return Err(DomainError::ProgramRequired { class: *class });
+                }
+                (TaskClass::Harness | TaskClass::Opaque, Some(_)) => {
+                    return Err(DomainError::ProgramNotAllowed { class: *class });
+                }
+                (_, Some(program)) => program
+                    .check()
+                    .map_err(|error| DomainError::BadProgram { error })?,
+                (_, None) => {}
+            }
+            let registered = ManagedEvent::TaskRegistered {
+                task: ids.task,
+                parent: Some(*parent),
+                kind: kind.clone(),
+                restart: *restart,
+                class: *class,
+                program: program.clone(),
+            };
+            // A program registered while its parent's attempt runs is
+            // spawned there; with none live it rides the next launch.
+            let live = state.attempts.iter().any(|a| {
+                a.task == *parent
+                    && matches!(a.status, AttemptStatus::Granted | AttemptStatus::Running)
+            });
+            if program.is_some() && live {
+                (
+                    true,
+                    vec![
+                        registered,
+                        ManagedEvent::EffectRequested {
+                            operation: ids.operation,
+                            request: EffectRequest::Spawn { task: ids.task },
+                        },
+                    ],
+                )
+            } else {
+                (false, vec![registered])
+            }
         }
         Command::FinishTask { task, outcome } => {
             open_task(state, *task)?;
@@ -728,6 +756,22 @@ pub fn apply_observation(
     // succeeded, whatever the attempt then did. A loss says nothing about it.
     if status != AttemptStatus::Lost {
         events.extend(grant_succeeded(job, attempt));
+    }
+    // A continue's grant that ends before `Continued` fails the continue:
+    // the target offered no allowed fidelity or could not start, and the
+    // task stays open for another one.
+    if matches!(observation, Observation::Exited { .. })
+        && let Some(grant) = job.operation(attempt.granted_by)
+        && grant.kind == CommandKind::Continue
+        && matches!(
+            grant.status,
+            OperationStatus::Dispatched | OperationStatus::Unknown
+        )
+    {
+        events.push(ManagedEvent::OperationMarked {
+            operation: grant.id,
+            status: OperationMark::Failed,
+        });
     }
     // An attempt that ended before its checkpoint command was cut fails
     // the command, so it never waits on, or claims, another attempt's cut.

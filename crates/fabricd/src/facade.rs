@@ -1100,7 +1100,7 @@ fn program_json(program: &fabric_core::managed::Program) -> Value {
     json!({
         "argv": program.argv,
         "cwd": program.cwd.as_ref().map(fabric_core::path::RelPath::as_str),
-        "env_allowlist": program.env_allowlist.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+        "env_allowlist": program.env_allowlist.iter().map(fabric_core::env::EnvVarName::as_str).collect::<Vec<_>>(),
     })
 }
 

@@ -458,6 +458,7 @@ dependencies = [
  "rustls",
  "rustls-webpki",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

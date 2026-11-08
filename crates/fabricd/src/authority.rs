@@ -416,11 +416,8 @@ impl Authority {
             .await
     }
 
-    /// Marks an operation, `Dispatched` right before its effect is asked for.
-    #[allow(
-        dead_code,
-        reason = "a launch's dispatch marks through it; no launch is dispatched by the node in M5, so only the tests call it"
-    )]
+    /// Marks an operation, `Dispatched` right before its effect is asked
+    /// for, then its outcome when the answer settles it (the dispatch).
     pub(crate) async fn mark(
         &self,
         job: JobId,

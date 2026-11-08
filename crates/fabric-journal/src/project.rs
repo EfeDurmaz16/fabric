@@ -11,8 +11,9 @@ use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
     Attempt, AttemptId, AttemptStatus, CommandKind, CutDigest, EffectRequest, EventDigest,
     EventFrame, Generation, JobState, ManagedEvent, ManagedJob, ManagedState, OperationId,
-    OperationKey, OperationProgress, OperationStatus, RequestDigest, RestartPolicy, StoredPart,
-    Task, TaskClass, TaskId, TaskKind, TaskState, Transition, WorkRevision, apply_batch,
+    OperationKey, OperationProgress, OperationStatus, Program, RequestDigest, RestartPolicy,
+    StoredPart, Task, TaskClass, TaskId, TaskKind, TaskState, Transition, WorkRevision,
+    apply_batch,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -221,7 +222,7 @@ fn load_requests(
 fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
     let id = job.to_bytes();
     let mut stmt = conn.prepare_cached(
-        "SELECT task_id, parent_id, kind_body, restart, state, class FROM tasks
+        "SELECT task_id, parent_id, kind_body, restart, state, class, program FROM tasks
          WHERE job_id = ?1 ORDER BY created_rev, rowid",
     )?;
     let rows = stmt.query_map([id], |r| {
@@ -232,11 +233,12 @@ fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
             r.get::<_, String>(3)?,
             r.get::<_, String>(4)?,
             r.get::<_, String>(5)?,
+            r.get::<_, Option<Vec<u8>>>(6)?,
         ))
     })?;
     let mut tasks = Vec::new();
     for row in rows {
-        let (task, parent, kind, restart_name, state, class) = row?;
+        let (task, parent, kind, restart_name, state, class, program) = row?;
         tasks.push(Task {
             id: TaskId::from_bytes(task),
             job,
@@ -247,10 +249,9 @@ fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
             state: task_state(&state).ok_or_else(|| corrupt(job, format!("task state {state}")))?,
             class: TaskClass::from_name(&class)
                 .ok_or_else(|| corrupt(job, format!("task class {class}")))?,
-            // The launch path's `program` column (schema version 3, amended
-            // in place) is owner A's; until it lands the projection holds no
-            // program and `verify` compares none.
-            program: None,
+            program: program
+                .map(|bytes| part::<Program>(job, &bytes, "task program"))
+                .transpose()?,
         });
     }
 
@@ -528,8 +529,8 @@ pub(crate) fn write_transition(
             continue;
         }
         conn.execute(
-            "INSERT INTO tasks (task_id, job_id, parent_id, kind, kind_body, restart, state, created_rev, class)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO tasks (task_id, job_id, parent_id, kind, kind_body, restart, state, created_rev, class, program)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT (task_id) DO UPDATE SET state = ?7",
             params![
                 task.id.to_bytes(),
@@ -544,6 +545,7 @@ pub(crate) fn write_transition(
                 task_state_name(task.state),
                 sql_u64(transition.revision.get())?,
                 task.class.name(),
+                task.program.as_ref().map(stored).transpose()?,
             ],
         )?;
     }
