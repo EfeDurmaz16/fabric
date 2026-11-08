@@ -207,10 +207,7 @@ mod tests {
             version("codex-cli 0.163.0-alpha.10.2").as_deref(),
             Some("0.163.0-alpha.10.2")
         );
-        assert_eq!(
-            version("2.1.294 (Claude Code)").as_deref(),
-            Some("2.1.294")
-        );
+        assert_eq!(version("2.1.294 (Claude Code)").as_deref(), Some("2.1.294"));
         assert_eq!(version("codex-cli").as_deref(), None);
     }
 }

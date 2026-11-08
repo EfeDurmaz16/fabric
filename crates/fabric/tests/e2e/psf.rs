@@ -96,7 +96,11 @@ fn e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back() -> Falli
     p.a.ok(&["job", "suspend", &job])?;
     let _ = finish(running, GIVE_UP)?;
     assert!(!refused.status.success(), "{}", text(&refused));
-    assert!(text(&refused).contains("already runs as pid"), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("already runs as pid"),
+        "{}",
+        text(&refused)
+    );
     assert!(!live.exists(), "a refused export wrote {}", live.display());
     Ok(())
 }
