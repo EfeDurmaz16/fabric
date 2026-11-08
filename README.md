@@ -1,8 +1,32 @@
 # Fabric
 
-Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped. The workspace goes with it: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Untracked secret-shaped files such as `.env` stay behind. A secret that is tracked or stashed in git is already in the repository's history, so it travels with the git state, and suspend names it instead of refusing. The session is redacted by pattern, which removes common key shapes, not every secret.
+Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped.
 
-The idea underneath is that the job, not the machine, is the unit of development work. Where a job's state is stored, which machine runs it, which toolchain it needs and which agent drives it are separate questions, and Fabric keeps them separate, so a job started under Claude Code on one machine can be suspended, resumed on another machine with its dependencies, and continued by a different agent.
+## What moves, what does not
+
+<!-- matrix:begin -->
+| On the source | On the target after a move | Why |
+|---|---|---|
+| Commits, branches, staged and unstaged changes, untracked files, the job's stashes | The same, byte for byte | Carried as a git bundle plus two private commits (index and working tree); your own index and refs are not touched |
+| Dependency caches: `node_modules`, `.venv`, Rust `target/` | Carried when the target's toolchain matches the recorded key, else made again by the setup step | The key is exact strings: Node major and package manager, `rustc -vV` and `CARGO_HOME`, Python version and home. A cache with no lockfile always travels |
+| Build output: `dist`, `.next`, `build`, `out`, `.turbo` | Carried under its ecosystem's key, else dropped for the next build | Output made for another OS or CPU is left behind |
+| `.env` and other secret-shaped untracked or ignored files | Stay on the source | `.env.example` travels. A secret that is tracked or stashed is in git history already, so it travels and suspend names it |
+| Claude Code session | Continues with `claude --resume`, the transcript's model | Transcript, sidecars, project memory and file history, redacted by pattern |
+| Codex session | Continues the same thread, with its model, provider, effort and sandbox | The thread's rollouts, byte for byte; a secret shape in them refuses the capture |
+| ACP agent session | Continues with `session/resume` or `session/load` | The files named for the session in the agent's declared state directory |
+| Logins, keychains, `~/.ssh`, `~/.aws`, `auth.json`, `~/.claude.json`, `~/.fabric` | Stay on the source | A hard-coded denylist, checked before every copy |
+| A harness that is still running | Nothing moves | Capture refuses while the session may be written; suspend stops the harness first |
+
+Both nodes need the same user name and the same home path, and `git` on the `PATH`: nothing rewrites paths (ADR 0011). One harness moves to the same harness; Claude to Codex is not supported. A Codex job moved between two real Macs on 2026-10-21, on the binary of that day, before M2 to M4 merged. That run's log is not in this repository; the README keeps its timings, and it has not been run again on `main` (gate G1 is pending). Claude Code has never been moved between two machines (gate G2 is pending). The end-to-end test, two nodes on one machine with fake harnesses, moves a job with uncommitted work, `.env`, `dist` and `node_modules` and checks each of them; the crates' own tests cover the other rows against fixtures.
+<!-- matrix:end -->
+
+Each row in detail is in [docs/start/what-moves.md](docs/start/what-moves.md). The docs, from install to the ADRs, start at [docs/README.md](docs/README.md) and are built into a site by `scripts/docs/build.sh`.
+
+## In more words
+
+A move carries the workspace: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Untracked secret-shaped files such as `.env` stay behind. A secret that is tracked or stashed in git is already in the repository's history, so it travels with the git state, and suspend names it instead of refusing. The session is redacted by pattern, which removes common key shapes, not every secret.
+
+The idea underneath is that the job, not the machine, is the unit of development work. Where a job's state is stored, which machine runs it, which toolchain it needs and which agent drives it are separate questions, and Fabric keeps them separate, so a job started under Claude Code on one machine can be suspended and resumed on another machine with its dependencies. Continuing it under a different agent is the same separation taken one step further; ADR 0006 lists it as an experiment, and it is not built.
 
 Fabric is a working name. It collides with Microsoft Fabric and others, and may change; see [ADR 0010](docs/adr/0010-name-and-scope-boundaries.md).
 
@@ -10,7 +34,7 @@ Fabric is a working name. It collides with Microsoft Fabric and others, and may 
 
 A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names.
 
-On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn.
+On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn. That ran on the binary of that day, before M2 to M4 merged; its log is not in this repository, and the walk has not been run again on `main` ([gate G1](docs/evidence/two-mac-gate-pending.md) is pending).
 
 | Step | Measured |
 |---|---|
@@ -35,7 +59,7 @@ That run found that the resumed agent used the other Mac's model setting instead
 | `crates/fabric-client` | The client API of a node (ADR 0018): typed requests, replies, progress events and refusals as length-prefixed JSON on the control socket after a version handshake, and a Rust client. `protocol/fixtures` holds one example of every message; the Rust and TypeScript clients both test against it. |
 | `sdk/typescript` | The TypeScript client of the same API for Node 22 and Bun, built to JavaScript with declarations in `dist/`: zod schemas at the boundary, the same trust checks and handshake as the Rust client, and the same contract test against `protocol/fixtures`, plus an end-to-end test against a real node and a test that imports the packed package with plain Node from `node_modules`. |
 | `crates/fabric-bridge` | The Fabric side of the provider bridge (ADR 0021, [docs/bridge-protocol.md](docs/bridge-protocol.md)): protocol v1 messages and frames, and a client that runs one provider worker over stdio, records each effect in the journal before it writes the request, and records `unknown`, never cancelled or failed, when a deadline passes or the worker is lost. Tested against every fixture in `protocol/bridge/v1`, which Capsule's worker tests against too, against a Rust test double worker, and against the real Capsule worker over its stdio (ignored by default; CI builds the worker from a pinned Capsule commit). |
-| `crates/fabric` | The `fabric` command, and the end-to-end test: two daemons over loopback on QUIC and on TCP+TLS, a job moved and back, the move broken at five named points by `SIGKILL` of either node or a lost or repeated answer. |
+| `crates/fabric` | The `fabric` command, and the end-to-end test: two daemons over loopback on QUIC and on TCP+TLS, a job moved and back, the move and the node broken at every named fault point ([Ledger](docs/concepts/ledger.md) lists them) by `SIGKILL` of either node or a lost or repeated answer. |
 | CI | fmt, clippy, test, the end-to-end test, doc, `cargo deny`, the hygiene script, and the TypeScript SDK's typecheck, build, contract, package and end-to-end tests, on macOS and Ubuntu |
 
 ## How a move works
@@ -82,6 +106,8 @@ fabric job resume <job> --headless --prompt "Which file did you name before?"
 fabric job status <job>
 fabric job log <job>
 ```
+
+Every command prints its answer on standard output and everything else (progress, notes, hints, errors) on standard error, so `job=$(fabric job new ...)` holds the job id alone; `--json` prints one JSON document instead, and a failure as one JSON line on standard error. [docs/cli-contract.md](docs/cli-contract.md) has the rules and the exit codes, and [docs/reference/cli.md](docs/reference/cli.md) the help of every command.
 
 The headless turn prints the answer and a last line `codex session <thread>` (or `claude-code session <id>`); the resume continues that session, and the `continuing ... session` line names the model, effort and sandbox it carried. Pick the harness `doctor` says is logged in. `claude.login` is what `claude` itself answers when the node asks it, so a node started from a shell whose `claude` login has lapsed, or over SSH, where the Keychain is closed to it, says `no`, and a headless Claude turn then fails with Claude's own `Failed to authenticate` message; log `claude` in from that shell, or start the node from the desktop session, and run it again.
 

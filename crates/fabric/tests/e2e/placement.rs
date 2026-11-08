@@ -64,7 +64,7 @@ fn submit(from: &Node, a: &Node, token: &str, key: &str, policy: &[&str]) -> Fal
         "place me where I can run",
         "--harness",
         "codex",
-        "--key",
+        "--operation-key",
         key,
     ];
     args.extend_from_slice(policy);
@@ -343,7 +343,7 @@ fn e2e_a_submit_runs_on_the_eligible_node_without_naming_it() -> Fallible {
         "--token",
         &token,
         &job,
-        "--key",
+        "--operation-key",
         "cancel-run",
     ])?)?;
     assert_eq!(cancelled["type"], "accepted", "{cancelled}");

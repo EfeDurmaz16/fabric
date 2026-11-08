@@ -190,7 +190,7 @@ async fn e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package(
         "1000",
         "--pin",
         &b.id,
-        "--key",
+        "--operation-key",
         "submit-1",
     ])?)?;
     assert_eq!(accepted["type"], "accepted", "{accepted}");

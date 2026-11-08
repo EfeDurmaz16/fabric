@@ -28,8 +28,6 @@ fabric-net = { path = "../fabric-net" }
 fabricd = { path = "../fabricd" }
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 rustix = { version = "1.1", features = ["process", "termios"] }
-# The facade's answers print as the JSON the authority wrote (ADR 0027);
-# already in the graph through fabric-client.
 serde_json = "1.0"
 tokio = { version = "1.54", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"

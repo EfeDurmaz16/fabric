@@ -17,9 +17,11 @@
 //! (`terminal`).
 //!
 //! The exit code says what happened without parsing text (ADR 0016, Exit
-//! codes): 0 for success, the harness's own code when it exits, 128 plus
-//! the signal when it was stopped by one, 80 to 85 for a refusal of a kind
-//! the daemon names, and 1 for any other failure.
+//! codes; docs/cli-contract.md): 0 for success, 2 for a usage error, the
+//! harness's own code when it exits, 128 plus the signal when it was
+//! stopped by one, 80 to 85 for a refusal of a kind the daemon names, and 1
+//! for any other failure. What prints where, the help layout, `--json` and
+//! the shape of a failure are the contract's (`contract`).
 
 use std::ffi::OsString;
 use std::fmt;
@@ -56,6 +58,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+pub mod contract;
 mod managed;
 mod render;
 mod terminal;
@@ -63,7 +66,7 @@ mod terminal;
 /// Move a development job between your machines and harnesses.
 #[derive(Debug, Parser)]
 #[command(name = "fabric", version)]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
@@ -72,25 +75,25 @@ struct Cli {
 enum Command {
     /// Run the node daemon in the foreground.
     Serve(ServeArgs),
-    /// This node's identity and its paired nodes.
+    /// Read this node's identity and pair it with other nodes.
     #[command(subcommand)]
     Node(NodeCommand),
     /// Make, run, suspend, move and resume jobs.
     #[command(subcommand)]
     Job(JobCommand),
-    /// Make, cancel and read managed jobs (ADR 0019), and the M5 operations on them.
+    /// Make, cancel and read managed jobs, and the M5 operations on them (experimental).
     #[command(subcommand)]
     Managed(managed::ManagedCommand),
-    /// Mint and revoke facade tokens; reach a job's authority from any of your nodes (ADR 0027).
+    /// Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental).
     #[command(subcommand)]
     Facade(managed::FacadeCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
     Doctor {
         /// The node to compare with.
-        #[arg(long)]
+        #[arg(long, value_name = "NODE")]
         peer: Option<NodeId>,
         /// The job a move would carry; only with --peer.
-        #[arg(long, requires = "peer")]
+        #[arg(long, requires = "peer", value_name = "JOB")]
         job: Option<JobId>,
     },
 }
@@ -98,7 +101,7 @@ enum Command {
 #[derive(Debug, Args)]
 struct ServeArgs {
     /// Where both transports listen.
-    #[arg(long, default_value = "0.0.0.0:7777")]
+    #[arg(long, default_value = "0.0.0.0:7777", value_name = "ADDR")]
     listen: SocketAddr,
     /// Which wires this node dials: QUIC then TCP+TLS, or only one of them.
     #[arg(long, value_enum, default_value_t = Wire::Auto)]
@@ -140,13 +143,13 @@ enum JobCommand {
     /// Make a job from a repository, rooted at ~/fabric/jobs/<id>/work.
     New {
         /// The repository to clone into the job's root.
-        #[arg(long)]
+        #[arg(long, value_name = "PATH")]
         repo: PathBuf,
         /// The goal in your words.
-        #[arg(long)]
+        #[arg(long, value_name = "TEXT")]
         goal: String,
         /// The harness: claude, codex or acp:<program>.
-        #[arg(long, default_value = "claude", value_parser = harness_arg)]
+        #[arg(long, default_value = "claude", value_parser = harness_arg, value_name = "HARNESS")]
         harness: HarnessKind,
     },
     /// Run the job's harness here, attached to this terminal.
@@ -154,7 +157,7 @@ enum JobCommand {
         /// The job.
         job: JobId,
         /// The first message to send; the goal for a new session.
-        #[arg(long)]
+        #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
         /// Run one turn without a terminal, print the answer and the session, and exit.
         #[arg(long, requires = "prompt")]
@@ -173,13 +176,13 @@ enum JobCommand {
         /// The job.
         job: JobId,
         /// The node that holds the job, when this node has never seen it.
-        #[arg(long)]
+        #[arg(long, value_name = "NODE")]
         on: Option<NodeId>,
         /// Continue under another harness: claude, codex or acp:<program>.
-        #[arg(long, value_parser = harness_arg)]
+        #[arg(long, value_parser = harness_arg, value_name = "HARNESS")]
         harness: Option<HarnessKind>,
         /// The first message to send.
-        #[arg(long)]
+        #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
         /// Run one turn without a terminal, print the answer and the session, and exit.
         #[arg(long, requires = "prompt")]
@@ -196,7 +199,7 @@ enum JobCommand {
         /// The job.
         job: JobId,
         /// The node to move it to.
-        #[arg(long)]
+        #[arg(long, value_name = "NODE")]
         to: NodeId,
         /// Waive the preflight refusals that can be waived.
         #[arg(long)]
@@ -210,17 +213,17 @@ enum JobCommand {
         #[arg(long)]
         force: bool,
         /// Why, for the ledger.
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", value_name = "TEXT")]
         reason: String,
     },
-    /// The job's state on this node.
+    /// Print the job's state on this node.
     Status {
         /// The job.
         job: JobId,
     },
-    /// Every job this node knows.
+    /// List every job this node knows.
     Ls,
-    /// The job's ledger.
+    /// Print the job's ledger.
     Log {
         /// The job.
         job: JobId,
@@ -230,7 +233,7 @@ enum JobCommand {
         /// The job.
         job: JobId,
         /// Your words.
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", value_name = "TEXT")]
         note: String,
     },
     /// Record a rejection in the ledger.
@@ -238,7 +241,7 @@ enum JobCommand {
         /// The job.
         job: JobId,
         /// Your words.
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", value_name = "TEXT")]
         note: String,
     },
     /// Settle a job frozen after a fork by the fork rule: take the peer's
@@ -254,7 +257,7 @@ enum JobCommand {
         job: JobId,
         /// A workspace a restore set aside under orphan/ beside the job's
         /// root; the workspace at the root when left out.
-        #[arg(long)]
+        #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
     },
 }
@@ -289,9 +292,12 @@ fn client(state: &StateDir) -> Client {
 /// error for a headless run, whose standard output carries only the
 /// harness's answer and the line naming the session, for a script to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Notes {
+pub(crate) enum Notes {
+    /// A headless turn's session line, which is part of its answer.
     Stdout,
     Stderr,
+    /// Nowhere: under `--json`, standard error carries only a failure.
+    Silent,
 }
 
 impl Notes {
@@ -299,6 +305,7 @@ impl Notes {
         match self {
             Notes::Stdout => write_lines(&mut std::io::stdout().lock(), lines)?,
             Notes::Stderr => write_lines(&mut std::io::stderr().lock(), lines)?,
+            Notes::Silent => {}
         }
         Ok(())
     }
@@ -323,32 +330,59 @@ fn write_lines<T: fmt::Display>(out: &mut impl Write, lines: &[T]) -> std::io::R
     Ok(())
 }
 
-/// A refusal, kept typed so `main` can pick the exit code.
+/// A refusal, kept typed so `main` can pick the exit code and the reason.
 #[derive(Debug)]
-struct Refused {
-    refusal: RefusalKind,
-    message: String,
+pub(crate) struct Refused {
+    pub(crate) refusal: RefusalKind,
+    /// The reason's stable `snake_case` code: the node's, or the CLI's own.
+    pub(crate) code: String,
+    /// The reason's facts, as the client API carries them.
+    pub(crate) data: Option<serde_json::Value>,
+    pub(crate) message: String,
 }
 
 impl Refused {
+    /// A refusal the CLI makes itself, under its own reason code.
+    fn local(refusal: RefusalKind, code: &str, message: String) -> Self {
+        Self {
+            refusal,
+            code: code.to_owned(),
+            data: None,
+            message,
+        }
+    }
+
+    /// The refusal the node answered, with its reason's code and facts.
+    pub(crate) fn from_refusal(refusal: &fabric_client::api::Refusal) -> Self {
+        let mut reason = serde_json::to_value(refusal.reason()).unwrap_or_default();
+        let code = reason
+            .as_object_mut()
+            .and_then(|fields| fields.remove("code"))
+            .and_then(|code| code.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unrecognized".to_owned());
+        let data = reason
+            .as_object()
+            .filter(|fields| !fields.is_empty())
+            .map(|_| reason.clone());
+        Self {
+            refusal: refusal.kind(),
+            code,
+            data,
+            message: refusal.message().to_owned(),
+        }
+    }
+
     /// The refusal the node answered with its sentence; any other client error as it is.
     fn from_client(error: ClientError) -> anyhow::Error {
         match error {
-            ClientError::Refused(refusal) => Refused {
-                refusal: refusal.kind(),
-                message: refusal.message().to_owned(),
-            }
-            .into(),
+            ClientError::Refused(refusal) => Refused::from_refusal(&refusal).into(),
             other => other.into(),
         }
     }
 }
 
-/// The exit code of a command that found no daemon to answer it.
-const NO_DAEMON_EXIT: u8 = 80;
-
 /// The exit code for a refusal of `kind` (ADR 0016, Exit codes).
-fn refusal_exit(kind: RefusalKind) -> u8 {
+pub(crate) fn refusal_exit(kind: RefusalKind) -> u8 {
     match kind {
         RefusalKind::NotOwner => 81,
         RefusalKind::Frozen => 82,
@@ -366,17 +400,6 @@ impl fmt::Display for Refused {
 }
 
 impl std::error::Error for Refused {}
-
-/// The exit code for an error that ended a command.
-fn exit_code(error: &anyhow::Error) -> ExitCode {
-    if let Some(refused) = error.downcast_ref::<Refused>() {
-        return ExitCode::from(refusal_exit(refused.refusal));
-    }
-    if let Some(ClientError::NoDaemon { .. }) = error.downcast_ref::<ClientError>() {
-        return ExitCode::from(NO_DAEMON_EXIT);
-    }
-    ExitCode::FAILURE
-}
 
 /// Prints each event of a call as it arrives, keeping the first failure to print.
 struct Printer {
@@ -425,25 +448,50 @@ async fn ask_watching(
         })
         .await;
     printer.finish()?;
-    let reply = answered.map_err(Refused::from_client)?;
-    notes.print(&render::reply(&reply))?;
-    if let Reply::JobStatus(status) = &reply
-        && let Some(error) = render::first_unreadable(status)
-    {
-        return Err(Refused {
-            refusal: RefusalKind::Failed,
-            message: error.to_owned(),
+    answered.map_err(Refused::from_client)
+}
+
+/// Prints a command's answer: the result on standard output, in words or
+/// as one JSON document, and the notes around it on standard error. A
+/// status with a record that does not read prints what does read, then
+/// fails.
+fn answer(run: &contract::Run, reply: &Reply, job: Option<JobId>) -> Result<()> {
+    let unreadable = match reply {
+        Reply::JobStatus(status) => render::first_unreadable(status).map(str::to_owned),
+        _ => None,
+    };
+    if run.modes.json {
+        let doc = render::document(reply, job);
+        if let Some(error) = unreadable {
+            let mut refused = Refused::local(RefusalKind::Failed, "unreadable_record", error);
+            refused.data = Some(doc);
+            return Err(refused.into());
         }
-        .into());
+        return contract::print_document(run.modes, &doc);
     }
-    Ok(reply)
+    let answer = render::answer(reply, job);
+    write_lines(&mut std::io::stdout().lock(), &answer.result)?;
+    run.notes().print(&answer.notes)?;
+    match unreadable {
+        Some(error) => Err(Refused::local(RefusalKind::Failed, "unreadable_record", error).into()),
+        None => Ok(()),
+    }
 }
 
 /// Parses the command line, runs the command and returns the exit code.
 #[must_use]
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let default = if matches!(cli.command, Command::Serve(_)) {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let (cli, run_of) = match contract::parse(&argv) {
+        contract::Parsed::Run(cli, run) => (*cli, run),
+        contract::Parsed::Exit(code) => return code,
+    };
+    let default = if run_of.modes.debug {
+        tracing::Level::DEBUG
+    } else if run_of.modes.json {
+        // Standard error carries only the failure under `--json`.
+        tracing::Level::ERROR
+    } else if matches!(cli.command, Command::Serve(_)) {
         tracing::Level::INFO
     } else {
         tracing::Level::WARN
@@ -454,6 +502,9 @@ pub fn main() -> ExitCode {
         .unwrap_or(default);
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // A closed standard error must not end the command: the
+        // subscriber's own report of a failed write would panic there.
+        .log_internal_errors(false)
         .with_max_level(level)
         .init();
     let runtime = match runtime_for(&cli.command) {
@@ -463,11 +514,12 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(cli)) {
+    match runtime.block_on(run(cli, &run_of)) {
         Ok(code) => code,
         Err(e) => {
-            let _ = Notes::Stderr.print(&[format!("error: {e:#}")]);
-            exit_code(&e)
+            let failure = run_of.failure(&e);
+            failure.print(run_of.modes);
+            ExitCode::from(failure.exit)
         }
     }
 }
@@ -495,12 +547,20 @@ fn runtime_for(command: &Command) -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-async fn run(cli: Cli) -> Result<ExitCode> {
+async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
+    if run.modes.json
+        && let Command::Job(JobCommand::Run { .. } | JobCommand::Resume { .. }) = &cli.command
+    {
+        return Err(contract::Usage(
+            "Can't use --json with fabric job run or fabric job resume. The harness owns standard output; a headless turn prints its answer there.".to_owned(),
+        )
+        .into());
+    }
     let home = home()?;
     let state = state_dir(&home)?;
     let client = client(&state);
     match cli.command {
-        Command::Serve(args) => serve(state, home, args).await,
+        Command::Serve(args) => serve(state, home, args, run).await,
         Command::Node(command) => {
             let request = match command {
                 NodeCommand::Id => Request::NodeId,
@@ -508,7 +568,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 NodeCommand::Ls => Request::NodeList,
                 NodeCommand::Ping { node } => Request::NodePing { node },
             };
-            ask(&client, &request, Notes::Stdout).await?;
+            let reply = ask(&client, &request, run.notes()).await?;
+            answer(run, &reply, None)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { peer, job } => {
@@ -517,33 +578,46 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 job,
                 env: Some(ClientEnv::current()?),
             };
-            let reply = ask(&client, &request, Notes::Stdout).await?;
+            let reply = ask(&client, &request, run.notes()).await?;
             // The node reports; a row or a path that would stop a move
-            // still fails the command, as a preflight does.
+            // still fails the command, as a preflight does. In words the
+            // rows print first; under `--json` they are the failure's data.
             if let Reply::Doctor {
                 report: DoctorReport::Compared { rows, carry, .. },
             } = &reply
                 && let Some(message) = render::refused_move(rows, carry.as_ref())
             {
-                return Err(Refused {
-                    refusal: RefusalKind::NeedsForce,
-                    message,
+                let mut refused = Refused::local(RefusalKind::NeedsForce, "preflight", message);
+                if run.modes.json {
+                    refused.data = Some(render::document(&reply, None));
+                } else {
+                    answer(run, &reply, None)?;
                 }
-                .into());
+                return Err(refused.into());
             }
+            answer(run, &reply, None)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Job(command) => job(&state, &home, command).await,
-        Command::Facade(command) => managed::run_facade(&client, command)
-            .await
-            .map(|_| ExitCode::SUCCESS),
-        Command::Managed(command) => managed::run(&client, command)
-            .await
-            .map(|_| ExitCode::SUCCESS),
+        Command::Job(command) => job(&state, &home, command, run).await,
+        Command::Managed(command) => {
+            let reply = managed::run(&client, command, run).await?;
+            answer(run, &reply, None)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Facade(command) => {
+            let reply = managed::run_facade(&client, command, run).await?;
+            answer(run, &reply, None)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
-async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCode> {
+async fn serve(
+    state: StateDir,
+    home: PathBuf,
+    args: ServeArgs,
+    run: &contract::Run,
+) -> Result<ExitCode> {
     let dial = match args.wire {
         Wire::Auto => DialOrder::QuicThenTcp,
         Wire::Quic => DialOrder::QuicOnly,
@@ -556,11 +630,19 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
         dial,
         env: ToolEnv::current(),
     })?;
-    {
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "node {}", node.id())?;
-        writeln!(stdout, "listening on {}", node.local_addr()?)?;
-        stdout.flush()?;
+    // The node runs until stopped, so its identity is context, on
+    // standard error; under `--json` it is the one document.
+    let listen = node.local_addr()?;
+    if run.modes.json {
+        contract::print_document(
+            run.modes,
+            &serde_json::json!({ "node": { "node": node.id().to_string(), "listen": listen.to_string() } }),
+        )?;
+    } else {
+        run.notes().print(&[
+            format!("node {}", node.id()),
+            format!("listening on {listen}"),
+        ])?;
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -572,21 +654,43 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
     Ok(ExitCode::SUCCESS)
 }
 
-async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
+async fn job(
+    state: &StateDir,
+    home: &Path,
+    command: JobCommand,
+    run: &contract::Run,
+) -> Result<ExitCode> {
     let client = client(state);
     let (request, mode, yes) = job_request(command)?;
+    let job = request_job(&request);
     let mut ahead = GuardAhead::default();
-    let reply = ask_watching(&client, &request, mode.notes(), |event| {
+    let notes = if run.modes.json {
+        Notes::Silent
+    } else {
+        mode.notes()
+    };
+    let reply = ask_watching(&client, &request, notes, |event| {
         ahead.watch(home, event);
     })
     .await?;
     let (Reply::JobRun(plan) | Reply::JobResume(plan)) = reply else {
+        answer(run, &reply, job)?;
         return Ok(ExitCode::SUCCESS);
+    };
+    // Only a run that may prompt asks; any other answers no, and the
+    // refusal names `--yes`.
+    let interactive = run.modes.interactive;
+    let ask = move || {
+        if interactive {
+            ask_on_terminal()
+        } else {
+            Ok(false)
+        }
     };
     let approval = Approval {
         record: state.job(plan.job).env_spec_ran(),
         yes,
-        ask: &ask_on_terminal,
+        ask: &ask,
     };
     launch(state, home, &client, &plan, (mode, ahead), &approval).await
 }
@@ -740,6 +844,21 @@ fn job_request(command: JobCommand) -> Result<(Request, Mode, bool)> {
     })
 }
 
+/// The job a request names, for the identifier a changing command prints.
+fn request_job(request: &Request) -> Option<JobId> {
+    match request {
+        Request::JobSuspend { job, .. }
+        | Request::JobMove { job, .. }
+        | Request::JobSteal { job, .. }
+        | Request::JobDecide { job, .. }
+        | Request::JobRepair { job }
+        | Request::JobStatus { job }
+        | Request::JobLog { job }
+        | Request::JobExport { job, .. } => Some(*job),
+        _ => None,
+    }
+}
+
 /// The repository `fabric job new` names, as the absolute path the client API carries.
 fn repository(repo: &Path) -> Result<SystemPath> {
     system_path(repo).with_context(|| format!("repository {}", repo.display()))
@@ -777,12 +896,15 @@ impl Mode {
         }
     }
 
-    /// Where `fabric`'s own lines go in this mode.
+    /// Where `fabric`'s own lines go in this mode: standard error, since
+    /// standard output is the harness's in a terminal and the answer's
+    /// in a headless turn.
+    #[expect(
+        clippy::unused_self,
+        reason = "both modes print there today; the mode stays the place that says so"
+    )]
     fn notes(&self) -> Notes {
-        match self {
-            Mode::Interactive(_) => Notes::Stdout,
-            Mode::Headless(_) => Notes::Stderr,
-        }
+        Notes::Stderr
     }
 }
 
@@ -1109,14 +1231,14 @@ async fn register(
             }
             Ok(())
         }
-        Err(ClientError::Refused(refusal)) => Err(Refused {
-            refusal: refusal.kind(),
-            message: format!(
+        Err(ClientError::Refused(refusal)) => {
+            let mut refused = Refused::from_refusal(&refusal);
+            refused.message = format!(
                 "the node refused the launch, so the harness was stopped: {}",
                 refusal.message()
-            ),
+            );
+            Err(refused.into())
         }
-        .into()),
         Err(e) => bail!("the node could not record the launch, so the harness was stopped: {e}"),
     }
 }
@@ -1829,10 +1951,11 @@ fn lock_tree(state: &StateDir, root: &Path) -> Result<TreeLock> {
     TreeLock::acquire(&state.tree_locks(), root).map_err(|e| match e {
         // Another run or resume of this workspace is starting its harness:
         // the same state as a harness that runs, so the same exit code.
-        MaterializeError::TreeBusy { .. } => anyhow::Error::new(Refused {
-            refusal: RefusalKind::JobState,
-            message: e.to_string(),
-        }),
+        MaterializeError::TreeBusy { .. } => anyhow::Error::new(Refused::local(
+            RefusalKind::JobState,
+            "workspace_busy",
+            e.to_string(),
+        )),
         e => e.into(),
     })
 }
@@ -1912,12 +2035,13 @@ impl Approval<'_> {
             return Ok(());
         }
         if !self.yes && !(self.ask)()? {
-            return Err(Refused {
-                refusal: RefusalKind::NeedsForce,
-                message: format!(
+            return Err(Refused::local(
+                RefusalKind::NeedsForce,
+                "confirmation_required",
+                format!(
                     "the setup steps above come from environment spec {id}, which this node has not run for the job over these lockfiles and install configuration, or not since the workspace came from another node, and were not approved; read them and what changed, then run the command again with --yes"
                 ),
-            }
+            )
             .into());
         }
         // The record sits in the job's directory, where a harness running
