@@ -478,10 +478,6 @@ fn ledger_event(event: &LedgerEvent) -> String {
     }
 }
 
-/// The lines an inspection prints after the job's own: whether it waits
-/// for a placement, each placement with its chosen node and why the rest
-/// were excluded, each continuation with the fidelity achieved, the
-/// notes, and what provider operations block or may remain.
 /// The lines of `fabric inspect`: the managed inspection, then each
 /// generation, operation and evidence row, and the last report.
 fn inspect_lines(report: &fabric_client::api::InspectReport) -> Vec<String> {
@@ -533,6 +529,10 @@ fn inspect_lines(report: &fabric_client::api::InspectReport) -> Vec<String> {
     lines
 }
 
+/// The lines an inspection prints after the job's own: whether it waits
+/// for a placement, each placement with its chosen node and why the rest
+/// were excluded, each continuation with the fidelity achieved, the
+/// notes, and what provider operations block or may remain.
 fn inspection_lines(inspection: &fabric_client::api::Inspection) -> Vec<String> {
     use fabric_client::api::{ExclusionWire, RankWire, VerdictWire};
     let mut lines = fabric_client::sentences::managed_job(&inspection.job);
