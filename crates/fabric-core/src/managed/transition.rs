@@ -199,6 +199,89 @@ fn no_effect_in_flight(state: &ManagedState) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// The marks that settle `op` as `mark`: an operation never dispatched
+/// is marked dispatched first, as an explicit grant settles a create.
+fn settle(op: &OperationProgress, mark: OperationMark) -> Vec<ManagedEvent> {
+    let mut events = Vec::with_capacity(2);
+    if op.status == OperationStatus::Accepted {
+        events.push(ManagedEvent::OperationMarked {
+            operation: op.id,
+            status: OperationMark::Dispatched,
+        });
+    }
+    events.push(ManagedEvent::OperationMarked {
+        operation: op.id,
+        status: mark,
+    });
+    events
+}
+
+/// The effect operations of `old` that are not settled: a checkpoint of
+/// it, a continue or a cancel of its task, or a cancel of the job.
+fn open_effects<'a>(
+    state: &'a ManagedState,
+    old: &'a Attempt,
+) -> impl Iterator<Item = (&'a OperationProgress, &'a EffectRequest)> + 'a {
+    state
+        .operations
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.status,
+                OperationStatus::Accepted | OperationStatus::Dispatched | OperationStatus::Unknown
+            )
+        })
+        .filter_map(move |o| {
+            let request = state.request(o.id)?;
+            let mine = match request {
+                EffectRequest::Checkpoint { attempt } => *attempt == old.id,
+                EffectRequest::Continue { task, .. } | EffectRequest::CancelTask { task, .. } => {
+                    *task == old.task
+                }
+                EffectRequest::CancelJob { .. } => true,
+            };
+            mine.then_some((o, request))
+        })
+}
+
+/// What a supersede of `old` does to its open effects (ADR 0028): a
+/// checkpoint of it or a continue of its task can no longer be reported
+/// by it and fails; a cancel it was asked to obey is done, because the
+/// superseded attempt can write nothing more. A `Recover` is refused while
+/// a cancel is open (`EffectInFlight`): no work is granted again on a job
+/// or task someone asked to stop.
+fn settle_superseded(
+    state: &ManagedState,
+    old: &Attempt,
+    regrant: bool,
+) -> Result<Vec<ManagedEvent>, DomainError> {
+    let mut events = Vec::new();
+    for (op, request) in open_effects(state, old) {
+        match request {
+            EffectRequest::Checkpoint { .. } | EffectRequest::Continue { .. } => {
+                events.extend(settle(op, OperationMark::Failed));
+            }
+            EffectRequest::CancelJob { .. } | EffectRequest::CancelTask { .. } if regrant => {
+                return Err(DomainError::EffectInFlight { operation: op.id });
+            }
+            EffectRequest::CancelJob { reason } => {
+                events.push(ManagedEvent::JobCancelled {
+                    reason: reason.clone(),
+                });
+                events.extend(settle(op, OperationMark::Succeeded));
+            }
+            EffectRequest::CancelTask { task, .. } => {
+                events.push(ManagedEvent::TaskFinished {
+                    task: *task,
+                    outcome: TaskOutcome::Cancelled,
+                });
+                events.extend(settle(op, OperationMark::Succeeded));
+            }
+        }
+    }
+    Ok(events)
+}
+
 /// The `unknown` live attempt a `Supersede` or `Recover` names; a
 /// reachable one is handed over, never recovered (ADR 0028).
 fn unknown_attempt(state: &ManagedState, attempt: AttemptId) -> Result<&Attempt, DomainError> {
@@ -229,15 +312,14 @@ fn command_events(
         Command::CreateJob { .. } => return Err(DomainError::BadEnvelope),
         Command::Supersede { attempt, reason } => {
             let old = unknown_attempt(state, *attempt)?;
-            (
-                false,
-                vec![ManagedEvent::GrantSuperseded {
-                    attempt: old.id,
-                    generation: old.generation,
-                    by: None,
-                    reason: reason.clone(),
-                }],
-            )
+            let mut events = vec![ManagedEvent::GrantSuperseded {
+                attempt: old.id,
+                generation: old.generation,
+                by: None,
+                reason: reason.clone(),
+            }];
+            events.extend(settle_superseded(state, old, false)?);
+            (false, events)
         }
         Command::Recover {
             attempt,
@@ -250,26 +332,24 @@ fn command_events(
                 return Err(DomainError::NotAcknowledged { snapshot: *from });
             }
             open_task(state, old.task)?;
+            let settled = settle_superseded(state, old, true)?;
             let next = state.job.generation.next().ok_or(DomainError::Exhausted)?;
-            return Ok((
-                true,
-                vec![
-                    ManagedEvent::GrantSuperseded {
-                        attempt: old.id,
-                        generation: old.generation,
-                        by: Some(next),
-                        reason: reason.clone(),
-                    },
-                    ManagedEvent::AttemptGranted {
-                        attempt: ids.attempt,
-                        task: old.task,
-                        resource: resource.clone(),
-                        generation: next,
-                        initial_checkpoint: Some(*from),
-                        operation: ids.operation,
-                    },
-                ],
-            ));
+            let mut events = vec![ManagedEvent::GrantSuperseded {
+                attempt: old.id,
+                generation: old.generation,
+                by: Some(next),
+                reason: reason.clone(),
+            }];
+            events.extend(settled);
+            events.push(ManagedEvent::AttemptGranted {
+                attempt: ids.attempt,
+                task: old.task,
+                resource: resource.clone(),
+                generation: next,
+                initial_checkpoint: Some(*from),
+                operation: ids.operation,
+            });
+            return Ok((true, events));
         }
         Command::StartAttempt {
             task,
@@ -589,7 +669,14 @@ pub fn apply_observation(
                 cut: cut.digest(),
                 receipts: cut.receipts.clone(),
             };
-            if job.in_flight(CommandKind::Checkpoint).is_some() {
+            // Only a checkpoint command of this attempt is fulfilled by its
+            // cut; one of another attempt is not this report's to settle.
+            if job.in_flight(CommandKind::Checkpoint).is_some_and(|op| {
+                matches!(
+                    job.request(op.id),
+                    Some(EffectRequest::Checkpoint { attempt: a }) if a == attempt
+                )
+            }) {
                 // A checkpoint command: the cut is recorded, the attempt goes on.
                 if !found.status.may_run() {
                     return Err(DomainError::AttemptEnded { attempt: *attempt });

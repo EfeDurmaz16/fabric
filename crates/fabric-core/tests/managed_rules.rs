@@ -1454,3 +1454,98 @@ fn an_attempt_is_judged_by_its_own_task_not_the_primary() {
     ));
     kept.replays();
 }
+
+#[test]
+fn a_recover_fails_the_old_attempt_s_checkpoint_so_the_new_one_may_take_one() {
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    let a = kept.state().attempts[0].clone();
+    let asked = kept
+        .submit("cp-1", Command::Checkpoint { attempt: a.id })
+        .unwrap();
+    let ManagedEvent::CommandAccepted { operation, .. } = asked.events[0] else {
+        panic!("not accepted");
+    };
+    kept.mark(operation, OperationMark::Dispatched).unwrap();
+    gone_silent(&mut kept);
+    let t = kept
+        .submit(
+            "r-1",
+            Command::Recover {
+                attempt: a.id,
+                resource: ResourceRef::Node { node: OTHER_NODE },
+                from: snapshot(1),
+                reason: "silent".into(),
+            },
+        )
+        .unwrap();
+    assert!(t.events.iter().any(|e| matches!(
+        e,
+        ManagedEvent::OperationMarked { operation: o, status: OperationMark::Failed } if *o == operation
+    )));
+    assert_eq!(
+        kept.state().operation(operation).unwrap().status,
+        OperationStatus::Failed
+    );
+    // The new attempt runs, and a checkpoint of it is not refused as in flight.
+    let next = kept.state().attempts[1].clone();
+    kept.mark(next.granted_by, OperationMark::Dispatched)
+        .unwrap();
+    kept.observe(&Observation::Started {
+        attempt: next.id,
+        generation: next.generation,
+    })
+    .unwrap();
+    kept.submit("cp-2", Command::Checkpoint { attempt: next.id })
+        .unwrap();
+    kept.replays();
+}
+
+#[test]
+fn an_open_cancel_refuses_a_recover_and_a_supersede_completes_it() {
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    let a = kept.state().attempts[0].clone();
+    let asked = kept
+        .submit(
+            "cancel",
+            Command::CancelJob {
+                reason: "stop".into(),
+            },
+        )
+        .unwrap();
+    let ManagedEvent::CommandAccepted { operation, .. } = asked.events[0] else {
+        panic!("not accepted");
+    };
+    kept.mark(operation, OperationMark::Dispatched).unwrap();
+    gone_silent(&mut kept);
+    assert_eq!(
+        kept.submit(
+            "r-1",
+            Command::Recover {
+                attempt: a.id,
+                resource: ResourceRef::Node { node: OTHER_NODE },
+                from: snapshot(1),
+                reason: "silent".into(),
+            },
+        ),
+        Err(DomainError::EffectInFlight { operation })
+    );
+    kept.submit(
+        "s-1",
+        Command::Supersede {
+            attempt: a.id,
+            reason: "silent".into(),
+        },
+    )
+    .unwrap();
+    let s = kept.state();
+    assert_eq!(s.job.state, JobState::Cancelled);
+    assert_eq!(
+        s.operation(operation).unwrap().status,
+        OperationStatus::Succeeded
+    );
+    kept.replays();
+}
