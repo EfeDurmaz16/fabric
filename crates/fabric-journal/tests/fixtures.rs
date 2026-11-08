@@ -918,6 +918,18 @@ fn check_v3(journal: &mut Journal) {
         fourth.operations
     );
     assert_eq!(fourth.requests.len(), 2);
+    check_v3_reads(journal, &fourth);
+    let recovery = journal
+        .recover(1_760_000_004_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert!(recovery.to_effect.is_empty());
+    assert!(recovery.unknown.is_empty());
+    journal.verify().unwrap();
+}
+
+/// The reads a work package is built from: the newest cut of an attempt
+/// and the job's head.
+fn check_v3_reads(journal: &Journal, fourth: &fabric_core::managed::ManagedState) {
     // The newest cut of the first attempt is the handoff's, not the in-place one.
     let (cut_snapshot, _) = journal
         .last_cut(FOURTH, fourth.attempts[0].id)
@@ -936,12 +948,6 @@ fn check_v3(journal: &mut Journal) {
             .last()
             .map(|e| fabric_core::managed::EventFrame::digest(&e.frame.encode().unwrap()))
     );
-    let recovery = journal
-        .recover(1_760_000_004_000, |_| fabric_journal::Liveness::CannotTell)
-        .unwrap();
-    assert!(recovery.to_effect.is_empty());
-    assert!(recovery.unknown.is_empty());
-    journal.verify().unwrap();
 }
 
 #[test]
