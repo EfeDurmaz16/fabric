@@ -86,13 +86,14 @@ sequenceDiagram
 
 ## Install
 
-There is no release yet. From the first tag on (`v0.1.0`, [docs/release.md](docs/release.md)), every release ships an unsigned `fabric` binary for macOS on Apple silicon, macOS on Intel and Linux on x86_64 (glibc 2.35 or newer), with sha256 checksums, a CycloneDX SBOM and a GitHub build attestation for each archive.
+There is no release yet. From the first tag on (`v0.1.0`, [docs/release.md](docs/release.md)), every release ships unsigned `fabric` and `fabric-sync` binaries for macOS on Apple silicon, macOS on Intel and Linux on x86_64 (glibc 2.35 or newer), with sha256 checksums, a CycloneDX SBOM and a GitHub build attestation for each archive.
 
 With Homebrew, on a Mac or on Linux:
 
 ```sh
 brew install EfeDurmaz16/tap/fabric-node
 fabric --version
+brew install EfeDurmaz16/tap/fabric-sync   # optional: the store alone, see Sync alone
 ```
 
 Or download the archive for your platform from [GitHub Releases](https://github.com/EfeDurmaz16/fabric/releases), check it and put the binary on your `PATH`:
