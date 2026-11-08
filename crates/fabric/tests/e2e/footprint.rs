@@ -14,11 +14,13 @@
 //! 303 KB once the M5 managed commands made the tree 45 commands, all of
 //! them built on every run; since every command defers its arguments
 //! until a parse enters it, and the global options go only on the
-//! commands the words name, the start makes 148 allocations of 84 KB.
+//! commands the words name, the start makes 147 allocations of 81 KB.
 //! The budget is sized to that tree, so a change that builds the whole
 //! tree on every run again fails here, whatever the command set grows to;
 //! a budget hit is read against the perf job's footprint table before it
-//! is raised.
+//! is raised. One enum going eager again stays under it (the root enum
+//! without `defer` makes 173); the contract's unit test
+//! `the_parsing_tree_builds_only_the_named_path` holds that.
 
 use std::path::Path;
 use std::process::Command;
