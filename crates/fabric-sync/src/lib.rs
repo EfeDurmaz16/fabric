@@ -4,8 +4,10 @@
 //! A push captures the tree with `fabric-store`'s capture, the same one a
 //! suspend runs: tracked changes, staged and unstaged, untracked files, the
 //! caches the store carries (`node_modules`, `.venv`, `target` and the
-//! rest), under the same policy, so `.env` and every other secret-shaped
-//! untracked or ignored file never enters the snapshot. The snapshot goes
+//! rest), under the same policy: the built-in secret list, `.fabricignore`
+//! and the secret patterns and caches `.fabric/env.toml` declares, so `.env`
+//! and every other secret-shaped untracked or ignored file never enters the
+//! snapshot. The snapshot goes
 //! into a store on this machine, then every object the target lacks is
 //! copied to the target's store, bundle bases first, and the target's head
 //! for the tree's name moves to it. A pull copies the other way and
@@ -154,6 +156,9 @@ pub enum SyncError {
     /// `.fabricignore` does not read.
     #[error(transparent)]
     Policy(#[from] fabric_store::policy::PolicyError),
+    /// `.fabric/env.toml` does not read.
+    #[error(transparent)]
+    Env(#[from] fabric_env::detect::DetectError),
     /// An object could not be read or written.
     #[error(transparent)]
     Object(#[from] fabric_store::objects::ObjectError),

@@ -16,6 +16,8 @@ faults = ["dep:rustix"]
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 fabric-core = { path = "../fabric-core" }
+# Only to read the secret patterns and caches `.fabric/env.toml` declares.
+fabric-env = { path = "../fabric-env" }
 fabric-store = { path = "../fabric-store" }
 # Only the fault points use it: a process that reaches one kills itself
 # with SIGKILL, as a crash would stop it, without the crash report abort makes.

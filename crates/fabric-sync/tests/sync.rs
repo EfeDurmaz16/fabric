@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use fabric_core::id::ChunkId;
+use fabric_core::snapshot::CacheClass;
 use fabric_store::store::Store;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fabric-sync");
@@ -490,4 +491,52 @@ fn a_pull_onto_a_tree_with_content_needs_replace() {
     assert!(err.starts_with("Error: "), "{err}");
     assert!(err.contains("--replace"), "{err}");
     assert_eq!(fs::read_to_string(b.join("mine.txt")).unwrap(), "mine\n");
+}
+
+#[test]
+fn the_secret_patterns_and_caches_a_tree_declares_hold_on_a_push() {
+    let world = World::new();
+    let a = world.path("a/app");
+    dirty_tree(&a);
+    write(
+        &a.join(".fabric/env.toml"),
+        "secret_patterns = [\"config/creds.json\"]\n\n[[cache]]\npath = \"data\"\nclass = \"build\"\n",
+    );
+    write(&a.join(".gitignore"), "node_modules/\n.env.local\ndata/\n");
+    write(
+        &a.join("config/creds.json"),
+        &format!("{{\"key\":\"{SECRET}\"}}\n"),
+    );
+    write(&a.join("data/out.bin"), "built\n");
+    let target = world.path("target");
+    let pushed = world.ok(
+        "home-a",
+        &[
+            "push",
+            target.to_str().unwrap(),
+            "--tree",
+            a.to_str().unwrap(),
+        ],
+    );
+    let left = pushed["sync"]["left_behind"].as_array().unwrap();
+    assert!(left.contains(&"config/creds.json".into()), "{left:?}");
+    for object in objects(&target) {
+        assert!(
+            !object.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
+            "the declared secret is in an object on the target"
+        );
+    }
+    let store = Store::open(&target.join("store")).unwrap();
+    let id = pushed["sync"]["snapshot"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let caches = store.manifest(id).unwrap().caches;
+    assert!(
+        caches
+            .iter()
+            .any(|c| c.path.as_str() == "data" && c.class == CacheClass::Build),
+        "the declared cache lost its class: {caches:?}"
+    );
 }

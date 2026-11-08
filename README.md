@@ -197,7 +197,7 @@ A resume continues with the settings the session ran with, not the ones the othe
 
 ## Sync alone
 
-`fabric-sync` is the store on its own: no node, no pairing, no job. It pushes a working tree, with its staged and unstaged changes, its untracked files and its caches such as `node_modules`, to a directory or over SSH, and pulls it onto another machine. `.env` and every other secret-shaped untracked or ignored file stays behind, by the same policy a suspend uses.
+`fabric-sync` is the store on its own: no node, no pairing, no job. It pushes a working tree, with its staged and unstaged changes, its untracked files and its caches such as `node_modules`, to a directory or over SSH, and pulls it onto another machine. `.env` and every other secret-shaped untracked or ignored file stays behind, by the same policy a suspend uses, `.fabric/env.toml`'s secret patterns and declared caches included.
 
 ```sh
 fabric-sync push box:sync                                  # on the first machine, in the tree

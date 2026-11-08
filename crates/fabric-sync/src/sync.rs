@@ -228,6 +228,22 @@ fn connect(target: &Target, create: bool) -> Result<Box<dyn Remote>, SyncError> 
     })
 }
 
+/// The policy a suspend of `tree` captures under: the built-in lists,
+/// `.fabricignore`, and the secret patterns and caches `.fabric/env.toml`
+/// declares, as the node's suspend widens it.
+fn policy_for(tree: &Path) -> Result<IgnorePolicy, SyncError> {
+    let mut policy = IgnorePolicy::default();
+    policy.load_fabricignore(tree)?;
+    let declared = fabric_env::detect::declared_policy(tree)?;
+    for pattern in &declared.secret_patterns {
+        policy.add_secret_pattern(pattern.as_str())?;
+    }
+    for (class, path) in &declared.caches {
+        policy.add_declared_cache(*class, path);
+    }
+    Ok(policy)
+}
+
 fn name_of(tree: &Path, given: Option<&TreeName>) -> Result<TreeName, SyncError> {
     if let Some(name) = given {
         return Ok(name.clone());
@@ -366,8 +382,7 @@ pub fn push(home: &Home, req: &PushRequest) -> Result<SyncReport, SyncError> {
         }
     }
     let job = state.map_or_else(|| new_job(&tree), |state| state.job);
-    let mut policy = IgnorePolicy::default();
-    policy.load_fabricignore(&tree)?;
+    let policy = policy_for(&tree)?;
     let captured = capture(
         &store,
         &CaptureRequest {

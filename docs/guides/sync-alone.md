@@ -11,7 +11,7 @@ A push captures the tree with the store's capture ([what moves](../start/what-mo
 - Commits, branches, the index and the working tree: a git bundle plus two private commits, one for the index and one for the working tree. Your own refs and index are not touched.
 - Untracked files, and ignored files that are nobody's cache: your work.
 - Caches by class: `node_modules`, `.pnpm-store`, `.venv`, `target` beside a `Cargo.toml`, `dist` and `build` beside a `package.json` or a Python project, `.next`, `.turbo`, `__pycache__` and the other tool caches. A sync has no node to measure a toolchain, so every cache travels as your files, byte for byte, modes and times included.
-- Left behind and named: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa` and the rest of the secret list, wherever they lie, and every pattern of `.fabricignore`. A secret that is tracked or stashed is in git history already; it travels with the history, and the push names it.
+- Left behind and named: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa` and the rest of the secret list, wherever they lie, every pattern of `.fabricignore`, and every `secret_patterns` entry of `.fabric/env.toml`. A cache that file declares under `[[cache]]` keeps its class, as a suspend keeps it. A secret that is tracked or stashed is in git history already; it travels with the history, and the push names it.
 
 A pull onto another platform warns about each cache with native Node addons (`*.node`) built for the first one.
 
