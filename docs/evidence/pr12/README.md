@@ -2,26 +2,13 @@
 
 Ran on one host, 2026-11-09: two `fabricd` daemons, each with its own state root and home, paired over a TCP and TLS node link on 127.0.0.1. Not two machines.
 
-## The Jaeger run: blocked
+## The Jaeger run
 
-The planned run sends the spans to `jaegertracing/all-in-one` and queries its API. Docker (OrbStack) started, and the one pull of the image failed inside the Docker daemon:
+[jaeger.md](jaeger.md) is the primary evidence: both daemons ran with `fabric serve --otlp-endpoint http://127.0.0.1:4318` against `jaegertracing/all-in-one:1.73.0`, and Jaeger's own query API returned the spans, saved as [spans-jaeger.json](spans-jaeger.json). 21 spans in 8 traces, 13 from `a` and 8 from `b`; trace `5e36d7b8ce59258e0a78955f788115b5` holds `b`'s launch, instructions and reports and `a`'s observations of them. No secret value, goal, argv, operation key or path is in the JSON.
 
-```text
-$ docker pull jaegertracing/all-in-one:latest
-latest: Pulling from jaegertracing/all-in-one
-failed to prepare extraction snapshot "extract-522255668-Yfcd sha256:326ce65caeaae9a7d740c654a301940ef7ee971b3172492843a42c6f5bee239f": failed to stat parent: stat /var/lib/docker/containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/14844/fs: no such file or directory
-```
+The first two tries pulled `jaegertracing/all-in-one:latest`, and both failed inside the Docker daemon on the same broken parent snapshot (`snapshots/14844/fs`), before any span was sent. The run above used the pinned `1.73.0` image, pulled after that.
 
-A second pull after the review, with `docker info` answering, failed the same way on the same parent snapshot (`snapshots/14844/fs`), so the Docker daemon's own snapshot store is broken, not the network or the image. The image was not on the host before, so no Jaeger run happened and no Jaeger trace is claimed here. The commands for the run, once the image pulls:
-
-```sh
-docker run --rm -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 fabric serve   # on each node
-# after a managed job ran:
-curl -s 'http://127.0.0.1:16686/api/traces?service=fabricd&limit=20'
-```
-
-## The same spans, received by the test's OTLP receiver
+## The deterministic run: the test's OTLP receiver
 
 `spans-fake-receiver.json` is the span list of `observability::e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_secret`, written by:
 
@@ -29,7 +16,7 @@ curl -s 'http://127.0.0.1:16686/api/traces?service=fabricd&limit=20'
 FABRIC_E2E_SPANS_OUT=$PWD/docs/evidence/pr12 cargo test -p fabric --locked --test e2e observability
 ```
 
-The test runs a plain HTTP listener that answers each OTLP post 200 and keeps its body; it is not a collector and checks nothing a collector would. The run: the job submitted to `a`'s facade and pinned to `b`, launched on `b`, a build task registered, a checkpoint, a continue pinned to `a` that granted generation 2 there. 21 spans: 13 from `a`, 8 from `b`. `b`'s `fabric peer.launch` is the root of the first attempt's trace, and `b`'s three `fabric report` spans and `a`'s `observe.started` and `observe.checkpointed` are in that trace. The continue's grant names `fabric.generation.supersedes = 1`. The test fails if the job's secret value, its goal, the build's argv, an operation key, a home path or the test root appears in any posted body or in the audit export.
+The test runs a plain HTTP listener that answers each OTLP post 200 and keeps its body; it is not a collector and checks nothing a collector would. The run: the job submitted to `a`'s facade and pinned to `b`, launched on `b`, a build task registered, a checkpoint, a continue pinned to `a` that granted generation 2 there. 21 spans: 13 from `a`, 8 from `b`. `b`'s `fabric peer.launch` is the root of the first attempt's trace, and `b`'s three `fabric report` spans and `a`'s `observe.started` and `observe.checkpointed` are in that trace. The continue's grant names `fabric.generation.supersedes = 1`. The test fails if the job's secret value, its goal, the build's argv, an operation key, a home path or the test root appears in any posted body or in the audit export. It is the run that repeats on every test run; the Jaeger run is a one-off on this host.
 
 ## What these spans do not show yet
 

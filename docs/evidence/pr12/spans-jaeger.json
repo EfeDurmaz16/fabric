@@ -1,0 +1,1757 @@
+{
+  "data": [
+    {
+      "traceID": "32ac8601a04d72779588a555b7af3148",
+      "spans": [
+        {
+          "traceID": "32ac8601a04d72779588a555b7af3148",
+          "spanID": "fd3f91c78b3784e1",
+          "operationName": "fabric node.add",
+          "references": [],
+          "startTime": 1794182024119309,
+          "duration": 9152,
+          "tags": [
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "node.add"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "d42e494482b3b995349dc1ac76b62c5b",
+      "spans": [
+        {
+          "traceID": "d42e494482b3b995349dc1ac76b62c5b",
+          "spanID": "d7a55434aad0184a",
+          "operationName": "fabric node.add",
+          "references": [],
+          "startTime": 1794182024135591,
+          "duration": 7818,
+          "tags": [
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "node.add"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "527cd928dfd80f7c138b6348d32abb4d",
+      "spans": [
+        {
+          "traceID": "527cd928dfd80f7c138b6348d32abb4d",
+          "spanID": "5c334402d02f8ae5",
+          "operationName": "fabric managed.create_job",
+          "references": [],
+          "startTime": 1794182024204298,
+          "duration": 5174,
+          "tags": [
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "managed.create_job"
+            },
+            {
+              "key": "fabric.operation.id",
+              "type": "string",
+              "value": "01M6YSA30CR7K4T7GVMETF1161"
+            },
+            {
+              "key": "fabric.operation.key_digest",
+              "type": "string",
+              "value": "f27df470ab1638c842170fe2124997214d80bdca69dbc21bed4a67885f103abf"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "527cd928dfd80f7c138b6348d32abb4d",
+          "spanID": "f9b5e046553db4a5",
+          "operationName": "fabric observe.placed",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "527cd928dfd80f7c138b6348d32abb4d",
+              "spanID": "5c334402d02f8ae5"
+            },
+            {
+              "refType": "FOLLOWS_FROM",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182024481893,
+          "duration": 4809,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "observe.placed"
+            },
+            {
+              "key": "fabric.operation.id",
+              "type": "string",
+              "value": "01M6YSA30CR7K4T7GVMETF1161"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "fabric.task",
+              "type": "string",
+              "value": "01M6YSA30CFHEN0DDRFDTDMV1T"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -277.4125ms"
+          ]
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "1976c57ac432893bc717a28be959d5fd",
+      "spans": [
+        {
+          "traceID": "1976c57ac432893bc717a28be959d5fd",
+          "spanID": "00d8c6103f2bc0ef",
+          "operationName": "fabric managed.register_task",
+          "references": [],
+          "startTime": 1794182024590384,
+          "duration": 4635,
+          "tags": [
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "managed.register_task"
+            },
+            {
+              "key": "fabric.operation.id",
+              "type": "string",
+              "value": "01M6YSA3CEEPHWJC9CBK6GFHVM"
+            },
+            {
+              "key": "fabric.operation.key_digest",
+              "type": "string",
+              "value": "9867d74fa4b3d47d72b4a70a00e3e0c19348495155696015913d2e314fc1b9a1"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 4
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "396ec4adc2099d82ddbcb60935c11f7b",
+      "spans": [
+        {
+          "traceID": "396ec4adc2099d82ddbcb60935c11f7b",
+          "spanID": "aac2b3d955adc364",
+          "operationName": "fabric observe.started",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "396ec4adc2099d82ddbcb60935c11f7b",
+              "spanID": "71c948924edef93e"
+            }
+          ],
+          "startTime": 1794182026631184,
+          "duration": 3746,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "5M4B0E180TT3Y6V4FMPA5RX5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "observe.started"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 14
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -52.2095ms"
+          ]
+        },
+        {
+          "traceID": "396ec4adc2099d82ddbcb60935c11f7b",
+          "spanID": "39e22c85393aec32",
+          "operationName": "fabric observe.continued",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "396ec4adc2099d82ddbcb60935c11f7b",
+              "spanID": "71c948924edef93e"
+            }
+          ],
+          "startTime": 1794182026635292,
+          "duration": 3674,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "5M4B0E180TT3Y6V4FMPA5RX5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "observe.continued"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 15
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -56.2815ms"
+          ]
+        },
+        {
+          "traceID": "396ec4adc2099d82ddbcb60935c11f7b",
+          "spanID": "71c948924edef93e",
+          "operationName": "fabric peer.launch",
+          "references": [],
+          "startTime": 1794182026576730,
+          "duration": 8235,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "5M4B0E180TT3Y6V4FMPA5RX5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "peer.launch"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "server"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+      "spans": [
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "77490dd82039f81b",
+          "operationName": "fabric observe.checkpointed",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182026560102,
+          "duration": 3901,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.checkpoint",
+              "type": "string",
+              "value": "bcd2e4df05b18492a6e8aff6bcb7b0a200feeb747f102cebe36d0bd43449353f"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "observe.checkpointed"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 12
+            },
+            {
+              "key": "fabric.snapshot",
+              "type": "string",
+              "value": "be27655f5b44a2516e0f74cd442cb6b27afaed326336b3267a5414ac858f15c0"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -2.0702325s"
+          ]
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "003abcd80738b7fa",
+          "operationName": "fabric peer.instruct",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182024599227,
+          "duration": 15466,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "peer.instruct"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "server"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": null
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "94f187539a6d9d85",
+          "operationName": "fabric report",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182025853895,
+          "duration": 5050,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "report"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "client"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -1.3646s"
+          ]
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "cb54a3467d0553ee",
+          "operationName": "fabric peer.instruct",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182026017387,
+          "duration": 17,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "peer.instruct"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "server"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -1.5255755s"
+          ]
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "de1fb2d00c953f81",
+          "operationName": "fabric observe.started",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182024504843,
+          "duration": 3609,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "observe.started"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 3
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -14.8275ms"
+          ]
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "4e1388b00a05e452",
+          "operationName": "fabric peer.launch",
+          "references": [],
+          "startTime": 1794182024487192,
+          "duration": 9256,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "peer.launch"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "server"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": null
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "c7954300440285e9",
+          "operationName": "fabric report",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182024504519,
+          "duration": 4128,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "report"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "client"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -14.763ms"
+          ]
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "4ede12ba8ca6a9d4",
+          "operationName": "fabric peer.instruct",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182024624049,
+          "duration": 18,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "peer.instruct"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "server"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -132.238ms"
+          ]
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "0ad15a4e77e303a9",
+          "operationName": "fabric observe.checkpointed",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182025854362,
+          "duration": 4433,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.checkpoint",
+              "type": "string",
+              "value": "5b87fa7ab74fd24683ac2e2d287fcc22597e78ad188a96f172031149d7d9362d"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "observe.checkpointed"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 9
+            },
+            {
+              "key": "fabric.snapshot",
+              "type": "string",
+              "value": "b54ffb6d1f3ff763808662e7120f77323e7f699521c02415523c84cea8df595b"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -1.3647585s"
+          ]
+        },
+        {
+          "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+          "spanID": "90984b4a372daf0a",
+          "operationName": "fabric report",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "5e36d7b8ce59258e0a78955f788115b5",
+              "spanID": "4e1388b00a05e452"
+            }
+          ],
+          "startTime": 1794182026559570,
+          "duration": 4654,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "13AM0EJ8RHS5GFFS69FBG1K5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "report"
+            },
+            {
+              "key": "fabric.peer",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "client"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -2.070077s"
+          ]
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        },
+        "p2": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1rqjw3a2eapieiz2v2ks3akceo4gu3tmpzck4r6k3afyidzn4skxq"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "c97edf15b3eebebe83523cac581548ec",
+      "spans": [
+        {
+          "traceID": "c97edf15b3eebebe83523cac581548ec",
+          "spanID": "f2b477035824afbc",
+          "operationName": "fabric managed.checkpoint",
+          "references": [],
+          "startTime": 1794182024601938,
+          "duration": 8799,
+          "tags": [
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "managed.checkpoint"
+            },
+            {
+              "key": "fabric.operation.id",
+              "type": "string",
+              "value": "01M6YSA3CYREWF2GCNBASH80AS"
+            },
+            {
+              "key": "fabric.operation.key_digest",
+              "type": "string",
+              "value": "67963f698ac67252bb7e445c18858eee5f371ddd6938c32999ea11c03304bbea"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 6
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "3d17391792803e82f1ee9dce59ca4d12",
+      "spans": [
+        {
+          "traceID": "3d17391792803e82f1ee9dce59ca4d12",
+          "spanID": "958d19b213d2810c",
+          "operationName": "fabric managed.continue",
+          "references": [],
+          "startTime": 1794182026005607,
+          "duration": 7554,
+          "tags": [
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "managed.continue"
+            },
+            {
+              "key": "fabric.operation.id",
+              "type": "string",
+              "value": "01M6YSA4RSTE35JGG8F25N0XRV"
+            },
+            {
+              "key": "fabric.operation.key_digest",
+              "type": "string",
+              "value": "527a76088bd778b58fa40295684215d93c5f4fac61a9c5323208823802e68d17"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 10
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "3d17391792803e82f1ee9dce59ca4d12",
+          "spanID": "7967417e2bbff66c",
+          "operationName": "fabric observe.placed",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "3d17391792803e82f1ee9dce59ca4d12",
+              "spanID": "958d19b213d2810c"
+            },
+            {
+              "refType": "FOLLOWS_FROM",
+              "traceID": "396ec4adc2099d82ddbcb60935c11f7b",
+              "spanID": "71c948924edef93e"
+            }
+          ],
+          "startTime": 1794182026572127,
+          "duration": 4032,
+          "tags": [
+            {
+              "key": "fabric.attempt",
+              "type": "string",
+              "value": "5M4B0E180TT3Y6V4FMPA5RX5HV"
+            },
+            {
+              "key": "fabric.generation",
+              "type": "int64",
+              "value": 2
+            },
+            {
+              "key": "fabric.generation.supersedes",
+              "type": "int64",
+              "value": 1
+            },
+            {
+              "key": "fabric.job",
+              "type": "string",
+              "value": "01M6YSA30CRQ0T1YQJ9ZFAM3K9"
+            },
+            {
+              "key": "fabric.node",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "fabric.op",
+              "type": "string",
+              "value": "observe.placed"
+            },
+            {
+              "key": "fabric.operation.id",
+              "type": "string",
+              "value": "01M6YSA4RSTE35JGG8F25N0XRV"
+            },
+            {
+              "key": "fabric.result",
+              "type": "string",
+              "value": "done"
+            },
+            {
+              "key": "fabric.revision",
+              "type": "int64",
+              "value": 13
+            },
+            {
+              "key": "fabric.task",
+              "type": "string",
+              "value": "01M6YSA30CFHEN0DDRFDTDMV1T"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "fabricd"
+            },
+            {
+              "key": "otel.scope.version",
+              "type": "string",
+              "value": "0.1.0"
+            },
+            {
+              "key": "otel.status_code",
+              "type": "string",
+              "value": "OK"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "internal"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "clock skew adjustment disabled; not applying calculated delta of -564.759ms"
+          ]
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "fabricd",
+          "tags": [
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "fab1iq2mie3blyitkfk3lojn6le4qznmwv7giva4syns76gesoiitmaa"
+            },
+            {
+              "key": "service.version",
+              "type": "string",
+              "value": "0.1.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}
