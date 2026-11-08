@@ -39,6 +39,7 @@
     "facade_revoke",
     "facade_call",
     "managed_register",
+    "job_export_psf",
     "harness_started.planned",
     "harness_started.version",
     "env.roots.cargo_home",
