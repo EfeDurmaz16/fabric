@@ -204,3 +204,33 @@ fn e2e_an_opencode_session_that_holds_a_secret_is_refused() -> Fallible {
     );
     Ok(())
 }
+
+/// The export names only the OpenCode that created the session, so the
+/// newest OpenCode that continued it travels with the job: a session
+/// continued by 1.19.0 on one node is refused to 1.18.34 on the other,
+/// which never starts on it.
+#[test]
+fn e2e_an_older_opencode_is_refused_a_session_a_newer_one_continued() -> Fallible {
+    let p = crate::setup(Wire::TcpTls, None, None)?;
+    let job = moved_job(&p)?;
+    fs::write(p.b.state().join("opencode-version"), "1.19.0\n")?;
+    p.b.ok(&["job", "resume", &job, "--headless", "--prompt", "two"])?;
+
+    fs::write(p.env.home.join("opencode-args"), "")?;
+    let back =
+        p.a.run(&["job", "resume", &job, "--headless", "--prompt", "three"])?;
+    let said = crate::world::text(&back);
+    assert!(!back.status.success(), "{said}");
+    assert!(
+        said.contains(&format!(
+            "opencode 1.18.34 is older than opencode 1.19.0, which wrote session {SESSION}"
+        )),
+        "{said}"
+    );
+    let args = fs::read_to_string(p.env.home.join("opencode-args"))?;
+    assert!(
+        !args.contains("three"),
+        "the older opencode started: {args}"
+    );
+    Ok(())
+}

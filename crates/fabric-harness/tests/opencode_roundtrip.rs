@@ -410,3 +410,36 @@ async fn an_import_that_fails_part_way_leaves_no_partial_session() {
     );
     assert_eq!(node.messages(SESSION), "");
 }
+
+/// The export names only the OpenCode that created the session, so the
+/// job carries the newest one that continued it: a capture records at
+/// least that version, and a resume refuses an OpenCode older than it.
+#[tokio::test]
+async fn the_known_writer_raises_the_floor_the_export_names() {
+    let node = Node::new("1.18.34");
+    let newer = fabric_core::version::HarnessVersion::parse("1.19.0").unwrap();
+    let adapter = node.adapter().with_known_writer(Some(newer));
+    let out = node.home.join("state");
+    let manifest = adapter.capture(&node.work, &session(), &out).await.unwrap();
+    assert_eq!(manifest.harness_version(), Some("1.19.0"));
+    let err = adapter
+        .launch(
+            &node.work,
+            Launch::Headless {
+                resume: Some(session()),
+                prompt: "next".to_owned(),
+            },
+            &node.env(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessOlderThanSession { ref local, ref recorded, .. }
+            if local == "1.18.34" && recorded == "1.19.0"),
+        "{err}"
+    );
+    assert!(
+        !node.home.join("opencode-args").exists(),
+        "the older opencode ran"
+    );
+}

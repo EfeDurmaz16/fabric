@@ -33,8 +33,9 @@
 //! `opencode -s <id>` (terminal) with the model and agent of the last
 //! user message and the variant of the session row, each one the adapter
 //! was configured with winning, after the version guard: the export
-//! records the OpenCode that wrote it (`info.version`), and an older
-//! binary is refused before it starts. `opencode run --format json`
+//! records the OpenCode that created the session (`info.version`), and
+//! the job carries the newest one that continued it (`with_known_writer`);
+//! a binary older than either is refused before it starts. `opencode run --format json`
 //! prints one JSON object per line, `{"type", "timestamp", "sessionID",
 //! ...}`, with the types `step_start`, `step_finish`, `text`, `reasoning`,
 //! `tool_use` and `error` (read on 2026-11-08 from the JavaScript the
@@ -114,6 +115,7 @@ pub struct OpenCode {
     binary: Option<PathBuf>,
     path_var: OsString,
     pinned: OpenCodeSettings,
+    known_writer: Option<HarnessVersion>,
 }
 
 /// True for an id of OpenCode's shape: `ses_` and letters and digits.
@@ -245,6 +247,33 @@ impl OpenCode {
             binary,
             path_var,
             pinned: OpenCodeSettings::default(),
+            known_writer: None,
+        }
+    }
+
+    /// The newest OpenCode known to have written the session, which the
+    /// job carries because the export names only the OpenCode that created
+    /// it (`info.version` is stamped on the session row when it is made,
+    /// and `opencode import` keeps whatever version the row carries,
+    /// checked on 1.18.34 on 2026-11-08; whether a later turn restamps it
+    /// is not shown). A resume refuses an OpenCode older than the newer of
+    /// this and the export's version, and a capture records at least this
+    /// one, so a node that never ran the session cannot lower it.
+    #[must_use]
+    pub fn with_known_writer(mut self, version: Option<HarnessVersion>) -> Self {
+        self.known_writer = version;
+        self
+    }
+
+    /// The version a capture records: the installed one, or the known
+    /// writer when that is newer or the installed one cannot be read.
+    fn captured_version(&self, installed: Option<String>) -> Option<String> {
+        let Some(known) = &self.known_writer else {
+            return installed;
+        };
+        match installed.as_deref().map(HarnessVersion::parse) {
+            Some(Ok(local)) if local >= *known => installed,
+            _ => Some(known.as_str().to_owned()),
         }
     }
 
@@ -505,6 +534,7 @@ impl OpenCode {
         let version =
             process::installed_version_in(self.binary.clone(), Some(&cwd), &self.path_var, PROGRAM)
                 .await;
+        let version = self.captured_version(version);
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
@@ -763,14 +793,19 @@ impl OpenCode {
             return Ok((Exported::default(), None));
         };
         let recorded = parse_export(&bytes, session, &self.database())?;
-        let Some(text) = &recorded.version else {
+        let created = recorded
+            .version
+            .as_deref()
+            .map(HarnessVersion::parse)
+            .transpose()
+            .map_err(|e| HarnessError::Malformed {
+                what: Input::SessionExport,
+                path: self.database(),
+                reason: e.to_string(),
+            })?;
+        let Some(writer) = created.into_iter().chain(self.known_writer.clone()).max() else {
             return Ok((recorded, None));
         };
-        let writer = HarnessVersion::parse(text).map_err(|e| HarnessError::Malformed {
-            what: Input::SessionExport,
-            path: self.database(),
-            reason: e.to_string(),
-        })?;
         let runs =
             crate::version::refuse_older(PROGRAM, (binary, cwd, env), None, session, &writer)
                 .await?;

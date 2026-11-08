@@ -3615,15 +3615,19 @@ pub(crate) fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeErr
 
 /// True for a harness whose session does not record every version that
 /// wrote it, so the job carries the newest writer: Codex, which writes its
-/// version only into the rollout it creates, and Gemini CLI, whose chat
+/// version only into the rollout it creates, OpenCode, whose export names
+/// the version that created the session, and Gemini CLI, whose chat
 /// records none.
 fn carries_known_writer(kind: &HarnessKind) -> bool {
-    matches!(kind, HarnessKind::Codex | HarnessKind::GeminiCli)
+    matches!(
+        kind,
+        HarnessKind::Codex | HarnessKind::OpenCode | HarnessKind::GeminiCli
+    )
 }
 
 /// The newest harness version known to have written the session a
-/// capture holds, read from its manifest, for a Codex or Gemini CLI
-/// session only (`carries_known_writer`); `None`, logged, when such a
+/// capture holds, read from its manifest, for a Codex, OpenCode or
+/// Gemini CLI session only (`carries_known_writer`); `None`, logged, when such a
 /// manifest records none that parses, and the session record then keeps
 /// the known writer it held (`writer_after`). A Codex resume writes no
 /// version into the rollout, and a Gemini chat records none, so the job
@@ -3648,7 +3652,7 @@ fn known_writer(manifest: &StateManifest) -> Option<HarnessVersion> {
 /// The known writer the session record keeps after a capture or a
 /// restore of `manifest`: the version the manifest records, or, when it
 /// records none that parses, `previous`, the one the record held for the
-/// same session; `None` for any harness but Codex. A version that does not
+/// same session; `None` for a harness `carries_known_writer` rejects. A version that does not
 /// parse is ignored and the job's previous known writer stays the floor:
 /// it cannot be ordered, so it cannot raise one, and failing the capture
 /// would keep the job from being suspended or moved off the node for the

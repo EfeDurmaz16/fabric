@@ -1007,10 +1007,10 @@ async fn adapter_for(
             (Box::new(agent), launch)
         }
         HarnessKind::OpenCode => (
-            Box::new(OpenCode::new(
-                harness_env.home.clone(),
-                harness_env.path_var.clone(),
-            )),
+            Box::new(
+                OpenCode::new(harness_env.home.clone(), harness_env.path_var.clone())
+                    .with_known_writer(plan.known_writer.clone()),
+            ),
             launch,
         ),
         HarnessKind::Pi => (

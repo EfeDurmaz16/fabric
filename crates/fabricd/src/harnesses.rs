@@ -282,12 +282,11 @@ impl HarnessEnv {
 
 /// Builds the adapter for `kind` on this node. `known_writer` is the
 /// newest harness version known to have written the session the adapter
-/// will capture (`SessionRecord::known_writer`); the Codex and Gemini CLI
-/// adapters take it, because neither records the version of every writer
-/// in the session, while a Claude transcript does and an ACP agent's
-/// state is opaque. The other PR 5 adapters (docs/harness-adapters.md)
-/// take the home and the `PATH` alone until their owners give them a
-/// known writer of their own.
+/// will capture (`SessionRecord::known_writer`); the Codex, OpenCode and
+/// Gemini CLI adapters take it, because none records the version of every
+/// writer in the session, while a Claude transcript does and an ACP
+/// agent's state is opaque. pi and Cursor take the home and the `PATH`
+/// alone (docs/harness-adapters.md).
 pub fn adapter(
     kind: &HarnessKind,
     env: &HarnessEnv,
@@ -301,7 +300,9 @@ pub fn adapter(
             Codex::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
         ),
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
-        HarnessKind::OpenCode => Box::new(OpenCode::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::OpenCode => Box::new(
+            OpenCode::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
+        ),
         HarnessKind::Pi => Box::new(Pi::new(env.home.clone(), env.path_var.clone())),
         HarnessKind::GeminiCli => Box::new(
             GeminiCli::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
@@ -355,7 +356,9 @@ pub fn adapter_with_installed(
                 .with_installed_ahead(ahead),
         ),
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
-        HarnessKind::OpenCode => Box::new(OpenCode::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::OpenCode => Box::new(
+            OpenCode::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
+        ),
         HarnessKind::Pi => Box::new(Pi::new(env.home.clone(), env.path_var.clone())),
         HarnessKind::GeminiCli => Box::new(
             GeminiCli::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
