@@ -573,6 +573,11 @@ impl Node {
         self.daemon_vars.push((name, value));
     }
 
+    /// Takes `name` back out of the daemon's environment for every later start.
+    pub fn clear_daemon_env(&mut self, name: &str) {
+        self.daemon_vars.retain(|(set, _)| *set != name);
+    }
+
     /// Its state directory, the `FABRIC_HOME` its commands run with.
     pub fn state(&self) -> &Path {
         &self.state

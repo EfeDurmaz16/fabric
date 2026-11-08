@@ -16,7 +16,8 @@
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
 //! acceptance tests, `facade` the M5 facade and placement acceptance tests,
 //! `launch` the M5 launch path across two daemons with homes of their own,
-//! `legacy` loads a state directory frozen from main, and `streams` holds
+//! `legacy` loads a state directory frozen from main, `gc` holds `fabric
+//! gc` after a `SIGKILL` mid capture and mid restore, and `streams` holds
 //! every command's answer to the CLI contract's streams and JSON shape
 //! against a live node. `opencode`, `pi`, `gemini` and `cursor` hold one
 //! row per PR 5 adapter (docs/harness-adapters.md).
@@ -29,6 +30,7 @@ mod client;
 mod continuity;
 mod cursor;
 mod facade;
+mod gc;
 mod gemini;
 mod headless;
 mod launch;
