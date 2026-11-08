@@ -26,20 +26,22 @@ pub(crate) fn check(bytes: &[u8]) -> Result<Value, Refusal> {
         return Err(Refusal::new(Code::TooLarge, ""));
     }
     let value = parse(bytes).ok_or_else(|| Refusal::new(Code::NotJson, ""))?;
+    let Value::Object(top) = &value else {
+        return Err(Refusal::new(Code::NotJson, ""));
+    };
+    // Before the form: a v2 document may change a canonical rule, and a
+    // v1 reader still names it by its version (section 11).
+    if let Some(version) = top.get("psf")
+        && version.as_str() != Some("1")
+    {
+        return Err(Refusal::new(Code::UnsupportedVersion, "psf"));
+    }
     match canon::write(&value) {
         Err(NoForm::Number(at) | NoForm::Key(at)) => {
             return Err(Refusal::new(Code::NotCanonical, at));
         }
         Ok(text) if text.as_bytes() != bytes => return Err(Refusal::new(Code::NotCanonical, "")),
         Ok(_) => {}
-    }
-    let Value::Object(top) = &value else {
-        return Err(Refusal::new(Code::NotJson, ""));
-    };
-    if let Some(version) = top.get("psf")
-        && version.as_str() != Some("1")
-    {
-        return Err(Refusal::new(Code::UnsupportedVersion, "psf"));
     }
     shape(top)?;
     if let Some(Value::Array(requires)) = top.get("requires")

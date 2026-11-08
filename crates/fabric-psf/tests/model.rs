@@ -141,3 +141,23 @@ fn a_written_container_reads_back_and_a_stray_file_is_refused() {
         ("blob_unlisted", "notes.txt")
     );
 }
+
+/// Section 11: a v2 document is refused `unsupported_version` whatever
+/// canonical rule it changed, so the version is read before the form.
+#[test]
+fn a_later_version_is_refused_as_such_before_its_form_is_checked() {
+    for doc in [
+        r#"{"psf":"2","n":2}"#,
+        r#"{"z":"x","psf":"2"}"#,
+        r#"{ "psf": "2" }"#,
+        r#"{"psf":"2","Key":"x"}"#,
+        r#"{"psf":2}"#,
+    ] {
+        let refused = read_manifest(doc.as_bytes()).unwrap_err();
+        assert_eq!(
+            (refused.code, refused.field.as_str()),
+            (Code::UnsupportedVersion, "psf"),
+            "{doc}"
+        );
+    }
+}

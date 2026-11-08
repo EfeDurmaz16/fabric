@@ -726,6 +726,7 @@ export function readManifest(bytes: Uint8Array): Manifest {
   if (bytes.length > PSF_MANIFEST_MAX_BYTES) throw new PsfError("too_large", "");
   const top = parse(bytes);
   if (top === undefined) throw new PsfError("not_json", "");
+  if (has(top, "psf") && top.psf !== "1") throw new PsfError("unsupported_version", "psf");
   let text: string;
   try {
     text = canonical(top);
@@ -734,7 +735,6 @@ export function readManifest(bytes: Uint8Array): Manifest {
     throw e;
   }
   if (Buffer.compare(encoder.encode(text), bytes) !== 0) throw new PsfError("not_canonical", "");
-  if (has(top, "psf") && top.psf !== "1") throw new PsfError("unsupported_version", "psf");
   fields(top, TOP, "");
   if ((get(top, "requires") as Json[]).length > 0) throw new PsfError("unknown_requirement", "requires[0]");
   first(top, "too_large", tooLarge);

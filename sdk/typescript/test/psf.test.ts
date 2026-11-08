@@ -188,6 +188,7 @@ function generated(): string[] {
   }
   for (let depth = 126; depth <= 130; depth++) out.push(`{"a":${"[".repeat(depth - 1)}${"]".repeat(depth - 1)}}`);
   out.push("", "[]", "null", "{}", '{"psf":"2"}', '{"psf":1}', "﻿{}", '{"a":"\\ud800"}', '{"a":NaN}');
+  out.push('{"psf":"2","n":2}', '{"z":"x","psf":"2"}', '{ "psf": "2" }', '{"Key":"x","psf":"2"}', '{"psf":"1","psf":"2"}');
   return out;
 }
 

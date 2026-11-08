@@ -558,14 +558,14 @@ def read_manifest(data):
     value = _parse(data)
     if value is None:
         raise Refusal("not_json", "")
+    if "psf" in value and value["psf"] != "1":
+        raise Refusal("unsupported_version", "psf")
     try:
         text = canonical(value)
     except _NoForm as e:
         raise Refusal("not_canonical", e.path)
     if text.encode("utf-8") != data:
         raise Refusal("not_canonical", "")
-    if "psf" in value and value["psf"] != "1":
-        raise Refusal("unsupported_version", "psf")
     _fields(value, TOP, "")
     if value["requires"]:
         raise Refusal("unknown_requirement", "requires[0]")
