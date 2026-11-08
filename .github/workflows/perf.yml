@@ -42,13 +42,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rep: [1, 2, 3]
-        candidate: [""]
+        rep: [1, 2, 3, 4]
+        candidate: [176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5]
         include:
           - rep: 1
-            candidate: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
-          - rep: 2
-            candidate: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
+            candidate: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
