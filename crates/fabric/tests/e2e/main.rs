@@ -14,15 +14,21 @@
 //! `fabric` op by op on the same fixture. `acp_cli` and `preflight` hold the
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
 //! acceptance tests, and `legacy` loads a state directory frozen from main.
+//! `opencode`, `pi`, `gemini` and `cursor` hold one row per PR 5 adapter
+//! (docs/harness-adapters.md).
 
 mod ab;
 mod acp_cli;
 mod bench;
 mod budget;
 mod client;
+mod cursor;
+mod gemini;
 mod headless;
 mod legacy;
 mod managed;
+mod opencode;
+mod pi;
 mod preflight;
 mod terminal;
 mod world;
