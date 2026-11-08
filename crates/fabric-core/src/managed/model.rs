@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{
     AttemptId, Generation, OperationId, OperationKey, RequestDigest, TaskId, WorkRevision,
 };
+use super::launch::{Program, ProgramError};
 use super::lifecycle::{
     CheckpointCut, CutDigest, DrainBudget, HandoffBlocker, TaskClass, TaskReceipt,
 };
@@ -242,6 +243,9 @@ pub struct Task {
     pub state: TaskState,
     /// What an interruption means for it (ADR 0023).
     pub class: TaskClass,
+    /// What a build or test task runs (M5 launch path); `None` for a
+    /// harness or opaque task.
+    pub program: Option<Program>,
 }
 
 /// Where an attempt runs.
@@ -541,6 +545,9 @@ pub enum Command {
         restart: RestartPolicy,
         /// What an interruption means for it.
         class: TaskClass,
+        /// What it runs: required for `Build` and `Test`, refused for
+        /// `Harness` and `Opaque` (M5 launch path).
+        program: Option<Program>,
     },
     /// Finishes a task none of whose attempts may still run.
     FinishTask {
@@ -684,6 +691,12 @@ pub enum EffectRequest {
         fidelity: AllowedFidelity,
         /// A pin.
         pin: Option<NodeId>,
+    },
+    /// Spawn a task registered with a program while its parent's attempt
+    /// runs (M5 launch path).
+    Spawn {
+        /// The task.
+        task: TaskId,
     },
 }
 
@@ -849,6 +862,8 @@ pub enum ManagedEvent {
         restart: RestartPolicy,
         /// Its class.
         class: TaskClass,
+        /// Its program, when it has one (M5 launch path).
+        program: Option<Program>,
     },
     /// An attempt was granted at a new generation.
     AttemptGranted {
@@ -1163,6 +1178,24 @@ pub enum DomainError {
     MissingPackage {
         /// The attempt that continued.
         attempt: AttemptId,
+    },
+    /// A build or test task was registered without a program (M5 launch path).
+    #[error("a {class:?} task needs a program")]
+    ProgramRequired {
+        /// The class.
+        class: TaskClass,
+    },
+    /// A harness or opaque task was registered with a program.
+    #[error("a {class:?} task takes no program")]
+    ProgramNotAllowed {
+        /// The class.
+        class: TaskClass,
+    },
+    /// The program failed its check.
+    #[error("bad program: {error}")]
+    BadProgram {
+        /// Why.
+        error: ProgramError,
     },
 }
 

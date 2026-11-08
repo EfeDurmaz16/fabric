@@ -66,6 +66,9 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::EffectInFlight { .. } => "effect_in_flight",
         DomainError::MissingReceipt { .. } => "missing_receipt",
         DomainError::MissingPackage { .. } => "missing_package",
+        DomainError::ProgramRequired { .. } => "program_required",
+        DomainError::ProgramNotAllowed { .. } => "program_not_allowed",
+        DomainError::BadProgram { .. } => "bad_program",
     }
 }
 

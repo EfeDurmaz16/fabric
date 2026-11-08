@@ -247,6 +247,10 @@ fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
             state: task_state(&state).ok_or_else(|| corrupt(job, format!("task state {state}")))?,
             class: TaskClass::from_name(&class)
                 .ok_or_else(|| corrupt(job, format!("task class {class}")))?,
+            // The launch path's `program` column (schema version 3, amended
+            // in place) is owner A's; until it lands the projection holds no
+            // program and `verify` compares none.
+            program: None,
         });
     }
 

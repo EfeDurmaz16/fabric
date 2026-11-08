@@ -404,6 +404,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
+            program: None,
         },
     )
     .unwrap();
@@ -415,6 +416,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
                 kind: TaskKind::Primary,
                 restart: RestartPolicy::Block,
                 class: TaskClass::Harness,
+                program: None,
             }
         ),
         Err(DomainError::BadParent { .. })
@@ -607,6 +609,7 @@ proptest! {
                     kind: TaskKind::Child { label: key.clone() },
                     restart: RestartPolicy::Block,
                     class: TaskClass::Build,
+                    program: None,
                 }),
                 Step::Finish(which) => {
                     let task = s.tasks[usize::from(which) % s.tasks.len()].id;

@@ -1093,6 +1093,17 @@ fn policy_json(policy: &JobPolicy) -> Value {
     })
 }
 
+/// A task's program as the client API writes it (docs/facade-protocol.md,
+/// "Launch path"): the arguments, the directory under the root and the
+/// variables of the node's environment it may see.
+fn program_json(program: &fabric_core::managed::Program) -> Value {
+    json!({
+        "argv": program.argv,
+        "cwd": program.cwd.as_ref().map(fabric_core::path::RelPath::as_str),
+        "env_allowlist": program.env_allowlist.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+    })
+}
+
 fn blocker_json(blocker: &HandoffBlocker) -> Value {
     match blocker {
         HandoffBlocker::EscapedChild { pid, group } => {
@@ -1171,6 +1182,7 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
             kind,
             restart,
             class,
+            program,
         } => json!({
             "task": task.to_string(),
             "parent": parent.map(|p| p.to_string()),
@@ -1183,6 +1195,7 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
                 RestartPolicy::ExplicitOnly => "explicit_only",
             },
             "class": class.name(),
+            "program": program.as_ref().map(program_json),
         }),
         ManagedEvent::AttemptGranted {
             attempt,
@@ -1289,6 +1302,7 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
                     "fidelity": fidelity_names(*fidelity),
                     "pin": pin.map(|n| n.to_string()),
                 } }),
+                EffectRequest::Spawn { task } => json!({ "spawn": { "task": task.to_string() } }),
             },
         }),
     };

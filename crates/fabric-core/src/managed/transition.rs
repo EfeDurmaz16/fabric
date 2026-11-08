@@ -113,6 +113,7 @@ pub fn accept_command(
                     kind: TaskKind::Primary,
                     restart: policy.restart,
                     class: TaskClass::Harness,
+                    program: None,
                 },
             ],
         });
@@ -291,11 +292,15 @@ fn command_events(
             kind,
             restart,
             class,
+            program,
         } => {
             if state.task(*parent).is_none() || *kind == TaskKind::Primary {
                 return Err(DomainError::BadParent { task: *parent });
             }
             open_task(state, *parent)?;
+            // The program rules (required for a build or test task, refused
+            // for the others, checked, and the Spawn effect while the
+            // parent's attempt runs) are the launch path's, owner A.
             (
                 false,
                 vec![ManagedEvent::TaskRegistered {
@@ -304,6 +309,7 @@ fn command_events(
                     kind: kind.clone(),
                     restart: *restart,
                     class: *class,
+                    program: program.clone(),
                 }],
             )
         }
@@ -1061,6 +1067,7 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
             kind,
             restart,
             class,
+            program,
         } => {
             if s.task(*task).is_some() {
                 return Err(broken(format!("task {task} registered twice")));
@@ -1078,6 +1085,7 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 restart: *restart,
                 state: TaskState::Open,
                 class: *class,
+                program: program.clone(),
             });
         }
         ManagedEvent::AttemptGranted {

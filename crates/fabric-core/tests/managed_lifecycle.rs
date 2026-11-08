@@ -299,6 +299,7 @@ fn a_continue_cuts_places_grants_and_records_the_fidelity_achieved() {
                 },
                 restart: RestartPolicy::Block,
                 class: TaskClass::Test,
+                program: None,
             },
         )
         .unwrap();
@@ -663,6 +664,7 @@ fn a_parent_waits_for_its_children_and_a_cancelled_task_without_an_attempt_ends_
                 },
                 restart: RestartPolicy::Block,
                 class: TaskClass::Build,
+                program: None,
             },
         )
         .unwrap();
@@ -932,6 +934,7 @@ fn a_cut_that_misses_an_open_task_is_refused() {
                 },
                 restart: RestartPolicy::Block,
                 class: TaskClass::Test,
+                program: None,
             },
         )
         .unwrap();

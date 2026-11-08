@@ -74,6 +74,7 @@ fn state_planted(goal: &str, acceptance: Vec<String>) -> ManagedState {
             kind: TaskKind::Primary,
             restart: RestartPolicy::ExplicitOnly,
             class: TaskClass::Harness,
+            program: None,
         },
     ];
     with_child(apply_batch(None, WorkRevision::FIRST, &events).unwrap())
@@ -91,6 +92,7 @@ fn with_child(state: ManagedState) -> ManagedState {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
+            program: None,
         },
     };
     let t = accept_command(Some(&state), &child, &ids(2)).unwrap();

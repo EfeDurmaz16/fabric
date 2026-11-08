@@ -131,6 +131,7 @@ fn make_v1_fixture() {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Harness,
+            program: None,
         },
         ids(FIRST, 2),
     );
@@ -621,6 +622,7 @@ fn write_v3_history(journal: &mut Journal) {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
+            program: None,
         },
         ids(FIRST, 10),
     );

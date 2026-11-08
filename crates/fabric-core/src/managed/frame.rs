@@ -335,6 +335,7 @@ pub mod v1 {
                     kind,
                     restart,
                     class: TaskClass::Harness,
+                    program: None,
                 },
                 ManagedEvent::AttemptGranted {
                     attempt,

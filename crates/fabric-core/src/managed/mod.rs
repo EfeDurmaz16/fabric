@@ -87,6 +87,7 @@ mod canon;
 pub mod facade;
 mod frame;
 mod ids;
+pub mod launch;
 pub mod lifecycle;
 mod model;
 pub mod package;
@@ -103,6 +104,7 @@ pub use ids::{
     AttemptId, EventDigest, EventSeq, Generation, MAX_OPERATION_KEY, OperationId, OperationKey,
     OperationKeyError, ParseCounterError, RequestDigest, TaskId, WorkRevision,
 };
+pub use launch::{GrantToken, Program, ProgramError};
 pub use lifecycle::{
     CheckpointCut, CutDigest, DrainBudget, EvidenceKind, EvidenceRef, HandoffBlocker,
     OutcomePolicy, ReceiptStatus, TaskClass, TaskReceipt, WorkspaceRevision,
