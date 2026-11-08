@@ -3,5 +3,5 @@ commit: 129820d6522f41879fff70e331a40b078ca72335
 started: 2026-11-08T13:48:38Z
 note: two fabricd processes on one host through a userspace relay; no firewall or system setting touched
 load before: 6.81 9.60 10.13
-fabricd and fabric-relay processes after: 0 and 0 (pgrep -x, checked by hand after the run)
+fabricd and fabric-relay processes after: 0 and 0 (pgrep -x, checked by hand after the run; this line was added by hand, the script at this commit did not write it)
 finished: 2026-11-08T13:49:24Z

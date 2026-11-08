@@ -1,7 +1,7 @@
     Blocking waiting for file lock on package cache
     Blocking waiting for file lock on package cache
     Blocking waiting for file lock on package cache
-   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m6/crates/fabric)
+   Compiling fabric v0.1.0 (<worktree m6>/crates/fabric)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.79s
      Running tests/e2e/main.rs (<scratch>/target/debug/deps/e2e-3eac00a6b76b5bfe)
 

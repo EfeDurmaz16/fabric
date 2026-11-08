@@ -222,6 +222,13 @@ fn until_inspection(
 /// runner node runs nothing for the grant (no node launches a grant on
 /// this base, docs/evidence/m6), so its silence is that of a node that
 /// holds a grant and does not answer for it.
+///
+/// What this does not prove: no heartbeat is ever sent for the grant, so
+/// the attempt becomes `unknown` with or without the pause, and every
+/// assertion here holds with `relay.pause()` removed; the pause changes
+/// only the relay's counters. Nothing in this file reaches the fence or
+/// the acknowledgement either. Both are proved one layer down until a
+/// node launches its grants (the question in docs/evidence/m6).
 #[test]
 #[expect(clippy::too_many_lines, reason = "one scenario, its steps in order")]
 fn block_policy_waits_with_the_state_visible() -> Fallible {
