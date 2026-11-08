@@ -2023,6 +2023,19 @@ pub struct ProviderOperationWire {
         with = "text::option"
     )]
     pub cleans: Option<OperationId>,
+    /// `effect` or `cleanup` (M5, the provider read surface); absent from
+    /// a node before it, which a reader takes as `effect` unless `cleans` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// The resource Fabric sent the action to, as the bridge names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The scope its last absent answer searched, as canonical JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched: Option<String>,
+    /// Why the owner abandoned it; set exactly when it is `abandoned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandon_reason: Option<String>,
 }
 
 /// One reason no replacement attempt may be granted (ADR 0022).
@@ -2048,6 +2061,9 @@ pub struct ResidualWire {
     /// Where the resource is, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<String>,
+    /// The scope the create's last absent attach searched, when it has no locator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched: Option<String>,
 }
 
 /// Everything the journal holds about one managed job (M5): the body of

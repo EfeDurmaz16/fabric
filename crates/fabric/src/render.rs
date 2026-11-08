@@ -532,6 +532,18 @@ fn inspection_lines(inspection: &fabric_client::api::Inspection) -> Vec<String> 
                 .as_deref()
                 .map_or(String::new(), |l| format!(" at {l}"))
         ));
+        if let Some(cleans) = op.cleans {
+            lines.push(format!("  cleans up after {cleans}"));
+        }
+        if let Some(target) = &op.target {
+            lines.push(format!("  sent to {target}"));
+        }
+        if let Some(searched) = &op.searched {
+            lines.push(format!("  searched {searched}"));
+        }
+        if let Some(reason) = &op.abandon_reason {
+            lines.push(format!("  abandoned: {reason}"));
+        }
     }
     for blocker in &inspection.blockers {
         lines.push(format!(
@@ -544,10 +556,11 @@ fn inspection_lines(inspection: &fabric_client::api::Inspection) -> Vec<String> 
             "may remain: the resource of {} ({}){}",
             residual.creating,
             residual.status,
-            residual
-                .locator
-                .as_deref()
-                .map_or(String::new(), |l| format!(" at {l}"))
+            match (&residual.locator, &residual.searched) {
+                (Some(locator), _) => format!(" at {locator}"),
+                (None, Some(searched)) => format!(", not found in {searched}"),
+                (None, None) => String::new(),
+            }
         ));
     }
     lines

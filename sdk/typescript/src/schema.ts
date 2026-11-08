@@ -1007,6 +1007,10 @@ export const ProviderOperation = z.object({
   status: UnicodeText,
   locator: optional(UnicodeText),
   cleans: optional(OperationId),
+  purpose: optional(UnicodeText),
+  target: optional(UnicodeText),
+  searched: optional(UnicodeText),
+  abandon_reason: optional(UnicodeText),
 });
 export type ProviderOperation = z.infer<typeof ProviderOperation>;
 
@@ -1015,7 +1019,12 @@ export const Blocker = z.object({ kind: UnicodeText, operation: OperationId, sta
 export type Blocker = z.infer<typeof Blocker>;
 
 /** A provider resource that may still exist (ADR 0022). */
-export const Residual = z.object({ creating: OperationId, status: UnicodeText, locator: optional(UnicodeText) });
+export const Residual = z.object({
+  creating: OperationId,
+  status: UnicodeText,
+  locator: optional(UnicodeText),
+  searched: optional(UnicodeText),
+});
 export type Residual = z.infer<typeof Residual>;
 
 /** The fields of an inspection (M5): the body of `managed_inspect` and of the facade's `inspection`. */
