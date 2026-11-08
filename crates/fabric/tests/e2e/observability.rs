@@ -311,8 +311,18 @@ async fn e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_se
     let events = records.iter().filter(|r| r["type"] == "event").count();
     assert!(events > 5, "{events} events");
     assert!(records.iter().all(|r| r.get("body").is_none()));
-    // A window after the run is empty.
-    assert_eq!(a.ok(&["audit", "export", "--since", "2999-01-01"])?, "");
+    // A window after the run is empty: nothing on stdout, a hint on stderr,
+    // and under --json an empty document with nothing on stderr.
+    let empty = a.run(&["audit", "export", "--since", "2999-01-01"])?;
+    assert!(empty.status.success(), "{empty:?}");
+    assert_eq!(String::from_utf8(empty.stdout)?, "");
+    let hint = String::from_utf8(empty.stderr)?;
+    assert!(hint.contains("no audit records"), "{hint:?}");
+    let empty = a.run(&["audit", "export", "--since", "2999-01-01", "--json"])?;
+    assert!(empty.status.success(), "{empty:?}");
+    assert_eq!(String::from_utf8(empty.stderr)?, "");
+    let doc: Value = serde_json::from_slice(&empty.stdout)?;
+    assert_eq!(doc["records"], serde_json::json!([]));
 
     let daemons = vec![a.stop()?, b.stop()?];
     for daemon in daemons {

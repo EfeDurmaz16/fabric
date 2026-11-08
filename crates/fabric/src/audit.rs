@@ -166,6 +166,7 @@ pub(crate) async fn audit(
     }
     let mut after = None;
     let mut all = Vec::new();
+    let mut written = 0usize;
     loop {
         let request = Request::AuditExport {
             since_ms: since,
@@ -183,6 +184,7 @@ pub(crate) async fn audit(
                 writeln!(out, "{}", serde_json::to_string(record)?)?;
             }
             out.flush()?;
+            written += page.records.len();
         }
         match page.next {
             Some(next) => after = Some(next),
@@ -191,6 +193,11 @@ pub(crate) async fn audit(
     }
     if run.modes.json {
         contract::print_document(run.modes, &json!({ "records": all }))?;
+    } else if written == 0 {
+        // An empty list is nothing on stdout and a hint on stderr.
+        run.notes().print(&[
+            "no audit records in this window; `fabric audit export` with no --since or --until writes every record the node's journal holds",
+        ])?;
     }
     Ok(ExitCode::SUCCESS)
 }
