@@ -38,6 +38,30 @@ export {
   UnsupportedFieldError,
   UntrustedError,
 } from "./errors.ts";
+export {
+  type Achieved,
+  achievable,
+  type Container,
+  Fidelity,
+  HARNESS_STATE_FORMAT,
+  looksLikeCredential,
+  type Manifest,
+  manifestDigest,
+  PSF_CODES,
+  PSF_CONTAINER_CODES,
+  PSF_MANIFEST_MAX_BYTES,
+  PSF_NAME_MAX_BYTES,
+  PSF_PACKAGE_MAX_BYTES,
+  PSF_TEXT_MAX_BYTES,
+  type PsfCode,
+  PsfContainerError,
+  type PsfContainerCode,
+  PsfError,
+  PsfManifest,
+  readContainer,
+  readManifest,
+  type Target,
+} from "./psf.ts";
 export { createFrameDecoder, decodeJson, encodeFrame, type FrameDecoder, MAX_FRAME } from "./frame.ts";
 export {
   AcpSettings,
