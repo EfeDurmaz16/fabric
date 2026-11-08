@@ -192,7 +192,20 @@ async fn place_handoff(
         current: None,
         snapshot: last_cut(state, task),
     };
-    let decision = link.place(&state.job, &ask).await;
+    // A continue's pin names the node the work moves to, in place of the
+    // job's own pin; without one the job's policy places it.
+    let pin = match state.request(operation) {
+        Some(EffectRequest::Continue { pin: Some(pin), .. }) => Some(*pin),
+        _ => None,
+    };
+    let decision = match pin {
+        Some(pin) => {
+            let mut job = state.job.clone();
+            job.policy.placement.pin = Some(pin);
+            link.place(&job, &ask).await
+        }
+        None => link.place(&state.job, &ask).await,
+    };
     tracing::info!(job = %state.job.id, chosen = ?decision.chosen.map(|n| n.to_string()), "continue placed");
     authority
         .observe(
@@ -714,6 +727,36 @@ mod tests {
             world.state(job).await.operation(cont).unwrap().status,
             OperationStatus::Failed
         );
+    }
+
+    /// A continue's pin is what the handoff is placed with, in place of
+    /// the job's own: the operator names the node the work moves to.
+    #[tokio::test]
+    async fn a_continue_s_pin_places_the_handoff_where_it_names() {
+        let world = World::new();
+        let link = FakeLink::new();
+        *link.place_on.lock().unwrap() = Some(OTHER);
+        let job = world.created("create").await;
+        let first = world.granted(job, REMOTE).await;
+        world.started(job, first).await;
+        let primary = world.state(job).await.job.primary;
+        world
+            .submit(
+                job,
+                "continue",
+                Command::Continue {
+                    task: primary,
+                    fidelity: AllowedFidelity::DEFAULT,
+                    pin: Some(OTHER),
+                },
+            )
+            .await
+            .unwrap();
+        let mut seen = Seen::default();
+        pass(&world.authority, &link, &mut seen).await;
+        world.cut(job, first, REMOTE).await;
+        pass(&world.authority, &link, &mut seen).await;
+        assert_eq!(*link.placed_pins.lock().unwrap(), vec![Some(OTHER)]);
     }
 
     /// A checkpoint of a running attempt is a `Checkpoint { Resume }` to

@@ -616,6 +616,8 @@ pub(crate) mod fixture {
         pub(crate) instruct_answer: Mutex<InstructAnswer>,
         /// Where a placement lands.
         pub(crate) place_on: Mutex<Option<NodeId>>,
+        /// The pin of the job each placement was asked with, in order.
+        pub(crate) placed_pins: Mutex<Vec<Option<NodeId>>>,
     }
 
     impl FakeLink {
@@ -626,6 +628,7 @@ pub(crate) mod fixture {
                 launch_answer: Mutex::new(LaunchAnswer::Accepted),
                 instruct_answer: Mutex::new(InstructAnswer::Accepted),
                 place_on: Mutex::new(None),
+                placed_pins: Mutex::new(Vec::new()),
             }
         }
 
@@ -703,7 +706,10 @@ pub(crate) mod fixture {
             job: &'a ManagedJob,
             ask: &'a PlacementAsk,
         ) -> BoxFuture<'a, PlacementDecision> {
-            let _ = job;
+            self.placed_pins
+                .lock()
+                .unwrap()
+                .push(job.policy.placement.pin);
             self.asked.lock().unwrap().push(Asked::Place(ask.kind));
             let chosen = *self.place_on.lock().unwrap();
             let kind = ask.kind;
