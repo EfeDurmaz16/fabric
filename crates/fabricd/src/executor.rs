@@ -1445,11 +1445,11 @@ mod tests {
         );
         assert!(b.executor.pids(b.attempt).await.is_empty());
         tokio::time::sleep(Duration::from_millis(300)).await;
-        if let Ok(pid) = std::fs::read_to_string(&marker) {
-            assert!(
-                !alive(pid.trim().parse().unwrap()),
-                "the process was stopped"
-            );
+        // The kill can land after the shell opened the marker and before
+        // it wrote its pid: an empty marker is a shell stopped early.
+        let written = std::fs::read_to_string(&marker).ok();
+        if let Some(pid) = written.and_then(|s| s.trim().parse().ok()) {
+            assert!(!alive(pid), "the process was stopped");
         }
     }
 
