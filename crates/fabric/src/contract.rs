@@ -8,7 +8,8 @@
 //!
 //! The rules come from the Vercel CLI design guidelines
 //! (<https://vercel.com/design/cli>); docs/cli-contract.md traces each one,
-//! and `tests/cli_contract.rs` walks every command against them.
+//! `tests/cli_contract.rs` walks every command against them, and the e2e
+//! test `streams` holds every answer against a live node.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;

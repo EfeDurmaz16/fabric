@@ -631,14 +631,33 @@ pub(crate) fn answer(reply: &Reply, job: Option<JobId>) -> Answer {
             result: job.map(|job| vec![job.to_string()]).unwrap_or_default(),
             notes: lines,
         },
-        _ if first_is_note && !lines.is_empty() => {
+        Reply::NodeList(_) | Reply::JobList(_) | Reply::JobLog(_)
+            if first_is_note && !lines.is_empty() =>
+        {
             let rest = lines.split_off(1);
             Answer {
                 result: rest,
                 notes: lines,
             }
         }
-        _ => Answer {
+        // A read prints its data. No arm catches the rest, so a reply
+        // added later fails to compile until it says which kind it is.
+        Reply::NodeList(_)
+        | Reply::NodePing(_)
+        | Reply::JobList(_)
+        | Reply::JobStatus(_)
+        | Reply::JobLog(_)
+        | Reply::Doctor { .. }
+        | Reply::ManagedStatus(_)
+        | Reply::ManagedList(_)
+        // A launch's own replies: `job run` and `job resume` hand
+        // standard output to the harness and never answer with these.
+        | Reply::JobRun(_)
+        | Reply::JobResume(_)
+        | Reply::HarnessStarted(_)
+        | Reply::HarnessSession(_)
+        | Reply::HarnessExited
+        | Reply::LaunchCheck => Answer {
             result: lines,
             notes: Vec::new(),
         },
@@ -678,8 +697,21 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
             };
             json!({ "operation": fields, "outcome": outcome })
         }
-        // A list's fields are already keyed by its noun, and a doctor's report is its own.
-        _ => fields,
+        // A list's fields are already keyed by its noun, and a doctor's
+        // report is its own. No arm catches the rest, so a reply added
+        // later fails to compile until it names its noun and outcome.
+        Reply::NodeList(_)
+        | Reply::JobList(_)
+        | Reply::JobLog(_)
+        | Reply::ManagedList(_)
+        | Reply::Doctor { .. }
+        // A launch's own replies, which no `--json` command answers with.
+        | Reply::JobRun(_)
+        | Reply::JobResume(_)
+        | Reply::HarnessStarted(_)
+        | Reply::HarnessSession(_)
+        | Reply::HarnessExited
+        | Reply::LaunchCheck => fields,
     }
 }
 
