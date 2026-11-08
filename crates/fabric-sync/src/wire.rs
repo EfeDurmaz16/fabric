@@ -53,36 +53,38 @@ fn write_frame(out: &mut dyn Write, header: &Value, blob: &[u8]) -> io::Result<(
     out.flush()
 }
 
-/// Reads one frame; `None` at a clean end of input before a frame starts.
 /// A header and its blob.
 type Frame = (Map<String, Value>, Vec<u8>);
 
+/// A read that failed: the link, not the other side's data. A frame cut
+/// short is a connection that went away, as one closed between frames is.
+fn cut(what: &str) -> impl FnOnce(io::Error) -> SyncError + '_ {
+    move |e| SyncError::Unreachable {
+        reason: format!("the connection closed while reading {what}: {e}"),
+    }
+}
+
+/// Reads one frame; `None` at a clean end of input before a frame starts.
 fn read_frame(input: &mut dyn Read) -> Result<Option<Frame>, SyncError> {
     let mut len = [0u8; 4];
     match input.read_exact(&mut len) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(bad(format!("reading a frame: {e}"))),
+        Err(e) => return Err(cut("a frame")(e)),
     }
     let header_len = u32::from_be_bytes(len) as usize;
     if header_len > MAX_HEADER {
         return Err(bad(format!("a header of {header_len} bytes")));
     }
     let mut header = vec![0u8; header_len];
-    input
-        .read_exact(&mut header)
-        .map_err(|e| bad(format!("reading a header: {e}")))?;
-    input
-        .read_exact(&mut len)
-        .map_err(|e| bad(format!("reading a frame: {e}")))?;
+    input.read_exact(&mut header).map_err(cut("a header"))?;
+    input.read_exact(&mut len).map_err(cut("a frame"))?;
     let blob_len = u32::from_be_bytes(len) as usize;
     if blob_len > max_blob() {
         return Err(bad(format!("a blob of {blob_len} bytes")));
     }
     let mut blob = vec![0u8; blob_len];
-    input
-        .read_exact(&mut blob)
-        .map_err(|e| bad(format!("reading a blob: {e}")))?;
+    input.read_exact(&mut blob).map_err(cut("a blob"))?;
     match serde_json::from_slice(&header) {
         Ok(Value::Object(map)) => Ok(Some((map, blob))),
         _ => Err(bad("a header that is not a JSON object")),
@@ -595,6 +597,22 @@ mod tests {
             read_frame(&mut frame.as_slice()),
             Err(SyncError::Protocol { .. })
         ));
+    }
+
+    #[test]
+    fn a_frame_cut_short_is_a_lost_link_not_bad_data() {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &json!({ "ok": true }), &[7; 64]).unwrap();
+        for at in [6, frame.len() - 70, frame.len() - 1] {
+            assert!(
+                matches!(
+                    read_frame(&mut &frame[..at]),
+                    Err(SyncError::Unreachable { .. })
+                ),
+                "cut at {at}"
+            );
+        }
+        assert!(read_frame(&mut &frame[..0]).unwrap().is_none());
     }
 
     #[test]
