@@ -41,6 +41,9 @@
 #                         machine
 #   --counted <n>         counted runs (default 3)
 #   --release             build both in the release profile instead of test
+#   --candidate-first     start the candidate's fixture before the anchor's;
+#                         CI's confirmation run does, to swap the order the
+#                         first run had
 # The output directory must not exist yet, so an earlier record is never
 # overwritten. --analyze writes report.md again from its samples.tsv.
 # --gate judges its samples.tsv against the performance rule, writes
@@ -55,12 +58,13 @@ candidate=
 pairs=15
 counted=3
 release=
+candidate_first=
 analyze=
 gate=
 confirm=
 
 usage() {
-  echo "usage: scripts/bench-ab.sh [--anchor <commit>] [--candidate <commit>] [--pairs <n>] [--counted <n>] [--release] <output-dir>" >&2
+  echo "usage: scripts/bench-ab.sh [--anchor <commit>] [--candidate <commit>] [--pairs <n>] [--counted <n>] [--release] [--candidate-first] <output-dir>" >&2
   echo "       scripts/bench-ab.sh --analyze <output-dir>" >&2
   echo "       scripts/bench-ab.sh --gate [--confirm <second-output-dir>] <output-dir>" >&2
   exit 2
@@ -73,6 +77,7 @@ while [ "$#" -gt 1 ]; do
     --pairs) pairs=$2; shift 2 ;;
     --counted) counted=$2; shift 2 ;;
     --release) release=--release; shift ;;
+    --candidate-first) candidate_first=1; shift ;;
     --analyze) analyze=1; shift ;;
     --gate) gate=1; shift ;;
     --confirm) confirm=$2; shift 2 ;;
@@ -228,6 +233,7 @@ size() { wc -c <"$1" | tr -d ' '; }
   echo "candidate: $candidate_desc"
   echo "driver: e2e test of the working tree at $(git rev-parse HEAD)"
   echo "profile: $profile, pairs: $pairs, counted runs: $counted"
+  echo "fixture started first: $(if [ -n "$candidate_first" ]; then echo candidate; else echo anchor; fi)"
   echo "binary bytes: anchor $(size "$scratch/anchor/fabric"), candidate $(size "$scratch/candidate/fabric")"
   echo "uname: $(uname -srm)"
   if command -v sysctl >/dev/null 2>&1; then
@@ -250,6 +256,7 @@ env FABRIC_AB_ANCHOR="$scratch/anchor/fabric" \
   FABRIC_AB_PAIRS="$pairs" \
   FABRIC_AB_COUNTED="$counted" \
   ${counters:+FABRIC_AB_COUNTERS=$counters} \
+  ${candidate_first:+FABRIC_AB_CANDIDATE_FIRST=1} \
   "$e2e" --ignored --exact ab::paired --nocapture --test-threads=1 >"$out/run.log" 2>&1 || status=$?
 echo "end: $(date -u +%Y-%m-%dT%H:%M:%SZ), load: $(uptime | sed 's/.*load average[s]*: //')" >>"$out/machine.txt"
 if [ "$status" -ne 0 ]; then

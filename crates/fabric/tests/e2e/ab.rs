@@ -640,6 +640,11 @@ struct Setup {
     pairs: usize,
     counted: usize,
     counters: Option<PathBuf>,
+    /// True when the candidate's fixture starts before the anchor's
+    /// (`FABRIC_AB_CANDIDATE_FIRST=1`). A daemon that lives through a whole
+    /// phase is one process per build, so an order effect on its size does
+    /// not average out over the runs; the confirmation run swaps the order.
+    candidate_first: bool,
 }
 
 /// `name` as a count, or `default` when it is unset.
@@ -669,7 +674,22 @@ impl Setup {
             pairs: count_var("FABRIC_AB_PAIRS", DEFAULT_PAIRS)?,
             counted: count_var("FABRIC_AB_COUNTED", DEFAULT_COUNTED)?,
             counters: std::env::var_os("FABRIC_AB_COUNTERS").map(PathBuf::from),
+            candidate_first: std::env::var_os("FABRIC_AB_CANDIDATE_FIRST")
+                .is_some_and(|value| value == "1"),
         })
+    }
+
+    /// Both fixtures, anchor then candidate, started in the order
+    /// `candidate_first` says, with their processes counting when
+    /// `counters` names the counter library.
+    fn sides(&self, counters: Option<&Path>) -> Fallible<[Side; 2]> {
+        if self.candidate_first {
+            let candidate = Side::new(&self.builds[1], counters)?;
+            Ok([Side::new(&self.builds[0], counters)?, candidate])
+        } else {
+            let anchor = Side::new(&self.builds[0], counters)?;
+            Ok([anchor, Side::new(&self.builds[1], counters)?])
+        }
     }
 }
 
@@ -733,10 +753,7 @@ fn counted_phase(
         progress("no FABRIC_AB_COUNTERS, so no counted phase")?;
         return Ok(());
     };
-    let mut sides = [
-        Side::new(&setup.builds[0], Some(library))?,
-        Side::new(&setup.builds[1], Some(library))?,
-    ];
+    let mut sides = setup.sides(Some(library))?;
     for run in 0..=runs {
         let first = SIDES[order(run)[0]];
         progress(&format!("counted run {run} of {runs}, {first} first"))?;
@@ -781,10 +798,7 @@ fn timed_phase(setup: &Setup, samples: &mut Samples) -> Fallible {
     if setup.pairs == 0 {
         return Ok(());
     }
-    let mut sides = [
-        Side::new(&setup.builds[0], None)?,
-        Side::new(&setup.builds[1], None)?,
-    ];
+    let mut sides = setup.sides(None)?;
     for run in 0..TIMED_WARM_UPS + setup.pairs {
         let first = SIDES[order(run)[0]];
         progress(&format!(
