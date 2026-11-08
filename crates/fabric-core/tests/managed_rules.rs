@@ -404,7 +404,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
-            program: None,
+            program: Some(program(&["cargo", "test"])),
         },
     )
     .unwrap();
@@ -431,6 +431,235 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
     let s = kept.state();
     assert_eq!(s.job.state, JobState::Cancelled);
     assert!(s.tasks.iter().all(|t| t.state == TaskState::Cancelled));
+    kept.replays();
+}
+
+fn program(argv: &[&str]) -> Program {
+    Program {
+        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+        cwd: None,
+        env_allowlist: Vec::new(),
+    }
+}
+
+fn register(parent: TaskId, class: TaskClass, program: Option<Program>) -> Command {
+    Command::RegisterTask {
+        parent,
+        kind: TaskKind::Child {
+            label: class.name().into(),
+        },
+        restart: RestartPolicy::Block,
+        class,
+        program,
+    }
+}
+
+#[test]
+fn a_build_or_test_task_needs_a_program() {
+    let mut kept = made();
+    let primary = kept.state().job.primary;
+    for class in [TaskClass::Build, TaskClass::Test] {
+        assert_eq!(
+            kept.submit(class.name(), register(primary, class, None))
+                .err(),
+            Some(DomainError::ProgramRequired { class })
+        );
+    }
+    let before = kept.history.len();
+    kept.submit(
+        "test",
+        register(primary, TaskClass::Test, Some(program(&["cargo", "test"]))),
+    )
+    .unwrap();
+    assert!(kept.history.len() > before);
+    let child = kept.state().tasks.last().unwrap();
+    assert_eq!(child.program, Some(program(&["cargo", "test"])));
+    kept.replays();
+}
+
+#[test]
+fn a_harness_or_opaque_task_takes_no_program() {
+    let mut kept = made();
+    let primary = kept.state().job.primary;
+    for class in [TaskClass::Harness, TaskClass::Opaque] {
+        assert_eq!(
+            kept.submit(
+                class.name(),
+                register(primary, class, Some(program(&["sh"])))
+            )
+            .err(),
+            Some(DomainError::ProgramNotAllowed { class })
+        );
+    }
+    kept.submit("opaque", register(primary, TaskClass::Opaque, None))
+        .unwrap();
+    kept.replays();
+}
+
+#[test]
+fn a_bad_program_is_refused_before_the_journal() {
+    let mut kept = made();
+    let primary = kept.state().job.primary;
+    let before = kept.history.len();
+    assert_eq!(
+        kept.submit(
+            "empty",
+            register(primary, TaskClass::Build, Some(program(&[])))
+        )
+        .err(),
+        Some(DomainError::BadProgram {
+            error: ProgramError::EmptyArgv
+        })
+    );
+    assert_eq!(
+        kept.submit(
+            "control",
+            register(
+                primary,
+                TaskClass::Test,
+                Some(program(&["sh", "-c", "a\u{1b}"]))
+            )
+        )
+        .err(),
+        Some(DomainError::BadProgram {
+            error: ProgramError::ControlCharacter { index: 2 }
+        })
+    );
+    assert_eq!(
+        kept.history.len(),
+        before,
+        "a refused program was journaled"
+    );
+}
+
+#[test]
+fn a_program_registered_under_a_live_attempt_asks_for_a_spawn() {
+    let mut kept = made();
+    let primary = kept.state().job.primary;
+    // No live attempt: succeeded at commit, the task rides the next launch.
+    let idle = kept
+        .submit(
+            "idle",
+            register(
+                primary,
+                TaskClass::Build,
+                Some(program(&["cargo", "build"])),
+            ),
+        )
+        .unwrap();
+    assert!(matches!(
+        idle.events[0],
+        ManagedEvent::CommandAccepted { effect: false, .. }
+    ));
+    assert!(CommandKind::RegisterTask.has_effect());
+    kept.submit("start", start(primary)).unwrap();
+    let live = kept
+        .submit(
+            "live",
+            register(primary, TaskClass::Test, Some(program(&["cargo", "test"]))),
+        )
+        .unwrap();
+    let ManagedEvent::CommandAccepted {
+        operation,
+        effect: true,
+        ..
+    } = live.events[0]
+    else {
+        panic!("a register under a live attempt has no effect: {live:?}");
+    };
+    let child = kept.state().tasks.last().unwrap().id;
+    assert!(live.events.iter().any(|e| matches!(
+        e,
+        ManagedEvent::EffectRequested {
+            operation: op,
+            request: EffectRequest::Spawn { task },
+        } if *op == operation && *task == child
+    )));
+    assert_eq!(
+        kept.state().operation(operation).unwrap().status,
+        OperationStatus::Accepted
+    );
+    kept.mark(operation, OperationMark::Dispatched).unwrap();
+    kept.mark(operation, OperationMark::Succeeded).unwrap();
+    kept.replays();
+}
+
+#[test]
+fn a_continue_s_grant_that_ends_before_continued_fails_the_continue() {
+    let mut kept = made();
+    let primary = kept.state().job.primary;
+    kept.submit("start", start(primary)).unwrap();
+    let first = kept.state().attempts[0].clone();
+    kept.observe(&Observation::Started {
+        attempt: first.id,
+        generation: first.generation,
+    })
+    .unwrap();
+    let snapshot = SnapshotId::of(b"cut");
+    let the_cut = cut(kept.state(), snapshot);
+    kept.observe(&Observation::Checkpointed {
+        attempt: first.id,
+        generation: first.generation,
+        snapshot,
+        cut: the_cut,
+    })
+    .unwrap();
+    let t = kept
+        .submit(
+            "continue",
+            Command::Continue {
+                task: primary,
+                fidelity: AllowedFidelity::DEFAULT,
+                pin: None,
+            },
+        )
+        .unwrap();
+    let ManagedEvent::CommandAccepted {
+        operation: cont, ..
+    } = t.events[0]
+    else {
+        panic!("no accept");
+    };
+    kept.mark(cont, OperationMark::Dispatched).unwrap();
+    kept.observe(&Observation::Placed {
+        operation: cont,
+        task: primary,
+        decision: PlacementDecision {
+            kind: PlacementKind::PlannedHandoff,
+            decided_at_ms: 1,
+            candidates: Vec::new(),
+            chosen: Some(NODE),
+        },
+    })
+    .unwrap();
+    let second = kept.state().attempts[1].clone();
+    assert_eq!(second.granted_by, cont);
+    kept.observe(&Observation::Started {
+        attempt: second.id,
+        generation: second.generation,
+    })
+    .unwrap();
+    kept.observe(&Observation::Exited {
+        attempt: second.id,
+        generation: second.generation,
+        outcome: ExitOutcome::Failed { code: None },
+    })
+    .unwrap();
+    assert_eq!(
+        kept.state().operation(cont).unwrap().status,
+        OperationStatus::Failed
+    );
+    assert_eq!(kept.state().task(primary).unwrap().state, TaskState::Open);
+    // The task takes another continue.
+    kept.submit(
+        "continue-2",
+        Command::Continue {
+            task: primary,
+            fidelity: AllowedFidelity::DEFAULT,
+            pin: None,
+        },
+    )
+    .unwrap();
     kept.replays();
 }
 
@@ -609,7 +838,7 @@ proptest! {
                     kind: TaskKind::Child { label: key.clone() },
                     restart: RestartPolicy::Block,
                     class: TaskClass::Build,
-                    program: None,
+                    program: Some(program(&["cargo", "build"])),
                 }),
                 Step::Finish(which) => {
                     let task = s.tasks[usize::from(which) % s.tasks.len()].id;
