@@ -28,7 +28,7 @@ use fabric_client::facade::{Bearer, ClientMessage, Submit};
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
-use fabric_core::managed::{EventSeq, OperationKey, TaskId, WorkRevision};
+use fabric_core::managed::{AttemptId, EventSeq, OperationKey, TaskId, WorkRevision};
 use fabric_core::path::RelPath;
 
 use crate::{Notes, ask, contract, harness_arg, repository, system_path};
@@ -261,6 +261,47 @@ pub(crate) enum ManagedCommand {
         /// The one node the new attempt may run on.
         #[arg(long)]
         pin: Option<NodeId>,
+        /// Refuse unless the job is at this revision.
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
+        expected_revision: Option<WorkRevision>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
+    },
+    /// Take the grant from the job's unknown attempt and grant nothing; its writes are refused from then on.
+    Supersede {
+        /// The job.
+        job: JobId,
+        /// The unknown attempt; the job's live attempt without it.
+        #[arg(long)]
+        attempt: Option<AttemptId>,
+        /// Why, for the history.
+        #[arg(
+            long,
+            default_value = "superseded by the operator",
+            value_name = "TEXT"
+        )]
+        reason: String,
+        /// Refuse unless the job is at this revision.
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
+        expected_revision: Option<WorkRevision>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
+    },
+    /// Recover the job's unknown attempt from an acknowledged checkpoint on another node, whatever its policy.
+    Recover {
+        /// The job.
+        job: JobId,
+        /// The unknown attempt; the job's live attempt without it.
+        #[arg(long)]
+        attempt: Option<AttemptId>,
+        /// The acknowledged checkpoint to start from; the job's newest without it.
+        #[arg(long, value_name = "SNAPSHOT")]
+        from: Option<SnapshotId>,
+        /// Why, for the history.
+        #[arg(long, default_value = "recovered by the operator", value_name = "TEXT")]
+        reason: String,
         /// Refuse unless the job is at this revision.
         #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
@@ -659,6 +700,34 @@ fn request(command: ManagedCommand, notes: Notes) -> Result<(Request, Option<Ope
             expected_revision,
             fidelity: (!allow_fidelity.is_empty()).then_some(allow_fidelity),
             pin,
+        },
+        ManagedCommand::Supersede {
+            job,
+            attempt,
+            reason,
+            expected_revision,
+            operation_key,
+        } => Request::ManagedSupersede {
+            operation_key: key_for(operation_key, notes, &mut minted)?,
+            job,
+            expected_revision,
+            attempt,
+            reason,
+        },
+        ManagedCommand::Recover {
+            job,
+            attempt,
+            from,
+            reason,
+            expected_revision,
+            operation_key,
+        } => Request::ManagedRecover {
+            operation_key: key_for(operation_key, notes, &mut minted)?,
+            job,
+            expected_revision,
+            attempt,
+            from,
+            reason,
         },
         ManagedCommand::Inspect { job } => Request::ManagedInspect { job },
         ManagedCommand::Import { dir, export } => Request::ManagedImport {

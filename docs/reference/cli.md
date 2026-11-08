@@ -556,6 +556,8 @@ Commands:
   register    Register a build or test task with the program it runs under a task of a job
   checkpoint  Take a checkpoint cut of the job's live attempt; the attempt goes on
   continue    Continue the job on a newly placed attempt: a quiescence, a cut, a placement
+  supersede   Take the grant from the job's unknown attempt and grant nothing; its writes are refused from then on
+  recover     Recover the job's unknown attempt from an acknowledged checkpoint on another node, whatever its policy
   inspect     Everything the journal holds about a job: placements, continuations, notes, provider operations
   import      Capture a directory on this node into a snapshot a job can start from, untouched
   status      One managed job: its revision, state, tasks and attempts
@@ -745,6 +747,58 @@ Examples:
     fabric managed continue <JOB> --pin <NODE>
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-continue
+```
+
+#### `fabric managed supersede`
+
+```text
+Usage: fabric managed supersede [OPTIONS] <JOB>
+Take the grant from the job's unknown attempt and grant nothing; its writes are refused from then on
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --attempt <ATTEMPT>             The unknown attempt; the job's live attempt without it
+      --expected-revision <REVISION>  Refuse unless the job is at this revision
+      --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
+      --reason <TEXT>                 Why, for the history [default: "superseded by the operator"]
+
+Global Options: See `fabric --help`
+
+Examples:
+  Take the grant from the job's unknown attempt
+    fabric managed supersede <JOB> --reason <TEXT>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-supersede
+```
+
+#### `fabric managed recover`
+
+```text
+Usage: fabric managed recover [OPTIONS] <JOB>
+Recover the job's unknown attempt from an acknowledged checkpoint on another node, whatever its policy
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --attempt <ATTEMPT>             The unknown attempt; the job's live attempt without it
+      --expected-revision <REVISION>  Refuse unless the job is at this revision
+      --from <SNAPSHOT>               The acknowledged checkpoint to start from; the job's newest without it
+      --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
+      --reason <TEXT>                 Why, for the history [default: "recovered by the operator"]
+
+Global Options: See `fabric --help`
+
+Examples:
+  Recover the unknown attempt from the newest acknowledged checkpoint
+    fabric managed recover <JOB>
+
+  Recover a named attempt from a named checkpoint
+    fabric managed recover <JOB> --attempt <ATTEMPT> --from <SNAPSHOT>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-recover
 ```
 
 #### `fabric managed inspect`

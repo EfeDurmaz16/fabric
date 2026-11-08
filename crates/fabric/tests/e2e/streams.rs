@@ -44,6 +44,15 @@ const ELSEWHERE: &[(&str, &str)] = &[
         "managed continue",
         "launch.rs: e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package",
     ),
+    // A supersede and a recover need an attempt the authority lost.
+    (
+        "managed supersede",
+        "partition.rs: captured_but_not_acknowledged_is_never_restarted_and_says_why",
+    ),
+    (
+        "managed recover",
+        "partition.rs: block_policy_waits_until_an_operator_recovers",
+    ),
     (
         "facade checkpoint",
         "placement.rs: e2e_a_submit_runs_on_the_eligible_node_without_naming_it",

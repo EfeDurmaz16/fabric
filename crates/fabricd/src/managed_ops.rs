@@ -273,6 +273,83 @@ impl Node {
                     .await?;
                 Ok(Reply::ManagedContinue(Box::new(operation)))
             }
+            Request::ManagedSupersede {
+                operation_key,
+                job,
+                expected_revision,
+                attempt,
+                reason,
+            } => {
+                let request = request_digest(&[
+                    b"supersede",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                    &attempt.map(|a| a.to_bytes().to_vec()).unwrap_or_default(),
+                    reason.as_bytes(),
+                ]);
+                let key = operation_key.clone();
+                let operation = self
+                    .managed_submit_derived(operation_key, request, job, move |state| {
+                        let attempt = unknown_or_named(state, attempt, job, &key)?;
+                        Ok(Envelope {
+                            key,
+                            job: Some(job),
+                            expected: expected_revision,
+                            body: Command::Supersede { attempt, reason },
+                        })
+                    })
+                    .await?;
+                Ok(Reply::ManagedSupersede(Box::new(operation)))
+            }
+            Request::ManagedRecover {
+                operation_key,
+                job,
+                expected_revision,
+                attempt,
+                from,
+                reason,
+            } => {
+                let request = request_digest(&[
+                    b"recover",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                    &attempt.map(|a| a.to_bytes().to_vec()).unwrap_or_default(),
+                    &from.map(|f| f.to_bytes().to_vec()).unwrap_or_default(),
+                    reason.as_bytes(),
+                ]);
+                let key = operation_key.clone();
+                let operation = self
+                    .managed_submit_derived(operation_key, request, job, move |state| {
+                        let attempt = unknown_or_named(state, attempt, job, &key)?;
+                        // The job's newest acknowledged checkpoint unless one
+                        // is named; the domain refuses one not acknowledged.
+                        let from = from
+                            .or_else(|| state.acknowledged().first().map(|a| a.snapshot))
+                            .ok_or_else(|| {
+                                refused(
+                                    Reason::ManagedRefused {
+                                        refusal: "not_acknowledged".into(),
+                                        job: Some(job),
+                                        operation_key: key.clone(),
+                                        replayed: false,
+                                    },
+                                    "the job has no acknowledged checkpoint to recover from",
+                                )
+                            })?;
+                        Ok(Envelope {
+                            key,
+                            job: Some(job),
+                            expected: expected_revision,
+                            body: Command::Recover {
+                                attempt,
+                                from,
+                                reason,
+                            },
+                        })
+                    })
+                    .await?;
+                Ok(Reply::ManagedRecover(Box::new(operation)))
+            }
             Request::ManagedInspect { job } => {
                 Ok(Reply::ManagedInspect(Box::new(self.inspect(job).await?)))
             }
@@ -382,4 +459,27 @@ impl Node {
                 )
             })
     }
+}
+
+/// The attempt an operator's supersede or recover names, or the job's
+/// live attempt; the domain refuses one that is not `unknown`.
+fn unknown_or_named(
+    state: &fabric_core::managed::ManagedState,
+    attempt: Option<fabric_core::managed::AttemptId>,
+    job: fabric_core::id::JobId,
+    key: &fabric_core::managed::OperationKey,
+) -> Result<fabric_core::managed::AttemptId, NodeError> {
+    attempt
+        .or_else(|| state.live_attempt().map(|a| a.id))
+        .ok_or_else(|| {
+            refused(
+                Reason::ManagedRefused {
+                    refusal: "not_live".into(),
+                    job: Some(job),
+                    operation_key: key.clone(),
+                    replayed: false,
+                },
+                "the job has no live attempt",
+            )
+        })
 }

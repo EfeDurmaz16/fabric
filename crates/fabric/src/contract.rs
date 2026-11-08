@@ -302,6 +302,26 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
         )],
     ),
     (
+        "managed supersede",
+        &[(
+            "Take the grant from the job's unknown attempt",
+            "fabric managed supersede <JOB> --reason <TEXT>",
+        )],
+    ),
+    (
+        "managed recover",
+        &[
+            (
+                "Recover the unknown attempt from the newest acknowledged checkpoint",
+                "fabric managed recover <JOB>",
+            ),
+            (
+                "Recover a named attempt from a named checkpoint",
+                "fabric managed recover <JOB> --attempt <ATTEMPT> --from <SNAPSHOT>",
+            ),
+        ],
+    ),
+    (
         "managed inspect",
         &[(
             "Read the job's placements and continuations",

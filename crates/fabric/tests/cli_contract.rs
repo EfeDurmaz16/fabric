@@ -148,6 +148,8 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "actor" | "ACTOR" => "e2e".to_owned(),
         "token_id" | "TOKEN_ID" => "01JABCDEFGHJKMNPQRSTVWXYZ1".to_owned(),
         "parent" | "TASK" => "01JABCDEFGHJKMNPQRSTVWXYZ2".to_owned(),
+        "ATTEMPT" => "01JABCDEFGHJKMNPQRSTVWXYZ4".to_owned(),
+        "SNAPSHOT" => "cd".repeat(32),
         "class" => "build".to_owned(),
         "argv" => "true".to_owned(),
         "ttl_ms" => "60000".to_owned(),

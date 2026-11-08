@@ -187,6 +187,8 @@ impl Node {
             | Request::ManagedRegister { .. }
             | Request::ManagedCheckpoint { .. }
             | Request::ManagedContinue { .. }
+            | Request::ManagedSupersede { .. }
+            | Request::ManagedRecover { .. }
             | Request::ManagedInspect { .. }
             | Request::ManagedImport { .. }
             | Request::FacadeMint { .. }

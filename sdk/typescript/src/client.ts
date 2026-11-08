@@ -47,6 +47,8 @@ import {
   type JobCreated,
   type JobId,
   type TaskId,
+  type AttemptId,
+  type SnapshotId,
   type JobList,
   type JobLog,
   type JobStatus,
@@ -416,6 +418,37 @@ export class FabricClient {
   ): Promise<ManagedOperation> {
     const expected_revision = expectedRevision;
     return this.call({ op: "managed_checkpoint", operation_key, job, expected_revision }, options);
+  }
+
+  /**
+   * Takes the grant away from a managed job's `unknown` attempt and grants
+   * nothing (ADR 0028); the job's live attempt when none is named.
+   */
+  managedSupersede(
+    operation_key: OperationKey,
+    job: JobId,
+    choice: { expectedRevision?: Counter; attempt?: AttemptId; reason?: string } = {},
+    options?: CallOptions,
+  ): Promise<ManagedOperation> {
+    const { expectedRevision: expected_revision, attempt } = choice;
+    const reason = choice.reason ?? "superseded by the operator";
+    return this.call({ op: "managed_supersede", operation_key, job, expected_revision, attempt, reason }, options);
+  }
+
+  /**
+   * Recovers a managed job's `unknown` attempt from an acknowledged
+   * checkpoint as a failover on another node, whatever its policy (ADR
+   * 0028); the job's newest acknowledged checkpoint when none is named.
+   */
+  managedRecover(
+    operation_key: OperationKey,
+    job: JobId,
+    choice: { expectedRevision?: Counter; attempt?: AttemptId; from?: SnapshotId; reason?: string } = {},
+    options?: CallOptions,
+  ): Promise<ManagedOperation> {
+    const { expectedRevision: expected_revision, attempt, from } = choice;
+    const reason = choice.reason ?? "recovered by the operator";
+    return this.call({ op: "managed_recover", operation_key, job, expected_revision, attempt, from, reason }, options);
   }
 
   /** Continues a managed job on a newly placed attempt (M5). */
