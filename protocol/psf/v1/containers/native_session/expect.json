@@ -3,7 +3,7 @@
   "summary": "A manifest and the one blob it names, present and matching.",
   "expect": {
     "outcome": "accept",
-    "digest": "bc580de7c3540c96290ac0e18bb226ce823f3d4a9175fe706a2df1b85a4735e7",
+    "digest": "2ce91e0bbae3bd72301be195315bbd25baebfd7b623a66674736851e62b337c5",
     "detached": []
   }
 }
