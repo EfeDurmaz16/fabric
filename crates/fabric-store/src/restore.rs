@@ -8,7 +8,10 @@
 //! outlives its process is the sign of a restore that did not finish. A
 //! staging directory is removed only when it holds the owner file restore
 //! writes into it first; a directory of that name that restore did not
-//! make is refused, never deleted.
+//! make is refused, never deleted. A request may carry a label, which
+//! restore writes beside the owner file before any tree, so a staging
+//! directory a crash leaves says whose it is without any journal
+//! (docs/concepts/residuals.md).
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -46,6 +49,15 @@ const STAGING_MAGIC: &[u8] = b"fabric restore staging, v1\n";
 /// The directory inside the staging directory that is renamed onto the target.
 const STAGING_TREE: &str = "tree";
 
+/// The file beside the owner file that holds the request's label, when it carries one.
+pub const STAGING_LABEL: &str = "fabric-label";
+
+/// The staging directory a restore of `target` writes into: `<target>.fabric-restoring`.
+#[must_use]
+pub fn staging_dir(target: &Path) -> Option<PathBuf> {
+    staging_path(target).ok()
+}
+
 /// How much of the written tree is re-read against the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verify {
@@ -80,6 +92,9 @@ pub struct RestoreRequest<'a> {
     pub durability: Durability,
     /// Decides per cache row whether its bytes are written (ADR 0012); a `NotCarried` row never is.
     pub carry: &'a dyn Fn(&CacheEntry) -> bool,
+    /// Who the restore is for, written into each staging directory as
+    /// [`STAGING_LABEL`] before any tree; opaque to the store.
+    pub label: Option<&'a [u8]>,
 }
 
 /// Files and bytes written for one class of path.
@@ -468,7 +483,11 @@ fn refuse_nested(target: &Path, harness_state: &Path) -> Result<(), RestoreError
 /// tree exists, so a staging directory that holds anything restore wrote
 /// also holds the proof that restore made it. A directory of the staging
 /// name without that proof is `ForeignStaging`.
-fn fresh_staging(target: &Path, durability: Durability) -> Result<PathBuf, RestoreError> {
+fn fresh_staging(
+    target: &Path,
+    durability: Durability,
+    label: Option<&[u8]>,
+) -> Result<PathBuf, RestoreError> {
     let staging = staging_path(target)?;
     match fs::symlink_metadata(&staging) {
         Ok(_) => {
@@ -491,6 +510,18 @@ fn fresh_staging(target: &Path, durability: Durability) -> Result<PathBuf, Resto
         .map_err(|e| io_err(&owner, e))?;
     file.write_all(STAGING_MAGIC)
         .map_err(|e| io_err(&owner, e))?;
+    if let Some(label) = label {
+        let path = staging.join(STAGING_LABEL);
+        let mut written = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| io_err(&path, e))?;
+        written.write_all(label).map_err(|e| io_err(&path, e))?;
+        if durability == Durability::PowerLoss {
+            rustix::fs::fsync(&written).map_err(|e| io_err(&path, e.into()))?;
+        }
+    }
     if durability == Durability::PowerLoss {
         rustix::fs::fsync(&file).map_err(|e| io_err(&owner, e.into()))?;
         rustix::fs::fsync(fs::File::open(&staging).map_err(|e| io_err(&staging, e))?)
@@ -511,8 +542,12 @@ fn move_into_place(tree: &Path, target: &Path) -> Result<(), RestoreError> {
     // directory a kill leaves here holds the owner file or nothing, and
     // `restore_state` and the next `fresh_staging` both know it for what it is.
     if let Some(staging) = tree.parent() {
-        let removed =
-            fs::remove_file(staging.join(STAGING_OWNER)).and_then(|()| fs::remove_dir(staging));
+        let label = staging.join(STAGING_LABEL);
+        let removed = match fs::remove_file(&label) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => fs::remove_file(staging.join(STAGING_OWNER)),
+        }
+        .and_then(|()| fs::remove_dir(staging));
         if let Err(e) = removed {
             tracing::warn!(path = %staging.display(), error = %e, "could not remove a finished staging directory");
         }
@@ -1621,7 +1656,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
         Some(dir) => harness_state_complete(store, &manifest.harness_state, dir)?,
         None => None,
     };
-    let staging = fresh_staging(req.target, req.durability)?;
+    let staging = fresh_staging(req.target, req.durability, req.label)?;
     let writer = TreeWriter::open(&staging)?;
     let mut report = RestoreReport::default();
 
@@ -1671,7 +1706,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
             report.verified += verified;
         }
         (Some(dir), None) => {
-            let hs_staging = fresh_staging(dir, req.durability)?;
+            let hs_staging = fresh_staging(dir, req.durability, req.label)?;
             let hs_writer = TreeWriter::open(&hs_staging)?;
             let keep_all = |_: &RelPath| false;
             let mut harness = Written::default();
