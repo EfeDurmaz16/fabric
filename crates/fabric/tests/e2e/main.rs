@@ -13,17 +13,20 @@
 //! job work touches, with no budget, and `ab` compares two builds of
 //! `fabric` op by op on the same fixture. `acp_cli` and `preflight` hold the
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
-//! acceptance tests, and `legacy` loads a state directory frozen from main.
+//! acceptance tests, `facade` the M5 facade and placement acceptance tests,
+//! and `legacy` loads a state directory frozen from main.
 
 mod ab;
 mod acp_cli;
 mod bench;
 mod budget;
 mod client;
+mod facade;
 mod headless;
 mod legacy;
 mod managed;
 mod partition;
+mod placement;
 mod preflight;
 mod relay;
 mod terminal;

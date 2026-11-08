@@ -10,8 +10,11 @@ use std::process::{Command as Process, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fabric_core::id::{NodeId, SnapshotId};
+use fabric_core::managed::placement::{PlacementDecision, PlacementKind};
 use fabric_core::managed::{
-    AttemptStatus, DomainError, OperationMark, OperationStatus, StoredResult,
+    AllowedFidelity, AttemptStatus, CheckpointCut, Command, DomainError, Observation,
+    OperationMark, OperationStatus, StoredResult,
 };
 
 use super::tests::{NODE, accepted, count, create, envelope, ids, start};
@@ -53,6 +56,23 @@ fn crash_child() {
             // The effect: reached only when the dispatch is durable.
             std::fs::write(dir.join(EFFECT), "launched").unwrap();
         }
+        "place" => {
+            let job = ids(1).job;
+            let primary = journal.job(job).unwrap().unwrap().job.primary;
+            journal
+                .observe_authority(job, &placed(ids(1).operation, primary, Some(NODE)), 3_000)
+                .unwrap();
+            // The launch: reached only when the placement is durable.
+            std::fs::write(dir.join(EFFECT), "launched").unwrap();
+        }
+        "continue-cut" => {
+            let job = ids(1).job;
+            let attempt = journal.job(job).unwrap().unwrap().attempts[0].clone();
+            journal
+                .observe_authority(job, &checkpointed(&attempt, b"cut"), 3_000)
+                .unwrap();
+            std::fs::write(dir.join(EFFECT), "placed").unwrap();
+        }
         other => panic!("unknown mode {other}"),
     }
     panic!("the child did not reach its crash point");
@@ -91,6 +111,78 @@ fn run_child_and_kill(dir: &Path, mode: &str, point: &str) {
         !child.wait().unwrap().success(),
         "{point}: the child was not killed"
     );
+}
+
+fn placed(
+    operation: fabric_core::managed::OperationId,
+    task: fabric_core::managed::TaskId,
+    chosen: Option<NodeId>,
+) -> Observation {
+    Observation::Placed {
+        operation,
+        task,
+        decision: PlacementDecision {
+            kind: PlacementKind::Initial,
+            decided_at_ms: 1,
+            candidates: Vec::new(),
+            chosen,
+        },
+    }
+}
+
+fn checkpointed(attempt: &fabric_core::managed::Attempt, name: &[u8]) -> Observation {
+    let snapshot = SnapshotId::of(name);
+    Observation::Checkpointed {
+        attempt: attempt.id,
+        generation: attempt.generation,
+        snapshot,
+        cut: CheckpointCut {
+            snapshot,
+            receipts: Vec::new(),
+            facts: Vec::new(),
+            evidence: Vec::new(),
+        },
+    }
+}
+
+/// A journal with the job of `ids(1)` placed on `NODE`, its first attempt
+/// started, and a `Continue` of `ids(3)` accepted and dispatched.
+fn journal_with_continue(dir: &Path) -> Journal {
+    let mut journal = journal_with_job(dir, false);
+    let job = ids(1).job;
+    let primary = journal.job(job).unwrap().unwrap().job.primary;
+    journal
+        .observe_authority(job, &placed(ids(1).operation, primary, Some(NODE)), 10)
+        .unwrap();
+    let attempt = journal.job(job).unwrap().unwrap().attempts[0].clone();
+    journal
+        .observe_authority(
+            job,
+            &Observation::Started {
+                attempt: attempt.id,
+                generation: attempt.generation,
+            },
+            11,
+        )
+        .unwrap();
+    journal
+        .submit(
+            &envelope(
+                "continue",
+                Some(job),
+                Command::Continue {
+                    task: primary,
+                    fidelity: AllowedFidelity::DEFAULT,
+                    pin: None,
+                },
+            ),
+            ids(3),
+        )
+        .unwrap();
+    journal
+        .mark_authority(job, ids(3).operation, OperationMark::Dispatched, 12)
+        .unwrap();
+    journal
 }
 
 /// A journal with the job of `ids(1)`, and with the grant of `ids(2)` when `grant`.
@@ -217,4 +309,105 @@ fn a_dispatch_killed_between_its_commit_and_its_effect_is_never_replayed() {
         journal.mark_authority(job, ids(2).operation, OperationMark::Dispatched, 4_001),
         Err(CommitError::Domain(DomainError::OperationState { .. }))
     ));
+}
+
+#[test]
+fn a_placement_killed_after_its_commit_never_places_or_launches_again() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(journal_with_job(dir.path(), false));
+    run_child_and_kill(dir.path(), "place", "placement.after_commit");
+    assert!(!dir.path().join(EFFECT).exists(), "the launch did not run");
+    let mut journal = Journal::open(&dir.path().join(FILE_NAME)).unwrap();
+    journal.verify().unwrap();
+    let job = ids(1).job;
+    let recovery = journal.recover(4_000, |_| Liveness::CannotTell).unwrap();
+    // The create was dispatched by the placement; its launch may have
+    // happened, so it is unknown, offered to no one, and the attempt stays.
+    assert_eq!(recovery.unknown, vec![(job, ids(1).operation)]);
+    assert!(recovery.to_effect.is_empty());
+    assert!(recovery.to_dispatch.is_empty());
+    let state = journal.job(job).unwrap().unwrap();
+    assert_eq!(state.attempts.len(), 1);
+    assert_eq!(state.attempts[0].status, AttemptStatus::Granted);
+    assert_eq!(journal.placements(job).unwrap().len(), 1);
+    let primary = state.job.primary;
+    assert!(matches!(
+        journal.observe_authority(job, &placed(ids(1).operation, primary, Some(NODE)), 4_001),
+        Err(CommitError::Domain(DomainError::OperationState { .. }))
+    ));
+    let refused = journal
+        .submit(&envelope("start-again", Some(job), start(primary)), ids(5))
+        .unwrap();
+    assert!(matches!(
+        refused.result,
+        StoredResult::Rejected(DomainError::AttemptStillLive { .. })
+    ));
+}
+
+#[test]
+fn a_continue_killed_after_its_cut_is_retried_from_the_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(journal_with_continue(dir.path()));
+    run_child_and_kill(dir.path(), "continue-cut", "continue.after_cut");
+    assert!(
+        !dir.path().join(EFFECT).exists(),
+        "the placement did not run"
+    );
+    let mut journal = Journal::open(&dir.path().join(FILE_NAME)).unwrap();
+    journal.verify().unwrap();
+    let job = ids(1).job;
+    let recovery = journal.recover(4_000, |_| Liveness::CannotTell).unwrap();
+    assert_eq!(recovery.unknown, vec![(job, ids(3).operation)]);
+    let state = journal.job(job).unwrap().unwrap();
+    let snapshot = SnapshotId::of(b"cut");
+    assert_eq!(
+        state.attempts[0].status,
+        AttemptStatus::Checkpointed { snapshot }
+    );
+    assert_eq!(journal.receipts(state.attempts[0].id).unwrap(), Vec::new());
+    // The owner's retry under a new key converges: nothing is live, nothing
+    // is in flight, and the placement starts from the cut.
+    let primary = state.job.primary;
+    let again = journal
+        .submit(
+            &envelope(
+                "continue-2",
+                Some(job),
+                Command::Continue {
+                    task: primary,
+                    fidelity: AllowedFidelity::DEFAULT,
+                    pin: None,
+                },
+            ),
+            ids(6),
+        )
+        .unwrap();
+    assert!(matches!(again.result, StoredResult::Accepted(_)));
+    let recovery = journal.recover(4_002, |_| Liveness::CannotTell).unwrap();
+    assert_eq!(
+        recovery.to_effect,
+        vec![(
+            job,
+            ids(6).operation,
+            fabric_core::managed::CommandKind::Continue
+        )]
+    );
+    journal
+        .mark_authority(job, ids(6).operation, OperationMark::Dispatched, 4_003)
+        .unwrap();
+    let decision = Observation::Placed {
+        operation: ids(6).operation,
+        task: primary,
+        decision: PlacementDecision {
+            kind: PlacementKind::PlannedHandoff,
+            decided_at_ms: 2,
+            candidates: Vec::new(),
+            chosen: Some(NODE),
+        },
+    };
+    journal.observe_authority(job, &decision, 4_004).unwrap();
+    let state = journal.job(job).unwrap().unwrap();
+    assert_eq!(state.attempts[1].initial_checkpoint, Some(snapshot));
+    assert_eq!(state.attempts[1].generation.get(), 2);
+    journal.verify().unwrap();
 }

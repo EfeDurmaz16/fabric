@@ -1,0 +1,5 @@
+commit: 3755e5ac783869b8455124df44dceb3b6178e5c5
+fabricd processes before: 0 (pgrep -x fabric)
+load before: { 7.62 8.76 7.88 }
+load after: { 9.03 9.03 8.00 }
+fabricd processes after: 0

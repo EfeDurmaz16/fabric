@@ -8,8 +8,8 @@ use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
     AttemptStatus, CheckpointAck, Command, CoveredPath, CutDigest, DomainError, Envelope,
     FenceVerdict, Generation, GrantToken, Intent, JobPolicy, ManagedEvent, NewIds, Observation,
-    OperationKey, OperationMark, OperationStatus, RecoveryPolicy, ResourceRef, RestartPolicy,
-    SourceBinding, StoredResult, TaskState, WorkRevision,
+    OperationKey, OperationMark, OperationStatus, ResourceRef, RestartPolicy, SourceBinding,
+    StoredResult, TaskState, WorkRevision,
 };
 use fabric_core::path::AbsPath;
 use rusqlite::Connection;
@@ -80,14 +80,12 @@ pub(crate) fn create() -> Command {
         intent: Intent {
             goal: "make the greeting louder".into(),
             harness: HarnessKind::Codex,
+            acceptance: Vec::new(),
         },
         source: SourceBinding::Repository {
             path: AbsPath::parse("/src/repo").unwrap(),
         },
-        policy: JobPolicy {
-            restart: RestartPolicy::ExplicitOnly,
-            recovery: RecoveryPolicy::Block,
-        },
+        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
     }
 }
 
@@ -256,7 +254,8 @@ fn a_restart_keeps_identity_and_progress_and_makes_a_dispatch_unknown() {
         refused.result,
         StoredResult::Rejected(DomainError::AttemptStillLive { .. })
     ));
-    // A second recovery changes nothing more.
+    // A second recovery changes nothing more; the explicit grant stood in
+    // for the create's initial placement, so no effect waits.
     let again = f.journal.recover(4_000, |_| Liveness::CannotTell).unwrap();
     assert_eq!(again, Recovery::default());
     // The executor's late report settles it.
@@ -412,11 +411,18 @@ fn events_and_evidence_are_append_only_and_tampering_is_found() {
                 attempt: attempt.id,
                 generation: attempt.generation,
                 snapshot,
+                cut: fabric_core::managed::CheckpointCut {
+                    snapshot,
+                    receipts: Vec::new(),
+                    facts: Vec::new(),
+                    evidence: Vec::new(),
+                },
             },
             2_000,
         )
         .unwrap();
-    assert_eq!(count(&f.path(), "evidence"), 1);
+    // The snapshot's evidence row and the cut's.
+    assert_eq!(count(&f.path(), "evidence"), 2);
 
     let conn = Connection::open(f.path()).unwrap();
     assert!(conn.execute("UPDATE events SET at_ms = 0", []).is_err());
@@ -520,10 +526,7 @@ fn a_draft_version_2_journal_is_refused_at_open() {
     drop(conn);
     assert!(matches!(
         Journal::open(&path),
-        Err(OpenError::DraftSchema {
-            version: 2,
-            amendment: "m4"
-        })
+        Err(OpenError::DraftSchema { version: 2 })
     ));
 }
 
@@ -591,7 +594,7 @@ fn running(f: &mut Fixture) -> (JobId, GrantToken) {
 
 fn captured(f: &mut Fixture, token: &GrantToken, n: u8) -> (SnapshotId, CutDigest) {
     let snapshot = SnapshotId::of(&[n; 3]);
-    let cut = CutDigest::of(&[n; 5]);
+    let cut = CutDigest::from_bytes([n; 32]);
     f.journal
         .observe(
             token,

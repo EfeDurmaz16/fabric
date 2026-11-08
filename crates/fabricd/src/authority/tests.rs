@@ -41,14 +41,12 @@ fn create(key: &str) -> Envelope<Command> {
             intent: Intent {
                 goal: "make the greeting louder".into(),
                 harness: HarnessKind::Codex,
+                acceptance: Vec::new(),
             },
             source: SourceBinding::Repository {
                 path: AbsPath::parse("/src/repo").unwrap(),
             },
-            policy: JobPolicy {
-                restart: RestartPolicy::ExplicitOnly,
-                recovery: RecoveryPolicy::Block,
-            },
+            policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
         },
     }
 }
@@ -519,7 +517,7 @@ async fn presence_marks_overdue_on_the_authority_clock_and_writes_no_heartbeat()
 /// acknowledgement is what recovery reads).
 async fn acknowledged(authority: &Authority, job: JobId, token: GrantToken) -> SnapshotId {
     let snapshot = SnapshotId::of(b"the runner's checkpoint");
-    let cut = CutDigest::of(b"its cut");
+    let cut = CutDigest::from_bytes([0x1c; 32]);
     authority
         .report(
             token,

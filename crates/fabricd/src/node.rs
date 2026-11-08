@@ -215,6 +215,7 @@ impl Node {
         // The authority's clock (ADR 0028): a tick every heartbeat
         // interval; nothing runs while no managed job exists.
         tokio::spawn(self.authority.clone().run_ticker());
+        tokio::spawn(crate::dispatch::run(Arc::clone(&self)));
         loop {
             tokio::select! {
                 accepted = self.endpoint.accept() => match accepted {

@@ -34,6 +34,12 @@ pub(crate) const ENVELOPE_ALLOWANCE: usize = 1024;
 /// is as long as the ledger allows, always fits with its envelope.
 pub const MAX_CONTROL_FRAME: usize = crate::wire::MAX_RECORD_PAGE + ENVELOPE_ALLOWANCE;
 
+/// The most bytes a frame that carries a facade answer may take: the
+/// answer's bound (ADR 0027) plus its envelope. Only the answer to
+/// `RequestBody::Facade` is read under it; every other control message
+/// keeps `MAX_CONTROL_FRAME`.
+pub const MAX_FACADE_FRAME: usize = crate::wire::MAX_FACADE_ANSWER + ENVELOPE_ALLOWANCE;
+
 /// The most bytes one stored chunk may take: zstd's worst case for `MAX_CHUNK_LEN`.
 pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_LEN + (MAX_CHUNK_LEN >> 8);
 

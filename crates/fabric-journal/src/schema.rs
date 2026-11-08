@@ -10,7 +10,7 @@
 pub const APPLICATION_ID: i32 = 0x4642_524A;
 
 /// The schema version this crate writes and reads.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The pragmas every connection runs before anything else.
 pub(crate) const CONNECTION_PRAGMAS: &str = "
@@ -173,20 +173,31 @@ CREATE TABLE provider_operations (
 CREATE INDEX provider_operations_by_status ON provider_operations (status, dispatched_ms);
 CREATE INDEX provider_operations_by_target ON provider_operations (target_key)
   WHERE target_key IS NOT NULL;
+";
 
--- ADR 0028 amended version 2 in place before any release: the attempt
--- status 'superseded', two projection columns on attempts, the evidence
--- kind 'checkpoint_ack' and the command kinds 'supersede' and 'recover'.
--- SQLite cannot alter a CHECK constraint, so each table is rebuilt with
--- its rows copied; the caller runs this with foreign keys off and checks
--- them before it commits. Events are not touched.
-CREATE TABLE operations_m6 (
+/// Version 3 (ADRs 0023 to 0027): the task class, the M5 command kinds,
+/// the facade tokens and the projections of placements and continuations.
+///
+/// `operations.kind` is checked against the command kinds and `SQLite`
+/// cannot widen a CHECK in place, so the table is rebuilt with the kinds
+/// `cancel_task`, `record_note`, `checkpoint` and `continue` added and
+/// every row copied; its rowids are not referenced by anything. The
+/// migration runs with foreign keys off (the documented table rebuild),
+/// and `open` runs `foreign_key_check` after it, so a dangling reference
+/// fails the open instead of hiding in the file. No event's `body` or
+/// `digest` changes: format 1 frames stay as they are and are read with
+/// their frozen shapes.
+const V3: &str = "
+ALTER TABLE tasks ADD COLUMN class TEXT NOT NULL DEFAULT 'harness'
+  CHECK (class IN ('build','test','harness','opaque'));
+
+CREATE TABLE operations_v3 (
   operation_id      BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
   op_key            TEXT NOT NULL UNIQUE,
   request_digest    BLOB NOT NULL CHECK (length(request_digest) = 32),
   job_id            BLOB REFERENCES jobs(job_id),
-  kind              TEXT NOT NULL CHECK (kind IN ('create_job','start_attempt','register_task','finish_task',
-                      'cancel_job','supersede','recover')),
+  kind              TEXT NOT NULL CHECK (kind IN ('create_job','start_attempt','register_task',
+                      'finish_task','cancel_job','cancel_task','record_note','checkpoint','continue')),
   expected_revision INTEGER,
   accepted_rev      INTEGER,
   status            TEXT NOT NULL CHECK (status IN ('accepted','dispatched','succeeded','failed','cancelled','rejected','unknown')),
@@ -196,12 +207,75 @@ CREATE TABLE operations_m6 (
   updated_ms        INTEGER NOT NULL,
   CHECK ((status = 'rejected') = (accepted_rev IS NULL))
 ) STRICT;
-INSERT INTO operations_m6 SELECT * FROM operations;
+INSERT INTO operations_v3 SELECT operation_id, op_key, request_digest, job_id, kind,
+  expected_revision, accepted_rev, status, result, first_seq, accepted_ms, updated_ms
+  FROM operations;
 DROP TABLE operations;
-ALTER TABLE operations_m6 RENAME TO operations;
+ALTER TABLE operations_v3 RENAME TO operations;
 CREATE INDEX operations_by_job ON operations (job_id, first_seq);
 
-CREATE TABLE attempts_m6 (
+CREATE TABLE facade_tokens (
+  token_id   BLOB PRIMARY KEY CHECK (length(token_id) = 16),
+  digest     BLOB NOT NULL UNIQUE CHECK (length(digest) = 32),
+  actor      TEXT NOT NULL,
+  jobs       BLOB NOT NULL,
+  resources  BLOB NOT NULL,
+  minted_ms  INTEGER NOT NULL,
+  expires_ms INTEGER NOT NULL,
+  revoked_ms INTEGER
+) STRICT;
+
+CREATE TABLE placements (
+  seq        INTEGER PRIMARY KEY REFERENCES events(seq),
+  job_id     BLOB NOT NULL REFERENCES jobs(job_id),
+  task_id    BLOB NOT NULL REFERENCES tasks(task_id),
+  kind       TEXT NOT NULL CHECK (kind IN ('initial','planned_handoff','failover')),
+  chosen     BLOB CHECK (chosen IS NULL OR length(chosen) = 32),
+  decided_ms INTEGER NOT NULL
+) STRICT;
+CREATE INDEX placements_by_job ON placements (job_id, seq);
+
+CREATE TABLE continuations (
+  attempt_id   BLOB PRIMARY KEY REFERENCES attempts(attempt_id),
+  from_attempt BLOB NOT NULL REFERENCES attempts(attempt_id),
+  achieved     TEXT NOT NULL CHECK (achieved IN ('native_session','new_native_session_with_package','workspace_only')),
+  package      BLOB CHECK (package IS NULL OR length(package) = 32),
+  seq          INTEGER NOT NULL REFERENCES events(seq)
+) STRICT;
+";
+
+/// Version 4 (ADR 0028): the attempt status `superseded`, the projection
+/// columns `last_acknowledged` and `unavailable_since_ms` on `attempts`,
+/// the evidence kind `checkpoint_ack`, and the command kinds `supersede`
+/// and `recover`. `SQLite` cannot alter a CHECK constraint, so each table
+/// is rebuilt with its rows copied, with foreign keys off as for version
+/// 3. No event's `body` or `digest` changes.
+const V4: &str = "
+CREATE TABLE operations_v4 (
+  operation_id      BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
+  op_key            TEXT NOT NULL UNIQUE,
+  request_digest    BLOB NOT NULL CHECK (length(request_digest) = 32),
+  job_id            BLOB REFERENCES jobs(job_id),
+  kind              TEXT NOT NULL CHECK (kind IN ('create_job','start_attempt','register_task',
+                      'finish_task','cancel_job','cancel_task','record_note','checkpoint','continue',
+                      'supersede','recover')),
+  expected_revision INTEGER,
+  accepted_rev      INTEGER,
+  status            TEXT NOT NULL CHECK (status IN ('accepted','dispatched','succeeded','failed','cancelled','rejected','unknown')),
+  result            BLOB NOT NULL,
+  first_seq         INTEGER,
+  accepted_ms       INTEGER NOT NULL,
+  updated_ms        INTEGER NOT NULL,
+  CHECK ((status = 'rejected') = (accepted_rev IS NULL))
+) STRICT;
+INSERT INTO operations_v4 SELECT operation_id, op_key, request_digest, job_id, kind,
+  expected_revision, accepted_rev, status, result, first_seq, accepted_ms, updated_ms
+  FROM operations;
+DROP TABLE operations;
+ALTER TABLE operations_v4 RENAME TO operations;
+CREATE INDEX operations_by_job ON operations (job_id, first_seq);
+
+CREATE TABLE attempts_v4 (
   attempt_id           BLOB PRIMARY KEY CHECK (length(attempt_id) = 16),
   task_id              BLOB NOT NULL REFERENCES tasks(task_id),
   job_id               BLOB NOT NULL REFERENCES jobs(job_id),
@@ -219,14 +293,14 @@ CREATE TABLE attempts_m6 (
   unavailable_since_ms INTEGER,
   UNIQUE (job_id, generation)
 ) STRICT;
-INSERT INTO attempts_m6 (attempt_id, task_id, job_id, generation, resource, initial_checkpoint,
+INSERT INTO attempts_v4 (attempt_id, task_id, job_id, generation, resource, initial_checkpoint,
                          granted_by, status, status_body, last_checkpoint, granted_ms, ended_ms)
   SELECT attempt_id, task_id, job_id, generation, resource, initial_checkpoint,
          granted_by, status, status_body, last_checkpoint, granted_ms, ended_ms FROM attempts;
 DROP TABLE attempts;
-ALTER TABLE attempts_m6 RENAME TO attempts;
+ALTER TABLE attempts_v4 RENAME TO attempts;
 
-CREATE TABLE evidence_m6 (
+CREATE TABLE evidence_v4 (
   evidence_id BLOB PRIMARY KEY CHECK (length(evidence_id) = 16),
   job_id      BLOB NOT NULL REFERENCES jobs(job_id),
   attempt_id  BLOB REFERENCES attempts(attempt_id),
@@ -236,9 +310,9 @@ CREATE TABLE evidence_m6 (
   digest      BLOB CHECK (digest IS NULL OR length(digest) = 32),
   seq         INTEGER NOT NULL REFERENCES events(seq)
 ) STRICT;
-INSERT INTO evidence_m6 SELECT * FROM evidence;
+INSERT INTO evidence_v4 SELECT * FROM evidence;
 DROP TABLE evidence;
-ALTER TABLE evidence_m6 RENAME TO evidence;
+ALTER TABLE evidence_v4 RENAME TO evidence;
 CREATE TRIGGER evidence_append_only_update BEFORE UPDATE ON evidence
   BEGIN SELECT RAISE(ABORT, 'evidence is append-only'); END;
 CREATE TRIGGER evidence_append_only_delete BEFORE DELETE ON evidence
@@ -250,14 +324,10 @@ CREATE TRIGGER evidence_append_only_delete BEFORE DELETE ON evidence
 pub(crate) const V2_COMPLETE: &str = "SELECT profile, effect_class, purpose, cleans, target_key,
   locator_key, searched, abandon_reason FROM provider_operations LIMIT 0";
 
-/// The `attempts` DDL of a version 2 journal amended by ADR 0028 names
-/// this status; the M4 draft of version 2 does not.
-pub(crate) const V2_M6_STATUS: &str = "'superseded'";
-
 /// `MIGRATIONS[n - 1]` takes a journal from version `n` to `n + 1`; a new
 /// journal is `V1` and then every migration. Each new version adds one
 /// here and a fixture under `tests/fixtures/v<n>.sqlite`.
-pub(crate) const MIGRATIONS: &[&str] = &[V2];
+pub(crate) const MIGRATIONS: &[&str] = &[V2, V3, V4];
 
 #[cfg(test)]
 mod tests {

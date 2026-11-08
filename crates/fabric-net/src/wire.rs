@@ -22,6 +22,7 @@ use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
 use fabric_core::managed::{AttemptId, FenceVerdict, GrantToken};
 use fabric_core::moves::MoveOffer;
+use fabric_core::path::AbsPath;
 use fabric_core::snapshot::{MAX_CHUNK_LEN, MAX_MANIFEST_LEN};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -76,6 +77,24 @@ pub const MAX_FACT_VALUE: usize = 4096;
 /// The most tools one `FactsFor` names.
 pub const MAX_TOOLS: usize = 32;
 
+/// The most bytes one facade message takes (docs/facade-protocol.md, Transport).
+pub const MAX_FACADE_MESSAGE: usize = 1 << 20;
+
+/// The most bytes one facade answer takes.
+pub const MAX_FACADE_ANSWER: usize = 16 << 20;
+
+/// The most harnesses one advert lists.
+pub const MAX_ADVERT_HARNESSES: usize = 16;
+
+/// The most secret names one `Advertise` asks about, `JobPolicy`'s bound.
+pub const MAX_SECRET_NAMES: usize = 32;
+
+/// The most bytes in a secret name, `SecretName`'s bound.
+pub const MAX_SECRET_NAME: usize = 64;
+
+/// The most bytes in a platform's `os` or `arch`.
+pub const MAX_PLATFORM_TEXT: usize = 64;
+
 /// The most a page of records may cost, counting each record as its length
 /// plus `RECORD_PREFIX`: one record of the largest size, or many small ones.
 pub const MAX_RECORD_PAGE: usize = MAX_RECORD_LEN + RECORD_PREFIX;
@@ -86,6 +105,14 @@ pub enum WireError {
     /// The bytes are not an encoding of the type, or the value cannot be encoded.
     #[error("malformed message: {0}")]
     Malformed(#[source] postcard::Error),
+    /// A list or a byte string is longer than its bound.
+    #[error("{count} items, above the {max} bound")]
+    TooMany {
+        /// How many there are.
+        count: usize,
+        /// The most allowed.
+        max: usize,
+    },
     /// Bytes follow the encoded value.
     #[error("{0} bytes follow the message")]
     Trailing(usize),
@@ -213,6 +240,143 @@ impl<const MAX: usize> fmt::Display for BoundedText<MAX> {
 
 /// The version string of the software behind a `Hello`.
 pub type VersionText = BoundedText<MAX_VERSION_LEN>;
+
+/// A secret's name in an `Advertise` and its answer: `[A-Z0-9_]{1,64}` as
+/// the policy writes it; the node that resolves it parses it again.
+pub type SecretNameText = BoundedText<MAX_SECRET_NAME>;
+
+/// A platform's `os` or `arch` in an advert.
+pub type PlatformText = BoundedText<MAX_PLATFORM_TEXT>;
+
+/// A list with a cap on its length enforced on parse and on decode.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct BoundedList<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedList<T, MAX> {
+    /// Wraps `items` if there are at most `MAX`.
+    pub fn new(items: Vec<T>) -> Result<Self, WireError> {
+        if items.len() > MAX {
+            return Err(WireError::TooMany {
+                count: items.len(),
+                max: MAX,
+            });
+        }
+        Ok(Self(items))
+    }
+
+    /// The items.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    /// The items, owned.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T, const MAX: usize> Default for BoundedList<T, MAX> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedList<T, MAX> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(Vec::<T>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<T: fmt::Debug, const MAX: usize> fmt::Debug for BoundedList<T, MAX> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// The bytes of one facade message or answer (ADR 0027): JSON the node
+/// link carries without reading, bounded on parse and on decode. Debug
+/// prints the length alone, since a message carries a bearer.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct FacadeBytes<const MAX: usize>(Vec<u8>);
+
+impl<const MAX: usize> FacadeBytes<MAX> {
+    /// Wraps `bytes` if there are at most `MAX`.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, WireError> {
+        if bytes.len() > MAX {
+            return Err(WireError::TooMany {
+                count: bytes.len(),
+                max: MAX,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// The bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The bytes, owned.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl<'de, const MAX: usize> Deserialize<'de> for FacadeBytes<MAX> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(Vec::<u8>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<const MAX: usize> fmt::Debug for FacadeBytes<MAX> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FacadeBytes({} bytes)", self.0.len())
+    }
+}
+
+/// One facade message from a client, at most `MAX_FACADE_MESSAGE` bytes.
+pub type FacadeMessage = FacadeBytes<MAX_FACADE_MESSAGE>;
+
+/// One facade answer from the authority, at most `MAX_FACADE_ANSWER` bytes.
+pub type FacadeAnswer = FacadeBytes<MAX_FACADE_ANSWER>;
+
+/// What a node advertises for one job's placement (ADR 0026): what
+/// `NodeAdvert` holds in `fabric-core`, in bounded wire forms, and the
+/// secrets of the job it cannot resolve. A version travels as its text;
+/// the asking node parses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvertWire {
+    /// The node.
+    pub node: NodeId,
+    /// Its operating system, as the facts name it.
+    pub os: PlatformText,
+    /// Its architecture, as the facts name it.
+    pub arch: PlatformText,
+    /// Each harness it has, with its version.
+    pub harnesses: BoundedList<(HarnessKind, VersionText), MAX_ADVERT_HARNESSES>,
+    /// The user's home on it.
+    pub home: AbsPath,
+    /// The job's root as it would be on it.
+    pub root: AbsPath,
+    /// The 1-minute load average in thousandths.
+    pub load_1m_milli: u32,
+    /// The free bytes of the store's volume.
+    pub free_disk_bytes: u64,
+    /// Whether its store holds the job's bundle chain.
+    pub bundle_chain: bool,
+    /// Whether it holds the job's workspace.
+    pub workspace: bool,
+    /// When it measured these, Unix milliseconds on its clock.
+    pub measured_at_ms: u64,
+    /// The secrets asked about that it cannot resolve now.
+    pub secrets_unresolved: BoundedList<SecretNameText, MAX_SECRET_NAMES>,
+}
 
 /// The text a `Fault` carries.
 pub type FaultText = BoundedText<MAX_FAULT_TEXT>;
@@ -569,6 +733,23 @@ pub enum RequestBody {
         /// need no process and the ACP ones.
         tools: Tools,
     },
+    /// Asks the peer for its advert for a job's placement (ADR 0026);
+    /// answered with `Advert`. Protocol 4, unshipped.
+    Advertise {
+        /// The job.
+        job: JobId,
+        /// The harness the job's primary task runs under.
+        harness: HarnessKind,
+        /// The job's root on the asking node, for the layout the peer would have.
+        root: AbsPath,
+        /// The snapshot the job would start from or continue, for the peer's warmth.
+        snapshot: Option<SnapshotId>,
+        /// The secrets the job's policy names, for the peer's resolver.
+        secrets: BoundedList<SecretNameText, MAX_SECRET_NAMES>,
+    },
+    /// One facade message for the peer's authority (ADR 0027), carried
+    /// without being read; answered with `Facade`. Protocol 4, unshipped.
+    Facade(FacadeMessage),
     /// A per-job message for a managed job, under the grant the sender
     /// acts under (ADR 0028). An epoch is never written for a managed job,
     /// so the grant takes the epoch's place; the receiver's authority runs
@@ -785,6 +966,10 @@ pub enum ResponseBody {
     Fault(Fault),
     /// What the node measured about itself.
     Facts(Facts),
+    /// The answer to `Advertise`.
+    Advert(Box<AdvertWire>),
+    /// The authority's answer to a facade message, carried without being read.
+    Facade(FacadeAnswer),
     /// The answer to a `Heartbeat`.
     Heartbeat(HeartbeatAnswer),
 }
@@ -1264,7 +1449,72 @@ mod tests {
                     tools: Tools::new(names.iter().map(|name| ToolName::truncated(name)).collect())
                         .expect("a set is sorted and holds no name twice"),
                 }),
+            (
+                bytes16(JobId::from_bytes),
+                harness(),
+                proptest::option::of(bytes32(SnapshotId::from_bytes)),
+                vec("[A-Z0-9_]{1,16}", 0..=MAX_SECRET_NAMES)
+            )
+                .prop_map(|(job, harness, snapshot, secrets)| RequestBody::Advertise {
+                    job,
+                    harness,
+                    root: AbsPath::parse("/Users/me/fabric/job").unwrap(),
+                    snapshot,
+                    secrets: BoundedList::new(
+                        secrets
+                            .iter()
+                            .map(|s| SecretNameText::truncated(s))
+                            .collect()
+                    )
+                    .unwrap(),
+                }),
+            vec(any::<u8>(), 0..256)
+                .prop_map(|bytes| RequestBody::Facade(FacadeMessage::new(bytes).unwrap())),
         ]
+    }
+
+    fn advert() -> impl Strategy<Value = AdvertWire> {
+        (
+            bytes32(NodeId::from_bytes),
+            vec(
+                (harness(), "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"),
+                0..=MAX_ADVERT_HARNESSES,
+            ),
+            any::<u32>(),
+            any::<u64>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<u64>(),
+            vec("[A-Z0-9_]{1,16}", 0..=MAX_SECRET_NAMES),
+        )
+            .prop_map(
+                |(node, harnesses, load, free, chain, workspace, at, secrets)| AdvertWire {
+                    node,
+                    os: PlatformText::truncated("macos"),
+                    arch: PlatformText::truncated("arm64"),
+                    harnesses: BoundedList::new(
+                        harnesses
+                            .into_iter()
+                            .map(|(kind, version)| (kind, VersionText::truncated(&version)))
+                            .collect(),
+                    )
+                    .unwrap(),
+                    home: AbsPath::parse("/Users/me").unwrap(),
+                    root: AbsPath::parse("/Users/me/fabric/job").unwrap(),
+                    load_1m_milli: load,
+                    free_disk_bytes: free,
+                    bundle_chain: chain,
+                    workspace,
+                    measured_at_ms: at,
+                    secrets_unresolved: BoundedList::new(
+                        secrets
+                            .iter()
+                            .map(|s| SecretNameText::truncated(s))
+                            .collect(),
+                    )
+                    .unwrap(),
+                },
+            )
     }
 
     fn harness() -> impl Strategy<Value = HarnessKind> {
@@ -1349,7 +1599,24 @@ mod tests {
             Just(ResponseBody::ChunksDone),
             fault().prop_map(ResponseBody::Fault),
             facts().prop_map(ResponseBody::Facts),
+            advert().prop_map(|advert| ResponseBody::Advert(Box::new(advert))),
+            vec(any::<u8>(), 0..256)
+                .prop_map(|bytes| ResponseBody::Facade(FacadeAnswer::new(bytes).unwrap())),
         ]
+    }
+
+    /// A facade message or answer past its bound is refused when parsed and
+    /// when decoded, so the link never buffers more than the protocol allows.
+    #[test]
+    fn facade_bytes_past_their_bound_are_refused() {
+        assert!(FacadeMessage::new(vec![0; MAX_FACADE_MESSAGE]).is_ok());
+        assert!(FacadeMessage::new(vec![0; MAX_FACADE_MESSAGE + 1]).is_err());
+        let over = encode(&vec![0u8; MAX_FACADE_MESSAGE + 1]).unwrap();
+        assert!(decode::<FacadeMessage>(&over).is_err());
+        let over = encode(&vec![0u8; MAX_SECRET_NAMES + 1]).unwrap();
+        assert!(decode::<BoundedList<u8, MAX_SECRET_NAMES>>(&over).is_err());
+        let fits = encode(&vec![0u8; MAX_SECRET_NAMES]).unwrap();
+        assert!(decode::<BoundedList<u8, MAX_SECRET_NAMES>>(&fits).is_ok());
     }
 
     proptest! {

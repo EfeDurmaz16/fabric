@@ -1,10 +1,14 @@
 //! Every released schema version keeps a fixture journal, and the current
 //! binary opens each one, migrates it when it is older and verifies it.
 //! `tests/fixtures/v1.sqlite` was made by `make_v1_fixture` with schema
-//! version 1, and `tests/fixtures/v2.sqlite` by `make_v2_fixture` from it;
-//! the tests below pin what each holds. `tests/fixtures/v2-pre-m6.sqlite`
-//! is the version 2 file the M4 code wrote before ADR 0028 amended the
-//! tables; it is kept so the refusal of that draft stays tested.
+//! version 1, `tests/fixtures/v2.sqlite` by `make_v2_fixture` from it, and
+//! `tests/fixtures/v3.sqlite` by `make_v3_fixture` from that, with the M5
+//! commands and observations on top, and `tests/fixtures/v4.sqlite` by
+//! `make_v4_fixture` from that, with an M6 job on top (ADR 0028); the
+//! tests below pin what each holds.
+//! The v1 and v2 makers ran under codec format 1 and cannot be run again
+//! byte for byte by this binary, which writes format 2; they stay as the
+//! record of what the fixtures hold.
 
 #![allow(
     clippy::unwrap_used,
@@ -16,15 +20,18 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
+use fabric_core::managed::placement::{Candidate, Exclusion, Verdict};
 use fabric_core::managed::{
-    AttemptId, AttemptStatus, CheckpointAck, Command, CoveredPath, CutDigest, Envelope,
-    ExitOutcome, FenceVerdict, GrantToken, Intent, JobPolicy, JobState, NewIds, Observation,
-    OperationId, OperationKey, OperationMark, OperationStatus, RecoveryBlock, RecoveryPolicy,
-    ResourceRef, RestartPolicy, SourceBinding, StoredResult, TaskId, TaskKind, TaskOutcome,
-    TaskState, WorkRevision,
+    AllowedFidelity, AttemptId, AttemptStatus, CheckpointAck, CheckpointCut, Command, CommitId,
+    CoveredPath, CutDigest, DomainError, Envelope, ExitOutcome, FenceVerdict, Fidelity, GitUri,
+    GrantToken, Intent, JobPolicy, JobState, NewIds, Note, Observation, OperationId, OperationKey,
+    OperationMark, OperationStatus, PackageDigest, PlacementDecision, PlacementKind, ReceiptStatus,
+    RecoveryBlock, RecoveryPolicy, ResourceRef, RestartPolicy, SecretName, SecretRef, SecretScope,
+    SourceBinding, TaskClass, TaskId, TaskKind, TaskOutcome, TaskReceipt, TaskState, WorkRevision,
 };
 use fabric_core::managed::{Generation, RequestDigest};
 use fabric_core::path::AbsPath;
+use fabric_journal::CommitError;
 use fabric_journal::{
     AbandonApproval, Acknowledged, Blocker, EffectClass, FILE_NAME, Journal, LocatorRecord,
     OpenError, ProviderAnswer, ProviderDispatch, ProviderStatus, Purpose, ResourceKey,
@@ -32,16 +39,20 @@ use fabric_journal::{
 };
 
 const NODE: NodeId = NodeId::from_bytes([4; 32]);
-const RUNNER: NodeId = NodeId::from_bytes([6; 32]);
+const OTHER_NODE: NodeId = NodeId::from_bytes([6; 32]);
+const RUNNER: NodeId = OTHER_NODE;
 const FIRST: JobId = JobId::from_bytes([0x01; 16]);
 const SECOND: JobId = JobId::from_bytes([0x02; 16]);
 const THIRD: JobId = JobId::from_bytes([0x03; 16]);
+const FOURTH: JobId = JobId::from_bytes([0x04; 16]);
+const FIFTH: JobId = JobId::from_bytes([0x05; 16]);
 
-/// The operations and jobs each fixture holds, as `verify` counts them.
+/// The jobs and operations each fixture holds, as `verify` counts them.
 fn pinned(version: u32) -> (u64, u64) {
     match version {
-        1 => (2, 8),
-        _ => (3, 12),
+        1 | 2 => (2, 8),
+        3 => (4, 14),
+        _ => (5, 18),
     }
 }
 
@@ -76,14 +87,21 @@ fn create(goal: &str) -> Command {
         intent: Intent {
             goal: goal.into(),
             harness: HarnessKind::ClaudeCode,
+            acceptance: Vec::new(),
         },
         source: SourceBinding::Repository {
             path: AbsPath::parse("/src/repo").unwrap(),
         },
-        policy: JobPolicy {
-            restart: RestartPolicy::ExplicitOnly,
-            recovery: RecoveryPolicy::Block,
-        },
+        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
+    }
+}
+
+fn cut(snapshot: SnapshotId, receipts: Vec<TaskReceipt>) -> CheckpointCut {
+    CheckpointCut {
+        snapshot,
+        receipts,
+        facts: vec![("os".into(), "macos".into())],
+        evidence: Vec::new(),
     }
 }
 
@@ -126,6 +144,7 @@ fn make_v1_fixture() {
                 label: "tests".into(),
             },
             restart: RestartPolicy::Block,
+            class: TaskClass::Harness,
         },
         ids(FIRST, 2),
     );
@@ -190,6 +209,7 @@ fn make_v1_fixture() {
                 attempt: second,
                 generation: g2,
                 snapshot: SnapshotId::of(b"fixture manifest"),
+                cut: cut(SnapshotId::of(b"fixture manifest"), Vec::new()),
             },
             14,
         )
@@ -407,11 +427,28 @@ fn make_v2_fixture() {
             at + 12,
         )
         .unwrap();
-    m6_job(&mut journal, at + 100);
     journal.verify().unwrap();
 }
 
-/// The M6 part of the v2 fixture (ADR 0028): a third job on a runner
+/// The v4 fixture: the v2 fixture opened (so migrated to version 4), the
+/// M5 history `make_v3_fixture` wrote, and the M6 job on top. The v3
+/// fixture itself is the unreleased M5 build's file, kept so its refusal
+/// stays tested: codec format 2 was amended in place by ADR 0028.
+#[test]
+#[ignore = "makes the v4 fixture; run by hand with FABRIC_JOURNAL_FIXTURE_OUT set"]
+fn make_v4_fixture() {
+    let Some(out) = std::env::var_os("FABRIC_JOURNAL_FIXTURE_OUT") else {
+        return;
+    };
+    let path = PathBuf::from(out).join("v4.sqlite");
+    std::fs::copy(fixture(2), &path).unwrap();
+    let mut journal = Journal::open(&path).unwrap();
+    write_v3_history(&mut journal);
+    m6_job(&mut journal, 1_760_000_100_000);
+    journal.verify().unwrap();
+}
+
+/// The M6 job of the v4 fixture (ADR 0028): a fifth job on a runner
 /// node with a captured and an acknowledged checkpoint, a covered write
 /// the fence refused, an attempt that went unavailable and was recovered
 /// from the acknowledged checkpoint, a blocked automatic recovery, and a
@@ -422,35 +459,35 @@ fn make_v2_fixture() {
     reason = "the fixture's steps read best as one script"
 )]
 fn m6_job(journal: &mut Journal, at: u64) {
-    let create = match create("third") {
+    let create = match create("fifth") {
         Command::CreateJob { intent, source, .. } => Command::CreateJob {
             intent,
             source,
             policy: JobPolicy {
-                restart: RestartPolicy::ExplicitOnly,
                 recovery: RecoveryPolicy::RestartFromAcknowledged,
+                ..JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly)
             },
         },
         other => other,
     };
-    submit(journal, "create-3", None, create, ids(THIRD, 9));
-    let primary = TaskId::from_bytes([9; 16]);
+    submit(journal, "create-5", None, create, ids(FIFTH, 80));
+    let primary = TaskId::from_bytes([80; 16]);
     let on_runner = Command::StartAttempt {
         task: primary,
         resource: ResourceRef::Node { node: RUNNER },
         initial_checkpoint: None,
     };
-    submit(journal, "start-3-1", Some(THIRD), on_runner, ids(THIRD, 10));
+    submit(journal, "start-5-1", Some(FIFTH), on_runner, ids(FIFTH, 81));
     let g1 = Generation::FIRST;
     let token1 = GrantToken {
-        job: THIRD,
-        attempt: AttemptId::from_bytes([10; 16]),
+        job: FIFTH,
+        attempt: AttemptId::from_bytes([81; 16]),
         generation: g1,
     };
     journal
         .mark_authority(
-            THIRD,
-            OperationId::from_bytes([10; 16]),
+            FIFTH,
+            OperationId::from_bytes([81; 16]),
             OperationMark::Dispatched,
             at,
         )
@@ -483,7 +520,7 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .unwrap()
         .unwrap();
     journal
-        .acknowledge(THIRD, &m6_ack(&token1, snapshot, cut), at + 3)
+        .acknowledge(FIFTH, &m6_ack(&token1, snapshot, cut), at + 3)
         .unwrap();
     // A second capture that is never acknowledged.
     journal
@@ -509,7 +546,7 @@ fn m6_job(journal: &mut Journal, at: u64) {
     // the authority recovers from the acknowledged checkpoint onto itself.
     journal
         .observe_authority(
-            THIRD,
+            FIFTH,
             &Observation::ResourceUnavailable {
                 attempt: token1.attempt,
                 generation: g1,
@@ -521,10 +558,10 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .unwrap();
     journal
         .recovery_blocked(
-            THIRD,
+            FIFTH,
             token1.attempt,
             RecoveryBlock::NoEligibleNode {
-                exclusions: vec![fabric_core::managed::Exclusion {
+                exclusions: vec![fabric_core::managed::RecoveryExclusion {
                     node: RUNNER,
                     reason: "unavailable".into(),
                 }],
@@ -534,15 +571,15 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .unwrap();
     submit(
         journal,
-        "recover-3-1",
-        Some(THIRD),
+        "recover-5-1",
+        Some(FIFTH),
         Command::Recover {
             attempt: token1.attempt,
             resource: ResourceRef::Node { node: NODE },
             from: snapshot,
             reason: "the fixture's runner went silent".into(),
         },
-        ids(THIRD, 11),
+        ids(FIFTH, 82),
     );
     // The old runner's late exit is refused by the fence and recorded.
     let late = journal
@@ -564,14 +601,14 @@ fn m6_job(journal: &mut Journal, at: u64) {
     // The recovered attempt runs, goes silent and is superseded by hand.
     let g2 = g1.next().unwrap();
     let token2 = GrantToken {
-        job: THIRD,
-        attempt: AttemptId::from_bytes([11; 16]),
+        job: FIFTH,
+        attempt: AttemptId::from_bytes([82; 16]),
         generation: g2,
     };
     journal
         .mark_authority(
-            THIRD,
-            OperationId::from_bytes([11; 16]),
+            FIFTH,
+            OperationId::from_bytes([82; 16]),
             OperationMark::Dispatched,
             at + 15_003,
         )
@@ -590,7 +627,7 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .unwrap();
     journal
         .observe_authority(
-            THIRD,
+            FIFTH,
             &Observation::ResourceUnavailable {
                 attempt: token2.attempt,
                 generation: g2,
@@ -602,7 +639,7 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .unwrap();
     journal
         .observe_authority(
-            THIRD,
+            FIFTH,
             &Observation::ResourceReachable {
                 attempt: token2.attempt,
                 generation: g2,
@@ -612,7 +649,7 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .unwrap();
     journal
         .observe_authority(
-            THIRD,
+            FIFTH,
             &Observation::ResourceUnavailable {
                 attempt: token2.attempt,
                 generation: g2,
@@ -624,13 +661,13 @@ fn m6_job(journal: &mut Journal, at: u64) {
         .unwrap();
     submit(
         journal,
-        "supersede-3-2",
-        Some(THIRD),
+        "supersede-5-2",
+        Some(FIFTH),
         Command::Supersede {
             attempt: token2.attempt,
             reason: "the fixture's operator took the grant away".into(),
         },
-        ids(THIRD, 12),
+        ids(FIFTH, 83),
     );
 }
 
@@ -639,7 +676,7 @@ fn m6_snapshot(n: u8) -> SnapshotId {
 }
 
 fn m6_cut(n: u8) -> CutDigest {
-    CutDigest::of(&[0x70 + n; 4])
+    CutDigest::from_bytes([0x70 + n; 32])
 }
 
 fn m6_ack(token: &GrantToken, snapshot: SnapshotId, cut: CutDigest) -> CheckpointAck {
@@ -656,18 +693,18 @@ fn m6_ack(token: &GrantToken, snapshot: SnapshotId, cut: CutDigest) -> Checkpoin
 }
 
 #[test]
-fn the_v2_fixture_holds_the_m6_job() {
+fn the_v4_fixture_holds_the_m6_job() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(FILE_NAME);
-    std::fs::copy(fixture(2), &path).unwrap();
+    std::fs::copy(fixture(4), &path).unwrap();
     let journal = Journal::open(&path).unwrap();
-    let third = journal.job(THIRD).unwrap().unwrap();
+    let fifth = journal.job(FIFTH).unwrap().unwrap();
     assert_eq!(
-        third.job.policy.recovery,
+        fifth.job.policy.recovery,
         RecoveryPolicy::RestartFromAcknowledged
     );
-    assert_eq!(third.job.generation.get(), 2);
-    let statuses: Vec<_> = third.attempts.iter().map(|a| a.status.clone()).collect();
+    assert_eq!(fifth.job.generation.get(), 2);
+    let statuses: Vec<_> = fifth.attempts.iter().map(|a| a.status.clone()).collect();
     assert_eq!(
         statuses,
         vec![
@@ -677,21 +714,21 @@ fn the_v2_fixture_holds_the_m6_job() {
             AttemptStatus::Superseded { by: None },
         ]
     );
-    assert_eq!(third.attempts[1].initial_checkpoint, Some(m6_snapshot(1)));
+    assert_eq!(fifth.attempts[1].initial_checkpoint, Some(m6_snapshot(1)));
     assert_eq!(
-        third.attempts[1].unavailable_since_ms, None,
+        fifth.attempts[1].unavailable_since_ms, None,
         "superseded clears it"
     );
-    let acknowledged = journal.acknowledged(THIRD).unwrap();
+    let acknowledged = journal.acknowledged(FIFTH).unwrap();
     assert_eq!(acknowledged.len(), 1);
     assert_eq!(acknowledged[0].snapshot, m6_snapshot(1));
     assert_eq!(acknowledged[0].fetched_from, RUNNER);
     assert_eq!(
-        third.captured_only(),
-        vec![(third.attempts[0].id, Generation::FIRST, m6_snapshot(2))]
+        fifth.captured_only(),
+        vec![(fifth.attempts[0].id, Generation::FIRST, m6_snapshot(2))]
     );
     let kinds: Vec<_> = journal
-        .events(THIRD, None, 100)
+        .events(FIFTH, None, 100)
         .unwrap()
         .iter()
         .map(|e| e.frame.event.name())
@@ -707,33 +744,8 @@ fn the_v2_fixture_holds_the_m6_job() {
     ] {
         assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
     }
-    assert!(third.live_attempt().is_none());
+    assert!(fifth.live_attempt().is_none());
     journal.verify().unwrap();
-}
-
-#[test]
-fn the_pre_m6_version_2_draft_is_refused_unwritten() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(FILE_NAME);
-    let draft = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2-pre-m6.sqlite");
-    std::fs::copy(&draft, &path).unwrap();
-    let before = std::fs::read(&path).unwrap();
-    let refused = Journal::open(&path).unwrap_err();
-    assert!(
-        matches!(
-            refused,
-            OpenError::DraftSchema {
-                version: 2,
-                amendment: "m6"
-            }
-        ),
-        "{refused:?}"
-    );
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "the draft was written to"
-    );
 }
 
 #[test]
@@ -797,7 +809,7 @@ fn the_v2_fixture_holds_what_it_was_made_with() {
 
 #[test]
 fn every_version_fixture_opens_migrates_and_verifies() {
-    for version in 1..=SCHEMA_VERSION {
+    for version in (1..=SCHEMA_VERSION).filter(|v| *v != 3) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
         std::fs::copy(fixture(version), &path).unwrap();
@@ -808,6 +820,400 @@ fn every_version_fixture_opens_migrates_and_verifies() {
         assert_eq!(report.jobs, jobs, "v{version}");
         assert_eq!(report.operations, operations, "v{version}");
     }
+}
+
+/// The M5 history the v3 fixture adds to the v2 one: a note and a
+/// classed child on the first job, a third job parked by its initial
+/// placement with a secret no node resolved, and a fourth job placed,
+/// checkpointed in place, then continued with a planned handoff.
+#[test]
+#[ignore = "makes the v3 fixture; run by hand with FABRIC_JOURNAL_FIXTURE_OUT set"]
+fn make_v3_fixture() {
+    let Some(out) = std::env::var_os("FABRIC_JOURNAL_FIXTURE_OUT") else {
+        return;
+    };
+    let path = PathBuf::from(out).join("v3.sqlite");
+    std::fs::copy(fixture(2), &path).unwrap();
+    let mut journal = Journal::open(&path).unwrap();
+    write_v3_history(&mut journal);
+    journal.verify().unwrap();
+}
+
+fn m5_create(job: JobId) -> Command {
+    match job {
+        THIRD => Command::CreateJob {
+            intent: Intent {
+                goal: "third: a git source and a secret".into(),
+                harness: HarnessKind::Codex,
+                acceptance: vec!["cargo test passes".into()],
+            },
+            source: SourceBinding::Git {
+                uri: GitUri::parse("https://example.invalid/o/r.git").unwrap(),
+                commit: CommitId::parse(&"a".repeat(40)).unwrap(),
+            },
+            policy: JobPolicy {
+                secrets: vec![SecretRef {
+                    name: SecretName::parse("TOKEN").unwrap(),
+                    scope: SecretScope::node_any(),
+                }],
+                ..JobPolicy::m2_defaults(RestartPolicy::Block)
+            },
+        },
+        _ => Command::CreateJob {
+            intent: Intent {
+                goal: "fourth: placed, checkpointed, continued".into(),
+                harness: HarnessKind::ClaudeCode,
+                acceptance: Vec::new(),
+            },
+            source: SourceBinding::Empty,
+            policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
+        },
+    }
+}
+
+fn parked_decision() -> PlacementDecision {
+    PlacementDecision {
+        kind: PlacementKind::Initial,
+        decided_at_ms: 1_760_000_003_000,
+        candidates: vec![Candidate {
+            node: NODE,
+            verdict: Verdict::Excluded {
+                reasons: vec![Exclusion::Secret {
+                    name: SecretName::parse("TOKEN").unwrap(),
+                }],
+            },
+        }],
+        chosen: None,
+    }
+}
+
+fn chosen_decision(kind: PlacementKind, node: NodeId) -> PlacementDecision {
+    PlacementDecision {
+        kind,
+        decided_at_ms: 1_760_000_003_001,
+        candidates: vec![Candidate {
+            node,
+            verdict: Verdict::Eligible {
+                rank: vec![fabric_core::managed::placement::RankReason::Identity],
+            },
+        }],
+        chosen: Some(node),
+    }
+}
+
+fn interrupted_test(task: TaskId) -> TaskReceipt {
+    TaskReceipt {
+        task,
+        class: TaskClass::Test,
+        status: ReceiptStatus::Interrupted,
+        exit: None,
+        interrupted: true,
+        workspace: None,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture's steps read best as one script"
+)]
+fn write_v3_history(journal: &mut Journal) {
+    let at = 1_760_000_003_000;
+    submit(
+        journal,
+        "note-1",
+        Some(FIRST),
+        Command::RecordNote {
+            note: Note::Decision {
+                what: "keep the first job's third attempt".into(),
+                reason: "its grant is unknown, not lost".into(),
+            },
+        },
+        ids(FIRST, 9),
+    );
+    submit(
+        journal,
+        "child-test",
+        Some(FIRST),
+        Command::RegisterTask {
+            parent: TaskId::from_bytes([1; 16]),
+            kind: TaskKind::Child {
+                label: "cargo test".into(),
+            },
+            restart: RestartPolicy::Block,
+            class: TaskClass::Test,
+        },
+        ids(FIRST, 10),
+    );
+    submit(journal, "create-3", None, m5_create(THIRD), ids(THIRD, 11));
+    journal
+        .observe_authority(
+            THIRD,
+            &Observation::Placed {
+                operation: OperationId::from_bytes([11; 16]),
+                task: TaskId::from_bytes([11; 16]),
+                decision: parked_decision(),
+            },
+            at,
+        )
+        .unwrap();
+    submit(
+        journal,
+        "create-4",
+        None,
+        m5_create(FOURTH),
+        ids(FOURTH, 12),
+    );
+    let primary = TaskId::from_bytes([12; 16]);
+    journal
+        .observe_authority(
+            FOURTH,
+            &Observation::Placed {
+                operation: OperationId::from_bytes([12; 16]),
+                task: primary,
+                decision: chosen_decision(PlacementKind::Initial, NODE),
+            },
+            at + 1,
+        )
+        .unwrap();
+    let first = journal.job(FOURTH).unwrap().unwrap().attempts[0].clone();
+    journal
+        .observe_authority(
+            FOURTH,
+            &Observation::Started {
+                attempt: first.id,
+                generation: first.generation,
+            },
+            at + 2,
+        )
+        .unwrap();
+    submit(
+        journal,
+        "checkpoint-4",
+        Some(FOURTH),
+        Command::Checkpoint { attempt: first.id },
+        ids(FOURTH, 13),
+    );
+    journal
+        .mark_authority(
+            FOURTH,
+            OperationId::from_bytes([13; 16]),
+            OperationMark::Dispatched,
+            at + 3,
+        )
+        .unwrap();
+    let in_place = SnapshotId::of(b"fixture cut in place");
+    journal
+        .observe_authority(
+            FOURTH,
+            &Observation::Checkpointed {
+                attempt: first.id,
+                generation: first.generation,
+                snapshot: in_place,
+                cut: cut(in_place, vec![interrupted_test(primary)]),
+            },
+            at + 4,
+        )
+        .unwrap();
+    submit(
+        journal,
+        "continue-4",
+        Some(FOURTH),
+        Command::Continue {
+            task: primary,
+            fidelity: AllowedFidelity::DEFAULT,
+            pin: None,
+        },
+        ids(FOURTH, 14),
+    );
+    let cont = OperationId::from_bytes([14; 16]);
+    journal
+        .mark_authority(FOURTH, cont, OperationMark::Dispatched, at + 5)
+        .unwrap();
+    let handoff = SnapshotId::of(b"fixture handoff cut");
+    journal
+        .observe_authority(
+            FOURTH,
+            &Observation::Checkpointed {
+                attempt: first.id,
+                generation: first.generation,
+                snapshot: handoff,
+                cut: cut(handoff, Vec::new()),
+            },
+            at + 6,
+        )
+        .unwrap();
+    journal
+        .observe_authority(
+            FOURTH,
+            &Observation::Placed {
+                operation: cont,
+                task: primary,
+                decision: chosen_decision(PlacementKind::PlannedHandoff, OTHER_NODE),
+            },
+            at + 7,
+        )
+        .unwrap();
+    let second = journal.job(FOURTH).unwrap().unwrap().attempts[1].clone();
+    journal
+        .observe_authority(
+            FOURTH,
+            &Observation::Started {
+                attempt: second.id,
+                generation: second.generation,
+            },
+            at + 8,
+        )
+        .unwrap();
+    journal
+        .observe_authority(
+            FOURTH,
+            &Observation::Continued {
+                attempt: second.id,
+                generation: second.generation,
+                from: first.id,
+                achieved: Fidelity::NewNativeSessionWithPackage,
+                package: Some(PackageDigest([0x33; 32])),
+            },
+            at + 9,
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_v2_journal_migrates_and_takes_the_m5_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE_NAME);
+    std::fs::copy(fixture(2), &path).unwrap();
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.schema_version().unwrap(), SCHEMA_VERSION);
+    // Every M2 task is a harness task and every M2 policy has the M5 defaults.
+    let first = journal.job(FIRST).unwrap().unwrap();
+    assert!(first.tasks.iter().all(|t| t.class == TaskClass::Harness));
+    assert_eq!(
+        first.job.policy,
+        JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly)
+    );
+    assert!(first.job.intent.acceptance.is_empty());
+    // The create of M2 was complete at its commit; it is not re-placed.
+    let recovery = journal
+        .recover(1_760_000_002_500, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert!(recovery.to_effect.is_empty(), "{recovery:?}");
+    write_v3_history(&mut journal);
+    journal.verify().unwrap();
+    check_v3(&mut journal);
+}
+
+#[test]
+fn the_v4_fixture_holds_the_m5_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE_NAME);
+    std::fs::copy(fixture(4), &path).unwrap();
+    let mut journal = Journal::open(&path).unwrap();
+    check_v3(&mut journal);
+}
+
+#[test]
+fn the_m5_draft_of_version_3_is_refused_unwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE_NAME);
+    std::fs::copy(fixture(3), &path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let refused = Journal::open(&path).unwrap_err();
+    assert!(
+        matches!(refused, OpenError::DraftSchema { version: 3 }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the draft was written to"
+    );
+}
+
+fn check_v3(journal: &mut Journal) {
+    assert!(
+        journal
+            .jobs()
+            .unwrap()
+            .starts_with(&[FIRST, SECOND, THIRD, FOURTH])
+    );
+    let notes = journal.notes(FIRST).unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(matches!(notes[0].1, Note::Decision { .. }));
+    let first = journal.job(FIRST).unwrap().unwrap();
+    assert_eq!(first.tasks.len(), 3);
+    assert_eq!(first.tasks[2].class, TaskClass::Test);
+
+    let third = journal.job(THIRD).unwrap().unwrap();
+    assert!(third.parked());
+    assert!(matches!(third.job.source, SourceBinding::Git { .. }));
+    assert_eq!(third.job.policy.secrets.len(), 1);
+    let placements = journal.placements(THIRD).unwrap();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].1, parked_decision());
+    assert_eq!(
+        third.operations[0].status,
+        OperationStatus::Succeeded,
+        "a parked create is complete"
+    );
+
+    let fourth = journal.job(FOURTH).unwrap().unwrap();
+    assert_eq!(fourth.attempts.len(), 2);
+    assert!(matches!(
+        fourth.attempts[0].status,
+        AttemptStatus::Checkpointed { .. }
+    ));
+    assert_eq!(fourth.attempts[1].status, AttemptStatus::Running);
+    assert_eq!(
+        fourth.attempts[1].initial_checkpoint,
+        Some(SnapshotId::of(b"fixture handoff cut"))
+    );
+    assert_eq!(
+        fourth.attempts[1].resource,
+        ResourceRef::Node { node: OTHER_NODE }
+    );
+    let kinds: Vec<_> = journal
+        .placements(FOURTH)
+        .unwrap()
+        .into_iter()
+        .map(|(_, d)| d.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![PlacementKind::Initial, PlacementKind::PlannedHandoff]
+    );
+    let continuations = journal.continuations(FOURTH).unwrap();
+    assert_eq!(
+        continuations,
+        vec![(
+            fourth.attempts[1].id,
+            fourth.attempts[0].id,
+            Fidelity::NewNativeSessionWithPackage,
+            Some(PackageDigest([0x33; 32]))
+        )]
+    );
+    // The in-place checkpoint's receipts said the test was interrupted;
+    // the handoff cut recorded none, and the last cut wins.
+    assert_eq!(journal.receipts(fourth.attempts[0].id).unwrap(), Vec::new());
+    assert!(
+        journal
+            .job(FOURTH)
+            .unwrap()
+            .unwrap()
+            .operations
+            .iter()
+            .all(|o| o.status == OperationStatus::Succeeded),
+        "{:?}",
+        fourth.operations
+    );
+    assert_eq!(fourth.requests.len(), 2);
+    let recovery = journal
+        .recover(1_760_000_004_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert!(recovery.to_effect.is_empty());
+    assert!(recovery.unknown.is_empty());
+    journal.verify().unwrap();
 }
 
 #[test]
@@ -846,16 +1252,20 @@ fn the_v1_fixture_holds_what_it_was_made_with() {
     assert_eq!(second.job.state, JobState::Finished);
     assert_eq!(second.tasks[0].state, TaskState::Succeeded);
 
-    // An old key still answers with the bytes stored when it was made.
+    // An old key was stored under a format 1 digest; the same command
+    // digests differently under format 2, so the repeat is a conflict and
+    // writes nothing (docs/managed-jobs.md, Codec and schema version 3).
     let envelope = Envelope {
         key: OperationKey::parse("create-2").unwrap(),
         job: None,
         expected: None,
         body: create("second"),
     };
-    let answer = journal.submit(&envelope, ids(SECOND, 99)).unwrap();
-    assert!(answer.replayed);
-    assert!(matches!(answer.result, StoredResult::Accepted(a) if a.job == SECOND));
+    assert!(matches!(
+        journal.submit(&envelope, ids(SECOND, 99)),
+        Err(CommitError::Domain(DomainError::OperationConflict { .. }))
+    ));
+    assert_eq!(journal.jobs().unwrap(), vec![FIRST, SECOND]);
     // And the fixture keeps taking commands.
     submit(
         &mut journal,
@@ -867,7 +1277,15 @@ fn the_v1_fixture_holds_what_it_was_made_with() {
         ids(FIRST, 100),
     );
     let first = journal.job(FIRST).unwrap().unwrap();
-    // The third attempt may still run (its grant is unknown), so the cancel waits.
+    // The third attempt may still run (its grant is unknown), so the
+    // cancel is accepted and waits for the attempt to be stopped (M5).
     assert_eq!(first.job.state, JobState::Active);
+    assert_eq!(
+        first
+            .operation(OperationId::from_bytes([100; 16]))
+            .unwrap()
+            .status,
+        OperationStatus::Accepted
+    );
     journal.verify().unwrap();
 }

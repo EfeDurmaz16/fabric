@@ -99,14 +99,21 @@ fn create() -> Command {
         intent: Intent {
             goal: "make the greeting louder".into(),
             harness: HarnessKind::ClaudeCode,
+            acceptance: Vec::new(),
         },
         source: SourceBinding::Repository {
             path: AbsPath::parse("/src/repo").unwrap(),
         },
-        policy: JobPolicy {
-            restart: RestartPolicy::ExplicitOnly,
-            recovery: RecoveryPolicy::Block,
-        },
+        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
+    }
+}
+
+fn cut(snapshot: SnapshotId) -> CheckpointCut {
+    CheckpointCut {
+        snapshot,
+        receipts: Vec::new(),
+        facts: Vec::new(),
+        evidence: Vec::new(),
     }
 }
 
@@ -133,7 +140,11 @@ fn a_new_job_has_its_primary_task_at_revision_one() {
     assert_eq!(s.tasks.len(), 1);
     assert_eq!(s.tasks[0].id, s.job.primary);
     assert_eq!(s.tasks[0].kind, TaskKind::Primary);
-    assert_eq!(s.operations[0].status, OperationStatus::Succeeded);
+    assert_eq!(s.tasks[0].class, TaskClass::Harness);
+    // M5: the create's effect is the initial placement, so it stays
+    // accepted until a `Placed` observation grants or parks.
+    assert_eq!(s.operations[0].status, OperationStatus::Accepted);
+    assert!(s.parked());
     kept.replays();
 }
 
@@ -206,10 +217,19 @@ fn no_second_grant_while_an_attempt_may_run_even_after_a_timeout() {
         ),
         Err(DomainError::AttemptStillLive { .. })
     ));
+    // M5: a cancel with a live attempt is accepted and asks the executor
+    // to stop it; the job is not cancelled until the attempt is seen ended.
+    let cancel = kept
+        .submit("cancel", Command::CancelJob { reason: "x".into() })
+        .unwrap();
     assert!(matches!(
-        kept.submit("cancel", Command::CancelJob { reason: "x".into() }),
-        Err(DomainError::AttemptStillLive { .. })
+        cancel.events[1],
+        ManagedEvent::EffectRequested {
+            request: EffectRequest::CancelJob { .. },
+            ..
+        }
     ));
+    assert_eq!(kept.state().job.state, JobState::Active);
     // Dispatching again is refused: the operation is past accepted.
     assert!(matches!(
         kept.mark(op, OperationMark::Dispatched),
@@ -283,6 +303,7 @@ fn a_repeated_report_changes_nothing_and_an_ended_attempt_stays_ended() {
         attempt: a.id,
         generation: a.generation,
         snapshot,
+        cut: cut(snapshot),
     })
     .unwrap();
     assert!(matches!(
@@ -373,6 +394,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
                 label: "tests".into(),
             },
             restart: RestartPolicy::Block,
+            class: TaskClass::Test,
         },
     )
     .unwrap();
@@ -383,6 +405,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
                 parent: primary,
                 kind: TaskKind::Primary,
                 restart: RestartPolicy::Block,
+                class: TaskClass::Harness,
             }
         ),
         Err(DomainError::BadParent { .. })
@@ -459,11 +482,6 @@ fn frames_and_answers_have_one_byte_form() {
         EventFrame::decode(&other),
         Err(FrameError::UnknownFormat(3))
     ));
-    // Format 1 is read beside format 2: the bytes after the format byte
-    // are the same for everything an M2 to M5 job stored.
-    let mut earlier = bytes.clone();
-    earlier[0] = 1;
-    assert_eq!(EventFrame::decode(&earlier).unwrap(), frame);
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert!(EventFrame::decode(&trailing).is_err());
@@ -491,9 +509,15 @@ fn a_broken_history_does_not_replay() {
     assert!(matches!(replay(job, &gap), Err(DomainError::Broken { .. })));
     // A grant at a generation that skips one.
     let mut skipped = kept.history.clone();
-    if let Some((_, ManagedEvent::AttemptGranted { generation, .. })) = skipped.last_mut() {
-        *generation = Generation::new(2).unwrap();
-    }
+    let grant = skipped
+        .iter_mut()
+        .rev()
+        .find_map(|(_, e)| match e {
+            ManagedEvent::AttemptGranted { generation, .. } => Some(generation),
+            _ => None,
+        })
+        .unwrap();
+    *grant = Generation::new(2).unwrap();
     assert!(matches!(
         replay(job, &skipped),
         Err(DomainError::Broken { .. })
@@ -558,7 +582,7 @@ proptest! {
                         1 => Observation::Lost { attempt, generation },
                         2 => Observation::Exited { attempt, generation, outcome: ExitOutcome::Succeeded },
                         3 => Observation::Exited { attempt, generation, outcome: ExitOutcome::Failed { code: Some(1) } },
-                        4 => Observation::Checkpointed { attempt, generation, snapshot: SnapshotId::of(&[which]) },
+                        4 => Observation::Checkpointed { attempt, generation, snapshot: SnapshotId::of(&[which]), cut: cut(SnapshotId::of(&[which])) },
                         _ => Observation::Exited { attempt, generation, outcome: ExitOutcome::Cancelled },
                     };
                     let lost = matches!(observation, Observation::Lost { .. });
@@ -573,6 +597,7 @@ proptest! {
                     parent: s.job.primary,
                     kind: TaskKind::Child { label: key.clone() },
                     restart: RestartPolicy::Block,
+                    class: TaskClass::Build,
                 }),
                 Step::Finish(which) => {
                     let task = s.tasks[usize::from(which) % s.tasks.len()].id;
@@ -615,8 +640,8 @@ fn snapshot(n: u8) -> SnapshotId {
     SnapshotId::of(&[n; 4])
 }
 
-fn cut(n: u8) -> CutDigest {
-    CutDigest::of(&[n; 8])
+fn cut_digest(n: u8) -> CutDigest {
+    CutDigest::from_bytes([n; 32])
 }
 
 fn capture(kept: &mut Kept, n: u8) -> Result<Transition, DomainError> {
@@ -625,7 +650,7 @@ fn capture(kept: &mut Kept, n: u8) -> Result<Transition, DomainError> {
         attempt: a.id,
         generation: a.generation,
         snapshot: snapshot(n),
-        cut: cut(n),
+        cut: cut_digest(n),
     })
 }
 
@@ -691,7 +716,7 @@ fn a_captured_checkpoint_restarts_nothing_until_acknowledged() {
             attempt: a.id,
             generation: a.generation,
             snapshot: snapshot(1),
-            cut: cut(9),
+            cut: cut_digest(9),
         }),
         Err(DomainError::UnknownCheckpoint { .. })
     ));
@@ -748,7 +773,7 @@ fn an_acknowledgement_names_the_reported_snapshot_and_cut() {
         Err(DomainError::UnknownCheckpoint { .. })
     ));
     let other_cut = CheckpointAck {
-        cut: cut(2),
+        cut: cut_digest(2),
         ..good.clone()
     };
     assert!(matches!(
@@ -784,21 +809,39 @@ fn unavailable_is_unknown_and_still_may_run() {
     assert_eq!(a.status, AttemptStatus::Unknown);
     assert_eq!(a.unavailable_since_ms, Some(50));
     assert!(a.status.may_run());
-    // The M2 wait rule holds: nothing grants, finishes or cancels behind it.
+    // The M2 wait rule holds: nothing grants behind it, and a cancel only
+    // asks the executor to stop it first (M5): the job is not cancelled
+    // and the attempt stays `unknown`, never taken for stopped.
     let primary = kept.state().job.primary;
     assert!(matches!(
         kept.submit("start-2", start(primary)),
         Err(DomainError::AttemptStillLive { .. })
     ));
-    assert!(matches!(
-        kept.submit(
+    let cancel = kept
+        .submit(
             "cancel",
             Command::CancelJob {
-                reason: "no".into()
-            }
-        ),
-        Err(DomainError::AttemptStillLive { .. })
-    ));
+                reason: "no".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        cancel
+            .events
+            .iter()
+            .any(|e| matches!(e, ManagedEvent::EffectRequested { .. }))
+    );
+    assert!(
+        !cancel
+            .events
+            .iter()
+            .any(|e| matches!(e, ManagedEvent::JobCancelled { .. }))
+    );
+    assert_eq!(kept.state().job.state, JobState::Active);
+    assert_eq!(
+        kept.state().attempt(a.id).unwrap().status,
+        AttemptStatus::Unknown
+    );
     // Unavailable again changes nothing; it never becomes lost by itself.
     assert!(
         kept.observe(&Observation::ResourceUnavailable {
@@ -1124,34 +1167,31 @@ fn fence_only_the_live_attempt_from_its_node_is_live() {
 #[test]
 fn block_is_the_default_and_format_1_decodes_to_it() {
     assert_eq!(RecoveryPolicy::default(), RecoveryPolicy::Block);
-    let before = JobPolicy {
-        restart: RestartPolicy::ExplicitOnly,
-        recovery: RecoveryPolicy::Block,
-    };
-    // A Block policy's bytes are the bytes M2 to M5 wrote: one varint of
-    // the restart variant, so every stored digest of an older job holds.
-    let bytes = before.to_stored().unwrap();
-    assert_eq!(bytes, vec![MANAGED_FORMAT, 1]);
-    let format_1 = [1u8, 1];
-    assert_eq!(JobPolicy::from_stored(&format_1).unwrap(), before);
-    let format_1_block = [1u8, 0];
+    // An M2 to M4 policy is format 1, the restart variant alone; it widens
+    // with every M5 default and `recovery: Block`.
+    let format_1 = [MANAGED_FORMAT_V1, 1];
+    let widened = JobPolicy::from_stored(&format_1).unwrap();
+    assert_eq!(widened, JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly));
+    assert_eq!(widened.recovery, RecoveryPolicy::Block);
+    let format_1_block = [MANAGED_FORMAT_V1, 0];
     assert_eq!(
-        JobPolicy::from_stored(&format_1_block).unwrap(),
-        JobPolicy {
-            restart: RestartPolicy::Block,
-            recovery: RecoveryPolicy::Block,
-        }
+        JobPolicy::from_stored(&format_1_block).unwrap().recovery,
+        RecoveryPolicy::Block
     );
+    // Format 2 keeps the recovery policy.
     let after = JobPolicy {
-        restart: RestartPolicy::ExplicitOnly,
         recovery: RecoveryPolicy::RestartFromAcknowledged,
+        ..JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly)
     };
     let bytes = after.to_stored().unwrap();
-    assert_eq!(bytes, vec![MANAGED_FORMAT, 3]);
+    assert_eq!(bytes[0], MANAGED_FORMAT);
     assert_eq!(JobPolicy::from_stored(&bytes).unwrap(), after);
-    assert!(JobPolicy::from_stored(&[MANAGED_FORMAT, 4]).is_err());
-    // A create's request digest is the one an older binary computed: the
-    // journal fixture test replays an M2 create under its stored key.
+    assert_ne!(
+        JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly)
+            .to_stored()
+            .unwrap(),
+        bytes
+    );
 }
 
 #[test]
@@ -1173,8 +1213,8 @@ fn restart_from_acknowledged_is_refused_for_an_opaque_primary() {
             intent,
             source,
             policy: JobPolicy {
-                restart: RestartPolicy::ExplicitOnly,
                 recovery: RecoveryPolicy::RestartFromAcknowledged,
+                ..JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly)
             },
         },
         other => other,
@@ -1213,7 +1253,7 @@ fn recovery_decision_falls_back_to_block_with_the_failed_condition() {
             blockers: vec![blocker]
         })
     );
-    let exclusion = Exclusion {
+    let exclusion = RecoveryExclusion {
         node: NODE,
         reason: "unavailable".into(),
     };
@@ -1333,22 +1373,17 @@ fn snapshot_of(n: u8) -> SnapshotId {
     snapshot(n)
 }
 
-/// The recovery decision judges an attempt by its own task's kind, never
-/// by the job's primary: on this base a child task declares no kind, so
-/// its outcome policy is `block` and the authority never restarts it by
-/// itself, while the primary is a harness task.
+/// The recovery decision judges an attempt by its own task's class, never
+/// by the job's primary: an `opaque` child's outcome policy is `block` and
+/// the authority never restarts it by itself, while the primary is a
+/// harness task.
 #[test]
 fn an_attempt_is_judged_by_its_own_task_not_the_primary() {
     assert_eq!(
-        OutcomePolicy::of_kind(&TaskKind::Primary),
+        TaskClass::Harness.outcome_policy(),
         OutcomePolicy::Checkpoint
     );
-    assert_eq!(
-        OutcomePolicy::of_kind(&TaskKind::Child {
-            label: "build".into()
-        }),
-        OutcomePolicy::Block
-    );
+    assert_eq!(TaskClass::Opaque.outcome_policy(), OutcomePolicy::Block);
     let mut kept = running();
     capture(&mut kept, 1).unwrap();
     kept.acknowledge(&ack_of(&kept, 1)).unwrap();
@@ -1368,6 +1403,7 @@ fn an_attempt_is_judged_by_its_own_task_not_the_primary() {
                 label: "build".into(),
             },
             restart: RestartPolicy::ExplicitOnly,
+            class: TaskClass::Opaque,
         },
     )
     .unwrap();

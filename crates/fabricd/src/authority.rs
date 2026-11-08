@@ -35,10 +35,11 @@ use std::sync::{Arc, Mutex};
 
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
-    AttemptId, AttemptStatus, CheckpointAck, Command, CoveredPath, DomainError, Envelope,
-    Exclusion, FenceVerdict, GrantToken, HEARTBEAT_INTERVAL_MS, ManagedEvent, ManagedState, NewIds,
-    Observation, OperationId, OperationKey, OperationMark, OutcomePolicy, RecoveryBlock,
-    RecoveryPolicy, ResourceRef, StoredResult, TaskId, Transition, fence, recovery_decision,
+    AttemptId, AttemptStatus, CheckpointAck, Command, CommandKind, CoveredPath, DomainError,
+    Envelope, FenceVerdict, GrantToken, HEARTBEAT_INTERVAL_MS, ManagedEvent, ManagedState, NewIds,
+    Observation, OperationId, OperationKey, OperationMark, OperationStatus, OutcomePolicy,
+    RecoveryBlock, RecoveryExclusion, RecoveryPolicy, ResourceRef, StoredResult, TaskId,
+    Transition, fence, recovery_decision,
 };
 use fabric_journal::{Answer, Blocker, CommitError, FILE_NAME, Journal, Liveness, OpenError};
 use fabric_net::wire::{Heartbeat, HeartbeatAnswer};
@@ -111,15 +112,7 @@ type Write = Box<dyn FnOnce(Fenced) + Send>;
 
 enum Call {
     Submit(Envelope<Command>, Reply<Answer>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 reports through it")
-    )]
     Observe(JobId, Observation, Reply<Transition>),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
-    )]
     Mark(JobId, OperationId, OperationMark, Reply<Transition>),
     /// An executor's report behind the fence (ADR 0028).
     #[cfg_attr(
@@ -156,7 +149,35 @@ enum Call {
     Tick(u64, Reply<Vec<Overdue>>),
     Job(JobId, Reply<Option<ManagedState>>),
     List(Reply<Vec<ManagedState>>),
+    Pending(Reply<Vec<PendingEffect>>),
+    /// Work on the open journal by the facade and the inspect read (owner
+    /// B, M5): the closure answers its own caller. `create` makes the
+    /// journal when there is none yet, as a first `CreateJob` does, for a
+    /// token minted before any job.
+    With {
+        create: bool,
+        work: JournalWork,
+    },
 }
+
+/// An accepted operation whose effect the node has not asked for yet: a
+/// grant to launch, a create to place, or an M5 command to dispatch. The
+/// request an M5 command was asked with is in the job's state
+/// (`ManagedState::request`). Read anew from the journal every time, so a
+/// restart and a running daemon see the same list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingEffect {
+    /// The job.
+    pub job: JobId,
+    /// The operation.
+    pub operation: OperationId,
+    /// Its kind.
+    pub kind: CommandKind,
+}
+
+/// Work the facade or a read runs inside the authority's thread; it
+/// answers its own caller.
+type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
 
 /// The managed ids as the standalone paths read them, without the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +194,9 @@ enum Ids {
 #[derive(Debug, Clone)]
 pub(crate) struct Authority {
     writer: Arc<Mutex<Writer>>,
+    /// The commit counter once the thread runs, `None` before: what the
+    /// node's dispatch waits on without starting the thread itself.
+    started: Arc<watch::Sender<Option<watch::Receiver<u64>>>>,
     /// How many threads this authority started, for the tests.
     #[cfg(test)]
     spawned: Arc<std::sync::atomic::AtomicUsize>,
@@ -192,6 +216,9 @@ enum Writer {
         calls: mpsc::Sender<Call>,
         /// The ids it publishes outside the queue.
         ids: watch::Receiver<Ids>,
+        /// How many calls have changed the journal; a watcher of the
+        /// facade waits on it (M5).
+        commits: watch::Receiver<u64>,
     },
 }
 
@@ -223,6 +250,7 @@ impl Authority {
         let journal = !matches!(managed_dir(state).join(FILE_NAME).try_exists(), Ok(false));
         let authority = Authority {
             writer: Arc::new(Mutex::new(Writer::Idle(state.clone(), node, executor))),
+            started: Arc::new(watch::channel(None).0),
             #[cfg(test)]
             spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -242,7 +270,7 @@ impl Authority {
     fn running(&self) -> std::io::Result<(mpsc::Sender<Call>, watch::Receiver<Ids>)> {
         let mut writer = crate::node::lock(&self.writer);
         let place = match &*writer {
-            Writer::Running { calls, ids } => return Ok((calls.clone(), ids.clone())),
+            Writer::Running { calls, ids, .. } => return Ok((calls.clone(), ids.clone())),
             Writer::Idle(state, node, executor) => Place {
                 dir: managed_dir(state),
                 jobs: state.jobs(),
@@ -252,17 +280,62 @@ impl Authority {
         };
         let (calls, queue) = mpsc::channel(QUEUE);
         let (publish, ids) = watch::channel(Ids::Loading);
+        let (committed, commits) = watch::channel(0_u64);
         std::thread::Builder::new()
             .name("fabric-authority".into())
-            .spawn(move || serve(&place, queue, &publish))?;
+            .spawn(move || serve(&place, queue, &publish, &committed))?;
         #[cfg(test)]
         self.spawned
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started.send_replace(Some(commits.clone()));
         *writer = Writer::Running {
             calls: calls.clone(),
             ids: ids.clone(),
+            commits,
         };
         Ok((calls, ids))
+    }
+
+    /// A counter of the calls that changed the journal, for a facade watch
+    /// that waits for the next event (M5): it starts the thread when none
+    /// runs, so a watch on an empty authority waits on a live counter.
+    pub(crate) fn commits(&self) -> Result<watch::Receiver<u64>, AuthorityError> {
+        self.running()
+            .map_err(|e| AuthorityError::Unavailable(format!("its thread did not start: {e}")))?;
+        match &*crate::node::lock(&self.writer) {
+            Writer::Running { commits, .. } => Ok(commits.clone()),
+            Writer::Idle(..) => Err(AuthorityError::Unavailable(
+                "its thread did not start".into(),
+            )),
+        }
+    }
+
+    /// The commit counter, once the thread runs: waits without starting
+    /// it, so a node with no managed job starts no thread for its
+    /// dispatch. `None` when the authority is dropped before it starts.
+    pub(crate) async fn started(&self) -> Option<watch::Receiver<u64>> {
+        let mut started = self.started.subscribe();
+        started.wait_for(Option::is_some).await.ok()?.clone()
+    }
+
+    /// Runs `work` on the journal inside the authority's thread, after
+    /// the calls before it (M5, owner B: the facade's token rows and
+    /// reads, the inspect read). With `create`, a journal is made when
+    /// there is none, as a first `CreateJob` makes it; without it, an
+    /// absent journal is `UnknownJob` for the job the work names, or
+    /// unavailable for work that names none.
+    pub(crate) async fn with_journal<T: Send + 'static>(
+        &self,
+        create: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        self.call(|reply: Reply<T>| Call::With {
+            create,
+            work: Box::new(move |journal| {
+                let _ = reply.send(journal.and_then(work));
+            }),
+        })
+        .await
     }
 
     /// Whether no thread runs: no journal at start and no command since,
@@ -317,11 +390,8 @@ impl Authority {
     }
 
     /// Records the authority's own observation of an attempt or an
-    /// operation: no runner presents a grant, so no fence runs.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 reports through it")
-    )]
+    /// operation, or what an executor on this node reports: no runner
+    /// presents a grant, so no fence runs (ADR 0028).
     pub(crate) async fn observe_authority(
         &self,
         job: JobId,
@@ -333,9 +403,9 @@ impl Authority {
 
     /// Marks an operation on the authority's own behalf, `Dispatched`
     /// right before its effect is asked for.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the executor wiring of M3 dispatches through it")
+    #[allow(
+        dead_code,
+        reason = "a launch's dispatch marks through it; no launch is dispatched by the node in M5, so only the tests call it"
     )]
     pub(crate) async fn mark_authority(
         &self,
@@ -495,6 +565,17 @@ impl Authority {
         }
         self.call(Call::List).await
     }
+
+    /// Every accepted operation whose effect was not asked for yet, oldest
+    /// job first: what the node's dispatch loop takes next, after a
+    /// restart as during a run. Each is dispatched once, after
+    /// `mark(Dispatched)` or, for a create or a continue, by its `Placed`.
+    pub(crate) async fn pending(&self) -> Result<Vec<PendingEffect>, AuthorityError> {
+        if self.idle() {
+            return Ok(Vec::new());
+        }
+        self.call(Call::Pending).await
+    }
 }
 
 /// Where the authority keeps its journal and where standalone jobs live.
@@ -513,11 +594,11 @@ impl Place {
     /// it runs managed attempts, and otherwise no eligible node, with this
     /// node's exclusion named, so the job falls back to `block` with the
     /// reason recorded and the old grant is kept.
-    fn placement(&self) -> Result<ResourceRef, Vec<Exclusion>> {
+    fn placement(&self) -> Result<ResourceRef, Vec<RecoveryExclusion>> {
         if self.executor {
             Ok(ResourceRef::Node { node: self.node })
         } else {
-            Err(vec![Exclusion {
+            Err(vec![RecoveryExclusion {
                 node: self.node,
                 reason: "no executor: this node runs no managed attempt".to_owned(),
             }])
@@ -615,16 +696,42 @@ fn stopped(e: &dyn std::fmt::Display) -> Holder {
     clippy::too_many_lines,
     reason = "one arm per call reads better than a helper per arm"
 )]
-fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids>) {
+fn serve(
+    place: &Place,
+    mut queue: mpsc::Receiver<Call>,
+    ids: &watch::Sender<Ids>,
+    committed: &watch::Sender<u64>,
+) {
     let mut holder = open_existing(place, ids);
+    let bump = || committed.send_modify(|n| *n = n.wrapping_add(1));
     let mut presence = Presence::default();
     if let Holder::Open(journal) = &holder {
         track_live(place, journal, &mut presence, mono_ms());
     }
     while let Some(call) = queue.blocking_recv() {
         match call {
+            Call::With { create, work } => {
+                if create && matches!(holder, Holder::Absent) {
+                    match self::create(place) {
+                        Ok(journal) => holder = Holder::Open(journal),
+                        Err(e) => {
+                            work(Err(e));
+                            continue;
+                        }
+                    }
+                }
+                work(match &mut holder {
+                    Holder::Open(journal) => Ok(journal),
+                    Holder::Absent => {
+                        Err(AuthorityError::Unavailable("no managed journal yet".into()))
+                    }
+                    Holder::Stopped(reason) => Err(AuthorityError::Unavailable(reason.clone())),
+                });
+                bump();
+            }
             Call::Submit(envelope, reply) => {
                 let answer = submit(place, &mut holder, &envelope);
+                bump();
                 // Published before the answer, so no caller that saw the
                 // job made can look its id up and miss it.
                 if let Ok(Answer {
@@ -654,12 +761,14 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                     note(place, &mut presence, job, &t.events, mono_ms());
                 }
                 let _ = reply.send(answer);
+                bump();
             }
             Call::Mark(job, operation, mark, reply) => {
                 let _ = reply.send(
                     open(&mut holder, job)
                         .and_then(|j| Ok(j.mark_authority(job, operation, mark, now_ms())?)),
                 );
+                bump();
             }
             Call::Report(token, from, observation, reply) => {
                 let from = from.unwrap_or(place.node);
@@ -674,6 +783,7 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                     note(place, &mut presence, token.job, &t.events, mono_ms());
                 }
                 let _ = reply.send(answer);
+                bump();
             }
             Call::Fenced(token, path, from, write) => {
                 let from = from.unwrap_or(place.node);
@@ -686,17 +796,21 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
                 };
                 // The write runs here, before the next call is taken.
                 write(fenced);
+                bump();
             }
             Call::Acknowledge(job, ack, reply) => {
                 let _ = reply.send(
                     open(&mut holder, job).and_then(|j| Ok(j.acknowledge(job, &ack, now_ms())?)),
                 );
+                bump();
             }
             Call::Heartbeat(from, beat, reply) => {
                 let _ = reply.send(heartbeat(place, &mut holder, &mut presence, from, &beat));
+                bump();
             }
             Call::Tick(now, reply) => {
                 let _ = reply.send(tick(place, &mut holder, &mut presence, now));
+                bump();
             }
             Call::Job(job, reply) => {
                 let _ = reply.send(match &holder {
@@ -708,8 +822,33 @@ fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids
             Call::List(reply) => {
                 let _ = reply.send(list(&holder));
             }
+            Call::Pending(reply) => {
+                let _ = reply.send(list(&holder).map(|jobs| pending(&jobs)));
+            }
         }
     }
+}
+
+/// The accepted effects of `jobs`: grants that may still be dispatched
+/// and M5 commands still `accepted`.
+fn pending(jobs: &[ManagedState]) -> Vec<PendingEffect> {
+    let mut out = Vec::new();
+    for state in jobs {
+        for op in &state.operations {
+            let waits = match op.kind {
+                CommandKind::StartAttempt => state.grant_may_dispatch(op.id),
+                _ => op.status == OperationStatus::Accepted,
+            };
+            if waits {
+                out.push(PendingEffect {
+                    job: state.job.id,
+                    operation: op.id,
+                    kind: op.kind,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The open journal; with none yet, `job` is a job the authority does not have.

@@ -15,8 +15,8 @@ use fabric_client::api::{
 };
 use fabric_core::id::JobId;
 use fabric_core::managed::{
-    Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, RecoveryPolicy, RestartPolicy,
-    SourceBinding, StoredResult,
+    Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, RestartPolicy, SourceBinding,
+    StoredResult,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::{Answer, CommitError};
@@ -57,6 +57,13 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::Exhausted => "exhausted",
         DomainError::Broken { .. } => "broken",
         DomainError::ReplacementBlocked { .. } => "replacement_blocked",
+        DomainError::BadPolicy { .. } => "bad_policy",
+        DomainError::UnsupportedSource { .. } => "unsupported_source",
+        DomainError::FidelityRefused { .. } => "fidelity_refused",
+        DomainError::NotLive { .. } => "not_live",
+        DomainError::NoteTooLong { .. } => "note_too_long",
+        DomainError::CredentialLike { .. } => "credential_like",
+        DomainError::EffectInFlight { .. } => "effect_in_flight",
         DomainError::UnknownCheckpoint { .. } => "unknown_checkpoint",
         DomainError::CutMismatch { .. } => "cut_mismatch",
         DomainError::NotAcknowledged { .. } => "not_acknowledged",
@@ -119,6 +126,7 @@ impl Node {
                 repo,
                 goal,
                 harness,
+                ..
             } => {
                 // As for a standalone job: a secret in an ACP argument is
                 // refused before the append-only journal records it.
@@ -128,12 +136,13 @@ impl Node {
                     job: None,
                     expected: None,
                     body: Command::CreateJob {
-                        intent: Intent { goal, harness },
-                        source: source(&repo)?,
-                        policy: JobPolicy {
-                            restart: RestartPolicy::ExplicitOnly,
-                            recovery: RecoveryPolicy::Block,
+                        intent: Intent {
+                            goal,
+                            harness,
+                            acceptance: Vec::new(),
                         },
+                        source: source(&repo)?,
+                        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
                     },
                 };
                 let operation = self.managed_submit(envelope).await?;
@@ -144,6 +153,7 @@ impl Node {
                 job,
                 expected_revision,
                 reason,
+                ..
             } => {
                 let envelope = Envelope {
                     key: operation_key,
@@ -188,7 +198,7 @@ impl Node {
         }
     }
 
-    async fn managed_job(&self, job: JobId) -> Result<ManagedJob, NodeError> {
+    pub(crate) async fn managed_job(&self, job: JobId) -> Result<ManagedJob, NodeError> {
         match self.authority.job(job).await? {
             Some(state) => Ok(ManagedJob::from(&state)),
             None if self.cfg.state.job(job).ledger().exists() => {
@@ -198,7 +208,7 @@ impl Node {
         }
     }
 
-    async fn managed_submit(
+    pub(crate) async fn managed_submit(
         &self,
         envelope: Envelope<Command>,
     ) -> Result<ManagedOperation, NodeError> {

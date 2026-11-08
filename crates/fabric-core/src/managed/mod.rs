@@ -1,5 +1,7 @@
 //! Managed jobs (ADR 0019): the job, its tasks, its attempts and the
-//! operations that changed them, kept by one authority (ADR 0020).
+//! operations that changed them, kept by one authority (ADR 0020), with
+//! the task lifecycle, the work package, the source bindings, the
+//! placement and the facade token of M5 (ADRs 0023 to 0027).
 //!
 //! Invariant: a managed job's state is exactly the replay of its events.
 //! The authority checks every command and observation here, writes the
@@ -16,9 +18,11 @@
 //! - A grant gets the job's next [`Generation`]; a report at an older
 //!   generation is recorded as refused and changes nothing.
 //! - A lost worker makes its attempt [`AttemptStatus::Lost`]. The task
-//!   stays open, and only an explicit `StartAttempt` grants again.
+//!   stays open, and only an explicit `StartAttempt` or `Continue` grants again.
 //! - Nothing here turns a timeout into a replay: an operation whose outcome
 //!   is not observed stays `Dispatched` or `Unknown`.
+//! - A create's effect is its initial placement: it stays `Accepted` until
+//!   a `Placed` observation grants the first attempt or parks the job.
 //!
 //! ```
 //! use fabric_core::harness::HarnessKind;
@@ -39,13 +43,18 @@
 //!     job: None,
 //!     expected: None,
 //!     body: Command::CreateJob {
-//!         intent: Intent { goal: "fix the test".into(), harness: HarnessKind::Codex },
+//!         intent: Intent {
+//!             goal: "fix the test".into(),
+//!             harness: HarnessKind::Codex,
+//!             acceptance: vec!["cargo test passes".into()],
+//!         },
 //!         source: SourceBinding::Repository { path: AbsPath::parse("/src/repo")? },
-//!         policy: JobPolicy { restart: RestartPolicy::ExplicitOnly, recovery: RecoveryPolicy::Block },
+//!         policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
 //!     },
 //! };
 //! let made = accept_command(None, &create, &ids(2))?;
 //! let job = apply_batch(None, made.revision, &made.events)?;
+//! assert!(job.parked(), "nothing runs until the initial placement");
 //!
 //! let start = Envelope {
 //!     key: OperationKey::parse("start-1")?,
@@ -74,26 +83,49 @@
 //! # Ok(()) }
 //! ```
 
+mod canon;
+pub mod facade;
 mod fence;
 mod frame;
 mod ids;
+pub mod lifecycle;
 mod model;
+pub mod package;
+pub mod place;
+pub mod placement;
+pub mod secret_ref;
+pub mod source;
 mod transition;
 
 pub use fence::{CoveredPath, FenceVerdict, GrantToken, fence};
-pub use frame::{EventFrame, FrameError, MANAGED_FORMAT, READ_FORMATS, StoredPart, request_digest};
+pub use frame::{
+    EventFrame, FrameError, MANAGED_FORMAT, MANAGED_FORMAT_V1, StoredPart, request_digest, v1,
+};
 pub use ids::{
     AttemptId, EventDigest, EventSeq, Generation, MAX_OPERATION_KEY, OperationId, OperationKey,
     OperationKeyError, ParseCounterError, RequestDigest, TaskId, WorkRevision,
 };
+pub use lifecycle::{
+    CheckpointCut, CutDigest, DrainBudget, EvidenceKind, EvidenceRef, HandoffBlocker,
+    OutcomePolicy, ReceiptStatus, TaskClass, TaskReceipt, WorkspaceRevision,
+};
 pub use model::{
     AcceptedOperation, Attempt, AttemptStatus, Checkpoint, CheckpointAck, Command, CommandKind,
-    CutDigest, Dedupe, DomainError, Envelope, Exclusion, ExitOutcome, HEARTBEAT_INTERVAL_MS,
-    Intent, JobMode, JobPolicy, JobState, ManagedEvent, ManagedJob, ManagedState, NewIds,
-    Observation, Operation, OperationMark, OperationProgress, OperationStatus, OutcomePolicy,
-    RecoveryBlock, RecoveryPolicy, ResourceRef, RestartPolicy, SourceBinding, StoredResult, Task,
-    TaskKind, TaskOutcome, TaskState, Transition, UNAVAILABLE_AFTER_MS,
+    Dedupe, DomainError, EffectRequest, Envelope, ExitOutcome, HEARTBEAT_INTERVAL_MS, Intent,
+    JobMode, JobPolicy, JobState, MAX_EXPORT_ALLOWLIST, MAX_SECRETS, ManagedEvent, ManagedJob,
+    ManagedState, NewIds, Note, Observation, Operation, OperationMark, OperationProgress,
+    OperationStatus, PlacementPolicy, RecoveryBlock, RecoveryExclusion, RecoveryPolicy,
+    ResourceRef, RestartPolicy, SourceBinding, StoredResult, Task, TaskKind, TaskOutcome,
+    TaskState, Transition, UNAVAILABLE_AFTER_MS,
 };
+pub use package::{
+    AllowedFidelity, Fidelity, FidelityRefusal, PACKAGE_MAX_BYTES, PACKAGE_VERSION, PackageDigest,
+    PackageError, PackageInput, TEXT_MAX_BYTES, WorkPackage, build_package, offered_fidelity,
+};
+pub use place::place;
+pub use placement::{NodeAdvert, PlacementDecision, PlacementKind};
+pub use secret_ref::{SECRET_ENV_PREFIX, SecretName, SecretRef, SecretScope, SecretValue};
+pub use source::{CommitId, GitUri, SourceError};
 pub use transition::{
     accept_command, acknowledge, admit_recovery, apply_batch, apply_observation, dedupe,
     mark_operation, record_recovery_block, recovery_decision, replay,

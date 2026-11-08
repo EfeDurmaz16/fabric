@@ -1,0 +1,37 @@
+{
+  "op": "managed_submit",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "goal": "Make the tests pass",
+  "harness": {
+    "kind": "claude_code"
+  },
+  "acceptance": [
+    "cargo test passes"
+  ],
+  "source": {
+    "kind": "git",
+    "uri": "https://example.com/org/repo.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "policy": {
+    "drain_budget_ms": 30000,
+    "allowed_fidelity": [
+      "native_session",
+      "new_native_session_with_package"
+    ],
+    "secrets": [
+      {
+        "name": "API_TOKEN",
+        "attempt": "any",
+        "resource_kinds": [
+          "node"
+        ]
+      }
+    ],
+    "export_allowlist": [
+      "notes/plan.md"
+    ],
+    "disk_bytes": 2147483648,
+    "pin": null
+  }
+}

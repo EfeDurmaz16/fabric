@@ -12,6 +12,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Attempt.** One execution of one task of a managed job on one resource, under one generation. A retry is a new attempt; an attempt that disappears is `lost`, never `cancelled` (ADR 0019).
 
+**Checkpoint cut.** The document a managed checkpoint leaves beside its snapshot: one receipt per task, the node's facts for the job and the accepted evidence by digest, stored content-addressed with its digest in the journal (ADR 0023). It says what the checkpoint interrupted, not how to resume a process.
+
 **Blob.** Bytes stored by hash. Chunks and manifests are both blobs.
 
 **Bridge.** The framed stdio protocol between Fabric and a Capsule provider worker, version 1 (ADR 0021, docs/bridge-protocol.md). Fabric keeps job identity and the journal; the worker maps one governed action at a time onto a provider and reports what it observed.
@@ -28,7 +30,13 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Covered write.** One of exactly four write paths that carry a grant token and run the fence before writing: a ledger append of a managed job, a bundle publish accepted as the job's checkpoint, a journal operation an executor reports, and the outcome of a facade command (ADR 0028). The harness's own files inside the workspace are not covered.
 
+**Escaped child.** A process in a managed task's process group that no registered task owns (ADR 0023). It blocks a strong handoff with its pid and is never adopted or killed in silence.
+
+**Exclusion.** The structured reason a node was not eligible for one placement: no answer in time, platform, a missing or old harness, path layout, an unresolvable secret, disk, or the user's pin (ADR 0026). Every exclusion of every candidate is in the decision.
+
 **Epoch.** A counter on a job's lease. It starts at 1 and increases by one on every `MoveImported` or `Stolen` record. Any message or write carrying an older epoch than the current one is stale and is refused.
+
+**Drain budget.** How long a quiescence waits for one task to settle on its own before its class's outcome policy applies: 30 s unless the job's policy says otherwise, between 1 s and 10 min (ADR 0023). It bounds the wait, never the task.
 
 **Doctor.** `fabric doctor`: the preflight that compares exact strings (user, home, tool versions, logins as yes or no, clock offset, synced folders) between two nodes and refuses a move on a mismatch the table marks as refuse.
 
@@ -36,7 +44,13 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Event.** One append-only record in a job's ledger. Events are never edited or deleted.
 
+**Facade.** The authenticated remote job operations of ADR 0027 (`submit`, `inspect`, `watch`, `cancel`, `checkpoint`, `continue`), carried over the node link as a protocol of their own and reachable from any registered node of the owner. No owner-only socket operation has a facade form.
+
+**Facade token.** The bearer the owner mints on the authority node for one actor, with the jobs and resources it may touch, an expiry and a revocation id (ADR 0027). The authority keeps its digest, never the bearer; revocation is immediate.
+
 **Fence.** The one rule every covered write runs first (ADR 0028): the grant token's attempt must be the job's live attempt at the job's generation, `granted` or `running`, from the node it was granted to. Any other verdict refuses the write, records it and changes nothing else.
+
+**Fidelity.** How much of a managed job a continuation carried: `native_session`, `new_native_session_with_package`, `workspace_only`, or `unsupported`, which is a refusal (ADR 0024). The job's policy says which are allowed; every continuation records the one achieved, and a refusal is never lowered into a weaker one.
 
 **Fencing.** Refusing work from a stale epoch. The fencing token is `(job_id, epoch)`. The mechanism that keeps exactly one live copy among Fabric processes; native tombstones cover the harness's own writers.
 
@@ -49,6 +63,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Harness adapter.** The Fabric code that knows how to detect, capture, restore and launch one harness.
 
 **Harness record.** The file under a job's directory that names the running harness process (pid, process group, start time, or the harness's own session id), its epoch and its supervisor. What a restarted supervisor reads to find the process.
+
+**Handoff blocker.** What stops a planned handoff without failing the job: an escaped child, an uncontrolled writer in the workspace, a harness checkpoint that failed, an opaque task, or a provider effect still unknown (ADR 0023). The owner decides; the attempt keeps running.
 
 **Harness state directory.** The files a harness needs to continue a conversation. Fabric treats it as opaque bytes owned by the adapter.
 
@@ -65,6 +81,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Job record.** The ledger and the manifest together.
 
 **Ledger.** The append-only, hash-chained log of a job's events.
+
+**Interrupted.** The receipt status of a build or test cut by a quiescence or a cancel (ADR 0023). A third outcome beside passed and failed; nothing may fold it into either.
 
 **Lease.** The right to run a job. Either `Owned` by one node at an epoch, or `Departing` toward a target under a move id. It has no expiry in this phase.
 
@@ -86,6 +104,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Node id.** The ed25519 public key of a node. Also the TLS identity pinned on every connection.
 
+**Note.** A decision with its stated reason, a question, or an answer, recorded on a managed job by the `RecordNote` command so the work package can carry it (ADR 0024).
+
 **Operation key.** The name a caller gives one command on a managed job. The authority keeps the first answer under it, so the same key and command sent again get the same answer and no second effect.
 
 **Orphan snapshot.** A snapshot that is not on its job's chain, made by `fabric job export` from an orphan workspace, or published by a chain a fork repair set aside, and pinned with its bundle chain in the job's `pins` file so no pass that forgets snapshots drops it.
@@ -98,9 +118,11 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Pairing.** Telling one node the id and address of another, out of band. Pairing is how trust is established. Discovery is never trust.
 
-**Placement.** Choosing which node runs a job. In this phase the user names it: `fabric job move --to` on the owner, or `fabric resume` on the node that wants it. The root is the recorded root.
+**Placement.** Choosing which node runs a job. For a standalone job the user names it: `fabric job move --to` on the owner, or `fabric resume` on the node that wants it; the root is the recorded root. For a managed job the authority chooses among registered nodes by hard filters and a deterministic ranking, and records the decision (ADR 0026); the user may pin a node.
 
 **Provider operation.** One effect a managed attempt asks a provider worker for over the bridge, such as creating a sandbox. The journal records it `dispatched` before the request is written, fenced on the job's current live attempt, and never sends its id or key twice (schema version 2, `provider_operations`).
+
+**Receipt (task).** What the executor records about one task of an attempt: its class, status, exit code, whether it was interrupted and the workspace revision it saw (ADR 0023). Receipts are in the checkpoint cut and the work package.
 
 **Replacement barrier.** The rule that refuses a new attempt while an effect of an earlier one may still act: a destroy not confirmed, an exec not settled whose sandbox was not destroyed, or a create whose resource no one can name (ADR 0022).
 
@@ -112,7 +134,11 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Snapshot commit.** One of the two git commits a capture makes with a private index: `I` for the index and `W` for the working tree. They carry uncommitted work inside a bundle without touching the user's index or refs.
 
+**SecretRef.** A managed job's declared need for a named secret, with the attempts and resource kinds it applies to (ADR 0025). The executing node's local resolver supplies the value from `FABRIC_SECRET_<name>` or a 0600 file under its config directory; a node that cannot resolve a ref is excluded before launch. The value never enters the journal, a snapshot, a package, a receipt or a log.
+
 **Snapshot.** An immutable, content-addressed capture of a workspace and its harness state at one moment.
+
+**Source binding.** Where a managed job's workspace comes from: a repository path on the authority (local only), a published snapshot, a git URI at an exact commit, or nothing (ADR 0019, ADR 0025). A local directory becomes a snapshot by import; adopting an active checkout is unsupported in M5.
 
 **Steal.** `fabric job steal --force`: bumping a job's epoch without the owner's consent, from a complete local snapshot, with a printed warning. The only way past an owner or a target that does not answer.
 
@@ -124,6 +150,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Suspend.** Stop the harness cleanly, publish a snapshot, push it to paired peers. The owner does not change.
 
+**Task class.** What an interruption means for a managed task: `build` and `test` are cancelled and restarted and recorded interrupted, `harness` takes the supported checkpoint, `opaque` blocks (ADR 0023). Declared when the task is registered; never inferred from a process name.
+
 **Tombstone (native).** The mark a harness's own store accepts for "continued elsewhere": Claude's `continued-in` record, Codex `thread/archive`. Written during capture so the harness's own picker or supervisor does not reopen the departed session.
 
 **Transport.** The trait that connects two nodes by id and gives them byte streams. QUIC first, TCP+TLS as fallback.
@@ -133,6 +161,10 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Unreferenced chunk.** A chunk or manifest that no live snapshot reaches. Invisible to readers; the only thing `fabric store gc` removes.
 
 **Warm cache.** A node already holds most chunks of a job's latest snapshot, so a resume there moves little data.
+
+**Watch cursor.** The journal event sequence a facade watcher resumes from (ADR 0027). An answer carries at most 256 events and the next cursor; a reader that fell behind the window is told so and continues from the cursor, losing nothing.
+
+**Work package.** The portable projection of a managed job's accepted state: intent, acceptance, decisions with reasons, tasks and receipts, workspace revision, evidence by digest, open questions, artifacts and permitted next actions, at most 256 KiB (ADR 0024). Never a second authority; native session attachments stay outside it.
 
 **Work revision.** The count of accepted changes to one managed job, starting at 1. A command names the revision it expects and is refused if the job has moved on.
 

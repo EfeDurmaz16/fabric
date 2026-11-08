@@ -967,7 +967,7 @@ fn a_recover_is_blocked_like_a_start_attempt() {
         .unwrap()
         .unwrap();
     let snapshot = SnapshotId::of(b"m6 checkpoint");
-    let cut = CutDigest::of(b"m6 cut");
+    let cut = CutDigest::from_bytes([0x6c; 32]);
     f.journal
         .observe(
             &token,

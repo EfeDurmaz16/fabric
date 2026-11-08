@@ -214,6 +214,20 @@ function isHarness(value: unknown): boolean {
   return kind === "claude_code" || kind === "codex" || kind === "acp";
 }
 
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether the object at `pointer` is carried through unchanged rather than read: a facade message inside
+ * `facade_call`, which the node forwards byte for byte (docs/facade-protocol.md), and a placement verdict's rank
+ * and exclusion reasons, which a client keeps as they came so a reason it does not know still shows (ADR 0026).
+ */
+function carried(message: unknown, pointer: string): boolean {
+  const op = isRecord(message) ? (message["op"] ?? message["kind"]) : undefined;
+  return (op === "facade_call" && pointer.startsWith("/message")) || pointer.includes("/rank/") || pointer.includes("/reasons/");
+}
+
 /**
  * Whether the object at `pointer` in `message` is part of what a client launches, where a reader refuses a
  * field it does not know (ADR 0018, Compatibility, rule 2): a run plan with all it holds, and a harness
@@ -564,9 +578,14 @@ describe("the shared fixtures", () => {
             throw new Error(`${dir}/${name}: ${pointer} names no object`);
           }
           Reflect.set(target, "added_by_a_newer_node", unknown);
-          const parsed = schema.safeParse(decodeJson(new TextEncoder().encode(JSON.stringify(grown))));
+          const body = decodeJson(new TextEncoder().encode(JSON.stringify(grown)));
+          const parsed = schema.safeParse(body);
           const where = `${dir}/${name}: a field at ${JSON.stringify(pointer)}`;
-          if (launched(json, pointer)) {
+          if (carried(json, pointer)) {
+            if (!parsed.success) throw new Error(`${where} was refused: ${parsed.error.message}`);
+            // The float in the unknown field is a symbol once read as a frame, and writes as `null` on both sides.
+            expect(written(parsed.data), `${where} is carried as it came`).toStrictEqual(written(body));
+          } else if (launched(json, pointer)) {
             expect(parsed.success, `${where} was skipped in what a client launches`).toBe(false);
           } else if (parsed.success) {
             expect(written(parsed.data), where).toStrictEqual(json);

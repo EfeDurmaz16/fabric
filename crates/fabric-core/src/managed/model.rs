@@ -8,9 +8,22 @@ use super::fence::{CoveredPath, FenceVerdict};
 use super::ids::{
     AttemptId, Generation, OperationId, OperationKey, RequestDigest, TaskId, WorkRevision,
 };
+use super::lifecycle::{
+    CheckpointCut, CutDigest, DrainBudget, HandoffBlocker, TaskClass, TaskReceipt,
+};
+use super::package::{AllowedFidelity, Fidelity, PackageDigest, TEXT_MAX_BYTES};
+use super::placement::{DEFAULT_DISK_BYTES, PlacementDecision};
+use super::secret_ref::SecretRef;
+use super::source::{CommitId, GitUri};
 use crate::harness::HarnessKind;
 use crate::id::{JobId, NodeId, SnapshotId};
-use crate::path::AbsPath;
+use crate::path::{AbsPath, RelPath};
+use crate::snapshot::Platform;
+
+/// The most secrets a job's policy names.
+pub const MAX_SECRETS: usize = 32;
+/// The most paths a job's export allowlist names.
+pub const MAX_EXPORT_ALLOWLIST: usize = 256;
 
 /// How often an executor node heartbeats for its live attempts (ADR 0028).
 pub const HEARTBEAT_INTERVAL_MS: u64 = 2_000;
@@ -34,21 +47,32 @@ pub struct Intent {
     pub goal: String,
     /// The harness the primary task runs under.
     pub harness: HarnessKind,
+    /// The acceptance criteria, each at most `TEXT_MAX_BYTES`; M5.
+    pub acceptance: Vec<String>,
 }
 
 /// Where the job's workspace comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceBinding {
-    /// A repository on the authority's host.
+    /// A repository on the authority's host; the local socket only.
     Repository {
         /// Its absolute path.
         path: AbsPath,
     },
-    /// A published snapshot, such as a standalone job's, imported as a new job's start.
+    /// A published snapshot, such as a standalone job's or an import's, as a new job's start.
     Snapshot {
         /// The snapshot.
         snapshot: SnapshotId,
     },
+    /// A git repository at an exact revision, cloned by the node that runs the attempt; M5.
+    Git {
+        /// Where.
+        uri: GitUri,
+        /// Which commit.
+        commit: CommitId,
+    },
+    /// A fresh workspace with nothing in it; M5.
+    Empty,
 }
 
 /// What may restart a task after its attempt ends without finishing it.
@@ -84,112 +108,104 @@ impl RecoveryPolicy {
     }
 }
 
+/// Where a job may be placed (ADR 0026).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementPolicy {
+    /// The platform the job needs; `None` for any.
+    pub platform: Option<Platform>,
+    /// The free disk the job needs.
+    pub disk_bytes: u64,
+    /// A node the user pinned the job to.
+    pub pin: Option<NodeId>,
+}
+
+impl PlacementPolicy {
+    /// Any platform, 2 GiB, no pin.
+    pub const DEFAULT: PlacementPolicy = PlacementPolicy {
+        platform: None,
+        disk_bytes: DEFAULT_DISK_BYTES,
+        pin: None,
+    };
+}
+
+impl Default for PlacementPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// The job's policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobPolicy {
     /// The restart policy of the primary task.
     pub restart: RestartPolicy,
-    /// What the authority may do by itself when an attempt is unavailable.
+    /// How long a quiescence waits per task, in milliseconds (ADR 0023).
+    pub drain_budget_ms: u32,
+    /// Which continuation fidelities the job allows (ADR 0024).
+    pub allowed_fidelity: AllowedFidelity,
+    /// The secrets its tasks need, at most `MAX_SECRETS` (ADR 0025).
+    pub secrets: Vec<SecretRef>,
+    /// Workspace paths that may leave the node although a secret pattern
+    /// matches them, at most `MAX_EXPORT_ALLOWLIST` (ADR 0025).
+    pub export_allowlist: Vec<RelPath>,
+    /// Where it may be placed (ADR 0026).
+    pub placement: PlacementPolicy,
+    /// What the authority may do by itself when an attempt is unavailable (ADR 0028).
     pub recovery: RecoveryPolicy,
 }
 
 impl JobPolicy {
-    /// The code the canonical encoding stores: the restart policy's
-    /// variant plus twice the recovery policy's. A policy written before
-    /// M6 is the restart variant alone (0 or 1), so it reads back with
-    /// `recovery: Block` and a `Block` policy encodes to the bytes it
-    /// always had, which keeps every stored digest and request digest of
-    /// an older job the same (ADR 0028).
-    fn code(self) -> u32 {
-        let restart = match self.restart {
-            RestartPolicy::Block => 0,
-            RestartPolicy::ExplicitOnly => 1,
-        };
-        let recovery = match self.recovery {
-            RecoveryPolicy::Block => 0,
-            RecoveryPolicy::RestartFromAcknowledged => 1,
-        };
-        restart + 2 * recovery
-    }
-
-    fn from_code(code: u32) -> Option<JobPolicy> {
-        let restart = match code % 2 {
-            0 => RestartPolicy::Block,
-            _ => RestartPolicy::ExplicitOnly,
-        };
-        let recovery = match code / 2 {
-            0 => RecoveryPolicy::Block,
-            1 => RecoveryPolicy::RestartFromAcknowledged,
-            _ => return None,
-        };
-        Some(JobPolicy { restart, recovery })
-    }
-}
-
-impl Serialize for JobPolicy {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u32(self.code())
-    }
-}
-
-impl<'de> Deserialize<'de> for JobPolicy {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let code = u32::deserialize(deserializer)?;
-        JobPolicy::from_code(code)
-            .ok_or_else(|| serde::de::Error::custom(format!("job policy code {code}")))
-    }
-}
-
-/// What an M5 task's outcome policy says happens to it at the end of a
-/// drain budget (ADR 0023), as M6 reads it for the recovery admission.
-/// The M5 code lands the type under this name at the restack; until then
-/// the primary task of a managed job is a harness task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum OutcomePolicy {
-    /// A build or test: interrupted and restarted from the job's newest checkpoint.
-    CancelAndRestart,
-    /// A harness turn: continued from its own acknowledged checkpoint.
-    Checkpoint,
-    /// An opaque task: never restarted by the authority.
-    Block,
-}
-
-impl OutcomePolicy {
-    /// The name ADR 0023 uses.
+    /// The policy an M2 job had: `restart`, every M5 default and the
+    /// M6 default `RecoveryPolicy::Block`.
     #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            OutcomePolicy::CancelAndRestart => "cancel_and_restart",
-            OutcomePolicy::Checkpoint => "checkpoint",
-            OutcomePolicy::Block => "block",
+    pub fn m2_defaults(restart: RestartPolicy) -> JobPolicy {
+        JobPolicy {
+            restart,
+            drain_budget_ms: DrainBudget::DEFAULT_MS,
+            allowed_fidelity: AllowedFidelity::DEFAULT,
+            secrets: Vec::new(),
+            export_allowlist: Vec::new(),
+            placement: PlacementPolicy::DEFAULT,
+            recovery: RecoveryPolicy::Block,
         }
     }
 
-    /// The outcome policy of a task, by its kind, until the M5 task kinds
-    /// land at the restack: the primary task is a harness task, so
-    /// `Checkpoint`; a child task declares no kind on this base, and a
-    /// task whose kind the authority does not know is never restarted by
-    /// the authority, so `Block`. The recovery decision judges the
-    /// unavailable attempt by its own task, never by the job's primary.
-    #[must_use]
-    pub fn of_kind(kind: &TaskKind) -> OutcomePolicy {
-        match kind {
-            TaskKind::Primary => OutcomePolicy::Checkpoint,
-            TaskKind::Child { .. } => OutcomePolicy::Block,
+    /// Checks every bound; `BadPolicy` names the first field that breaks one.
+    pub fn check(&self) -> Result<(), DomainError> {
+        DrainBudget::new(self.drain_budget_ms)?;
+        let bad = |field: &str| DomainError::BadPolicy {
+            field: field.to_owned(),
+        };
+        if self.allowed_fidelity.is_empty() {
+            return Err(bad("allowed_fidelity"));
         }
+        if self.secrets.len() > MAX_SECRETS {
+            return Err(bad("secrets"));
+        }
+        let mut names: Vec<_> = self.secrets.iter().map(|s| &s.name).collect();
+        names.sort();
+        names.dedup();
+        if names.len() != self.secrets.len() {
+            return Err(bad("secrets"));
+        }
+        if self.export_allowlist.len() > MAX_EXPORT_ALLOWLIST {
+            return Err(bad("export_allowlist"));
+        }
+        if self.placement.disk_bytes == 0 {
+            return Err(bad("placement.disk_bytes"));
+        }
+        Ok(())
     }
 
-    /// `of_kind` for a task.
-    #[must_use]
-    pub fn of_task(task: &Task) -> OutcomePolicy {
-        OutcomePolicy::of_kind(&task.kind)
+    /// The drain budget, checked.
+    pub fn drain_budget(&self) -> Result<DrainBudget, DomainError> {
+        DrainBudget::new(self.drain_budget_ms)
     }
 }
 
-/// Why an M5 placement excluded a node (ADR 0026), as the recovery
-/// decision records it. The M5 code lands the type at the restack.
+/// Why the recovery decision found a node ineligible for the restart.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Exclusion {
+pub struct RecoveryExclusion {
     /// The node.
     pub node: NodeId,
     /// Why it is not eligible.
@@ -217,48 +233,8 @@ pub enum RecoveryBlock {
     /// M5 placement found no eligible node with the unavailable node excluded.
     NoEligibleNode {
         /// Every candidate and why it was excluded.
-        exclusions: Vec<Exclusion>,
+        exclusions: Vec<RecoveryExclusion>,
     },
-}
-
-/// The digest of a checkpoint cut (ADR 0024): the receipts, facts and
-/// evidence refs the cut names, canonically encoded and hashed with blake3.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CutDigest([u8; 32]);
-
-impl CutDigest {
-    /// A digest from its bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> CutDigest {
-        CutDigest(bytes)
-    }
-
-    /// The digest's bytes.
-    #[must_use]
-    pub const fn to_bytes(self) -> [u8; 32] {
-        self.0
-    }
-
-    /// The digest of a cut's canonical bytes.
-    #[must_use]
-    pub fn of(cut: &[u8]) -> CutDigest {
-        CutDigest(*blake3::hash(cut).as_bytes())
-    }
-}
-
-impl std::fmt::Display for CutDigest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::fmt::Debug for CutDigest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CutDigest({self})")
-    }
 }
 
 /// What the authority verified before it accepted a checkpoint as the
@@ -374,6 +350,8 @@ pub struct Task {
     pub restart: RestartPolicy,
     /// Where it is in its life.
     pub state: TaskState,
+    /// What an interruption means for it (ADR 0023).
+    pub class: TaskClass,
 }
 
 /// Where an attempt runs.
@@ -464,19 +442,37 @@ pub enum CommandKind {
     FinishTask,
     /// `Command::CancelJob`.
     CancelJob,
-    /// `Command::Supersede`.
+    /// `Command::CancelTask`; M5.
+    CancelTask,
+    /// `Command::RecordNote`; M5.
+    RecordNote,
+    /// `Command::Checkpoint`; M5.
+    Checkpoint,
+    /// `Command::Continue`; M5.
+    Continue,
+    /// `Command::Supersede`; M6.
     Supersede,
-    /// `Command::Recover`.
+    /// `Command::Recover`; M6.
     Recover,
 }
 
 impl CommandKind {
-    /// Whether the command asks an executor for an effect after it commits.
-    /// Only a grant does (`StartAttempt`, and `Recover`, which grants);
-    /// every other command is complete once committed.
+    /// Whether a command of this kind may ask an executor for an effect
+    /// after it commits. Whether one did is `CommandAccepted::effect`: a
+    /// cancel has an effect only while an attempt is live, and `Recover`
+    /// grants (ADR 0028).
     #[must_use]
     pub fn has_effect(self) -> bool {
-        self.grants()
+        matches!(
+            self,
+            CommandKind::StartAttempt
+                | CommandKind::CreateJob
+                | CommandKind::CancelJob
+                | CommandKind::CancelTask
+                | CommandKind::Checkpoint
+                | CommandKind::Continue
+                | CommandKind::Recover
+        )
     }
 
     /// Whether the command grants an attempt.
@@ -494,9 +490,32 @@ impl CommandKind {
             CommandKind::RegisterTask => "register_task",
             CommandKind::FinishTask => "finish_task",
             CommandKind::CancelJob => "cancel_job",
+            CommandKind::CancelTask => "cancel_task",
+            CommandKind::RecordNote => "record_note",
+            CommandKind::Checkpoint => "checkpoint",
+            CommandKind::Continue => "continue",
             CommandKind::Supersede => "supersede",
             CommandKind::Recover => "recover",
         }
+    }
+
+    /// The kind from its stored name.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<CommandKind> {
+        Some(match name {
+            "create_job" => CommandKind::CreateJob,
+            "start_attempt" => CommandKind::StartAttempt,
+            "register_task" => CommandKind::RegisterTask,
+            "finish_task" => CommandKind::FinishTask,
+            "cancel_job" => CommandKind::CancelJob,
+            "cancel_task" => CommandKind::CancelTask,
+            "record_note" => CommandKind::RecordNote,
+            "checkpoint" => CommandKind::Checkpoint,
+            "continue" => CommandKind::Continue,
+            "supersede" => CommandKind::Supersede,
+            "recover" => CommandKind::Recover,
+            _ => return None,
+        })
     }
 }
 
@@ -624,6 +643,10 @@ impl TaskOutcome {
 
 /// A command a caller sends the authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a create carries the job's whole policy once; boxing it would change the stored encoding for no gain"
+)]
 pub enum Command {
     /// Makes a managed job and its primary task.
     CreateJob {
@@ -651,6 +674,8 @@ pub enum Command {
         kind: TaskKind,
         /// What may restart it.
         restart: RestartPolicy,
+        /// What an interruption means for it.
+        class: TaskClass,
     },
     /// Finishes a task none of whose attempts may still run.
     FinishTask {
@@ -659,10 +684,38 @@ pub enum Command {
         /// How it finished.
         outcome: TaskOutcome,
     },
-    /// Ends the job; refused while an attempt may still run.
+    /// Ends the job. With a live attempt it is dispatched to stop the
+    /// attempt first (M5); without one the job is cancelled at commit.
     CancelJob {
         /// Why, for the history.
         reason: String,
+    },
+    /// Cancels one task, stopping its live attempt first when it has one; M5.
+    CancelTask {
+        /// The task.
+        task: TaskId,
+        /// Why, for the history.
+        reason: String,
+    },
+    /// Records a decision, a question or an answer; M5.
+    RecordNote {
+        /// The note.
+        note: Note,
+    },
+    /// Quiesces and cuts the live attempt, which then continues; M5.
+    Checkpoint {
+        /// The attempt.
+        attempt: AttemptId,
+    },
+    /// The planned handoff: cut the live attempt, place the task again and
+    /// grant the next attempt there; M5.
+    Continue {
+        /// The task.
+        task: TaskId,
+        /// Which fidelities this continuation allows.
+        fidelity: AllowedFidelity,
+        /// A node to pin it to.
+        pin: Option<NodeId>,
     },
     /// Takes the grant away from an `unknown` attempt and grants nothing (ADR 0028).
     Supersede {
@@ -696,10 +749,99 @@ impl Command {
             Command::RegisterTask { .. } => CommandKind::RegisterTask,
             Command::FinishTask { .. } => CommandKind::FinishTask,
             Command::CancelJob { .. } => CommandKind::CancelJob,
+            Command::CancelTask { .. } => CommandKind::CancelTask,
+            Command::RecordNote { .. } => CommandKind::RecordNote,
+            Command::Checkpoint { .. } => CommandKind::Checkpoint,
+            Command::Continue { .. } => CommandKind::Continue,
             Command::Supersede { .. } => CommandKind::Supersede,
             Command::Recover { .. } => CommandKind::Recover,
         }
     }
+}
+
+/// A note the owner or a harness records on the job (ADR 0024).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Note {
+    /// A decision with its reason.
+    Decision {
+        /// What was decided.
+        what: String,
+        /// Why; never empty.
+        reason: String,
+    },
+    /// An open question.
+    Question {
+        /// The question.
+        text: String,
+    },
+    /// An answer to the question recorded at `question`.
+    Answer {
+        /// The revision the question was recorded at.
+        question: WorkRevision,
+        /// The answer.
+        text: String,
+    },
+}
+
+impl Note {
+    /// Checks every text against `TEXT_MAX_BYTES`, the credential guard
+    /// and the non-empty reason of a decision.
+    pub fn check(&self) -> Result<(), DomainError> {
+        let texts: &[&str] = match self {
+            Note::Decision { what, reason } => {
+                if reason.trim().is_empty() {
+                    return Err(DomainError::BadPolicy {
+                        field: "note.reason".into(),
+                    });
+                }
+                &[what, reason]
+            }
+            Note::Question { text } | Note::Answer { text, .. } => &[text],
+        };
+        for text in texts {
+            if text.len() > TEXT_MAX_BYTES {
+                return Err(DomainError::NoteTooLong { bytes: text.len() });
+            }
+            if crate::credential::looks_like_credential(text) {
+                return Err(DomainError::CredentialLike {
+                    field: "note".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An effect an accepted M5 command asked the authority for, kept in the
+/// history so a restart can dispatch it with what it was asked with.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EffectRequest {
+    /// Stop the live attempt, then cancel the job.
+    CancelJob {
+        /// Why.
+        reason: String,
+    },
+    /// Stop the task's live attempt, then cancel the task.
+    CancelTask {
+        /// The task.
+        task: TaskId,
+        /// Why.
+        reason: String,
+    },
+    /// Quiesce and cut the attempt.
+    Checkpoint {
+        /// The attempt.
+        attempt: AttemptId,
+    },
+    /// Cut, place and grant again.
+    Continue {
+        /// The task.
+        task: TaskId,
+        /// Which fidelities.
+        fidelity: AllowedFidelity,
+        /// A pin.
+        pin: Option<NodeId>,
+    },
 }
 
 /// How an attempt's process ended.
@@ -726,7 +868,9 @@ pub enum Observation {
         /// The generation the reporter acts under.
         generation: Generation,
     },
-    /// The attempt ended at a checkpoint.
+    /// The attempt was quiesced and cut. The attempt ends `Checkpointed`,
+    /// unless a `Checkpoint` command of the job is dispatched, in which
+    /// case the cut is recorded and the attempt goes on (ADR 0023).
     Checkpointed {
         /// The attempt.
         attempt: AttemptId,
@@ -734,6 +878,50 @@ pub enum Observation {
         generation: Generation,
         /// The snapshot it left.
         snapshot: SnapshotId,
+        /// The cut.
+        cut: CheckpointCut,
+    },
+    /// The receipts of the attempt's tasks, as they stand; M5.
+    Receipts {
+        /// The attempt.
+        attempt: AttemptId,
+        /// The generation the reporter acts under.
+        generation: Generation,
+        /// The receipts.
+        receipts: Vec<TaskReceipt>,
+    },
+    /// A quiescence found blockers; the attempt goes on; M5.
+    HandoffBlocked {
+        /// The attempt.
+        attempt: AttemptId,
+        /// The generation the reporter acts under.
+        generation: Generation,
+        /// The blockers.
+        blockers: Vec<HandoffBlocker>,
+    },
+    /// The authority placed a task for `operation`, a create or a
+    /// continue: the decision is recorded and, when a node was chosen, the
+    /// task's next attempt is granted there; M5.
+    Placed {
+        /// The create or continue the placement serves.
+        operation: OperationId,
+        /// The task.
+        task: TaskId,
+        /// The decision.
+        decision: PlacementDecision,
+    },
+    /// The new attempt's executor reported what the continuation achieved; M5.
+    Continued {
+        /// The new attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
+        /// The attempt it continues.
+        from: AttemptId,
+        /// The fidelity achieved.
+        achieved: Fidelity,
+        /// The package used, if one was.
+        package: Option<PackageDigest>,
     },
     /// The attempt's process ended.
     Exited {
@@ -807,6 +995,10 @@ pub struct Envelope<T> {
 
 /// One change the authority recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a job is created once; boxing its policy would change the stored encoding for no gain"
+)]
 pub enum ManagedEvent {
     /// A command was accepted; the events after it, up to the next
     /// `CommandAccepted`, are its effects on the history.
@@ -819,6 +1011,9 @@ pub enum ManagedEvent {
         digest: RequestDigest,
         /// The kind of command.
         kind: CommandKind,
+        /// Whether an executor is asked for an effect after the commit:
+        /// the operation starts `accepted` when so and `succeeded` when not.
+        effect: bool,
     },
     /// The job was made.
     JobCreated {
@@ -843,6 +1038,8 @@ pub enum ManagedEvent {
         kind: TaskKind,
         /// What may restart it.
         restart: RestartPolicy,
+        /// Its class.
+        class: TaskClass,
     },
     /// An attempt was granted at a new generation.
     AttemptGranted {
@@ -895,6 +1092,64 @@ pub enum ManagedEvent {
         operation: OperationId,
         /// The new status.
         status: OperationMark,
+    },
+    /// A note was recorded; M5.
+    NoteRecorded {
+        /// The note.
+        note: Note,
+    },
+    /// Receipts were recorded for an attempt; M5.
+    ReceiptsRecorded {
+        /// The attempt.
+        attempt: AttemptId,
+        /// The receipts.
+        receipts: Vec<TaskReceipt>,
+    },
+    /// A checkpoint cut was recorded; M5.
+    CheckpointCutRecorded {
+        /// The attempt.
+        attempt: AttemptId,
+        /// The snapshot.
+        snapshot: SnapshotId,
+        /// The cut's digest.
+        cut: CutDigest,
+        /// The cut's receipts.
+        receipts: Vec<TaskReceipt>,
+    },
+    /// A quiescence found blockers; M5.
+    HandoffBlocked {
+        /// The attempt.
+        attempt: AttemptId,
+        /// The blockers.
+        blockers: Vec<HandoffBlocker>,
+    },
+    /// A placement was decided; M5.
+    PlacementDecided {
+        /// The task.
+        task: TaskId,
+        /// The decision.
+        decision: PlacementDecision,
+    },
+    /// A continuation was recorded with the fidelity it achieved; M5.
+    ContinuationRecorded {
+        /// The new attempt.
+        attempt: AttemptId,
+        /// The attempt it continues.
+        from: AttemptId,
+        /// What the continue allowed.
+        requested: AllowedFidelity,
+        /// What was achieved.
+        achieved: Fidelity,
+        /// The package used.
+        package: Option<PackageDigest>,
+    },
+    /// An accepted command asked for an effect, kept with what it was
+    /// asked with; M5.
+    EffectRequested {
+        /// The operation.
+        operation: OperationId,
+        /// The request.
+        request: EffectRequest,
     },
     /// An attempt captured a checkpoint into its own store and keeps
     /// running (ADR 0028); the bytes may exist only there.
@@ -979,6 +1234,13 @@ impl ManagedEvent {
             ManagedEvent::JobCancelled { .. } => "job_cancelled",
             ManagedEvent::StaleObservationRefused { .. } => "stale_observation_refused",
             ManagedEvent::OperationMarked { .. } => "operation_marked",
+            ManagedEvent::NoteRecorded { .. } => "note_recorded",
+            ManagedEvent::ReceiptsRecorded { .. } => "receipts_recorded",
+            ManagedEvent::CheckpointCutRecorded { .. } => "checkpoint_cut_recorded",
+            ManagedEvent::HandoffBlocked { .. } => "handoff_blocked",
+            ManagedEvent::PlacementDecided { .. } => "placement_decided",
+            ManagedEvent::ContinuationRecorded { .. } => "continuation_recorded",
+            ManagedEvent::EffectRequested { .. } => "effect_requested",
             ManagedEvent::CheckpointCaptured { .. } => "checkpoint_captured",
             ManagedEvent::CheckpointAcknowledged { .. } => "checkpoint_acknowledged",
             ManagedEvent::CoveredWriteRefused { .. } => "covered_write_refused",
@@ -1107,6 +1369,52 @@ pub enum DomainError {
         /// The oldest provider operation that blocks it.
         operation: OperationId,
     },
+    /// A policy field breaks its bound; M5.
+    #[error("policy field {field} is out of its bounds")]
+    BadPolicy {
+        /// The field.
+        field: String,
+    },
+    /// A source binding this authority does not take; M5.
+    #[error("the source is not supported: {reason}")]
+    UnsupportedSource {
+        /// Why: `adoption` or `repository_over_facade`.
+        reason: String,
+    },
+    /// No allowed fidelity was offered, or a continue allows nothing; M5.
+    #[error("no allowed continuation fidelity")]
+    FidelityRefused {
+        /// What is allowed.
+        allowed: AllowedFidelity,
+        /// What was offered.
+        offered: Vec<Fidelity>,
+    },
+    /// A checkpoint named an attempt that is not granted or running; M5.
+    #[error("attempt {attempt} is not live")]
+    NotLive {
+        /// The attempt.
+        attempt: AttemptId,
+    },
+    /// A note's text is over `TEXT_MAX_BYTES`; M5.
+    #[error("a note of {bytes} bytes is over the limit")]
+    NoteTooLong {
+        /// Its size.
+        bytes: usize,
+    },
+    /// A text looks like a credential and is refused before the journal
+    /// records it; M5.
+    #[error("{field} looks like a credential")]
+    CredentialLike {
+        /// The field.
+        field: String,
+    },
+    /// An effect of the job is dispatched and not yet observed, so another
+    /// checkpoint or continue waits; M5.
+    #[error("operation {operation} is still in flight")]
+    EffectInFlight {
+        /// The operation.
+        operation: OperationId,
+    },
     /// `Captured` repeats a snapshot the attempt already reported, or an
     /// acknowledgement names one it never reported (ADR 0028).
     #[error("attempt {attempt} has no reported checkpoint {snapshot}")]
@@ -1182,6 +1490,8 @@ pub struct ManagedState {
     pub operations: Vec<OperationProgress>,
     /// Its checkpoints, in the order they were captured (ADR 0028).
     pub checkpoints: Vec<Checkpoint>,
+    /// The effects its M5 commands asked for, in order; M5.
+    pub requests: Vec<(OperationId, EffectRequest)>,
 }
 
 impl ManagedState {
@@ -1211,6 +1521,38 @@ impl ManagedState {
             .filter(|c| c.ack.is_none())
             .map(|c| (c.attempt, c.generation, c.snapshot))
             .collect()
+    }
+
+    /// The effect `operation` asked for, if it is an M5 command.
+    #[must_use]
+    pub fn request(&self, operation: OperationId) -> Option<&EffectRequest> {
+        self.requests
+            .iter()
+            .find(|(id, _)| *id == operation)
+            .map(|(_, r)| r)
+    }
+
+    /// The dispatched operation of `kind`, if one is: the effect whose
+    /// outcome the next observation of that kind reports.
+    #[must_use]
+    pub fn in_flight(&self, kind: CommandKind) -> Option<&OperationProgress> {
+        self.operations
+            .iter()
+            .find(|o| o.kind == kind && o.status == OperationStatus::Dispatched)
+    }
+
+    /// Whether the job is parked: active, its primary task open, no
+    /// attempt may run and no operation is in flight; the last placement
+    /// chose no node, or none was made yet.
+    #[must_use]
+    pub fn parked(&self) -> bool {
+        self.job.state == JobState::Active
+            && self.task(self.job.primary).map(|t| t.state) == Some(TaskState::Open)
+            && self.live_attempt().is_none()
+            && !self
+                .operations
+                .iter()
+                .any(|o| o.status == OperationStatus::Dispatched)
     }
 
     /// The task with this id.

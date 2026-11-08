@@ -1,0 +1,10 @@
+{
+  "op": "managed_note",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "note": {
+    "question": {
+      "text": "Which branch?"
+    }
+  }
+}

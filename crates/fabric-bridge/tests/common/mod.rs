@@ -15,7 +15,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::NodeId;
 use fabric_core::managed::{
     Command, Envelope, Generation, Intent, JobPolicy, NewIds, OperationId, OperationKey,
-    RecoveryPolicy, ResourceRef, RestartPolicy, SourceBinding,
+    ResourceRef, RestartPolicy, SourceBinding,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::{FILE_NAME, Journal};
@@ -101,14 +101,12 @@ pub fn journal_for(dir: &Path, scope: Scope) -> Journal {
             intent: Intent {
                 goal: "bridge scenario".into(),
                 harness: HarnessKind::Codex,
+                acceptance: Vec::new(),
             },
             source: SourceBinding::Repository {
                 path: AbsPath::parse("/src/repo").unwrap(),
             },
-            policy: JobPolicy {
-                restart: RestartPolicy::ExplicitOnly,
-                recovery: RecoveryPolicy::Block,
-            },
+            policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
         },
     };
     journal.submit(&create, ids(1)).unwrap();

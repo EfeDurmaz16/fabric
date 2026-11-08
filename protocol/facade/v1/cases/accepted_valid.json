@@ -1,0 +1,16 @@
+{
+  "case": "accepted_valid",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "accepted",
+    "facade": 1,
+    "operation": "01K8W3A0000000000000000P01",
+    "key": "key-submit-1",
+    "replayed": false,
+    "job": "01K8W3A00000000000000000J1",
+    "revision": "1"
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

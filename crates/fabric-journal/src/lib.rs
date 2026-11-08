@@ -19,6 +19,7 @@
 //! verify; an operation left `accepted` is returned for its one dispatch.
 
 mod crashpoint;
+mod facade;
 mod project;
 mod provider;
 mod schema;
@@ -34,11 +35,12 @@ use std::path::{Path, PathBuf};
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::Command;
 use fabric_core::managed::{
-    AcceptedOperation, Attempt, AttemptId, AttemptStatus, CheckpointAck, CoveredPath, DomainError,
-    Envelope, EventFrame, EventSeq, FenceVerdict, GrantToken, ManagedEvent, ManagedState, NewIds,
-    Observation, Operation, OperationId, OperationKey, OperationMark, OperationStatus,
-    RecoveryBlock, RequestDigest, StoredResult, Transition, WorkRevision, acknowledge,
-    apply_observation, fence, mark_operation, record_recovery_block, replay, request_digest,
+    AcceptedOperation, Attempt, AttemptId, AttemptStatus, CheckpointAck, CommandKind, CoveredPath,
+    DomainError, Envelope, EventFrame, EventSeq, FenceVerdict, Fidelity, GrantToken, ManagedEvent,
+    ManagedState, NewIds, Note, Observation, Operation, OperationId, OperationKey, OperationMark,
+    OperationStatus, PackageDigest, PlacementDecision, RecoveryBlock, RequestDigest, StoredResult,
+    TaskReceipt, Transition, WorkRevision, acknowledge, apply_observation, fence, mark_operation,
+    record_recovery_block, replay, request_digest,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -66,17 +68,15 @@ pub enum OpenError {
     #[error("{0} is not a Fabric managed journal")]
     NotAJournal(PathBuf),
     /// The journal was written by an unreleased draft of its schema
-    /// version (version 2 before ADR 0022 completed it, or before ADR 0028
-    /// amended it); nothing released wrote one, so it is refused rather
-    /// than read with missing columns.
+    /// version (version 2 before ADR 0022 completed it, or version 3 with
+    /// codec format 2 frames from before ADR 0028 amended that format);
+    /// nothing released wrote one, so it is refused rather than misread.
     #[error(
-        "the journal has a draft of schema version {version} from before the {amendment} amendment that no release wrote; recreate it"
+        "the journal has a draft of schema version {version} that no release wrote; recreate it"
     )]
     DraftSchema {
         /// Its version.
         version: u32,
-        /// The amendment the file predates: `m4` (ADR 0022) or `m6` (ADR 0028).
-        amendment: &'static str,
     },
     /// The file was written by a newer binary; nothing was written to it.
     #[error("the journal has schema version {found}, this binary knows up to {known}")]
@@ -208,6 +208,11 @@ pub struct Recovery {
     /// Grants still `accepted` whose attempt is still `granted` at the
     /// job's current generation: one dispatch each is the caller's next step (rule 2).
     pub to_dispatch: Vec<(JobId, OperationId)>,
+    /// M5 commands still `accepted`: a create awaiting its initial
+    /// placement, or a cancel, checkpoint or continue whose effect was not
+    /// asked for yet. The request each was asked with is in the job's
+    /// state (`ManagedState::request`); one dispatch each is the caller's.
+    pub to_effect: Vec<(JobId, OperationId, CommandKind)>,
 }
 
 /// The journal: one connection, owned by one writer.
@@ -243,33 +248,6 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> OpenError + '_ {
 
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
-}
-
-/// Runs each migration from `version` to this binary's, one transaction
-/// each, with foreign keys off: a migration may rebuild a table (ADR
-/// 0028), which drops and renames tables other tables reference. Every
-/// foreign key is checked before each commit.
-fn migrate(conn: &mut Connection, version: u32, path: &Path) -> Result<(), OpenError> {
-    conn.pragma_update(None, "foreign_keys", false)?;
-    let mut run = || -> Result<(), OpenError> {
-        for from in version..SCHEMA_VERSION {
-            let Some(step) = usize::try_from(from)
-                .ok()
-                .and_then(|n| schema::MIGRATIONS.get(n - 1))
-            else {
-                return Err(OpenError::NotAJournal(path.to_owned()));
-            };
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(step)?;
-            foreign_keys_hold(&tx)?;
-            tx.pragma_update(None, "user_version", from + 1)?;
-            tx.commit()?;
-        }
-        Ok(())
-    };
-    let outcome = run();
-    conn.pragma_update(None, "foreign_keys", true)?;
-    outcome
 }
 
 /// Fails when any row violates a foreign key, as `PRAGMA foreign_key_check` reports.
@@ -313,7 +291,7 @@ impl Journal {
         }
         {
             let mut conn = connect(&tmp)?;
-            // A migration rebuilds tables; see `migrate`.
+            // A migration rebuilds tables with foreign keys off; see `open`.
             conn.pragma_update(None, "foreign_keys", false)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(schema::V1)?;
@@ -384,30 +362,63 @@ impl Journal {
                 known: SCHEMA_VERSION,
             });
         }
-        if version < SCHEMA_VERSION {
-            migrate(&mut conn, version, path)?;
+        // Codec format 2 was amended in place by ADR 0028 before any
+        // release (`JobPolicy` gained `recovery`): a version 3 journal that
+        // holds a format 2 frame was written by the unreleased M5 build,
+        // whose frames this binary cannot decode, and is refused before
+        // anything is written. A version 3 journal with format 1 frames
+        // only migrates.
+        if version == 3 {
+            let draft: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM events WHERE substr(body, 1, 1) = x'02'
+                     UNION ALL
+                     SELECT 1 FROM operations WHERE substr(result, 1, 1) = x'02'
+                     LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if draft.is_some() {
+                return Err(OpenError::DraftSchema { version: 3 });
+            }
         }
-        // Version 2 was amended in place before any release (ADR 0022,
-        // then ADR 0028): a journal an unreleased build made has a draft
-        // table, and is refused before anything is written.
+        for from in version..SCHEMA_VERSION {
+            let Some(step) = usize::try_from(from)
+                .ok()
+                .and_then(|n| schema::MIGRATIONS.get(n - 1))
+            else {
+                return Err(OpenError::NotAJournal(path.to_owned()));
+            };
+            // A migration may rebuild a table other tables reference
+            // (version 3 rebuilds `operations`), which SQLite's documented
+            // procedure does with foreign keys off; the check after the
+            // commit fails the open on any reference the rebuild broke.
+            conn.pragma_update(None, "foreign_keys", false)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(step)?;
+            tx.pragma_update(None, "user_version", from + 1)?;
+            tx.commit()?;
+            let broken: Option<String> = conn
+                .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+                .optional()?;
+            conn.pragma_update(None, "foreign_keys", true)?;
+            if let Some(table) = broken {
+                return Err(OpenError::Sqlite(SqliteError(
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                        Some(format!(
+                            "migration to version {} left a dangling reference in {table}",
+                            from + 1
+                        )),
+                    ),
+                )));
+            }
+        }
+        // Version 2 was amended in place before any release (ADR 0022): a
+        // journal an unreleased build made has the draft table.
         if conn.prepare(schema::V2_COMPLETE).is_err() {
-            return Err(OpenError::DraftSchema {
-                version: 2,
-                amendment: "m4",
-            });
-        }
-        let attempts: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if !attempts.is_some_and(|sql| sql.contains(schema::V2_M6_STATUS)) {
-            return Err(OpenError::DraftSchema {
-                version: 2,
-                amendment: "m6",
-            });
+            return Err(OpenError::DraftSchema { version: 2 });
         }
         Ok(Journal {
             conn,
@@ -627,7 +638,48 @@ impl Journal {
         observation: &Observation,
         at_ms: u64,
     ) -> Result<Transition, CommitError> {
-        self.change(job, at_ms, |state| apply_observation(state, observation))
+        // A placement that grants is a replacement like any grant: the
+        // barrier of ADR 0022 applies (docs/managed-jobs.md, M5 rules).
+        let placing = matches!(
+            observation,
+            Observation::Placed {
+                decision: PlacementDecision {
+                    chosen: Some(_),
+                    ..
+                },
+                ..
+            }
+        );
+        let blocker = if placing {
+            self.replacement_blockers(job)?
+                .first()
+                .map(provider::Blocker::operation)
+        } else {
+            None
+        };
+        let transition = self.change(job, at_ms, |state| {
+            if let Some(operation) = blocker {
+                return Err(DomainError::ReplacementBlocked { operation });
+            }
+            apply_observation(state, observation)
+        })?;
+        if placing {
+            crashpoint::reached("placement.after_commit");
+        }
+        if matches!(observation, Observation::Checkpointed { .. })
+            && transition.events.iter().any(|e| {
+                matches!(
+                    e,
+                    ManagedEvent::AttemptObserved {
+                        status: AttemptStatus::Checkpointed { .. },
+                        ..
+                    }
+                )
+            })
+        {
+            crashpoint::reached("continue.after_cut");
+        }
+        Ok(transition)
     }
 
     /// The authority's own marks: `Dispatched` right before an effect is
@@ -885,6 +937,10 @@ impl Journal {
     /// its digest and links to the job's previous event; the replay of the
     /// events is the stored projection; the stored answer of every accepted
     /// operation decodes. Repairs nothing (replay rule 1).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one check per invariant, in the order the tables depend on each other"
+    )]
     pub fn verify(&self) -> Result<VerifyReport, CommitError> {
         let mut report = VerifyReport {
             jobs: 0,
@@ -948,6 +1004,24 @@ impl Journal {
             if u64::try_from(head).ok() != Some(last_seq) {
                 return Err(CommitError::ProjectionMismatch { job });
             }
+            for (table, kind) in [
+                ("placements", "placement_decided"),
+                ("continuations", "continuation_recorded"),
+            ] {
+                let rows: i64 = self.conn.query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE seq IN (SELECT seq FROM events WHERE job_id = ?1)"),
+                    [job.to_bytes()],
+                    |r| r.get(0),
+                )?;
+                let events: i64 = self.conn.query_row(
+                    "SELECT count(*) FROM events WHERE job_id = ?1 AND kind = ?2",
+                    params![job.to_bytes(), kind],
+                    |r| r.get(0),
+                )?;
+                if rows != events {
+                    return Err(CommitError::ProjectionMismatch { job });
+                }
+            }
         }
         let mut stmt = self
             .conn
@@ -967,7 +1041,7 @@ impl Journal {
             let answer = StoredResult::decode(&result)
                 .map_err(|e| corrupt(format!("the answer under {key}: {e}")))?;
             let rejected = matches!(answer, StoredResult::Rejected(_));
-            if rejected != (status == "rejected") || project::command_kind(&kind).is_none() {
+            if rejected != (status == "rejected") || CommandKind::from_name(&kind).is_none() {
                 return Err(corrupt(format!(
                     "operation {key} does not match its answer"
                 )));
@@ -1051,8 +1125,130 @@ impl Journal {
             for op in &now.operations {
                 if now.grant_may_dispatch(op.id) {
                     out.to_dispatch.push((job, op.id));
+                } else if op.status == OperationStatus::Accepted
+                    && op.kind != CommandKind::StartAttempt
+                {
+                    out.to_effect.push((job, op.id, op.kind));
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// The notes of `job`, each with the revision it was recorded at, in order.
+    pub fn notes(&self, job: JobId) -> Result<Vec<(WorkRevision, Note)>, CommitError> {
+        let mut out = Vec::new();
+        for frame in self.frames_of_kind(job, "note_recorded")? {
+            if let ManagedEvent::NoteRecorded { note } = frame.event {
+                out.push((frame.revision, note));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The placement decisions of `job`, oldest first, each with its event's seq.
+    pub fn placements(
+        &self,
+        job: JobId,
+    ) -> Result<Vec<(EventSeq, PlacementDecision)>, CommitError> {
+        let mut out = Vec::new();
+        for (seq, frame) in self.frames_with_seq(job, "placement_decided")? {
+            if let ManagedEvent::PlacementDecided { decision, .. } = frame.event {
+                out.push((seq, decision));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The continuations of `job`, oldest first: the new attempt, the
+    /// attempt it continued, the fidelity achieved and the package used.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple is the contract's row shape (docs/managed-jobs.md, Journal)"
+    )]
+    pub fn continuations(
+        &self,
+        job: JobId,
+    ) -> Result<Vec<(AttemptId, AttemptId, Fidelity, Option<PackageDigest>)>, CommitError> {
+        let mut out = Vec::new();
+        for frame in self.frames_of_kind(job, "continuation_recorded")? {
+            if let ManagedEvent::ContinuationRecorded {
+                attempt,
+                from,
+                achieved,
+                package,
+                ..
+            } = frame.event
+            {
+                out.push((attempt, from, achieved, package));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The last receipts recorded for `attempt`, by a cut or by a report;
+    /// empty when none were.
+    pub fn receipts(&self, attempt: AttemptId) -> Result<Vec<TaskReceipt>, CommitError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT job_id, body FROM events
+             WHERE kind IN ('receipts_recorded','checkpoint_cut_recorded')
+             ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (job, body) = row?;
+            let frame = EventFrame::decode(&body).map_err(|e| CommitError::Corrupt {
+                job: Some(JobId::from_bytes(job)),
+                reason: e.to_string(),
+            })?;
+            match frame.event {
+                ManagedEvent::ReceiptsRecorded {
+                    attempt: a,
+                    receipts,
+                }
+                | ManagedEvent::CheckpointCutRecorded {
+                    attempt: a,
+                    receipts,
+                    ..
+                } if a == attempt => return Ok(receipts),
+                _ => {}
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn frames_of_kind(&self, job: JobId, kind: &str) -> Result<Vec<EventFrame>, CommitError> {
+        Ok(self
+            .frames_with_seq(job, kind)?
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect())
+    }
+
+    fn frames_with_seq(
+        &self,
+        job: JobId,
+        kind: &str,
+    ) -> Result<Vec<(EventSeq, EventFrame)>, CommitError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, body FROM events WHERE job_id = ?1 AND kind = ?2 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![job.to_bytes(), kind], |r| {
+            Ok((get_u64(r, 0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, body) = row?;
+            let corrupt = |reason: String| CommitError::Corrupt {
+                job: Some(job),
+                reason,
+            };
+            out.push((
+                EventSeq::new(seq).ok_or_else(|| corrupt("event seq 0".into()))?,
+                EventFrame::decode(&body).map_err(|e| corrupt(e.to_string()))?,
+            ));
         }
         Ok(out)
     }

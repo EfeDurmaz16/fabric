@@ -78,7 +78,7 @@ pub(crate) enum VerifyError {
 /// The cut of a snapshot: the digest of its head manifest's canonical bytes.
 #[must_use]
 pub(crate) fn cut_of(head_manifest: &[u8]) -> CutDigest {
-    CutDigest::of(head_manifest)
+    CutDigest::from_bytes(*blake3::hash(head_manifest).as_bytes())
 }
 
 /// The pure decision: the acknowledgement to commit for `snapshot` of

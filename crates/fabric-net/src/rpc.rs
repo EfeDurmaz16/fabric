@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
+use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::managed::GrantToken;
 use fabric_core::moves::MoveOffer;
@@ -41,17 +41,18 @@ use tokio::time::timeout;
 
 use crate::accept::refresh;
 use crate::frame::{
-    FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, MAX_STORED_CHUNK, Room, read_frame, read_header,
-    read_payload, write_frame,
+    FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, MAX_FACADE_FRAME, MAX_STORED_CHUNK, Room,
+    read_frame, read_header, read_payload, write_frame,
 };
 use crate::idle::{IdleReader, StallWriter};
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
-    Appended, ChunkBatch, Facts, Fault, FaultText, Fenced, Heartbeat, HeartbeatAnswer, Hello,
-    JobAnswer, JobRequest, JobResponse, KnownWriter, ManifestChunks, MoveRequested, MoveState,
-    Offered, PROTOCOL_VERSION, Pulled, RecordBytes, RecordPage, Request, RequestBody, RequestId,
-    Response, ResponseBody, Tools, VersionText, WireError, decode, encode, wall_clock_ms,
+    AdvertWire, Appended, BoundedList, ChunkBatch, FacadeAnswer, FacadeMessage, Facts, Fault,
+    FaultText, Fenced, Heartbeat, HeartbeatAnswer, Hello, JobAnswer, JobRequest, JobResponse,
+    KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled,
+    RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody,
+    SecretNameText, Tools, VersionText, WireError, decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -327,6 +328,48 @@ pub trait Service: Send + Sync {
             )))
         })
     }
+    /// Answers `Advertise`: what this node offers for the placement of a
+    /// job (ADR 0026), measured now. The default refuses: a node that
+    /// does not advertise is no candidate, and the asking node records
+    /// the fault as that node's exclusion.
+    fn advertise(&self, peer: NodeId, ask: Advertise) -> BoxFuture<'_, Result<AdvertWire, Fault>> {
+        let _ = (peer, ask);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node does not advertise for placements",
+            )))
+        })
+    }
+    /// Answers `Facade`: one facade message for this node's authority
+    /// (ADR 0027), answered with the authority's bytes unchanged. The
+    /// default refuses; the asking node answers its client `unavailable`.
+    fn facade(
+        &self,
+        peer: NodeId,
+        message: FacadeMessage,
+    ) -> BoxFuture<'_, Result<FacadeAnswer, Fault>> {
+        let _ = (peer, message);
+        Box::pin(async {
+            Err(Fault::BadRequest(FaultText::truncated(
+                "this node serves no facade",
+            )))
+        })
+    }
+}
+
+/// What `RequestBody::Advertise` asks, as one value a service takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advertise {
+    /// The job.
+    pub job: JobId,
+    /// The harness the job's primary task runs under.
+    pub harness: HarnessKind,
+    /// The job's root on the asking node.
+    pub root: fabric_core::path::AbsPath,
+    /// The snapshot the job would start from or continue.
+    pub snapshot: Option<SnapshotId>,
+    /// The secrets the job's policy names.
+    pub secrets: Vec<SecretNameText>,
 }
 
 /// An authenticated connection after the `Hello` exchange.
@@ -427,6 +470,8 @@ fn kind_of(body: &ResponseBody) -> &'static str {
         ResponseBody::ChunksDone => "chunks done",
         ResponseBody::Fault(_) => "fault",
         ResponseBody::Facts(_) => "facts",
+        ResponseBody::Advert(_) => "advert",
+        ResponseBody::Facade(_) => "facade",
         ResponseBody::Heartbeat(_) => "heartbeat",
     }
 }
@@ -611,6 +656,17 @@ impl Session {
     /// so with `Fault::Deadline`. That is the same outcome as this side's
     /// timer firing first, so both are `RpcError::Deadline`.
     async fn call(&self, body: RequestBody, deadline: Duration) -> Result<ResponseBody, RpcError> {
+        self.call_bounded(body, deadline, MAX_CONTROL_FRAME).await
+    }
+
+    /// `call`, reading the answer under `answer_max` bytes: the control
+    /// frame for every message but a facade answer (`MAX_FACADE_FRAME`).
+    async fn call_bounded(
+        &self,
+        body: RequestBody,
+        deadline: Duration,
+        answer_max: usize,
+    ) -> Result<ResponseBody, RpcError> {
         let id = self.next_request_id();
         let request = Request {
             id,
@@ -619,7 +675,7 @@ impl Session {
         };
         let exchange = async {
             let mut recv = send_request(self.connection.as_ref(), &request).await?;
-            match read_response(recv.as_mut(), id, MAX_CONTROL_FRAME).await? {
+            match read_response(recv.as_mut(), id, answer_max).await? {
                 ResponseBody::Fault(Fault::Deadline) => Err(RpcError::Deadline(deadline)),
                 ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
                 body => Ok(body),
@@ -688,6 +744,43 @@ impl Session {
         match self.call(body, deadline).await? {
             ResponseBody::Facts(facts) => Ok(facts),
             other => Err(unexpected("facts", &other)),
+        }
+    }
+
+    /// Asks the peer for its advert for a job's placement (ADR 0026),
+    /// waiting at most `deadline`; the placement's probe bound.
+    pub async fn advertise(
+        &self,
+        ask: Advertise,
+        deadline: Duration,
+    ) -> Result<AdvertWire, RpcError> {
+        let body = RequestBody::Advertise {
+            job: ask.job,
+            harness: ask.harness,
+            root: ask.root,
+            snapshot: ask.snapshot,
+            secrets: BoundedList::new(ask.secrets)?,
+        };
+        match self.call(body, deadline).await? {
+            ResponseBody::Advert(advert) => Ok(*advert),
+            other => Err(unexpected("advert", &other)),
+        }
+    }
+
+    /// Sends one facade message to the peer's authority (ADR 0027) and
+    /// returns its answer unchanged, waiting at most `deadline`. The
+    /// answer is read under the facade's own bound.
+    pub async fn facade(
+        &self,
+        message: FacadeMessage,
+        deadline: Duration,
+    ) -> Result<FacadeAnswer, RpcError> {
+        match self
+            .call_bounded(RequestBody::Facade(message), deadline, MAX_FACADE_FRAME)
+            .await?
+        {
+            ResponseBody::Facade(answer) => Ok(answer),
+            other => Err(unexpected("facade", &other)),
         }
     }
 
@@ -1217,6 +1310,31 @@ async fn handle(
                 .unwrap_or(Err(Fault::Deadline))
                 .map_or_else(ResponseBody::Fault, ResponseBody::Facts)
         }
+        RequestBody::Advertise {
+            job,
+            harness,
+            root,
+            snapshot,
+            secrets,
+        } => {
+            let ask = Advertise {
+                job,
+                harness,
+                root,
+                snapshot,
+                secrets: secrets.into_inner(),
+            };
+            timeout(budget, service.advertise(peer, ask))
+                .await
+                .unwrap_or(Err(Fault::Deadline))
+                .map_or_else(ResponseBody::Fault, |a| ResponseBody::Advert(Box::new(a)))
+        }
+        RequestBody::Facade(message) => {
+            let body = answer_facade(peer, message, service, limits, held, budget).await;
+            reply(&mut send, id, body, MAX_FACADE_FRAME).await?;
+            send.shutdown().await.map_err(FrameError::Io)?;
+            return Ok(());
+        }
         RequestBody::WantChunks(batch) => {
             let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
                 reply(
@@ -1272,6 +1390,42 @@ where
     };
     match timeout(budget, run).await {
         Ok(answer) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Job),
+        Err(_) => ResponseBody::Fault(Fault::Deadline),
+    }
+}
+
+/// Serves one facade message under the per-peer job work cap, as a
+/// per-job message is served (docs/managed-jobs.md, fabric-net): a watch
+/// holds one slot for at most its wait. The work is never dropped
+/// halfway; only the answer races the budget.
+async fn answer_facade(
+    peer: NodeId,
+    message: FacadeMessage,
+    service: Arc<dyn Service>,
+    limits: &Limits,
+    held: OwnedSemaphorePermit,
+    budget: Duration,
+) -> ResponseBody {
+    let job_work = Arc::clone(&limits.job_work);
+    let work = async move {
+        let Ok(permit) = job_work.acquire_owned().await else {
+            return Err(Fault::Internal(FaultText::truncated(
+                "the session takes no more job requests",
+            )));
+        };
+        tokio::spawn(async move {
+            let _held = (permit, held);
+            service.facade(peer, message).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Fault::Internal(FaultText::truncated(
+                "the facade request failed",
+            )))
+        })
+    };
+    match timeout(budget, work).await {
+        Ok(answer) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Facade),
         Err(_) => ResponseBody::Fault(Fault::Deadline),
     }
 }
@@ -1718,6 +1872,117 @@ mod tests {
         }
     }
 
+    /// A service that answers a facade message with its bytes and a word
+    /// more, and an advert built from the question.
+    struct Echo;
+    impl Service for Echo {
+        fn pull(&self, _: NodeId, _: FencingToken, _: Option<RecordHash>) -> JobFuture<'_, Pulled> {
+            no_job()
+        }
+        fn append(&self, _: NodeId, _: FencingToken, _: RecordPage) -> JobFuture<'_, Appended> {
+            no_job()
+        }
+        fn move_request(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, MoveRequested> {
+            no_job()
+        }
+        fn offer(&self, _: NodeId, _: FencingToken, _: MoveOffer) -> JobFuture<'_, Offered> {
+            no_job()
+        }
+        fn move_status(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, MoveState> {
+            no_job()
+        }
+        fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+            no_job()
+        }
+        fn known_writer(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, KnownWriter> {
+            no_job()
+        }
+        fn manifest(
+            &self,
+            _: NodeId,
+            _: SnapshotId,
+        ) -> BoxFuture<'_, Result<ManifestChunks, Fault>> {
+            Box::pin(async { Err(Fault::UnknownSnapshot) })
+        }
+        fn chunk(&self, _: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
+            Box::pin(async move { Err(Fault::UnknownChunk(id)) })
+        }
+        fn facts(&self, _: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
+            Box::pin(async { Ok(Facts::default()) })
+        }
+        fn facade(
+            &self,
+            _: NodeId,
+            message: FacadeMessage,
+        ) -> BoxFuture<'_, Result<FacadeAnswer, Fault>> {
+            Box::pin(async move {
+                let mut bytes = message.into_inner();
+                bytes.extend_from_slice(b" answered");
+                FacadeAnswer::new(bytes)
+                    .map_err(|e| Fault::Internal(FaultText::truncated(&e.to_string())))
+            })
+        }
+        fn advertise(&self, _: NodeId, ask: Advertise) -> BoxFuture<'_, Result<AdvertWire, Fault>> {
+            Box::pin(async move {
+                Ok(AdvertWire {
+                    node: NodeId::from_bytes([7; 32]),
+                    os: crate::wire::PlatformText::truncated("macos"),
+                    arch: crate::wire::PlatformText::truncated("arm64"),
+                    harnesses: BoundedList::new(vec![(
+                        ask.harness,
+                        VersionText::truncated("2.1.0"),
+                    )])
+                    .unwrap(),
+                    home: fabric_core::path::AbsPath::parse("/Users/me").unwrap(),
+                    root: ask.root,
+                    load_1m_milli: 120,
+                    free_disk_bytes: 1 << 40,
+                    bundle_chain: ask.snapshot.is_some(),
+                    workspace: false,
+                    measured_at_ms: 5,
+                    secrets_unresolved: BoundedList::new(ask.secrets).unwrap(),
+                })
+            })
+        }
+    }
+
+    /// ADR 0027: a facade message reaches the peer's service as the bytes
+    /// the client wrote and its answer comes back as the authority wrote
+    /// it; a peer whose service serves no facade answers a fault, never a
+    /// silent empty answer, and an advert comes back whole.
+    #[tokio::test]
+    async fn a_facade_message_and_an_advert_cross_the_link_unchanged() {
+        let (session, _serving) =
+            serving_pair_wrapped(paired(), Arc::new(Echo), Arc::default(), |c| c).await;
+        let message = FacadeMessage::new(b"{\"type\":\"inspect\"}".to_vec()).unwrap();
+        let answer = session.facade(message, IDLE * 10).await.unwrap();
+        assert_eq!(answer.as_bytes(), b"{\"type\":\"inspect\"} answered");
+        let ask = Advertise {
+            job: JobId::from_bytes([1; 16]),
+            harness: HarnessKind::Codex,
+            root: fabric_core::path::AbsPath::parse("/Users/me/fabric/j").unwrap(),
+            snapshot: Some(SnapshotId::from_bytes([2; 32])),
+            secrets: vec![SecretNameText::truncated("API_TOKEN")],
+        };
+        let advert = session.advertise(ask, IDLE * 10).await.unwrap();
+        assert_eq!(advert.node, NodeId::from_bytes([7; 32]));
+        assert!(advert.bundle_chain);
+        assert_eq!(
+            advert.secrets_unresolved.as_slice()[0].as_str(),
+            "API_TOKEN"
+        );
+
+        // A service without a facade or an advert refuses, as the defaults say.
+        let (session, _serving) = serving_pair(paired(), Arc::default()).await;
+        let refused = session
+            .facade(FacadeMessage::new(Vec::new()).unwrap(), IDLE * 10)
+            .await;
+        assert!(
+            matches!(refused, Err(RpcError::Fault(Fault::BadRequest(_)))),
+            "{refused:?}"
+        );
+    }
+
     /// Issue #16: a question for the facts of a job's target carries the
     /// job's harness to the peer's service, which a question with none
     /// does not reach; item 19 of the A/B lab: and the tools the asking
@@ -1764,7 +2029,7 @@ mod tests {
     /// `serving_pair_under`, with the acceptor's connection passed through `wrap`.
     async fn serving_pair_wrapped(
         trust: Arc<Revocable>,
-        service: Arc<Nothing>,
+        service: Arc<dyn Service>,
         limits: Arc<ServeLimits>,
         wrap: impl FnOnce(Arc<dyn Connection>) -> Arc<dyn Connection>,
     ) -> (Session, tokio::task::JoinHandle<RpcError>) {
@@ -1941,18 +2206,15 @@ mod tests {
         let mut held = Vec::new();
         for _ in 0..2 {
             let counted = Arc::clone(&read);
-            let (session, serving) = serving_pair_wrapped(
-                paired(),
-                Arc::clone(&service),
-                Arc::clone(&limits),
-                move |inner| {
+            let service: Arc<Nothing> = Arc::clone(&service);
+            let (session, serving) =
+                serving_pair_wrapped(paired(), service, Arc::clone(&limits), move |inner| {
                     Arc::new(Counted {
                         inner,
                         read: counted,
                     })
-                },
-            )
-            .await;
+                })
+                .await;
             for n in 0..REQUESTS {
                 let request = Request {
                     id: RequestId(u64::try_from(n).unwrap() + 1),

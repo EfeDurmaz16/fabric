@@ -1,0 +1,39 @@
+{
+  "case": "watch_revoked_token",
+  "direction": "client_to_authority",
+  "given": {
+    "now_ms": 1762128000000,
+    "tokens": [
+      {
+        "token_id": "01K8W3A0000000000000000K03",
+        "bearer": "3333333333333333333333333333333333333333333333333333333333333333",
+        "actor": "efe-laptop",
+        "jobs": "any",
+        "resources": "any",
+        "expires_ms": 1762131600000,
+        "revoked_ms": 1762127999000
+      }
+    ],
+    "jobs": [
+      {
+        "job": "01K8W3A00000000000000000J1",
+        "revision": "1",
+        "state": "active",
+        "live_attempt": false
+      }
+    ],
+    "operations": []
+  },
+  "message": {
+    "type": "watch",
+    "facade": 1,
+    "token": "3333333333333333333333333333333333333333333333333333333333333333",
+    "job": "01K8W3A00000000000000000J1",
+    "after": null
+  },
+  "expect": {
+    "outcome": "reject",
+    "code": "unauthorized",
+    "reason": "revoked"
+  }
+}
