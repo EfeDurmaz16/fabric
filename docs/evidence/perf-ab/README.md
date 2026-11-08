@@ -566,3 +566,45 @@ slower.
   on 2026-10-29: the performance rule gates the release build only, and the
   test profile is tracked, not gated (CONTRIBUTING, ADR 0009). These
   test-profile numbers stay in the record as tracked; they gate nothing.
+
+## M5, release
+
+Run on 2026-11-08 by `scripts/bench-ab.sh --release --pairs 20 --counted 1`
+on the M5 head `df1283b` (product code as of `1da8a9b`), each run started
+once the 1-minute load was at or below 6 (`machine.txt` has the load at
+start, at the start of the new paths and at the end).
+
+| Directory | Anchor | Profile | Pairs | Counted runs |
+|---|---|---|---:|---:|
+| `m5-release/` | `176622e` | release | 20 | 1 |
+| `m5-vs-m4-release/` | `ed11431`, the local M4 head; its `1 changed paths` is the untracked `m5-release/` | release | 20 | 1 |
+
+Against the anchor: every op is faster or not shown, none slower; both
+daemons' resident size and timed physical footprint are smaller. The
+counted footprint of daemon a has a median ratio of 1.006 whose interval,
+0.979 to 1.006, holds 1, over one counted run; the 20 timed runs give 0.964
+(0.946 to 0.978).
+
+Against the M4 head, which is not the rule's reference but says what M5
+adds: `claude suspend` is slower, 1.051 (1.032 to 1.077), with the same
+spawns, flushes, bytes and total CPU (31.0 ms to 31.2 ms) in the counted
+run, so the 9 ms is waiting, not work; no other op is slower. The daemons
+are 3% to 7% larger in resident size and 1% to 6% in physical footprint,
+and each CLI starts with about 310 more allocations (`cli version` 244 to
+553) and about 300 KiB more peak resident size: the binary is 1.7 MB
+larger, with the facade, placement, executor and secrets code and the CLI's
+managed and facade subcommands. Against the anchor all of these are still
+below.
+
+The new paths, `new-paths.md` in each directory, have no reference build:
+the anchor and the M4 head have no facade. `ab::new_paths`
+(`crates/fabric/tests/e2e/ab/new_paths.rs`) drives the candidate alone on
+the same fixture, 20 timed runs after 2 warm-ups and one counted run. In
+`m5-release/`: `facade submit` 7.7 ms (7.5 to 8.1), `placement decision`
+78.1 ms (76.0 to 78.6; both nodes eligible in every run), `watch delivery`
+12.9 ms (12.4 to 13.4, from the start of the note's CLI to the waiting
+watch's exit), `facade continue` 14.8 ms (13.8 to 15.0). The planned
+handoff after the continue is not timed: no node launches a granted
+attempt yet, so the continue stays accepted and its cut is never taken
+(docs/managed-jobs.md, "As built (M5)", and the question in
+docs/evidence/m5/README.md, "Blocked").

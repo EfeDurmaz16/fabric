@@ -1,0 +1,208 @@
+phase	run	op	side	first	metric	value
+counted	1	new paths run	candidate	candidate	cli_cpu_us	69920
+counted	1	new paths run	candidate	candidate	cli_maxrss_kib	4816
+counted	1	new paths run	candidate	candidate	cli_processes	10
+counted	1	new paths run	candidate	candidate	cpu_us	79493
+counted	1	new paths run	candidate	candidate	frees	16133
+counted	1	new paths run	candidate	candidate	fullfsync	5
+counted	1	new paths run	candidate	candidate	malloc_bytes	5169169
+counted	1	new paths run	candidate	candidate	mallocs	18363
+counted	1	new paths run	candidate	candidate	opens	3
+counted	1	new paths run	candidate	candidate	read_bytes.ipc	80
+counted	1	new paths run	candidate	candidate	read_bytes.state	61
+counted	1	new paths run	candidate	candidate	read_calls.ipc	8
+counted	1	new paths run	candidate	candidate	read_calls.state	2
+counted	1	new paths run	candidate	candidate	spawn:claude	2
+counted	1	new paths run	candidate	candidate	spawn:codex	2
+counted	1	new paths run	candidate	candidate	spawns	4
+counted	1	new paths run	candidate	candidate	syncs.journal	5
+counted	1	new paths run	candidate	candidate	write_bytes.ipc	5612
+counted	1	new paths run	candidate	candidate	write_bytes.journal	177160
+counted	1	new paths run	candidate	candidate	write_bytes.state	163
+counted	1	new paths run	candidate	candidate	write_calls.ipc	15
+counted	1	new paths run	candidate	candidate	write_calls.journal	86
+counted	1	new paths run	candidate	candidate	write_calls.state	1
+counted	1	new paths run	candidate	candidate	daemon_rss_kib.a	12144
+counted	1	new paths run	candidate	candidate	daemon_footprint_kib.a	4976
+counted	1	new paths run	candidate	candidate	daemon_rss_kib.b	10384
+counted	1	new paths run	candidate	candidate	daemon_footprint_kib.b	4256
+timed	2	facade submit	candidate	candidate	us	9485
+timed	2	placement decision	candidate	candidate	us	83322
+timed	2	watch delivery	candidate	candidate	us	12324
+timed	2	facade continue	candidate	candidate	us	15146
+timed	2	placement decision	candidate	candidate	eligible	2
+timed	2	daemon a	candidate	candidate	rss_kib	11824
+timed	2	daemon a	candidate	candidate	footprint_kib	4576
+timed	2	daemon b	candidate	candidate	rss_kib	10032
+timed	2	daemon b	candidate	candidate	footprint_kib	3824
+timed	3	facade submit	candidate	candidate	us	7694
+timed	3	placement decision	candidate	candidate	us	75681
+timed	3	watch delivery	candidate	candidate	us	9090
+timed	3	facade continue	candidate	candidate	us	10916
+timed	3	placement decision	candidate	candidate	eligible	2
+timed	3	daemon a	candidate	candidate	rss_kib	11888
+timed	3	daemon a	candidate	candidate	footprint_kib	4640
+timed	3	daemon b	candidate	candidate	rss_kib	10064
+timed	3	daemon b	candidate	candidate	footprint_kib	3856
+timed	4	facade submit	candidate	candidate	us	7504
+timed	4	placement decision	candidate	candidate	us	76647
+timed	4	watch delivery	candidate	candidate	us	12210
+timed	4	facade continue	candidate	candidate	us	14991
+timed	4	placement decision	candidate	candidate	eligible	2
+timed	4	daemon a	candidate	candidate	rss_kib	11968
+timed	4	daemon a	candidate	candidate	footprint_kib	4720
+timed	4	daemon b	candidate	candidate	rss_kib	10144
+timed	4	daemon b	candidate	candidate	footprint_kib	3936
+timed	5	facade submit	candidate	candidate	us	9145
+timed	5	placement decision	candidate	candidate	us	73090
+timed	5	watch delivery	candidate	candidate	us	13904
+timed	5	facade continue	candidate	candidate	us	14334
+timed	5	placement decision	candidate	candidate	eligible	2
+timed	5	daemon a	candidate	candidate	rss_kib	12000
+timed	5	daemon a	candidate	candidate	footprint_kib	4752
+timed	5	daemon b	candidate	candidate	rss_kib	10160
+timed	5	daemon b	candidate	candidate	footprint_kib	3952
+timed	6	facade submit	candidate	candidate	us	7976
+timed	6	placement decision	candidate	candidate	us	78849
+timed	6	watch delivery	candidate	candidate	us	13008
+timed	6	facade continue	candidate	candidate	us	15986
+timed	6	placement decision	candidate	candidate	eligible	2
+timed	6	daemon a	candidate	candidate	rss_kib	12032
+timed	6	daemon a	candidate	candidate	footprint_kib	4784
+timed	6	daemon b	candidate	candidate	rss_kib	10176
+timed	6	daemon b	candidate	candidate	footprint_kib	3968
+timed	7	facade submit	candidate	candidate	us	7861
+timed	7	placement decision	candidate	candidate	us	78463
+timed	7	watch delivery	candidate	candidate	us	12797
+timed	7	facade continue	candidate	candidate	us	14968
+timed	7	placement decision	candidate	candidate	eligible	2
+timed	7	daemon a	candidate	candidate	rss_kib	12112
+timed	7	daemon a	candidate	candidate	footprint_kib	4864
+timed	7	daemon b	candidate	candidate	rss_kib	10208
+timed	7	daemon b	candidate	candidate	footprint_kib	4000
+timed	8	facade submit	candidate	candidate	us	7167
+timed	8	placement decision	candidate	candidate	us	77959
+timed	8	watch delivery	candidate	candidate	us	13105
+timed	8	facade continue	candidate	candidate	us	9530
+timed	8	placement decision	candidate	candidate	eligible	2
+timed	8	daemon a	candidate	candidate	rss_kib	12112
+timed	8	daemon a	candidate	candidate	footprint_kib	4864
+timed	8	daemon b	candidate	candidate	rss_kib	10208
+timed	8	daemon b	candidate	candidate	footprint_kib	4000
+timed	9	facade submit	candidate	candidate	us	7271
+timed	9	placement decision	candidate	candidate	us	74574
+timed	9	watch delivery	candidate	candidate	us	11648
+timed	9	facade continue	candidate	candidate	us	15079
+timed	9	placement decision	candidate	candidate	eligible	2
+timed	9	daemon a	candidate	candidate	rss_kib	12128
+timed	9	daemon a	candidate	candidate	footprint_kib	4880
+timed	9	daemon b	candidate	candidate	rss_kib	10224
+timed	9	daemon b	candidate	candidate	footprint_kib	4016
+timed	10	facade submit	candidate	candidate	us	7585
+timed	10	placement decision	candidate	candidate	us	78262
+timed	10	watch delivery	candidate	candidate	us	11046
+timed	10	facade continue	candidate	candidate	us	11655
+timed	10	placement decision	candidate	candidate	eligible	2
+timed	10	daemon a	candidate	candidate	rss_kib	12160
+timed	10	daemon a	candidate	candidate	footprint_kib	4912
+timed	10	daemon b	candidate	candidate	rss_kib	10272
+timed	10	daemon b	candidate	candidate	footprint_kib	4048
+timed	11	facade submit	candidate	candidate	us	7528
+timed	11	placement decision	candidate	candidate	us	79436
+timed	11	watch delivery	candidate	candidate	us	12936
+timed	11	facade continue	candidate	candidate	us	13874
+timed	11	placement decision	candidate	candidate	eligible	2
+timed	11	daemon a	candidate	candidate	rss_kib	12160
+timed	11	daemon a	candidate	candidate	footprint_kib	4912
+timed	11	daemon b	candidate	candidate	rss_kib	10272
+timed	11	daemon b	candidate	candidate	footprint_kib	4048
+timed	12	facade submit	candidate	candidate	us	7510
+timed	12	placement decision	candidate	candidate	us	78670
+timed	12	watch delivery	candidate	candidate	us	14226
+timed	12	facade continue	candidate	candidate	us	14975
+timed	12	placement decision	candidate	candidate	eligible	2
+timed	12	daemon a	candidate	candidate	rss_kib	12160
+timed	12	daemon a	candidate	candidate	footprint_kib	4912
+timed	12	daemon b	candidate	candidate	rss_kib	10272
+timed	12	daemon b	candidate	candidate	footprint_kib	4048
+timed	13	facade submit	candidate	candidate	us	7642
+timed	13	placement decision	candidate	candidate	us	66565
+timed	13	watch delivery	candidate	candidate	us	13276
+timed	13	facade continue	candidate	candidate	us	13697
+timed	13	placement decision	candidate	candidate	eligible	2
+timed	13	daemon a	candidate	candidate	rss_kib	12224
+timed	13	daemon a	candidate	candidate	footprint_kib	4976
+timed	13	daemon b	candidate	candidate	rss_kib	10304
+timed	13	daemon b	candidate	candidate	footprint_kib	4080
+timed	14	facade submit	candidate	candidate	us	7937
+timed	14	placement decision	candidate	candidate	us	78868
+timed	14	watch delivery	candidate	candidate	us	15814
+timed	14	facade continue	candidate	candidate	us	14723
+timed	14	placement decision	candidate	candidate	eligible	2
+timed	14	daemon a	candidate	candidate	rss_kib	12240
+timed	14	daemon a	candidate	candidate	footprint_kib	4992
+timed	14	daemon b	candidate	candidate	rss_kib	10304
+timed	14	daemon b	candidate	candidate	footprint_kib	4080
+timed	15	facade submit	candidate	candidate	us	8743
+timed	15	placement decision	candidate	candidate	us	74229
+timed	15	watch delivery	candidate	candidate	us	12546
+timed	15	facade continue	candidate	candidate	us	14905
+timed	15	placement decision	candidate	candidate	eligible	2
+timed	15	daemon a	candidate	candidate	rss_kib	12336
+timed	15	daemon a	candidate	candidate	footprint_kib	5088
+timed	15	daemon b	candidate	candidate	rss_kib	10336
+timed	15	daemon b	candidate	candidate	footprint_kib	4112
+timed	16	facade submit	candidate	candidate	us	8670
+timed	16	placement decision	candidate	candidate	us	79883
+timed	16	watch delivery	candidate	candidate	us	12892
+timed	16	facade continue	candidate	candidate	us	14743
+timed	16	placement decision	candidate	candidate	eligible	2
+timed	16	daemon a	candidate	candidate	rss_kib	12352
+timed	16	daemon a	candidate	candidate	footprint_kib	5104
+timed	16	daemon b	candidate	candidate	rss_kib	10352
+timed	16	daemon b	candidate	candidate	footprint_kib	4128
+timed	17	facade submit	candidate	candidate	us	7769
+timed	17	placement decision	candidate	candidate	us	77686
+timed	17	watch delivery	candidate	candidate	us	14921
+timed	17	facade continue	candidate	candidate	us	15326
+timed	17	placement decision	candidate	candidate	eligible	2
+timed	17	daemon a	candidate	candidate	rss_kib	12400
+timed	17	daemon a	candidate	candidate	footprint_kib	5152
+timed	17	daemon b	candidate	candidate	rss_kib	10368
+timed	17	daemon b	candidate	candidate	footprint_kib	4144
+timed	18	facade submit	candidate	candidate	us	8130
+timed	18	placement decision	candidate	candidate	us	78484
+timed	18	watch delivery	candidate	candidate	us	12708
+timed	18	facade continue	candidate	candidate	us	15947
+timed	18	placement decision	candidate	candidate	eligible	2
+timed	18	daemon a	candidate	candidate	rss_kib	12416
+timed	18	daemon a	candidate	candidate	footprint_kib	5168
+timed	18	daemon b	candidate	candidate	rss_kib	10400
+timed	18	daemon b	candidate	candidate	footprint_kib	4176
+timed	19	facade submit	candidate	candidate	us	7399
+timed	19	placement decision	candidate	candidate	us	76282
+timed	19	watch delivery	candidate	candidate	us	14628
+timed	19	facade continue	candidate	candidate	us	13810
+timed	19	placement decision	candidate	candidate	eligible	2
+timed	19	daemon a	candidate	candidate	rss_kib	12416
+timed	19	daemon a	candidate	candidate	footprint_kib	5168
+timed	19	daemon b	candidate	candidate	rss_kib	10416
+timed	19	daemon b	candidate	candidate	footprint_kib	4192
+timed	20	facade submit	candidate	candidate	us	8290
+timed	20	placement decision	candidate	candidate	us	78337
+timed	20	watch delivery	candidate	candidate	us	8147
+timed	20	facade continue	candidate	candidate	us	11162
+timed	20	placement decision	candidate	candidate	eligible	2
+timed	20	daemon a	candidate	candidate	rss_kib	12432
+timed	20	daemon a	candidate	candidate	footprint_kib	5184
+timed	20	daemon b	candidate	candidate	rss_kib	10416
+timed	20	daemon b	candidate	candidate	footprint_kib	4192
+timed	21	facade submit	candidate	candidate	us	6522
+timed	21	placement decision	candidate	candidate	us	73146
+timed	21	watch delivery	candidate	candidate	us	13523
+timed	21	facade continue	candidate	candidate	us	38508
+timed	21	placement decision	candidate	candidate	eligible	2
+timed	21	daemon a	candidate	candidate	rss_kib	12448
+timed	21	daemon a	candidate	candidate	footprint_kib	5200
+timed	21	daemon b	candidate	candidate	rss_kib	10448
+timed	21	daemon b	candidate	candidate	footprint_kib	4224
