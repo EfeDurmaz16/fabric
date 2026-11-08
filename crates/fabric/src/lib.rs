@@ -442,6 +442,11 @@ async fn ask_watching(
 /// Parses the command line, runs the command and returns the exit code.
 #[must_use]
 pub fn main() -> ExitCode {
+    if let Some(version) = version_only(std::env::args_os().skip(1)) {
+        // As clap does for --version: a failed write still exits 0.
+        let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), version.as_bytes());
+        return ExitCode::SUCCESS;
+    }
     let cli = Cli::parse();
     let default = if matches!(cli.command, Command::Serve(_)) {
         tracing::Level::INFO
@@ -470,6 +475,20 @@ pub fn main() -> ExitCode {
             exit_code(&e)
         }
     }
+}
+
+/// What `fabric --version` (or `-V`) alone prints, without building the
+/// parser: clap builds every subcommand and argument before it looks at
+/// `--version`, so with the managed and facade subcommands a version run
+/// made about 360 more allocations and peaked about 150 KiB above the
+/// anchor (docs/evidence/perf-ab/m6-release). Any other arguments, or a
+/// flag beside it, go to clap as before. The text is clap's own.
+fn version_only(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<String> {
+    let first = args.next()?;
+    if args.next().is_some() || !(first == "--version" || first == "-V") {
+        return None;
+    }
+    Some(concat!("fabric ", env!("CARGO_PKG_VERSION"), "\n").to_owned())
 }
 
 /// The worker threads of a client command's runtime.
@@ -2024,6 +2043,33 @@ mod tests {
     use fabric_harness::{NotCarried, SettingName};
 
     use super::*;
+
+    /// `--version` or `-V` alone prints clap's own version text without
+    /// building the parser; anything else is left to clap.
+    #[test]
+    fn version_alone_prints_clap_s_text_and_nothing_else_is_taken() {
+        use clap::CommandFactory;
+        let args = |list: &[&str]| {
+            list.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        let clap_text = Cli::command().render_version();
+        assert_eq!(
+            version_only(args(&["--version"]).into_iter()),
+            Some(clap_text.clone())
+        );
+        assert_eq!(version_only(args(&["-V"]).into_iter()), Some(clap_text));
+        for other in [
+            &[][..],
+            &["--version", "job"],
+            &["job", "--version"],
+            &["--versions"],
+            &["-v"],
+        ] {
+            assert_eq!(version_only(args(other).into_iter()), None, "{other:?}");
+        }
+    }
 
     /// A headless harness's output is read a line at a time with at most
     /// `max` bytes of one line held: a line past it is read through and
