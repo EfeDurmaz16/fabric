@@ -11,7 +11,8 @@
 //! through `fabric-client` instead of the CLI. `budget` times the hot
 //! paths against `budget.toml`, `bench` times the paths the durable
 //! job work touches, with no budget, and `ab` compares two builds of
-//! `fabric` op by op on the same fixture. `acp_cli` and `preflight` hold the
+//! `fabric` op by op on the same fixture, and `sync_bench` counts what
+//! `fabric-sync` moves for a dirty tree. `acp_cli` and `preflight` hold the
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
 //! acceptance tests, `legacy` loads a state directory frozen from main, and
 //! `streams` holds every command's answer to the CLI contract's streams
@@ -28,6 +29,7 @@ mod managed;
 mod preflight;
 mod psf;
 mod streams;
+mod sync_bench;
 mod terminal;
 mod world;
 

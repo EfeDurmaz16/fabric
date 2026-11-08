@@ -347,6 +347,7 @@ dependencies = [
  "fabric-harness",
  "fabric-net",
  "fabric-psf",
+ "fabric-sync",
  "fabricd",
  "nix",
  "rustix",
