@@ -183,7 +183,7 @@ The ladder is ADR 0024's, with its stored names:
 | `requires` | 16 entries | |
 | `harness.args` | 64 entries | |
 
-A limit is a refusal (`too_large`), never a truncation. A writer that would exceed one leaves the field out of the document (a goal cut to 16 KiB with a note, evidence by the newest 1,024) and says so in the document's own text, not silently.
+A limit is a refusal (`too_large`) for a reader, never a truncation. A writer that would exceed one cuts before it writes (a goal cut to 16 KiB with a note, evidence by the newest 1,024) and says so in the document's own text, not silently. Fabric's writer cuts the goal on a character boundary, keeps the first 1,024 `secrets.left_behind` paths and the first 256 `caches` rows by path, keeps fewer paths, halving, while the manifest would pass 1,048,576 bytes, and names each cut in one note at the end of `job.goal`, as `[fabric export: the goal was cut from 20000 bytes; secrets.left_behind lists the first 1024 of 1500 left-behind paths]`. It never cuts `harness.args`, since a shorter command runs something else: a harness with more than 64 arguments is not exported.
 
 ## 8. Secrets
 

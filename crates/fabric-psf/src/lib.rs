@@ -26,7 +26,9 @@ mod sha256;
 mod verdict;
 
 pub use achieve::{Achieved, HARNESS_STATE_FORMAT, Target, achievable};
-pub use check::{MANIFEST_MAX_BYTES, NAME_MAX_BYTES, PACKAGE_MAX_BYTES, TEXT_MAX_BYTES};
+pub use check::{
+    CACHES_MAX, LIST_MAX, MANIFEST_MAX_BYTES, NAME_MAX_BYTES, PACKAGE_MAX_BYTES, TEXT_MAX_BYTES,
+};
 pub use container::{
     BLOBS_DIR, Container, MANIFEST_FILE, WriteError, read_container, write_container,
 };

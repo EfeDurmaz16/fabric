@@ -21,8 +21,9 @@ use fabric_core::snapshot::{
 };
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_psf::{
-    Attachment, Bound, Cache, Fidelity, HARNESS_STATE_FORMAT, Harness, Job, Manifest, Parts,
-    Produced, Source, Workspace, harness_state, hex, sha256, write_container,
+    Attachment, Bound, CACHES_MAX, Cache, Code, Fidelity, HARNESS_STATE_FORMAT, Harness, Job,
+    LIST_MAX, Manifest, Parts, Produced, Refusal, Source, TEXT_MAX_BYTES, Workspace, harness_state,
+    hex, sha256, write_container,
 };
 
 use crate::error::NodeError;
@@ -118,7 +119,7 @@ impl Node {
                 .collect(),
             allowlist: Vec::new(),
         };
-        let manifest = Manifest::new(&parts).map_err(|r| {
+        let manifest = fitted(&parts).map_err(|r| {
             NodeError::Psf(format!(
                 "the job's state does not make a valid document: {r}"
             ))
@@ -302,6 +303,63 @@ fn carry_key(key: &CarryKey) -> Vec<(String, String)> {
     pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
 }
 
+/// The document for `parts` within the limits of section 7: a goal cut
+/// to fit, the first `LIST_MAX` left-behind paths and `CACHES_MAX` cache
+/// rows by path, fewer paths while the whole manifest is over its cap,
+/// and every cut said at the end of the goal. Arguments are never cut:
+/// a harness command with more than 64 is refused, since a shorter one
+/// would run something else.
+fn fitted(parts: &Parts) -> Result<Manifest, Refusal> {
+    let mut keep = LIST_MAX;
+    loop {
+        match Manifest::new(&cut(parts, keep)) {
+            Err(r) if r.code == Code::TooLarge && r.field.is_empty() && keep > 0 => keep /= 2,
+            done => return done,
+        }
+    }
+}
+
+/// `parts` with at most `keep` left-behind paths and `CACHES_MAX` cache
+/// rows, and a goal that holds a note of each cut within `TEXT_MAX_BYTES`.
+fn cut(parts: &Parts, keep: usize) -> Parts {
+    let mut out = parts.clone();
+    let mut said = Vec::new();
+    if out.left_behind.len() > keep {
+        said.push(format!(
+            "secrets.left_behind lists the first {keep} of {} left-behind paths",
+            out.left_behind.len()
+        ));
+        out.left_behind.truncate(keep);
+    }
+    if out.caches.len() > CACHES_MAX {
+        said.push(format!(
+            "caches lists the first {CACHES_MAX} of {} cache rows",
+            out.caches.len()
+        ));
+        out.caches.truncate(CACHES_MAX);
+    }
+    let note = |said: &[String]| {
+        if said.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n[fabric export: {}]", said.join("; "))
+        }
+    };
+    let goal = &parts.job.goal;
+    out.job.goal = if goal.len() + note(&said).len() > TEXT_MAX_BYTES {
+        said.insert(0, format!("the goal was cut from {} bytes", goal.len()));
+        let tail = note(&said);
+        let mut end = TEXT_MAX_BYTES.saturating_sub(tail.len());
+        while !goal.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{tail}", &goal[..end])
+    } else {
+        format!("{goal}{}", note(&said))
+    };
+    out
+}
+
 /// The revision `latest` is (section 5.2): the hash of the record at
 /// which it became the job's state, the last `SnapshotPublished` or
 /// `Suspended` that names it, and the epoch that record was written in.
@@ -340,7 +398,9 @@ fn fetchable_elsewhere(uri: &str) -> bool {
             return false;
         }
         let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
         host.split(':').next().unwrap_or_default()
     } else {
         // git's scp form: a colon with no slash before it. One letter
@@ -369,7 +429,102 @@ mod tests {
     use fabric_core::id::{EventId, JobId, NodeId, SnapshotId};
     use fabric_core::ledger::{EventKind, Ledger};
 
-    use super::{fetchable_elsewhere, revision_record};
+    use fabric_psf::{
+        CACHES_MAX, Cache, Fidelity, Harness, Job as PsfJob, LIST_MAX, MANIFEST_MAX_BYTES, Parts,
+        Produced, Source, TEXT_MAX_BYTES, Workspace, write_manifest,
+    };
+
+    use super::{fetchable_elsewhere, fitted, revision_record};
+
+    const NODE: &str = "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
+
+    fn parts(goal: String, left_behind: Vec<String>, caches: usize) -> Parts {
+        Parts {
+            job: PsfJob {
+                id: "01JABCDEFGHJKMNPQRSTVWXYZ0".into(),
+                goal,
+                created_by: NODE.into(),
+            },
+            produced: Produced {
+                at_ms: 1,
+                by: NODE.into(),
+                writer: "fabric/0.1.0".into(),
+            },
+            workspace: Workspace {
+                root: "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work".into(),
+                bundle_head: "ab".repeat(32),
+                ledger_head: "cd".repeat(32),
+                epoch: 1,
+                os: "macos".into(),
+                arch: "arm64".into(),
+            },
+            source: Source::Empty,
+            harness: Harness {
+                kind: "codex".into(),
+                program: None,
+                args: vec![],
+                version: None,
+            },
+            fidelity: Fidelity::WorkspaceOnly,
+            reason: None,
+            attachments: vec![],
+            caches: (0..caches)
+                .map(|i| Cache {
+                    path: format!("c{i:04}"),
+                    class: "build".into(),
+                    carry: "not_carried".into(),
+                    key: None,
+                    digest: None,
+                })
+                .collect(),
+            evidence: vec![],
+            package: None,
+            left_behind,
+            allowlist: vec![],
+        }
+    }
+
+    /// Section 7: a job over a limit is still exported, cut, and the
+    /// document says what was cut; one within every limit is unchanged.
+    #[test]
+    fn a_job_over_a_limit_is_exported_cut_and_says_so() {
+        let small = parts("fix it".into(), vec![".env".into()], 1);
+        assert_eq!(fitted(&small).unwrap().parts(), &small);
+
+        let goal = "é".repeat(TEXT_MAX_BYTES);
+        let paths: Vec<String> = (0..LIST_MAX + 500).map(|i| format!("p{i:05}")).collect();
+        let m = fitted(&parts(goal, paths, CACHES_MAX + 44)).unwrap();
+        let got = m.parts();
+        assert!(got.job.goal.len() <= TEXT_MAX_BYTES);
+        assert!(got.job.goal.starts_with("éé"));
+        assert_eq!(got.left_behind.len(), LIST_MAX);
+        assert_eq!(got.left_behind[0], "p00000");
+        assert_eq!(got.caches.len(), CACHES_MAX);
+        for said in [
+            "the goal was cut from 32768 bytes",
+            "1024 of 1524 left-behind paths",
+            "256 of 300 cache rows",
+        ] {
+            assert!(got.job.goal.contains(said), "{said}: {}", got.job.goal);
+        }
+
+        // Paths long enough that 1024 of them overflow the manifest.
+        let long: Vec<String> = (0..LIST_MAX)
+            .map(|i| format!("{i:05}/{}", "d".repeat(2000)))
+            .collect();
+        let m = fitted(&parts("fix it".into(), long, 0)).unwrap();
+        assert!(write_manifest(&m).len() <= MANIFEST_MAX_BYTES);
+        let kept = m.parts().left_behind.len();
+        assert!(kept > 0 && kept < LIST_MAX, "{kept}");
+        assert!(
+            m.parts()
+                .job
+                .goal
+                .contains(&format!("{kept} of 1024 left-behind paths")),
+            "{}",
+            m.parts().job.goal
+        );
+    }
     use crate::job::Job;
     use crate::paths::StateDir;
 
@@ -400,7 +555,9 @@ mod tests {
             },
         )
         .unwrap();
-        let suspended = job.append(me, EventKind::Suspended { snapshot: s1 }).unwrap();
+        let suspended = job
+            .append(me, EventKind::Suspended { snapshot: s1 })
+            .unwrap();
         let want = (suspended.hash(), suspended.event().epoch.get());
         assert_eq!(revision_record(job.ledger(), s1), want);
         job.append(
@@ -412,9 +569,12 @@ mod tests {
             },
         )
         .unwrap();
-        job.append(me, EventKind::Note { text: "n".into() }).unwrap();
+        job.append(me, EventKind::Note { text: "n".into() })
+            .unwrap();
         assert_eq!(revision_record(job.ledger(), s1), want);
-        let again = job.append(me, EventKind::Suspended { snapshot: s1 }).unwrap();
+        let again = job
+            .append(me, EventKind::Suspended { snapshot: s1 })
+            .unwrap();
         assert_eq!(
             revision_record(job.ledger(), s1),
             (again.hash(), again.event().epoch.get())

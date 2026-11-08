@@ -19,6 +19,10 @@ pub const TEXT_MAX_BYTES: usize = 16 * 1024;
 pub const PACKAGE_MAX_BYTES: usize = 256 * 1024;
 /// The cap on a name: `produced.writer`, `attachments[].name`, `attachments[].format`.
 pub const NAME_MAX_BYTES: usize = 128;
+/// The cap on `caches`.
+pub const CACHES_MAX: usize = 256;
+/// The cap on `evidence`, `secrets.left_behind` and `secrets.allowlist`.
+pub const LIST_MAX: usize = 1024;
 
 /// Checks `bytes` and returns the canonical value they hold.
 pub(crate) fn check(bytes: &[u8]) -> Result<Value, Refusal> {
@@ -288,8 +292,8 @@ fn too_large(pattern: &str, value: &Value) -> bool {
             let cap = match pattern {
                 "requires" => 16,
                 "harness.args" | "attachments" => 64,
-                "caches" => 256,
-                "evidence" | "secrets.left_behind" | "secrets.allowlist" => 1024,
+                "caches" => CACHES_MAX,
+                "evidence" | "secrets.left_behind" | "secrets.allowlist" => LIST_MAX,
                 _ => return false,
             };
             items.len() > cap
