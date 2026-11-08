@@ -409,18 +409,18 @@ fn phys_footprint_kib(report: &str) -> Fallible<u64> {
 
 /// One process's counter page.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Page {
+pub(crate) struct Page {
     /// The arguments it ran with, after the program.
     role: String,
     /// Every counter, by name: the scalar words, then `<counter>.<class>`.
-    counts: BTreeMap<String, u64>,
+    pub(crate) counts: BTreeMap<String, u64>,
     /// How many times it started each program, by file name.
     programs: BTreeMap<String, u64>,
 }
 
 impl Page {
     /// Reads a page `counters.c` wrote; `None` while it is not filled in yet.
-    fn parse(bytes: &[u8]) -> Fallible<Option<Self>> {
+    pub(crate) fn parse(bytes: &[u8]) -> Fallible<Option<Self>> {
         let word = |at: usize| -> Fallible<u64> {
             let bytes = bytes
                 .get(at * 8..at * 8 + 8)
