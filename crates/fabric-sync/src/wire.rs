@@ -228,6 +228,9 @@ fn refusal(e: &SyncError) -> Value {
         SyncError::BadTree { .. } => {
             json!({ "ok": false, "kind": "absent", "error": e.to_string() })
         }
+        SyncError::Store(fabric_store::store::StoreError::Locked { .. }) => {
+            json!({ "ok": false, "kind": "busy", "error": e.to_string() })
+        }
         _ => json!({ "ok": false, "kind": "refused", "error": e.to_string() }),
     }
 }
@@ -460,6 +463,9 @@ impl SshRemote {
                 path: PathBuf::from(&self.path),
                 why: error,
             },
+            Some("busy") => SyncError::Store(fabric_store::store::StoreError::Locked {
+                path: PathBuf::from(&self.path),
+            }),
             _ => SyncError::Refused { reason: error },
         })
     }

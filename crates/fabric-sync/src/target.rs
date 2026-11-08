@@ -3,8 +3,9 @@
 //!
 //! A target directory holds `store/`, a `fabric-store` store, and
 //! `heads/<name>`, one line `<job> <snapshot>` per tree. A head is replaced
-//! by a rename while the store's lock is held, so two pushes to one target
-//! take turns and neither loses the other's head unseen.
+//! by a rename while the store's lock is held, so of two pushes to one
+//! target the second finds the store busy (`store_busy`, retryable) and
+//! neither loses the other's head unseen.
 
 use std::fmt;
 use std::fs;

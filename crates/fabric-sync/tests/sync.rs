@@ -540,3 +540,20 @@ fn the_secret_patterns_and_caches_a_tree_declares_hold_on_a_push() {
         "the declared cache lost its class: {caches:?}"
     );
 }
+
+#[test]
+fn a_busy_store_over_ssh_is_store_busy_and_retryable() {
+    let world = World::new();
+    let a = world.path("a/app");
+    dirty_tree(&a);
+    let target = world.path("target");
+    let (t, ta) = (target.to_str().unwrap(), a.to_str().unwrap());
+    world.ok("home-a", &["push", t, "--tree", ta]);
+    let held = Store::open(&target.join("store")).unwrap();
+    let ssh = format!("box:{t}");
+    let output = world.run("home-a", &["push", &ssh, "--tree", ta, "--json"], None);
+    drop(held);
+    let doc: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(doc["reason"], "store_busy", "{doc}");
+    assert_eq!(doc["retryable"], true, "{doc}");
+}
