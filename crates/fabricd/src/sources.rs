@@ -117,6 +117,17 @@ pub fn prepare_in(
     source: &SourceBinding,
     store: Option<&Store>,
 ) -> Result<Prepared, SourceError> {
+    prepare_at(root, source, store, None)
+}
+
+/// As [`prepare_in`]; a snapshot's harness state, when it holds one, is
+/// written to `harness_state` too, an absent or empty directory.
+fn prepare_at(
+    root: &Path,
+    source: &SourceBinding,
+    store: Option<&Store>,
+    harness_state: Option<&Path>,
+) -> Result<Prepared, SourceError> {
     let root_abs = abs(root)?;
     match source {
         SourceBinding::Repository { .. } => Err(SourceError::Adoption),
@@ -173,7 +184,7 @@ pub fn prepare_in(
                 &RestoreRequest {
                     snapshot: *snapshot,
                     target: root,
-                    harness_state: None,
+                    harness_state,
                     verify: Verify::None,
                     durability: Durability::ProcessCrash,
                     carry: &|_| true,
@@ -233,17 +244,25 @@ pub fn root_for(node: &Node, job: JobId) -> PathBuf {
 }
 
 /// Prepares `source` as `job`'s workspace on this node.
+/// A snapshot's harness state, when it holds one, is written to
+/// `harness_state` too, an absent or empty directory.
 pub async fn prepare(
     node: &Node,
     job: JobId,
     source: &SourceBinding,
+    harness_state: Option<PathBuf>,
 ) -> Result<Prepared, SourceError> {
     let root = root_for(node, job);
     let source = source.clone();
     if matches!(source, SourceBinding::Snapshot { .. }) {
         let root = root.clone();
         return with_store(&node.store, move |store| {
-            Ok(prepare_in(&root, &source, Some(store)))
+            Ok(prepare_at(
+                &root,
+                &source,
+                Some(store),
+                harness_state.as_deref(),
+            ))
         })
         .await
         .map_err(unavailable)?;

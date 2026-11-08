@@ -31,12 +31,14 @@ use fabric_core::managed::launch::{
     InstructRefusal, Instruction, LaunchAnswer, LaunchRefusal, LaunchRequest, Report, ReportAnswer,
     ReportRefusal, TaskLaunch,
 };
+use fabric_core::managed::placement::PathLayout;
 use fabric_core::managed::{
-    AttemptId, DrainBudget, ExitOutcome, Fidelity, GrantToken, Observation, Program, ReceiptStatus,
-    TaskClass, TaskReceipt,
+    AllowedFidelity, AttemptId, DrainBudget, ExitOutcome, Fidelity, GrantToken, NodeAdvert,
+    Observation, Program, ReceiptStatus, TaskClass, TaskReceipt,
 };
 use fabric_core::path::AbsPath;
 use fabric_core::session::SessionId;
+use fabric_core::version::HarnessVersion;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 
@@ -982,6 +984,131 @@ impl HarnessProcess for AdapterHarness {
     }
 }
 
+/// The harness state a cut holds, as its manifest names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedSession {
+    /// The harness that wrote it.
+    pub harness: HarnessKind,
+    /// The session it continues.
+    pub session: SessionId,
+    /// The root and home it was captured under (ADR 0011).
+    pub layout: PathLayout,
+    /// The version that last wrote it, when the manifest names one.
+    pub writer: Option<HarnessVersion>,
+}
+
+/// What this node offers a continuation of `harness` from a cut that holds
+/// `captured`, with `advert` its own and `here` its physical root and home,
+/// and the session it restores for it: one only when the continuation
+/// allows a native session and this node can offer one. The layout is the
+/// same only when the harness, the root and the home all are (ADR 0011).
+pub(crate) fn continuation_offer(
+    harness: &HarnessKind,
+    allowed: AllowedFidelity,
+    captured: Option<&CapturedSession>,
+    here: &PathLayout,
+    advert: &NodeAdvert,
+) -> (Vec<Fidelity>, Option<SessionId>) {
+    let same = captured.filter(|c| c.harness == *harness && c.layout == *here);
+    let writer = same.and_then(|c| c.writer.as_ref());
+    let offered = fabric_core::managed::offered_fidelity(harness, writer, advert, same.is_some());
+    let restore = same
+        .filter(|_| allowed.native_session && offered.contains(&Fidelity::NativeSession))
+        .map(|c| c.session.clone());
+    (offered, restore)
+}
+
+/// Reads the harness state a restore wrote to `dir`; `None` when the cut
+/// held none, which leaves `dir` absent or empty. A state that is there
+/// and cannot be read is an error.
+fn captured_in(dir: &std::path::Path) -> Result<Option<CapturedSession>, String> {
+    match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+        Ok(mut entries) => {
+            if entries.next().is_none() {
+                return Ok(None);
+            }
+        }
+    }
+    let manifest = fabric_harness::manifest::StateManifest::read(dir)
+        .map_err(|e| format!("the cut's harness state cannot be read: {e}"))?;
+    Ok(Some(CapturedSession {
+        harness: manifest.kind().clone(),
+        session: manifest.session().clone(),
+        layout: PathLayout {
+            home: manifest.home().clone(),
+            root: manifest.root().clone(),
+        },
+        writer: manifest
+            .harness_version()
+            .and_then(|v| HarnessVersion::parse(v).ok()),
+    }))
+}
+
+/// Removes `dir`, this node's own copy of a cut's harness state.
+fn remove_state(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("{}: {e}", dir.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// What this node offers the continuation `ask` of `request` from the
+/// root it prepared, and the session it restored for a native session:
+/// the cut's harness state in `state_dir` goes back through the adapter's
+/// restore, as `job resume` does, when the layout is the same. A refusal
+/// there fails the launch, never lowers the fidelity.
+async fn native_offer(
+    node: &crate::node::Node,
+    request: &LaunchRequest,
+    ask: &fabric_core::managed::launch::ContinuationAsk,
+    root: &AbsPath,
+    state_dir: Option<&std::path::Path>,
+) -> Result<(Vec<Fidelity>, Option<SessionId>), String> {
+    let wire = fabric_net::rpc::Advertise {
+        job: request.token.job,
+        harness: request.intent.harness.clone(),
+        root: root.clone(),
+        snapshot: request.initial_checkpoint,
+        secrets: Vec::new(),
+    };
+    let advert = crate::placement::advert_from_wire(&node.own_advert(&wire).await);
+    let harness_env = node
+        .harness_env(&node.node_env())
+        .map_err(|e| e.to_string())?;
+    let captured = match state_dir {
+        Some(dir) => captured_in(dir)?,
+        None => None,
+    };
+    let physical = std::fs::canonicalize(root.as_str())
+        .ok()
+        .and_then(|p| AbsPath::parse(p.to_str()?).ok())
+        .ok_or_else(|| format!("{root} has no physical path"))?;
+    let here = PathLayout {
+        home: harness_env.home.clone(),
+        root: physical,
+    };
+    let (offered, session) = continuation_offer(
+        &request.intent.harness,
+        ask.allowed,
+        captured.as_ref(),
+        &here,
+        &advert,
+    );
+    if let (Some(_), Some(dir)) = (&session, state_dir) {
+        let adapter = crate::harnesses::adapter(&request.intent.harness, &harness_env, None)
+            .map_err(|e| e.to_string())?;
+        adapter
+            .restore(std::path::Path::new(root.as_str()), dir)
+            .await
+            .map_err(|e| format!("the harness state was not restored: {e}"))?;
+    }
+    Ok((offered, session))
+}
+
 /// Moves a root a previous attempt left aside, so the new attempt's
 /// preparation starts from an empty directory and nothing is lost.
 fn set_aside(root: &std::path::Path, attempt: AttemptId) -> Result<(), String> {
@@ -1047,7 +1174,29 @@ impl Host for NodeHost {
                 }
                 None => request.source.clone(),
             };
-            let prepared = crate::sources::prepare(&node, job, &source)
+            // A continuation that allows a native session takes the cut's
+            // harness state too, into this node's own copy of it.
+            let native = request.initial_checkpoint.is_some()
+                && request
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|ask| ask.allowed.native_session);
+            let state_dir = native.then(|| {
+                node.cfg
+                    .state
+                    .root()
+                    .join("runs")
+                    .join("restored")
+                    .join(request.token.attempt.to_string())
+            });
+            if let Some(dir) = &state_dir {
+                remove_state(dir)?;
+                if let Some(parent) = dir.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+            }
+            let prepared = crate::sources::prepare(&node, job, &source, state_dir.clone())
                 .await
                 .map_err(|e| e.to_string())?;
             let root = match prepared {
@@ -1055,32 +1204,22 @@ impl Host for NodeHost {
                 | crate::sources::Prepared::Restored { root, .. }
                 | crate::sources::Prepared::Empty { root } => root,
             };
-            let offered = if request.continuation.is_some() {
-                let ask = fabric_net::rpc::Advertise {
-                    job,
-                    harness: request.intent.harness.clone(),
-                    root: root.clone(),
-                    snapshot: request.initial_checkpoint,
-                    secrets: Vec::new(),
-                };
-                let advert = crate::placement::advert_from_wire(&node.own_advert(&ask).await);
-                // A restore of the harness's own state is not part of this
-                // launch, so the layout is never called the same and no
-                // native session is offered (docs/managed-jobs.md, "Launch
-                // path", as built).
-                fabric_core::managed::offered_fidelity(
-                    &request.intent.harness,
-                    None,
-                    &advert,
-                    false,
-                )
-            } else {
-                Vec::new()
+            let Some(ask) = &request.continuation else {
+                return Ok(Prepared {
+                    root,
+                    offered: Vec::new(),
+                    session: None,
+                });
             };
+            let offer = native_offer(&node, request, ask, &root, state_dir.as_deref()).await;
+            if let Some(dir) = &state_dir {
+                remove_state(dir)?;
+            }
+            let (offered, session) = offer?;
             Ok(Prepared {
                 root,
                 offered,
-                session: None,
+                session,
             })
         })
     }
@@ -2078,5 +2217,110 @@ mod tests {
             std::task::Poll::Ready(output) => Some(output),
             std::task::Poll::Pending => None,
         }
+    }
+
+    /// A native session is offered, and its session restored, only for the
+    /// same harness, root and home, a version not older than its writer,
+    /// and a continuation that allows it; anything else offers the package.
+    #[test]
+    fn a_native_session_is_restored_only_for_the_same_layout() {
+        use fabric_core::managed::placement::{Capacity, HarnessInventory, Warmth};
+        use fabric_core::snapshot::Platform;
+
+        let abs = |p: &str| AbsPath::parse(p).unwrap();
+        let here = PathLayout {
+            home: abs("/home/u"),
+            root: abs("/home/u/fabric/jobs/j/work"),
+        };
+        let advert = NodeAdvert {
+            node: NodeId::from_bytes([2; 32]),
+            platform: Platform {
+                os: "macos".to_owned(),
+                arch: "aarch64".to_owned(),
+            },
+            harnesses: vec![HarnessInventory {
+                kind: HarnessKind::Codex,
+                version: HarnessVersion::parse("0.155.1").unwrap(),
+            }],
+            layout: here.clone(),
+            capacity: Capacity {
+                load_1m_milli: 0,
+                free_disk_bytes: 0,
+            },
+            warmth: Warmth {
+                bundle_chain: false,
+                workspace: false,
+            },
+            measured_at_ms: 0,
+        };
+        let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let captured = CapturedSession {
+            harness: HarnessKind::Codex,
+            session: session.clone(),
+            layout: here.clone(),
+            writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
+        };
+        let allowed = AllowedFidelity::DEFAULT;
+        let offer = |captured: Option<&CapturedSession>, allowed: AllowedFidelity| {
+            continuation_offer(&HarnessKind::Codex, allowed, captured, &here, &advert)
+        };
+        let package = vec![
+            Fidelity::NewNativeSessionWithPackage,
+            Fidelity::WorkspaceOnly,
+        ];
+
+        let (offered, restored) = offer(Some(&captured), allowed);
+        assert_eq!(offered[0], Fidelity::NativeSession);
+        assert_eq!(restored, Some(session.clone()));
+        assert_eq!(allowed.highest(&offered).unwrap(), Fidelity::NativeSession);
+
+        for other in [
+            CapturedSession {
+                layout: PathLayout {
+                    home: abs("/home/v"),
+                    ..here.clone()
+                },
+                ..captured.clone()
+            },
+            CapturedSession {
+                layout: PathLayout {
+                    root: abs("/home/u/elsewhere"),
+                    ..here.clone()
+                },
+                ..captured.clone()
+            },
+            CapturedSession {
+                harness: HarnessKind::ClaudeCode,
+                ..captured.clone()
+            },
+            CapturedSession {
+                writer: Some(HarnessVersion::parse("0.200.0").unwrap()),
+                ..captured.clone()
+            },
+        ] {
+            assert_eq!(
+                offer(Some(&other), allowed),
+                (package.clone(), None),
+                "{other:?}"
+            );
+        }
+        assert_eq!(
+            offer(None, allowed),
+            (package.clone(), None),
+            "no state in the cut"
+        );
+        let no_native = AllowedFidelity {
+            native_session: false,
+            ..AllowedFidelity::DEFAULT
+        };
+        let (offered, restored) = offer(Some(&captured), no_native);
+        assert_eq!(
+            restored, None,
+            "a native session not allowed restores nothing"
+        );
+        assert_eq!(
+            no_native.highest(&offered).unwrap(),
+            Fidelity::NewNativeSessionWithPackage
+        );
     }
 }
