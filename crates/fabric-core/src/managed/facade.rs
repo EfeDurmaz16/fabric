@@ -229,15 +229,42 @@ pub enum TokenCheck {
     },
 }
 
+/// What a message asks of a token's job scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobAsk {
+    /// Nothing: the message names no job.
+    Nothing,
+    /// To act on this job.
+    Existing(JobId),
+    /// To create a job, which no list of jobs can name yet.
+    Create,
+}
+
+/// What a message asks of a token's resource scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceAsk {
+    /// Nothing: the message places no work.
+    Nothing,
+    /// Work placed on this node.
+    Pinned(NodeId),
+    /// Work placed on whichever node the authority chooses.
+    Anywhere,
+}
+
 /// Checks a token in one order: unknown, revoked, expired, job scope,
-/// resource scope. `job` and `resource` are what the command names;
-/// `None` asks nothing of that scope.
+/// resource scope.
+///
+/// Deny by default: a token limited to listed jobs may not create one (a
+/// new job is in no list), and a token limited to listed nodes may not
+/// place work it does not pin to one of them, since the authority could
+/// choose any node. Selected by the implementation agent on 2026-11-02
+/// under Efe's delegation of 2026-11-02.
 #[must_use]
 pub fn check_token(
     record: Option<&FacadeTokenRecord>,
     now_ms: u64,
-    job: Option<JobId>,
-    resource: Option<NodeId>,
+    job: JobAsk,
+    resource: ResourceAsk,
 ) -> TokenCheck {
     let Some(record) = record else {
         return TokenCheck::Unknown;
@@ -248,19 +275,29 @@ pub fn check_token(
     if now_ms >= record.expires_ms {
         return TokenCheck::Expired;
     }
-    if let (Some(job), JobScope::Jobs(jobs)) = (job, &record.jobs)
-        && !jobs.contains(&job)
-    {
-        return TokenCheck::OutOfScope {
-            what: ScopeKind::Job,
+    if let JobScope::Jobs(jobs) = &record.jobs {
+        let covered = match job {
+            JobAsk::Nothing => true,
+            JobAsk::Existing(job) => jobs.contains(&job),
+            JobAsk::Create => false,
         };
+        if !covered {
+            return TokenCheck::OutOfScope {
+                what: ScopeKind::Job,
+            };
+        }
     }
-    if let (Some(node), ResourceScope::Nodes(nodes)) = (resource, &record.resources)
-        && !nodes.contains(&node)
-    {
-        return TokenCheck::OutOfScope {
-            what: ScopeKind::Resource,
+    if let ResourceScope::Nodes(nodes) = &record.resources {
+        let covered = match resource {
+            ResourceAsk::Nothing => true,
+            ResourceAsk::Pinned(node) => nodes.contains(&node),
+            ResourceAsk::Anywhere => false,
         };
+        if !covered {
+            return TokenCheck::OutOfScope {
+                what: ScopeKind::Resource,
+            };
+        }
     }
     TokenCheck::Ok
 }
@@ -284,42 +321,52 @@ mod tests {
 
     #[test]
     fn a_token_is_checked_in_one_order() {
+        use JobAsk::{Create, Existing};
+        use ResourceAsk::{Anywhere, Nothing, Pinned};
         let job = JobId::from_bytes([1; 16]);
         let other_job = JobId::from_bytes([9; 16]);
         let node = NodeId::from_bytes([2; 32]);
         let other_node = NodeId::from_bytes([3; 32]);
-        assert_eq!(check_token(None, 500, None, None), TokenCheck::Unknown);
+        assert_eq!(
+            check_token(None, 500, JobAsk::Nothing, Nothing),
+            TokenCheck::Unknown
+        );
         let revoked = FacadeTokenRecord {
             revoked_ms: Some(400),
             ..record()
         };
         // Revoked wins over expired and scope.
         assert_eq!(
-            check_token(Some(&revoked), 5_000, Some(other_job), None),
+            check_token(Some(&revoked), 5_000, Existing(other_job), Nothing),
             TokenCheck::Revoked
         );
         assert_eq!(
-            check_token(Some(&record()), 1_000, Some(other_job), None),
+            check_token(Some(&record()), 1_000, Existing(other_job), Nothing),
             TokenCheck::Expired
         );
         assert_eq!(
-            check_token(Some(&record()), 999, Some(other_job), Some(other_node)),
+            check_token(
+                Some(&record()),
+                999,
+                Existing(other_job),
+                Pinned(other_node)
+            ),
             TokenCheck::OutOfScope {
                 what: ScopeKind::Job
             }
         );
         assert_eq!(
-            check_token(Some(&record()), 999, Some(job), Some(other_node)),
+            check_token(Some(&record()), 999, Existing(job), Pinned(other_node)),
             TokenCheck::OutOfScope {
                 what: ScopeKind::Resource
             }
         );
         assert_eq!(
-            check_token(Some(&record()), 999, Some(job), Some(node)),
+            check_token(Some(&record()), 999, Existing(job), Pinned(node)),
             TokenCheck::Ok
         );
         assert_eq!(
-            check_token(Some(&record()), 999, None, None),
+            check_token(Some(&record()), 999, JobAsk::Nothing, Nothing),
             TokenCheck::Ok
         );
         let any = FacadeTokenRecord {
@@ -328,7 +375,58 @@ mod tests {
             ..record()
         };
         assert_eq!(
-            check_token(Some(&any), 999, Some(other_job), Some(other_node)),
+            check_token(Some(&any), 999, Existing(other_job), Pinned(other_node)),
+            TokenCheck::Ok
+        );
+        assert_eq!(
+            check_token(Some(&any), 999, Create, Anywhere),
+            TokenCheck::Ok
+        );
+    }
+
+    /// A token limited to listed jobs creates none, and one limited to
+    /// listed nodes places nothing it does not pin to one of them.
+    #[test]
+    fn a_listed_scope_denies_what_it_cannot_name() {
+        let node = NodeId::from_bytes([2; 32]);
+        let any_job = FacadeTokenRecord {
+            jobs: JobScope::AnyOwned,
+            ..record()
+        };
+        assert_eq!(
+            check_token(
+                Some(&record()),
+                999,
+                JobAsk::Create,
+                ResourceAsk::Pinned(node)
+            ),
+            TokenCheck::OutOfScope {
+                what: ScopeKind::Job
+            }
+        );
+        assert_eq!(
+            check_token(Some(&any_job), 999, JobAsk::Create, ResourceAsk::Anywhere),
+            TokenCheck::OutOfScope {
+                what: ScopeKind::Resource
+            }
+        );
+        let no_nodes = FacadeTokenRecord {
+            resources: ResourceScope::Nodes(Vec::new()),
+            ..any_job.clone()
+        };
+        assert_eq!(
+            check_token(Some(&no_nodes), 999, JobAsk::Create, ResourceAsk::Anywhere),
+            TokenCheck::OutOfScope {
+                what: ScopeKind::Resource
+            }
+        );
+        assert_eq!(
+            check_token(
+                Some(&any_job),
+                999,
+                JobAsk::Create,
+                ResourceAsk::Pinned(node)
+            ),
             TokenCheck::Ok
         );
     }

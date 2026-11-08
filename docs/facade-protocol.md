@@ -102,7 +102,7 @@ Answered with `accepted`. Refused with reason `not_live` when no attempt of the 
   "fidelity": ["native_session", "new_native_session_with_package"], "pin": null }
 ```
 
-`fidelity` is optional and defaults to the job's allowance; empty is `bad_request`/`empty_fidelity`. `pin` is required and nullable; a pin outside the token's resource scope is `refused`/`scope`/`resource`. Answered with `accepted`.
+`fidelity` is optional and defaults to the job's allowance; empty is `bad_request`/`empty_fidelity`. `pin` is required and nullable; a pin outside the token's resource scope, or no pin under a token limited to listed nodes, is `refused`/`scope`/`resource`. Answered with `accepted`.
 
 ## Messages from the authority
 
@@ -147,7 +147,7 @@ At most 256 events, in sequence order, all after `after`. `next` is the sequence
 | `unsupported_version` | `facade` | the `facade` field is not 1 |
 | `bad_request` | `unknown_variant`, `unknown_field`, `bad_integer`, `bad_id`, `bad_string`, `missing_field`, `source_local`, `empty_fidelity`, `wait_above_limit` | the message does not parse under this document |
 | `unauthorized` | `unknown_token`, `revoked`, `expired` | the token, in the check order |
-| `scope` | `job`, `resource` | the token does not cover the job, or the pin or target node |
+| `scope` | `job`, `resource` | the token does not cover the job, or the pin or target node; a token limited to listed jobs may not `submit` (a new job is in no list), and a token limited to listed nodes may not `submit` or `continue` without a pin to one of them (the authority could choose any node) |
 | `unknown_job` | `job` | the job is not in this authority's journal |
 | `conflict` | `key` | the key was used for another request |
 | `revision_mismatch` | `revision` | `expected_revision` is not the job's current one |

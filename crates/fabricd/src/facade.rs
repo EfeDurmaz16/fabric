@@ -33,8 +33,8 @@ use fabric_client::facade::{
 };
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::facade::{
-    Actor, BEARER_BYTES, FacadeTokenRecord, JobScope, ResourceScope, ScopeKind, TokenCheck,
-    TokenId, check_token, token_digest,
+    Actor, BEARER_BYTES, FacadeTokenRecord, JobAsk, JobScope, ResourceAsk, ResourceScope,
+    ScopeKind, TokenCheck, TokenId, check_token, token_digest,
 };
 use fabric_core::managed::placement::{Exclusion, RankReason, Verdict};
 use fabric_core::managed::secret_ref::{AttemptScope, ResourceKind, SecretScope};
@@ -256,7 +256,12 @@ impl Node {
             Ok(record) => record,
             Err(refusal) => return FacadeAnswer::Refused(refusal),
         };
-        match check_token(record.as_ref(), now_ms, message.job(), message.pin()) {
+        match check_token(
+            record.as_ref(),
+            now_ms,
+            message.job_ask(),
+            message.resource_ask(),
+        ) {
             TokenCheck::Ok => {}
             TokenCheck::Unknown => {
                 return FacadeAnswer::Refused(Refusal::new(
@@ -549,8 +554,8 @@ impl Node {
             let check = check_token(
                 live.as_ref(),
                 now_ms.saturating_add(elapsed),
-                Some(job),
-                None,
+                JobAsk::Existing(job),
+                ResourceAsk::Nothing,
             );
             if check != TokenCheck::Ok {
                 closed = Some("revoked".to_owned());
@@ -1337,11 +1342,38 @@ mod tests {
             RefusalCode::Scope,
             "job",
         );
-        // A pin outside the resource scope is refused before the commit.
-        let mut pinned = submit_json(&hex_of(2), "k-pin", "pinned");
+        // A token limited to listed jobs creates none.
+        refused_as(
+            &submit(&node, &hex_of(2), "k-new", "new").await,
+            RefusalCode::Scope,
+            "job",
+        );
+        // A continue with no pin, from a token limited to listed nodes,
+        // could be placed anywhere: refused.
+        let unpinned = json!({ "type": "continue", "facade": 1, "token": hex_of(2),
+            "key": "k-cont", "job": job.to_string(), "expected_revision": null, "pin": null });
+        refused_as(
+            &node.facade_answer(&unpinned, NOW).await,
+            RefusalCode::Scope,
+            "resource",
+        );
+        let nodes_only = FacadeTokenRecord {
+            jobs: JobScope::AnyOwned,
+            resources: ResourceScope::Nodes(vec![NodeId::from_bytes([9; 32])]),
+            ..any_token(3, "ci-nodes", NOW + 1_000)
+        };
+        seed_token(&node, bearer(3), nodes_only).await;
+        // A pin outside the resource scope is refused before the commit,
+        // and so is no pin at all.
+        let mut pinned = submit_json(&hex_of(3), "k-pin", "pinned");
         pinned["policy"] = json!({ "pin": node.id.to_string() });
         refused_as(
             &node.facade_answer(&pinned, NOW).await,
+            RefusalCode::Scope,
+            "resource",
+        );
+        refused_as(
+            &submit(&node, &hex_of(3), "k-anywhere", "anywhere").await,
             RefusalCode::Scope,
             "resource",
         );

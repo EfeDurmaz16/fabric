@@ -32,7 +32,7 @@ use support::sha256;
 /// The sha256 of `protocol/facade/v1/manifest.sha256`. Change it only with
 /// the same change in `sdk/typescript/test/facade_fixtures.test.ts`
 /// (docs/facade-protocol.md, Fixtures).
-const MANIFEST_SHA256: &str = "2a149a1b080e97fb4efe5ecbedd1eb0f45e0c2fff4a73b5184a39444f0e78a24";
+const MANIFEST_SHA256: &str = "edc586f8a82573e41dc647af045021740cb5568141b582abc482702ad2faffa7";
 
 /// The messages a client sends; every one has a case the authority accepts.
 const CLIENT_TYPES: [&str; 6] = [
