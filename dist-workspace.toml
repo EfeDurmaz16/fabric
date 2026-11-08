@@ -27,11 +27,14 @@ dist = false
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 unix-archive = ".tar.gz"
 checksum = "sha256"
-# The product name lives here and in packaging/homebrew-tap (FORMULA in its
-# workflow). A rename changes these two places and the crate name.
+# The formula is fabric-node, not fabric: homebrew-core has a fabric (the
+# Python SSH tool, binary fab), and two formulae with one name share
+# Cellar/fabric, so a user with it installed could not install this one.
+# The binary is still fabric. docs/release.md lists every place the name
+# lives for a rename.
 installers = ["homebrew"]
 tap = "EfeDurmaz16/homebrew-tap"
-formula = "fabric"
+formula = "fabric-node"
 # No publish job pushes to the tap: that needs a token with write access to
 # another repository, and this workflow uses GITHUB_TOKEN only. The tap pulls
 # the formula from the release instead (packaging/homebrew-tap).

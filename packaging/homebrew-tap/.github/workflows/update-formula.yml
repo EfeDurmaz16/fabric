@@ -21,10 +21,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The product name and where it is released; a rename changes these and
-  # `formula` in the source repository's dist-workspace.toml.
+  # Where the formula is released, the formula's name (`formula` in the
+  # source repository's dist-workspace.toml) and the app it installs (the
+  # shipped crate and binary, which names the archives).
   SOURCE_REPO: EfeDurmaz16/fabric
-  FORMULA: fabric
+  FORMULA: fabric-node
+  APP: fabric
 
 jobs:
   update:
@@ -62,19 +64,19 @@ jobs:
           version=${TAG#v}
           work=$(mktemp -d)
           gh release download "$TAG" -R "$SOURCE_REPO" -D "$work" \
-            -p "$FORMULA.rb" -p "$FORMULA-*.tar.gz" -p sha256.sum
+            -p "$FORMULA.rb" -p "$APP-*.tar.gz" -p sha256.sum
           formula=$work/$FORMULA.rb
 
           grep -q "^  version \"$version\"$" "$formula" || { echo "the formula is not for $version"; exit 1; }
           urls=$(grep -c "url \"https://github.com/$SOURCE_REPO/releases/download/$TAG/" "$formula")
           shas=$(grep -c 'sha256 "' "$formula")
-          archives=$(find "$work" -name "$FORMULA-*.tar.gz" | wc -l)
+          archives=$(find "$work" -name "$APP-*.tar.gz" | wc -l)
           if [ "$urls" -ne "$archives" ] || [ "$shas" -ne "$archives" ]; then
             echo "the formula has $urls urls and $shas sha256 lines for $archives archives"
             exit 1
           fi
           (cd "$work" && sha256sum --check --ignore-missing sha256.sum)
-          for archive in "$work/$FORMULA"-*.tar.gz; do
+          for archive in "$work/$APP"-*.tar.gz; do
             sha=$(sha256sum "$archive" | cut -d ' ' -f 1)
             grep -q "sha256 \"$sha\"" "$formula" || { echo "the formula does not pin $archive"; exit 1; }
             # Built by the source repository's release workflow, from a tag.
@@ -111,7 +113,7 @@ jobs:
           set -eu
           brew tap "${GITHUB_REPOSITORY%%/*}/${GITHUB_REPOSITORY#*/homebrew-}"
           brew install "${GITHUB_REPOSITORY%%/*}/${GITHUB_REPOSITORY#*/homebrew-}/$FORMULA"
-          bin=$(brew --prefix)/bin/$FORMULA
+          bin=$(brew --prefix)/bin/$APP
           "$bin" --version
           real=$(realpath "$bin")
           if xattr -p com.apple.quarantine "$real" >/dev/null 2>&1; then

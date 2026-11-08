@@ -3,7 +3,7 @@
 Homebrew formulae for [Fabric](https://github.com/EfeDurmaz16/fabric).
 
 ```sh
-brew install EfeDurmaz16/tap/fabric
+brew install EfeDurmaz16/tap/fabric-node
 ```
 
 The formula installs the prebuilt, unsigned binary from the newest GitHub

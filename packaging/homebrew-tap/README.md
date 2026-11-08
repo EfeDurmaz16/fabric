@@ -8,21 +8,22 @@ root (`TAP.md` becomes its `README.md`). Nothing else is needed: no token, no
 secret.
 
 How the formula gets there: the release workflow of `EfeDurmaz16/fabric`
-builds `fabric.rb` as a release asset, with a url and a sha256 for each of
+builds `fabric-node.rb` as a release asset, with a url and a sha256 for each of
 the three archives. `.github/workflows/update-formula.yml` here runs in the
 tap every hour and on demand, downloads that formula and the archives of the
 newest release, checks each archive against the release's `sha256.sum`, the
 formula's sha256 lines and its GitHub artifact attestation, and commits
-`Formula/fabric.rb`. A second job installs it with `brew` on a clean macOS
+`Formula/fabric-node.rb`. A second job installs it with `brew` on a clean macOS
 runner and runs `fabric --version`.
 
 The tap pulls instead of the release pushing because a push from
 `EfeDurmaz16/fabric` would need a token with write access to another
 repository; this way each repository uses only its own `GITHUB_TOKEN`.
 
-The product name is in two places: `formula` in `dist-workspace.toml` and
-`FORMULA` at the top of the update workflow. A rename changes both, with
-the crate name.
+The formula is `fabric-node` because homebrew-core already has a `fabric`
+(the Python SSH tool); the binary it installs is `fabric`. The update
+workflow names both at its top, `FORMULA` and `APP`; `docs/release.md` in
+the Fabric repository lists every other place a rename touches.
 
 GitHub turns off scheduled workflows in a public repository after 60 days
 without a commit. A release commits the formula, which keeps it on; after a

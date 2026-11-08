@@ -1,6 +1,6 @@
 # Install
 
-There is no release yet. From the first tag on, `brew install EfeDurmaz16/tap/fabric` and unsigned binaries for three platforms on GitHub Releases are the quick way in; the [README](https://github.com/EfeDurmaz16/fabric#install) has both and the macOS Gatekeeper note, and [Releases](../release.md) says what a release holds. This page builds from source, which works today.
+There is no release yet. From the first tag on, `brew install EfeDurmaz16/tap/fabric-node` and unsigned binaries for three platforms on GitHub Releases are the quick way in; the [README](https://github.com/EfeDurmaz16/fabric#install) has both and the macOS Gatekeeper note, and [Releases](../release.md) says what a release holds. This page builds from source, which works today.
 
 ## Needs
 

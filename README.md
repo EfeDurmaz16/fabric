@@ -90,7 +90,7 @@ There is no release yet. From the first tag on (`v0.1.0`, [docs/release.md](docs
 With Homebrew, on a Mac or on Linux:
 
 ```sh
-brew install EfeDurmaz16/tap/fabric
+brew install EfeDurmaz16/tap/fabric-node
 fabric --version
 ```
 
