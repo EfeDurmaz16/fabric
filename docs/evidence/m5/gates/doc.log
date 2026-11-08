@@ -1,21 +1,5 @@
-    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
-   Compiling rustix v1.1.5
- Documenting fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
-    Checking fabric-journal v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-journal)
-    Checking fabric-client v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-client)
-    Checking fabric-env v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-env)
-    Checking fabric-store v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-store)
-    Checking fabric-net v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-net)
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
- Documenting fabric-journal v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-journal)
- Documenting fabric-store v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-store)
- Documenting fabric-client v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-client)
- Documenting fabric-env v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-env)
- Documenting fabric-net v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-net)
- Documenting fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
     Checking fabricd v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabricd)
  Documenting fabricd v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabricd)
- Documenting fabric-bridge v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-bridge)
  Documenting fabric v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.81s
-   Generated /var/folders/7x/672w195d6vqbvcnwq1hm7tkc0000gn/T/tmp.VZ5tnLUXAc/doc/fabric/index.html and 9 other files
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.45s
+   Generated $CARGO_TARGET_DIR/doc/fabric/index.html and 9 other files

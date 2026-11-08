@@ -5,7 +5,7 @@
 cd /tmp/fabric-wt/m5
 OUT=$1
 BASE=5e38dfa
-export CARGO_BUILD_JOBS=6
+export CARGO_BUILD_JOBS=4
 : > $OUT/summary.txt
 git rev-parse HEAD > $OUT/commit.txt
 echo "load at start: $(sysctl -n vm.loadavg)" >> $OUT/summary.txt
@@ -22,6 +22,7 @@ run budget-check bash -c "scripts/check-budget.sh $BASE && scripts/test-check-bu
 run fixtures bash -c "scripts/check-fixtures.sh $BASE && scripts/test-check-fixtures.sh"
 run actionlint actionlint .github/workflows/ci.yml .github/workflows/deny.yml
 run build-fabric cargo build -p fabric --locked
+run cli-reference env DOCS_CLI="$CARGO_TARGET_DIR/debug/fabric" scripts/docs/cli-reference.sh --check
 run sdk bash -c 'cd sdk/typescript && bun install --frozen-lockfile && bun run typecheck && bun run build && FABRIC_BIN="$CARGO_TARGET_DIR/debug/fabric" bun test'
 run budget-count env FABRIC_BUDGET=count cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
 echo DONE >> $OUT/summary.txt

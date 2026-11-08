@@ -1,6 +1,6 @@
 bun install v1.3.14 (0d9b296a)
 
-Checked 6 installs across 7 packages (no changes) [28.00ms]
+Checked 6 installs across 7 packages (no changes) [26.00ms]
 $ tsc --noEmit
 $ tsc -p tsconfig.build.json
 bun test v1.3.14 (0d9b296a)
@@ -8,4 +8,4 @@ bun test v1.3.14 (0d9b296a)
  69 pass
  0 fail
  3158 expect() calls
-Ran 69 tests across 6 files. [8.96s]
+Ran 69 tests across 6 files. [2.60s]

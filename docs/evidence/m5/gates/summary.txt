@@ -1,16 +1,17 @@
-load at start: { 8.89 11.11 12.65 }
-fmt: exit 0 (1 s) load { 8.90 11.08 12.63 }
-clippy: exit 0 (17 s) load { 10.08 11.23 12.66 }
-clippy-features: exit 0 (40 s) load { 13.35 12.00 12.87 }
-test: exit 0 (284 s) load { 15.25 14.52 13.89 }
-e2e: exit 0 (112 s) load { 19.56 17.40 15.18 }
-doc: exit 0 (25 s) load { 20.04 17.72 15.36 }
-deny: exit 0 (1 s) load { 20.04 17.72 15.36 }
-hygiene: exit 0 (5 s) load { 19.48 17.64 15.34 }
-budget-check: exit 0 (28 s) load { 18.10 17.56 15.40 }
-fixtures: exit 0 (26 s) load { 15.82 17.04 15.27 }
-actionlint: exit 0 (1 s) load { 15.82 17.04 15.27 }
-build-fabric: exit 0 (26 s) load { 16.59 17.11 15.35 }
-sdk: exit 0 (14 s) load { 16.63 17.10 15.37 }
-budget-count: exit 0 (47 s) load { 19.87 17.87 15.75 }
+load at start: { 9.04 9.51 9.76 }
+fmt: exit 0 (1 s) load { 9.04 9.51 9.76 }
+clippy: exit 0 (7 s) load { 9.91 9.69 9.82 }
+clippy-features: exit 0 (0 s) load { 9.91 9.69 9.82 }
+test: exit 0 (137 s) load { 9.51 9.53 9.72 }
+e2e: exit 0 (98 s) load { 8.30 9.38 9.66 }
+doc: exit 0 (2 s) load { 8.30 9.38 9.66 }
+deny: exit 0 (1 s) load { 7.95 9.29 9.63 }
+hygiene: exit 0 (3 s) load { 7.95 9.29 9.63 }
+budget-check: exit 0 (14 s) load { 8.18 9.28 9.61 }
+fixtures: exit 0 (14 s) load { 7.62 9.10 9.54 }
+actionlint: exit 0 (0 s) load { 7.62 9.10 9.54 }
+build-fabric: exit 0 (13 s) load { 7.74 9.08 9.53 }
+cli-reference: exit 0 (3 s) load { 7.52 9.01 9.51 }
+sdk: exit 0 (5 s) load { 7.56 9.00 9.50 }
+budget-count: exit 0 (22 s) load { 6.86 8.74 9.39 }
 DONE

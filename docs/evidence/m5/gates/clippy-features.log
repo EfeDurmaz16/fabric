@@ -1,64 +1,12 @@
 == fabric-harness features []
-    Checking hashbrown v0.17.1
-    Checking rustix v1.1.5
-    Checking ulid v3.0.0
-    Checking tokio v1.54.1
-    Checking nix v0.31.3
-    Checking rand v0.10.3
-    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
-    Checking proptest v1.12.0
-    Checking indexmap v2.14.2
-    Checking serde_json v1.0.154
-    Checking tempfile v3.27.0
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.56s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
 == fabric-harness features [acp]
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.90s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
 == fabric-harness features [claude]
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.84s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
 == fabric-harness features [codex]
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.47s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
 == fabric-net features [tap]
-   Compiling libc v0.2.191
-   Compiling zstd-safe v8.2.0
-   Compiling rustix v1.1.5
-   Compiling serde_json v1.0.154
-    Checking getrandom v0.2.17
-    Checking getrandom v0.4.3
-    Checking socket2 v0.6.5
-    Checking mio v1.2.4
-   Compiling jobserver v0.1.35
-    Checking errno v0.3.14
-    Checking rand v0.10.3
-    Checking quinn-udp v0.5.16
-   Compiling cc v1.9.0
-    Checking tokio v1.54.1
-    Checking proptest v1.12.0
-    Checking tempfile v3.27.0
-   Compiling ring v0.17.14
-   Compiling zstd-sys v2.1.2+zstd.1.5.7
-   Compiling blake3 v1.8.7
-    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
-   Compiling rustls v0.23.46
-    Checking zstd v0.14.3
-    Checking rustls-webpki v0.103.16
-    Checking rcgen v0.14.10
-    Checking quinn-proto v0.11.19
-    Checking tokio-rustls v0.26.6
-    Checking quinn v0.11.12
-    Checking fabric-net v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-net)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.72s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 == fabricd features [faults]
-    Checking tokio v1.54.1
-    Checking fabric-env v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-env)
-    Checking fabric-store v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-store)
-    Checking quinn v0.11.12
-    Checking tokio-rustls v0.26.6
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
-    Checking fabric-client v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-client)
-    Checking fabric-net v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-net)
-    Checking fabricd v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabricd)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.24s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
