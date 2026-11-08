@@ -1417,7 +1417,7 @@ Made after the M5 review of 2026-11-08; each fix has a regression test that fail
 - The authority's commit counter moves only for calls that write (`with_journal` reads, `write_journal` writes), so an idle watch costs no authority work; a watch also wakes at its token's expiry. `Journal::receipts(job, attempt)` searches `events_by_job` for the one job.
 - Domain: the state keeps every cut (`ManagedState.cuts`) and a continue starts from the newest cut of its task; a `Checkpointed` observation settles only the checkpoint command that names its attempt, and an attempt that ends first fails that command; a cut must hold a receipt for every open task of its attempt (`MissingReceipt`); `new_native_session_with_package` needs a package (`MissingPackage`); an accepted, not yet dispatched checkpoint or continue counts as in flight.
 - Executor: no `FABRIC_SECRET_*` variable reaches a task but the declared ones under their bare names; each attempt has its own lock, so one attempt's drain does not stall another; `resume` lifts a quiescence's freeze after a checkpoint command's cut; a spawn that fails after its process exists kills the group before it returns.
-- The `TypeScript` free-text rule refuses a carriage return, as the Rust parser does (fixture `submit_text_carriage_return`).
+- The TypeScript free-text rule refuses a carriage return, as the Rust parser does (fixture `submit_text_carriage_return`).
 
 ### As built (M5): the initial placement's dispatch and what the acceptance runs prove
 
