@@ -124,6 +124,10 @@ async fn e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_lo
         "managed",
         "continue",
         &job.to_string(),
+        // The package is what this test searches; on this one node the
+        // layout is the same, so a native session would carry none.
+        "--allow-fidelity",
+        "new_native_session_with_package",
         "--operation-key",
         "continue-1",
     ])?;
