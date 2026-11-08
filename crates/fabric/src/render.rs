@@ -849,7 +849,9 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         Reply::NodeId(_) | Reply::NodePing(_) => json!({ "node": fields }),
         Reply::NodeAdd(_) => json!({ "node": fields, "outcome": "added" }),
         Reply::JobNew(_) => json!({ "job": fields, "outcome": "created" }),
-        Reply::JobStatus(_) | Reply::ManagedStatus(_) => json!({ "job": fields }),
+        Reply::JobStatus(_) | Reply::ManagedStatus(_) | Reply::ManagedInspect(_) => {
+            json!({ "job": fields })
+        }
         Reply::JobSuspend(_) => json!({ "job": with_job(fields), "outcome": "suspended" }),
         Reply::JobMove(_) => json!({ "job": with_job(fields), "outcome": "moved" }),
         Reply::JobSteal(_) => json!({ "job": with_job(fields), "outcome": "stolen" }),
@@ -873,7 +875,6 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
             };
             json!({ "operation": fields, "outcome": outcome })
         }
-        Reply::ManagedInspect(_) => json!({ "job": fields }),
         Reply::ManagedImport(_) => json!({ "snapshot": fields, "outcome": "imported" }),
         Reply::FacadeMint(_) => json!({ "token": fields, "outcome": "minted" }),
         Reply::FacadeRevoke(revoked) => json!({

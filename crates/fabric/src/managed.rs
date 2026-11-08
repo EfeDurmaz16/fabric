@@ -1054,6 +1054,11 @@ mod tests {
             Cli::try_parse_from(["fabric", "managed", "create", "--goal", "g"]).is_err(),
             "no source named"
         );
+    }
+
+    /// A facade submit takes only a source that names the same thing on every node.
+    #[test]
+    fn a_facade_submit_takes_no_path() {
         assert!(
             Cli::try_parse_from([
                 "fabric",
