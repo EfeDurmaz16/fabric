@@ -9,10 +9,14 @@ publish.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-# The one crate cargo-dist ships (dist-workspace.toml), with the one binary
-# users install; the fixtures stay out of the archive.
+# A crate cargo-dist ships (dist-workspace.toml), with the one binary users
+# install; the fixtures stay out of the archive. The formula is fabric-node,
+# not fabric: homebrew-core has a fabric (the Python SSH tool, binary fab),
+# and two formulae with one name share Cellar/fabric, so a user with it
+# installed could not install this one. The binary is still fabric.
 [package.metadata.dist]
 dist = true
+formula = "fabric-node"
 
 [package.metadata.dist.binaries]
 aarch64-apple-darwin = ["fabric"]

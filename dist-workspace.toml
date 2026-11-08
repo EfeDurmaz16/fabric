@@ -17,8 +17,10 @@ ci = "github"
 # --check, run by the plan job, fails when the file is not dist's output
 # plus that patch.
 allow-dirty = ["ci"]
-# No crate ships unless it says so: only crates/fabric opts in, with its one
-# `fabric` binary (crates/fabric/Cargo.toml). The test doubles stay out.
+# No crate ships unless it says so: crates/fabric opts in with its one
+# `fabric` binary and crates/fabric-sync with its one `fabric-sync` binary,
+# each in its own archives and its own formula (their Cargo.toml). The test
+# doubles stay out.
 dist = false
 # The three platforms a node runs on. Linux is gnu, not musl: musl's
 # allocator is measurably slower for a daemon that hashes and copies
@@ -27,14 +29,11 @@ dist = false
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 unix-archive = ".tar.gz"
 checksum = "sha256"
-# The formula is fabric-node, not fabric: homebrew-core has a fabric (the
-# Python SSH tool, binary fab), and two formulae with one name share
-# Cellar/fabric, so a user with it installed could not install this one.
-# The binary is still fabric. docs/release.md lists every place the name
-# lives for a rename.
+# Each shipped crate names its formula in its own [package.metadata.dist],
+# so one formula name never covers two apps. docs/release.md lists every
+# place a name lives for a rename.
 installers = ["homebrew"]
 tap = "EfeDurmaz16/homebrew-tap"
-formula = "fabric-node"
 # No publish job pushes to the tap: that needs a token with write access to
 # another repository, and this workflow uses GITHUB_TOKEN only. The tap pulls
 # the formula from the release instead (packaging/homebrew-tap).

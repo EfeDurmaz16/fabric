@@ -8,6 +8,19 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# A crate cargo-dist ships (dist-workspace.toml), in its own archives, with
+# its one binary; the formula has the binary's name.
+[package.metadata.dist]
+dist = true
+formula = "fabric-sync"
+
+[package.metadata.dist.binaries]
+aarch64-apple-darwin = ["fabric-sync"]
+x86_64-apple-darwin = ["fabric-sync"]
+x86_64-unknown-linux-gnu = ["fabric-sync"]
 
 [features]
 # Named fault points, for the crate's own crash tests only.
