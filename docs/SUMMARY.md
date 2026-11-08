@@ -71,6 +71,7 @@
   - [ADR 0025: Source bindings, secret references and the export policy](adr/0025-source-bindings-and-secret-references.md)
   - [ADR 0026: Resource placement among registered nodes](adr/0026-resource-placement.md)
   - [ADR 0027: The job facade: authenticated remote job operations over the node link](adr/0027-job-facade-protocol.md)
+  - [ADR 0028: Capability-gated unexpected-loss recovery](adr/0028-unexpected-loss-recovery.md)
   - [ADR 0029: The Portable Session Format v1](adr/0029-portable-session-format.md)
 <!-- adr:end -->
 

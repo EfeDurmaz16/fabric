@@ -28,7 +28,7 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Chunk.** One stored object: a whole file of 8 MiB or less, or one FastCDC piece of a larger file. Compressed with zstd and named by its blake3 hash.
 
-**Covered write.** One of exactly four write paths that carry a grant token and run the fence before writing: a ledger append of a managed job, a bundle publish accepted as the job's checkpoint, a journal operation an executor reports, and the outcome of a facade command (ADR 0028). The harness's own files inside the workspace are not covered.
+**Covered write.** One of exactly four write paths that carry a grant token and run the fence before writing: a ledger append of a managed job, a bundle publish accepted as the job's checkpoint, a journal operation an executor reports, and the outcome of a facade command (ADR 0028). On the merged tree the journal operation (every report, the cut among them) and the managed ledger append have writers behind the fence; no node holds a managed ledger yet, a bundle becomes the checkpoint only through the fenced cut report, and no runner writes a facade outcome. The harness's own files inside the workspace are not covered.
 
 **Escaped child.** A process in a managed task's process group that no registered task owns (ADR 0023). It blocks a strong handoff with its pid and is never adopted or killed in silence.
 
@@ -51,6 +51,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Fence.** The one rule every covered write runs first (ADR 0028): the grant token's attempt must be the job's live attempt at the job's generation, `granted` or `running`, from the node it was granted to. Any other verdict refuses the write, records it and changes nothing else.
 
 **Fidelity.** How much of a managed job a continuation carried: `native_session`, `new_native_session_with_package`, `workspace_only`, or `unsupported`, which is a refusal (ADR 0024). The job's policy says which are allowed; every continuation records the one achieved, and a refusal is never lowered into a weaker one.
+
+**Failover.** The placement of a `Recover`'s next attempt (ADR 0028): the M5 placement with the superseded attempt's node excluded whatever it answers (`Exclusion::Unavailable`), from an acknowledged checkpoint. Granted when placed, launched like any other grant; with no eligible node the job parks with every exclusion recorded.
 
 **Fencing.** Refusing work from a stale epoch. The fencing token is `(job_id, epoch)`. The mechanism that keeps exactly one live copy among Fabric processes; native tombstones cover the harness's own writers.
 
@@ -149,6 +151,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Supervisor.** The process that kills a job's harness when a higher epoch is learned and keeps the harness record current. Always the holder of the data directory lock: the node process, or else the `fabric resume` command that launched the harness, which stays resident until the harness exits.
 
 **Suspend.** Stop the harness cleanly, publish a snapshot, push it to paired peers. The owner does not change.
+
+**Taken marker.** The record a node writes when it takes a grant (`runs/taken/<attempt>.json`): the grant token, the authority that granted it, and how this node's part ended. After a restart the node presents every grant whose marker has not ended to its authority, writes the verdict into the marker and resumes none (ADR 0028).
 
 **Task class.** What an interruption means for a managed task: `build` and `test` are cancelled and restarted and recorded interrupted, `harness` takes the supported checkpoint, `opaque` blocks (ADR 0023). Declared when the task is registered; never inferred from a process name.
 
