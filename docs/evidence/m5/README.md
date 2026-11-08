@@ -46,6 +46,8 @@ The executor's per-kind outcome rules (an interrupted test or build is `interrup
 
 The question for Efe: M5's acceptance needs a remote launch path. Should M5 add it as (a) one new node-link request in protocol 4, `Launch { job, attempt, generation, task, initial_checkpoint, package }`, answered at once, with the target reporting observations to the authority by a second request `Report { job, observation }` fenced by generation, and the snapshot fetched with the existing pull transfer, plus a `command` field on `RegisterTask` for build and test children (codec format 2, not shipped); or (b) should M5 ship with placement and the facade only, and the launch, the cut and the carry move to a milestone of their own before M6, whose old-runner wake needs a remote runner too?
 
+Answered 2026-11-08, under Efe's delegation of 2026-11-02 and not approved by Efe: option (a). The selection is recorded in the decisions file as "M5 launch path, selected 2026-11-08" and the contract is docs/managed-jobs.md, "Launch path (M5, as built)": `Launch`, `Instruct`, `Report` and `Heartbeat` on protocol 4, `RegisterTask` with a program for build and test tasks, the runner loop on the node, the work package built by the authority at the cut, and the dispatch of `Checkpoint`, `Continue`, `CancelJob` and `CancelTask` to the live attempt's node. #38 merges only after the launch path is proved end to end and reviewed; M6's five scenarios run against it before M6 merges.
+
 ## Gates
 
 `gates/run-gates.sh` ran every gate once, serially, at the commit in `gates/commit.txt`; `gates/summary.txt` has each exit code, time and load, and each gate's log is beside it.

@@ -138,7 +138,15 @@ fn checkpointed(attempt: &fabric_core::managed::Attempt, name: &[u8]) -> Observa
         snapshot,
         cut: CheckpointCut {
             snapshot,
-            receipts: Vec::new(),
+            // One receipt per open task: the attempt's harness.
+            receipts: vec![fabric_core::managed::TaskReceipt {
+                task: attempt.task,
+                class: fabric_core::managed::TaskClass::Harness,
+                status: fabric_core::managed::ReceiptStatus::Checkpointed { snapshot },
+                exit: None,
+                interrupted: true,
+                workspace: None,
+            }],
             facts: Vec::new(),
             evidence: Vec::new(),
         },
@@ -364,7 +372,9 @@ fn a_continue_killed_after_its_cut_is_retried_from_the_cut() {
         state.attempts[0].status,
         AttemptStatus::Checkpointed { snapshot }
     );
-    assert_eq!(journal.receipts(state.attempts[0].id).unwrap(), Vec::new());
+    let receipts = journal.receipts(job, state.attempts[0].id).unwrap();
+    assert_eq!(receipts.len(), 1, "the cut's one receipt, for the harness");
+    assert_eq!(receipts[0].task, state.attempts[0].task);
     // The owner's retry under a new key converges: nothing is live, nothing
     // is in flight, and the placement starts from the cut.
     let primary = state.job.primary;

@@ -12,17 +12,22 @@
 
 mod common;
 
+use std::future::Future;
 use std::os::unix::process::ExitStatusExt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{Logged, create, double, journal, operation, scope};
 use fabric_bridge::wire::{
     Action, CancelState, CreateParams, ErrorCode, ExecParams, Locator, ResultState, Versions,
 };
-use fabric_bridge::{Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError};
+use fabric_bridge::{
+    Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError, Recorder, Slot,
+};
 use fabric_core::managed::OperationId;
 use fabric_journal::{AbandonApproval, Acknowledged, CleanupRefusal, Journal, ProviderStatus};
 use rustix::process::Pid;
+use tokio::sync::Notify;
 
 fn config() -> Config {
     let mut config = Config::new("fixture");
@@ -163,6 +168,18 @@ async fn a_worker_crash_mid_request_leaves_the_operation_unknown() {
         None,
         "nothing recorded for a lost worker"
     );
+    // Before the profile is checked: a request for an action the profile
+    // does not offer, which Fabric records `rejected` while the worker is
+    // up, is refused as lost and recorded nowhere.
+    let mut other = create(5, "fixture/ok");
+    other.action = Action::Other {
+        name: "sandbox.snapshot".into(),
+        target: None,
+        params: serde_json::Map::new(),
+    };
+    let next = bridge.request(&mut journal, other).await;
+    assert!(matches!(next, Err(BridgeError::Lost(_))), "{next:?}");
+    assert_eq!(status(&journal, 5), None);
     let state = journal.job(scope().job).unwrap().unwrap();
     assert_eq!(state.job.generation, scope().generation);
     let exit = bridge.close().await.unwrap();
@@ -1605,4 +1622,210 @@ async fn a_cleanup_without_a_named_resource_is_refused_before_anything_is_writte
         CleanupRefusal::AlreadyDestroyed
     );
     journal.verify().unwrap();
+}
+
+/// A shutdown the bridge refuses because the worker is already gone sent
+/// nothing, so it changes nothing: what comes next is refused as lost,
+/// which is what happened, not as shutting down, which never began.
+#[tokio::test]
+async fn a_shutdown_refused_for_a_lost_worker_leaves_later_requests_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let outcome = bridge
+        .request(&mut journal, create(110, "double/crash"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert!(matches!(outcome.answer, Answer::Lost(_)), "{outcome:?}");
+    assert!(bridge.lost().is_some());
+    match bridge.shutdown(1000).await {
+        Err(BridgeError::Lost(_)) => {}
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("sent a shutdown to a worker that is gone"),
+    }
+    let next = bridge
+        .request(&mut journal, create(111, "fixture/ok"))
+        .await;
+    assert!(matches!(next, Err(BridgeError::Lost(_))), "{next:?}");
+    assert_eq!(status(&journal, 111), None);
+    assert!(bridge.lost().is_some());
+    assert_eq!(bridge.close().await.unwrap().code(), Some(3));
+}
+
+/// A request refused before anything is done for it records nothing, not
+/// even the locator a late answer named: that waits for `record_late` or
+/// the next request, observe or step that is admitted.
+#[tokio::test]
+async fn a_refused_request_records_no_late_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let mut late = create(120, "double/late");
+    late.deadline_ms = 1;
+    let outcome = bridge
+        .request(&mut journal, late)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(outcome.answer, Answer::TimedOut);
+    let started = Instant::now();
+    while bridge.late_answers() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(locator(&journal, 120), None);
+    bridge.shutdown(1000).await.unwrap().wait().await.unwrap();
+    let refused = bridge
+        .request(&mut journal, create(121, "fixture/ok"))
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::ShuttingDown)),
+        "{refused:?}"
+    );
+    assert_eq!(bridge.late_answers(), 1);
+    assert_eq!(
+        locator(&journal, 120),
+        None,
+        "a refused request recorded the late locator"
+    );
+    bridge.record_late(&mut journal).await.unwrap();
+    assert_eq!(status(&journal, 120), Some(ProviderStatus::Unknown));
+    assert_eq!(
+        locator(&journal, 120),
+        Some(fabric_bridge::wire::locator_record(&fx("key-120")))
+    );
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// A recorder that parks its `n`th `reserve` until the test lets it go,
+/// and says when it is parked.
+struct Gated<'a> {
+    inner: &'a mut common::Logged,
+    at: u32,
+    calls: u32,
+    parked: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Recorder for Gated<'_> {
+    type Log = Journal;
+
+    fn reserve(&mut self) -> impl Future<Output = Result<Slot<'_, Journal>, LogError>> + Send {
+        self.calls += 1;
+        let park = self.calls == self.at;
+        let parked = Arc::clone(&self.parked);
+        let release = Arc::clone(&self.release);
+        async move {
+            if park {
+                parked.notify_one();
+                release.notified().await;
+            }
+            self.inner.reserve().await
+        }
+    }
+}
+
+/// A request passes its first check, records the locator a late answer
+/// named, then waits on the log; a worker lost meanwhile refuses it when
+/// it registers. It is refused as lost, and the locator stays recorded:
+/// what the first check refuses records nothing, what the second refuses
+/// already has.
+#[tokio::test]
+async fn a_request_refused_when_it_registers_has_recorded_the_late_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let mut late = create(130, "double/late");
+    late.deadline_ms = 1;
+    let outcome = bridge
+        .request(&mut journal, late)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(outcome.answer, Answer::TimedOut);
+    let started = Instant::now();
+    while bridge.late_answers() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(locator(&journal, 130), None);
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    // The first reserve records the late locator; the second is the
+    // request's own, where it is parked until the worker is gone.
+    let mut log = Gated {
+        inner: &mut journal,
+        at: 2,
+        calls: 0,
+        parked: Arc::clone(&parked),
+        release: Arc::clone(&release),
+    };
+    let lose = async {
+        parked.notified().await;
+        bridge.kill().await;
+        let started = Instant::now();
+        while bridge.lost().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(5), "not lost");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        release.notify_one();
+    };
+    let (refused, ()) = tokio::join!(bridge.request(&mut log, create(131, "fixture/ok")), lose);
+    assert!(matches!(refused, Err(BridgeError::Lost(_))), "{refused:?}");
+    assert_eq!(log.calls, 2);
+    assert_eq!(
+        status(&journal, 131),
+        None,
+        "a refused request was recorded"
+    );
+    assert_eq!(status(&journal, 130), Some(ProviderStatus::Unknown));
+    assert_eq!(
+        locator(&journal, 130),
+        Some(fabric_bridge::wire::locator_record(&fx("key-130"))),
+        "the late locator was not recorded before the request waited on the log"
+    );
+    assert_eq!(bridge.late_answers(), 1);
+}
+
+/// Losing the worker empties the outstanding requests, so a cancel after
+/// the loss would find nothing and read as answered. It is refused as
+/// lost instead, like every other call, and the request it names settles
+/// as lost.
+#[tokio::test]
+async fn a_cancel_after_the_worker_is_lost_is_refused_as_lost_not_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let silent = bridge
+        .request(&mut journal, create(140, "double/silent"))
+        .await
+        .unwrap();
+    let crashed = bridge
+        .request(&mut journal, create(141, "double/crash"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert!(matches!(crashed.answer, Answer::Lost(_)), "{crashed:?}");
+    assert!(bridge.lost().is_some());
+    match bridge.cancel(silent.request_id()).await {
+        Err(BridgeError::Lost(_)) => {}
+        other => panic!("a cancel after the loss: {other:?}"),
+    }
+    match bridge.cancel("r-404").await {
+        Err(BridgeError::Lost(_)) => {}
+        other => panic!("a cancel of nothing after the loss: {other:?}"),
+    }
+    let outcome = silent.finish(&mut journal).await.unwrap();
+    assert!(matches!(outcome.answer, Answer::Lost(_)), "{outcome:?}");
+    assert_eq!(status(&journal, 140), Some(ProviderStatus::Unknown));
+    assert_eq!(bridge.close().await.unwrap().code(), Some(3));
 }

@@ -74,6 +74,7 @@ fn state_planted(goal: &str, acceptance: Vec<String>) -> ManagedState {
             kind: TaskKind::Primary,
             restart: RestartPolicy::ExplicitOnly,
             class: TaskClass::Harness,
+            program: None,
         },
     ];
     with_child(apply_batch(None, WorkRevision::FIRST, &events).unwrap())
@@ -91,6 +92,7 @@ fn with_child(state: ManagedState) -> ManagedState {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
+            program: None,
         },
     };
     let t = accept_command(Some(&state), &child, &ids(2)).unwrap();
@@ -168,6 +170,10 @@ fn a_package_over_a_limit_is_refused_naming_the_field() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "every planted source reads best as one script"
+)]
 fn planted_credentials_and_approvals_never_enter_a_package() {
     let token = format!("ghp_{}", "a".repeat(40));
     let state = state_with("goal", Vec::new());
@@ -212,6 +218,28 @@ fn planted_credentials_and_approvals_never_enter_a_package() {
     };
     assert!(matches!(
         accept_command(None, &planted, &ids(1)),
+        Err(DomainError::CredentialLike { .. })
+    ));
+    // So is one in an ACP agent's arguments, which every path journals.
+    let in_args = Envelope {
+        key: OperationKey::parse("create-acp").unwrap(),
+        job: None,
+        expected: None,
+        body: Command::CreateJob {
+            intent: Intent {
+                goal: "fix the test".into(),
+                harness: HarnessKind::Acp {
+                    program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+                    args: vec!["--api-key".into(), token.clone()],
+                },
+                acceptance: Vec::new(),
+            },
+            source: SourceBinding::Empty,
+            policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
+        },
+    };
+    assert!(matches!(
+        accept_command(None, &in_args, &ids(2)),
         Err(DomainError::CredentialLike { .. })
     ));
     // And the builder refuses one that reached a history anyway.
@@ -350,7 +378,19 @@ fn a_refusal_is_never_lowered() {
     let first = state.attempts[0].id;
     let cut = CheckpointCut {
         snapshot: SnapshotId::of(b"s"),
-        receipts: Vec::new(),
+        // One receipt per open task: the harness and its test child.
+        receipts: state
+            .tasks
+            .iter()
+            .map(|task| TaskReceipt {
+                task: task.id,
+                class: task.class,
+                status: ReceiptStatus::Interrupted,
+                exit: None,
+                interrupted: true,
+                workspace: None,
+            })
+            .collect(),
         facts: Vec::new(),
         evidence: Vec::new(),
     };

@@ -8,6 +8,7 @@ use super::fence::{CoveredPath, FenceVerdict};
 use super::ids::{
     AttemptId, Generation, OperationId, OperationKey, RequestDigest, TaskId, WorkRevision,
 };
+use super::launch::{Program, ProgramError};
 use super::lifecycle::{
     CheckpointCut, CutDigest, DrainBudget, HandoffBlocker, TaskClass, TaskReceipt,
 };
@@ -352,6 +353,9 @@ pub struct Task {
     pub state: TaskState,
     /// What an interruption means for it (ADR 0023).
     pub class: TaskClass,
+    /// What a build or test task runs (M5 launch path); `None` for a
+    /// harness or opaque task.
+    pub program: Option<Program>,
 }
 
 /// Where an attempt runs.
@@ -676,6 +680,9 @@ pub enum Command {
         restart: RestartPolicy,
         /// What an interruption means for it.
         class: TaskClass,
+        /// What it runs: required for `Build` and `Test`, refused for
+        /// `Harness` and `Opaque` (M5 launch path).
+        program: Option<Program>,
     },
     /// Finishes a task none of whose attempts may still run.
     FinishTask {
@@ -841,6 +848,12 @@ pub enum EffectRequest {
         fidelity: AllowedFidelity,
         /// A pin.
         pin: Option<NodeId>,
+    },
+    /// Spawn a task registered with a program while its parent's attempt
+    /// runs (M5 launch path).
+    Spawn {
+        /// The task.
+        task: TaskId,
     },
 }
 
@@ -1040,6 +1053,8 @@ pub enum ManagedEvent {
         restart: RestartPolicy,
         /// Its class.
         class: TaskClass,
+        /// Its program, when it has one (M5 launch path).
+        program: Option<Program>,
     },
     /// An attempt was granted at a new generation.
     AttemptGranted {
@@ -1462,6 +1477,38 @@ pub enum DomainError {
         /// The outcome policy's name.
         kind: String,
     },
+    /// A checkpoint cut has no receipt for an open task of its attempt
+    /// (ADR 0023: one receipt per task); M5.
+    #[error("the cut has no receipt for open task {task}")]
+    MissingReceipt {
+        /// The task.
+        task: TaskId,
+    },
+    /// A continuation at `new_native_session_with_package` named no
+    /// package (ADR 0024); M5.
+    #[error("attempt {attempt} continued with a package fidelity and no package")]
+    MissingPackage {
+        /// The attempt that continued.
+        attempt: AttemptId,
+    },
+    /// A build or test task was registered without a program (M5 launch path).
+    #[error("a {class:?} task needs a program")]
+    ProgramRequired {
+        /// The class.
+        class: TaskClass,
+    },
+    /// A harness or opaque task was registered with a program.
+    #[error("a {class:?} task takes no program")]
+    ProgramNotAllowed {
+        /// The class.
+        class: TaskClass,
+    },
+    /// The program failed its check.
+    #[error("bad program: {error}")]
+    BadProgram {
+        /// Why.
+        error: ProgramError,
+    },
 }
 
 /// The ids and the time a command may need, made by the authority before it applies one.
@@ -1494,6 +1541,10 @@ pub struct ManagedState {
     pub checkpoints: Vec<Checkpoint>,
     /// The effects its M5 commands asked for, in order; M5.
     pub requests: Vec<(OperationId, EffectRequest)>,
+    /// The snapshot of every checkpoint cut recorded, by attempt, in the
+    /// order recorded; M5. A continue starts from the newest of its task.
+    #[serde(default)]
+    pub cuts: Vec<(AttemptId, crate::id::SnapshotId)>,
 }
 
 impl ManagedState {

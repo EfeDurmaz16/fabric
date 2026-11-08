@@ -242,6 +242,11 @@ CREATE TABLE continuations (
   package      BLOB CHECK (package IS NULL OR length(package) = 32),
   seq          INTEGER NOT NULL REFERENCES events(seq)
 ) STRICT;
+
+CREATE TABLE request_keys (
+  op_key         TEXT PRIMARY KEY,
+  request_digest BLOB NOT NULL CHECK (length(request_digest) = 32)
+) STRICT;
 ";
 
 /// Version 4 (ADR 0028): the attempt status `superseded`, the projection

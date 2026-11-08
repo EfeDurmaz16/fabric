@@ -173,6 +173,7 @@ pub(crate) fn load_state(
         operations: load_operations(conn, job)?,
         checkpoints: load_checkpoints(conn, job)?,
         requests: load_requests(conn, job)?,
+        cuts: load_cuts(conn, job)?,
     }))
 }
 
@@ -222,6 +223,29 @@ fn load_checkpoints(conn: &Connection, job: JobId) -> Result<Vec<Checkpoint>, Co
         }
     }
     Ok(checkpoints)
+}
+
+/// The job's checkpoint cuts, read from their events: one per
+/// `checkpoint_cut_recorded`, in order, as the replay folds them.
+fn load_cuts(
+    conn: &Connection,
+    job: JobId,
+) -> Result<Vec<(fabric_core::managed::AttemptId, fabric_core::id::SnapshotId)>, CommitError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT body FROM events WHERE job_id = ?1 AND kind = 'checkpoint_cut_recorded' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([job.to_bytes()], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let frame = EventFrame::decode(&row?).map_err(|e| corrupt(job, e))?;
+        if let ManagedEvent::CheckpointCutRecorded {
+            attempt, snapshot, ..
+        } = frame.event
+        {
+            out.push((attempt, snapshot));
+        }
+    }
+    Ok(out)
 }
 
 /// The effects the job's M5 commands asked for, read from their events:
@@ -274,6 +298,10 @@ fn load_tasks(conn: &Connection, job: JobId) -> Result<Vec<Task>, CommitError> {
             state: task_state(&state).ok_or_else(|| corrupt(job, format!("task state {state}")))?,
             class: TaskClass::from_name(&class)
                 .ok_or_else(|| corrupt(job, format!("task class {class}")))?,
+            // The launch path's `program` column (schema version 3, amended
+            // in place) is owner A's; until it lands the projection holds no
+            // program and `verify` compares none.
+            program: None,
         });
     }
 

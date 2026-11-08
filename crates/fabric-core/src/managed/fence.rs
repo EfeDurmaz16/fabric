@@ -10,22 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{AttemptId, Generation};
+use super::ids::Generation;
+use super::launch::GrantToken;
 use super::model::{AttemptStatus, ManagedState, ResourceRef};
-use crate::id::{JobId, NodeId};
-
-/// What a runner presents with every covered write for a managed job: the
-/// grant it acts under. The managed counterpart of `FencingToken`; an
-/// epoch is never written for a managed job (ADR 0019).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct GrantToken {
-    /// The job.
-    pub job: JobId,
-    /// The attempt.
-    pub attempt: AttemptId,
-    /// The generation of its grant.
-    pub generation: Generation,
-}
+use crate::id::NodeId;
 
 /// The covered write set. Exactly these four; a test lists them and fails
 /// when a variant is added without a path.
@@ -180,6 +168,8 @@ pub fn fence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::JobId;
+    use crate::managed::AttemptId;
 
     #[test]
     fn the_covered_write_set_is_exactly_four() {

@@ -33,7 +33,7 @@ pub fn place(input: &PlacementInput<'_>) -> PlacementDecision {
         if reasons.is_empty() {
             // `exclusions` is empty only when the advert answered.
             if let Some(advert) = &probe.advert {
-                let key = Key::of(input.current, advert);
+                let key = Key::of(input.current, probe.node, advert);
                 eligible.push((
                     key,
                     Candidate {
@@ -144,14 +144,18 @@ struct Key {
 }
 
 impl Key {
-    fn of(current: Option<CurrentPlacement>, advert: &NodeAdvert) -> Key {
-        let current_healthy = current.is_some_and(|c| c.healthy && c.node == advert.node);
+    /// The key of `node`'s advert. `node` is the node the probe reached,
+    /// the authenticated identity; the id the advert claims is never used,
+    /// so a peer that names another node can take neither its current
+    /// rank nor its place in the identity order.
+    fn of(current: Option<CurrentPlacement>, node: crate::id::NodeId, advert: &NodeAdvert) -> Key {
+        let current_healthy = current.is_some_and(|c| c.healthy && c.node == node);
         Key {
             not_current_healthy: !current_healthy,
             no_bundle_chain: !advert.warmth.bundle_chain,
             no_workspace: !advert.warmth.workspace,
             load_1m_milli: advert.capacity.load_1m_milli,
-            node: advert.node,
+            node,
         }
     }
 

@@ -1045,3 +1045,104 @@ fn a_recover_is_blocked_like_a_start_attempt() {
     assert_eq!(blocked_by(&replace(&mut f, "start-2")), Some(op(1)));
     f.journal.verify().unwrap();
 }
+
+/// A destroy the provider answers `not_found` says the provider did not
+/// find the resource, not where it went: it stays `unknown` with that
+/// answer visible on its row, keeps the replacement barrier and holds a
+/// fresh cleanup back. An observe that finds the resource absent in the
+/// scope it searched is the evidence the barrier asks for: the destroy
+/// settles `succeeded` with the scope stored, the residual is gone and a
+/// replacement is granted.
+#[test]
+fn a_not_found_destroy_stays_unknown_until_an_observe_finds_its_resource_absent() {
+    let mut f = granted();
+    created(&mut f, 1);
+    begin(&mut f, &destroy(2, &loc(1)));
+    let not_found = answer("provider_failed", "not_found");
+    f.journal
+        .provider_record(op(2), ProviderStatus::Unknown, &not_found, None, 2)
+        .unwrap();
+    let row = f.journal.provider_operation(op(2)).unwrap().unwrap();
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(row.answer, not_found, "the reason stays visible");
+    lose(&mut f);
+    assert_eq!(
+        f.journal.replacement_blockers(JOB).unwrap(),
+        vec![Blocker::StopNotConfirmed {
+            operation: op(2),
+            status: ProviderStatus::Unknown
+        }]
+    );
+    assert_eq!(blocked_by(&replace(&mut f, "replace-1")), Some(op(2)));
+    assert_eq!(f.journal.residuals(JOB).unwrap().len(), 1);
+    assert!(matches!(
+        refusal(f.journal.provider_begin(&cleanup(3, 1, &loc(1)), None, 3)),
+        ProviderError::Cleanup {
+            refusal: CleanupRefusal::InFlight { .. },
+            ..
+        }
+    ));
+
+    let absent = ProviderAnswer {
+        code: Some("unknown".into()),
+        reason: Some("absent".into()),
+        effect: Some("unknown".into()),
+    };
+    let searched = r#"{"kind":"sandbox","provider":"fixture","scope":{}}"#;
+    f.journal
+        .provider_absent(op(2), &absent, searched, 4)
+        .unwrap();
+    let row = f.journal.provider_operation(op(2)).unwrap().unwrap();
+    assert_eq!(row.status, ProviderStatus::Succeeded);
+    assert_eq!(row.answer, absent);
+    assert_eq!(row.searched.as_deref(), Some(searched));
+    assert!(f.journal.replacement_blockers(JOB).unwrap().is_empty());
+    assert_eq!(f.journal.residuals(JOB).unwrap(), vec![]);
+    assert_eq!(blocked_by(&replace(&mut f, "replace-2")), None);
+    // Settled, it never moves again.
+    assert!(matches!(
+        refusal(f.journal.provider_absent(op(2), &absent, searched, 5)),
+        ProviderError::Transition { .. }
+    ));
+}
+
+/// Absence settles a destroy only. A create or an exec whose resource an
+/// observe did not find stays where it is, as after an absent attach, and
+/// a destroy settled `failed` is not rewritten by a later look.
+#[test]
+fn an_absent_observe_settles_nothing_but_a_destroy() {
+    let mut f = granted();
+    created(&mut f, 1);
+    begin(&mut f, &exec(2, &loc(1)));
+    to(&mut f, 2, ProviderStatus::Unknown, None);
+    begin(&mut f, &dispatch(3));
+    to(&mut f, 3, ProviderStatus::Unknown, None);
+    begin(&mut f, &destroy(4, &loc(1)));
+    to(&mut f, 4, ProviderStatus::Failed, None);
+    let absent = ProviderAnswer {
+        code: Some("unknown".into()),
+        reason: Some("absent".into()),
+        effect: Some("unknown".into()),
+    };
+    let searched = r#"{"kind":"sandbox","provider":"fixture","scope":{}}"#;
+    for (n, was) in [
+        (2, ProviderStatus::Unknown),
+        (3, ProviderStatus::Unknown),
+        (4, ProviderStatus::Failed),
+    ] {
+        assert!(
+            matches!(
+                refusal(f.journal.provider_absent(op(n), &absent, searched, 5)),
+                ProviderError::Transition { .. }
+            ),
+            "{n}"
+        );
+        let row = f.journal.provider_operation(op(n)).unwrap().unwrap();
+        assert_eq!(row.status, was, "{n}");
+        assert_eq!(row.searched, None, "{n}");
+    }
+    assert!(matches!(
+        refusal(f.journal.provider_absent(op(9), &absent, searched, 5)),
+        ProviderError::UnknownOperation { .. }
+    ));
+}

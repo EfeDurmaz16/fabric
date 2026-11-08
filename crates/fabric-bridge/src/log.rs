@@ -98,6 +98,16 @@ pub trait OperationLog {
         searched: &str,
     ) -> Result<(), LogError>;
 
+    /// Records an `absent` answer to an observe of a destroy's resource
+    /// and the scope it searched: the destroy settles `succeeded`.
+    /// Anything but a destroy that is not terminal is a `Transition`.
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError>;
+
     /// Records a locator reported before the answer; the status stays.
     fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError>;
 
@@ -335,6 +345,15 @@ impl OperationLog for Journal {
         Ok(self.provider_searched(operation, answer, searched, now_ms())?)
     }
 
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        Ok(self.provider_absent(operation, answer, searched, now_ms())?)
+    }
+
     fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
         Ok(self.provider_locate(operation, locator, now_ms())?)
     }
@@ -524,6 +543,27 @@ impl OperationLog for MemoryLog {
                 "no provider operation {operation}"
             ))),
         }
+    }
+
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        _answer: &ProviderAnswer,
+        _searched: &str,
+    ) -> Result<(), LogError> {
+        let entry = self
+            .entries
+            .get_mut(&operation)
+            .ok_or_else(|| LogError::Transition(format!("no provider operation {operation}")))?;
+        if entry.effect != EffectClass::Destroy || entry.status.is_terminal() {
+            return Err(LogError::Transition(format!(
+                "{operation} is {} {}, which absence does not settle",
+                entry.status.name(),
+                entry.action
+            )));
+        }
+        entry.status = ProviderStatus::Succeeded;
+        Ok(())
     }
 
     fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {

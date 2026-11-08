@@ -108,10 +108,23 @@ fn create() -> Command {
     }
 }
 
-fn cut(snapshot: SnapshotId) -> CheckpointCut {
+/// A cut with one receipt per open task of `state`, as ADR 0023 asks.
+fn cut(state: &ManagedState, snapshot: SnapshotId) -> CheckpointCut {
     CheckpointCut {
         snapshot,
-        receipts: Vec::new(),
+        receipts: state
+            .tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Open)
+            .map(|t| TaskReceipt {
+                task: t.id,
+                class: t.class,
+                status: ReceiptStatus::Interrupted,
+                exit: None,
+                interrupted: true,
+                workspace: None,
+            })
+            .collect(),
         facts: Vec::new(),
         evidence: Vec::new(),
     }
@@ -303,7 +316,7 @@ fn a_repeated_report_changes_nothing_and_an_ended_attempt_stays_ended() {
         attempt: a.id,
         generation: a.generation,
         snapshot,
-        cut: cut(snapshot),
+        cut: cut(kept.state(), snapshot),
     })
     .unwrap();
     assert!(matches!(
@@ -395,6 +408,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
             },
             restart: RestartPolicy::Block,
             class: TaskClass::Test,
+            program: None,
         },
     )
     .unwrap();
@@ -406,6 +420,7 @@ fn child_tasks_need_an_open_parent_and_cancel_closes_open_tasks() {
                 kind: TaskKind::Primary,
                 restart: RestartPolicy::Block,
                 class: TaskClass::Harness,
+                program: None,
             }
         ),
         Err(DomainError::BadParent { .. })
@@ -582,7 +597,7 @@ proptest! {
                         1 => Observation::Lost { attempt, generation },
                         2 => Observation::Exited { attempt, generation, outcome: ExitOutcome::Succeeded },
                         3 => Observation::Exited { attempt, generation, outcome: ExitOutcome::Failed { code: Some(1) } },
-                        4 => Observation::Checkpointed { attempt, generation, snapshot: SnapshotId::of(&[which]), cut: cut(SnapshotId::of(&[which])) },
+                        4 => Observation::Checkpointed { attempt, generation, snapshot: SnapshotId::of(&[which]), cut: cut(&s, SnapshotId::of(&[which])) },
                         _ => Observation::Exited { attempt, generation, outcome: ExitOutcome::Cancelled },
                     };
                     let lost = matches!(observation, Observation::Lost { .. });
@@ -598,6 +613,7 @@ proptest! {
                     kind: TaskKind::Child { label: key.clone() },
                     restart: RestartPolicy::Block,
                     class: TaskClass::Build,
+                    program: None,
                 }),
                 Step::Finish(which) => {
                     let task = s.tasks[usize::from(which) % s.tasks.len()].id;
@@ -1404,6 +1420,7 @@ fn an_attempt_is_judged_by_its_own_task_not_the_primary() {
             },
             restart: RestartPolicy::ExplicitOnly,
             class: TaskClass::Opaque,
+            program: None,
         },
     )
     .unwrap();

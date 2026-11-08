@@ -88,6 +88,7 @@ pub mod facade;
 mod fence;
 mod frame;
 mod ids;
+pub mod launch;
 pub mod lifecycle;
 mod model;
 pub mod package;
@@ -97,7 +98,7 @@ pub mod secret_ref;
 pub mod source;
 mod transition;
 
-pub use fence::{CoveredPath, FenceVerdict, GrantToken, fence};
+pub use fence::{CoveredPath, FenceVerdict, fence};
 pub use frame::{
     EventFrame, FrameError, MANAGED_FORMAT, MANAGED_FORMAT_V1, StoredPart, request_digest, v1,
 };
@@ -105,6 +106,7 @@ pub use ids::{
     AttemptId, EventDigest, EventSeq, Generation, MAX_OPERATION_KEY, OperationId, OperationKey,
     OperationKeyError, ParseCounterError, RequestDigest, TaskId, WorkRevision,
 };
+pub use launch::{GrantToken, Program, ProgramError};
 pub use lifecycle::{
     CheckpointCut, CutDigest, DrainBudget, EvidenceKind, EvidenceRef, HandoffBlocker,
     OutcomePolicy, ReceiptStatus, TaskClass, TaskReceipt, WorkspaceRevision,

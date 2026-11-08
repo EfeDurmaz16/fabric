@@ -1,0 +1,38 @@
+{
+  "case": "report_receipts",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "report",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "observation": {
+      "kind": "receipts",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1",
+      "receipts": [
+        {
+          "task": "01K8W3A00000000000000000T1",
+          "class": "harness",
+          "status": "running",
+          "exit": null,
+          "interrupted": false,
+          "workspace": null
+        },
+        {
+          "task": "01K8W3A00000000000000000T2",
+          "class": "test",
+          "status": "exited",
+          "exit": 0,
+          "interrupted": false,
+          "workspace": null
+        }
+      ]
+    }
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

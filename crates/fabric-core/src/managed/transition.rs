@@ -9,7 +9,7 @@
 
 use super::frame::request_digest;
 use super::ids::{AttemptId, Generation, OperationId, TaskId, WorkRevision};
-use super::lifecycle::{OutcomePolicy, TaskClass};
+use super::lifecycle::{CheckpointCut, OutcomePolicy, TaskClass};
 use super::model::{
     Attempt, AttemptStatus, Checkpoint, CheckpointAck, Command, CommandKind, Dedupe, DomainError,
     EffectRequest, Envelope, ExitOutcome, JobState, ManagedEvent, ManagedJob, ManagedState, NewIds,
@@ -17,7 +17,7 @@ use super::model::{
     RecoveryExclusion, RecoveryPolicy, ResourceRef, SourceBinding, Task, TaskKind, TaskOutcome,
     TaskState, Transition,
 };
-use super::package::TEXT_MAX_BYTES;
+use super::package::{Fidelity, TEXT_MAX_BYTES};
 use crate::credential::looks_like_credential;
 use crate::id::{JobId, SnapshotId};
 
@@ -83,8 +83,14 @@ pub fn accept_command(
         if intent.acceptance.iter().any(|a| a.len() > TEXT_MAX_BYTES) {
             return Err(bad_policy("acceptance"));
         }
+        let acp_args: &[String] = match &intent.harness {
+            crate::harness::HarnessKind::Acp { args, .. } => args,
+            _ => &[],
+        };
         if looks_like_credential(&intent.goal)
             || intent.acceptance.iter().any(|a| looks_like_credential(a))
+            || acp_args.iter().any(|a| looks_like_credential(a))
+            || looks_like_credential(&acp_args.join(" "))
         {
             return Err(DomainError::CredentialLike {
                 field: "intent".into(),
@@ -110,6 +116,7 @@ pub fn accept_command(
                     kind: TaskKind::Primary,
                     restart: policy.restart,
                     class: TaskClass::Harness,
+                    program: None,
                 },
             ],
         });
@@ -189,14 +196,78 @@ fn no_open_child(state: &ManagedState, task: TaskId) -> Result<(), DomainError> 
     }
 }
 
-/// Refuses a checkpoint or a continue while one is in flight.
+/// Refuses a checkpoint or a continue while one is in flight: dispatched,
+/// or accepted and not yet dispatched, so they never pile up. An accepted
+/// checkpoint of an attempt that has ended since has nothing left to do
+/// and blocks nothing.
 fn no_effect_in_flight(state: &ManagedState) -> Result<(), DomainError> {
-    for kind in [CommandKind::Checkpoint, CommandKind::Continue] {
-        if let Some(op) = state.in_flight(kind) {
-            return Err(DomainError::EffectInFlight { operation: op.id });
-        }
+    let waiting = state.operations.iter().find(|op| match op.kind {
+        CommandKind::Continue => matches!(
+            op.status,
+            OperationStatus::Accepted | OperationStatus::Dispatched
+        ),
+        CommandKind::Checkpoint => match op.status {
+            OperationStatus::Dispatched => true,
+            OperationStatus::Accepted => match state.request(op.id) {
+                Some(EffectRequest::Checkpoint { attempt }) => {
+                    state.attempt(*attempt).is_some_and(|a| a.status.may_run())
+                }
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    });
+    match waiting {
+        Some(op) => Err(DomainError::EffectInFlight { operation: op.id }),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The dispatched checkpoint command of `attempt`, if one is.
+fn checkpoint_of(job: &ManagedState, attempt: AttemptId) -> Option<&OperationProgress> {
+    job.in_flight(CommandKind::Checkpoint).filter(|op| {
+        matches!(
+            job.request(op.id),
+            Some(EffectRequest::Checkpoint { attempt: a }) if *a == attempt
+        )
+    })
+}
+
+/// Every open task of an attempt that runs `task`: the task and its open
+/// descendants, each of which a cut must have a receipt for (ADR 0023).
+fn open_tasks_of(job: &ManagedState, task: TaskId) -> Vec<TaskId> {
+    let mut out = Vec::new();
+    if job.task(task).is_some_and(|t| t.state == TaskState::Open) {
+        out.push(task);
+    }
+    let mut next = 0;
+    while next < out.len() {
+        let parent = out[next];
+        out.extend(
+            job.tasks
+                .iter()
+                .filter(|t| t.parent == Some(parent) && t.state == TaskState::Open)
+                .map(|t| t.id),
+        );
+        next += 1;
+    }
+    out
+}
+
+/// Refuses a cut that misses a receipt for an open task of the attempt.
+fn cut_covers(
+    job: &ManagedState,
+    attempt: &Attempt,
+    cut: &CheckpointCut,
+) -> Result<(), DomainError> {
+    match open_tasks_of(job, attempt.task)
+        .into_iter()
+        .find(|task| !cut.receipts.iter().any(|r| r.task == *task))
+    {
+        Some(task) => Err(DomainError::MissingReceipt { task }),
+        None => Ok(()),
+    }
 }
 
 /// The marks that settle `op` as `mark`: an operation never dispatched
@@ -217,7 +288,8 @@ fn settle(op: &OperationProgress, mark: OperationMark) -> Vec<ManagedEvent> {
 }
 
 /// The effect operations of `old` that are not settled: a checkpoint of
-/// it, a continue or a cancel of its task, or a cancel of the job.
+/// it, a continue or a cancel of its task, a spawn of an open task under
+/// its task, or a cancel of the job.
 fn open_effects<'a>(
     state: &'a ManagedState,
     old: &'a Attempt,
@@ -239,14 +311,16 @@ fn open_effects<'a>(
                     *task == old.task
                 }
                 EffectRequest::CancelJob { .. } => true,
+                // A spawn under the attempt's task is the attempt's to run.
+                EffectRequest::Spawn { task } => open_tasks_of(state, old.task).contains(task),
             };
             mine.then_some((o, request))
         })
 }
 
 /// What a supersede of `old` does to its open effects (ADR 0028): a
-/// checkpoint of it or a continue of its task can no longer be reported
-/// by it and fails; a cancel it was asked to obey is done, because the
+/// checkpoint of it, a continue of its task or a spawn under it can no
+/// longer be reported by it and fails; a cancel it was asked to obey is done, because the
 /// superseded attempt can write nothing more. A `Recover` is refused while
 /// a cancel is open (`EffectInFlight`): no work is granted again on a job
 /// or task someone asked to stop.
@@ -258,7 +332,9 @@ fn settle_superseded(
     let mut events = Vec::new();
     for (op, request) in open_effects(state, old) {
         match request {
-            EffectRequest::Checkpoint { .. } | EffectRequest::Continue { .. } => {
+            EffectRequest::Checkpoint { .. }
+            | EffectRequest::Continue { .. }
+            | EffectRequest::Spawn { .. } => {
                 events.extend(settle(op, OperationMark::Failed));
             }
             EffectRequest::CancelJob { .. } | EffectRequest::CancelTask { .. } if regrant => {
@@ -392,11 +468,15 @@ fn command_events(
             kind,
             restart,
             class,
+            program,
         } => {
             if state.task(*parent).is_none() || *kind == TaskKind::Primary {
                 return Err(DomainError::BadParent { task: *parent });
             }
             open_task(state, *parent)?;
+            // The program rules (required for a build or test task, refused
+            // for the others, checked, and the Spawn effect while the
+            // parent's attempt runs) are the launch path's, owner A.
             (
                 false,
                 vec![ManagedEvent::TaskRegistered {
@@ -405,6 +485,7 @@ fn command_events(
                     kind: kind.clone(),
                     restart: *restart,
                     class: *class,
+                    program: program.clone(),
                 }],
             )
         }
@@ -669,25 +750,20 @@ pub fn apply_observation(
                 cut: cut.digest(),
                 receipts: cut.receipts.clone(),
             };
-            // Only a checkpoint command of this attempt is fulfilled by its
-            // cut; one of another attempt is not this report's to settle.
-            if job.in_flight(CommandKind::Checkpoint).is_some_and(|op| {
-                matches!(
-                    job.request(op.id),
-                    Some(EffectRequest::Checkpoint { attempt: a }) if a == attempt
-                )
-            }) {
-                // A checkpoint command: the cut is recorded, the attempt goes on.
+            if let Some(command) = checkpoint_of(job, *attempt) {
+                // This attempt's checkpoint command: the cut is recorded,
+                // the attempt goes on.
                 if !found.status.may_run() {
                     return Err(DomainError::AttemptEnded { attempt: *attempt });
                 }
-                let mut events = vec![recorded];
-                events.extend(settle_in_flight(
-                    job,
-                    CommandKind::Checkpoint,
-                    OperationMark::Succeeded,
-                ));
-                return transition(events);
+                cut_covers(job, found, cut)?;
+                return transition(vec![
+                    recorded,
+                    ManagedEvent::OperationMarked {
+                        operation: command.id,
+                        status: OperationMark::Succeeded,
+                    },
+                ]);
             }
             let ended = AttemptStatus::Checkpointed {
                 snapshot: *snapshot,
@@ -698,6 +774,7 @@ pub fn apply_observation(
             if !found.status.may_run() {
                 return Err(DomainError::AttemptEnded { attempt: *attempt });
             }
+            cut_covers(job, found, cut)?;
             let mut events = vec![
                 ManagedEvent::AttemptObserved {
                     attempt: *attempt,
@@ -740,11 +817,12 @@ pub fn apply_observation(
                 attempt: *attempt,
                 blockers: blockers.clone(),
             }];
-            events.extend(settle_in_flight(
-                job,
-                CommandKind::Checkpoint,
-                OperationMark::Failed,
-            ));
+            events.extend(
+                checkpoint_of(job, *attempt).map(|op| ManagedEvent::OperationMarked {
+                    operation: op.id,
+                    status: OperationMark::Failed,
+                }),
+            );
             events.extend(settle_in_flight(
                 job,
                 CommandKind::Continue,
@@ -777,6 +855,9 @@ pub fn apply_observation(
                     allowed: requested,
                     offered: vec![*achieved],
                 });
+            }
+            if *achieved == Fidelity::NewNativeSessionWithPackage && package.is_none() {
+                return Err(DomainError::MissingPackage { attempt: *attempt });
             }
             let mut events = vec![ManagedEvent::ContinuationRecorded {
                 attempt: *attempt,
@@ -831,6 +912,16 @@ pub fn apply_observation(
     // succeeded, whatever the attempt then did. A loss says nothing about it.
     if status != AttemptStatus::Lost {
         events.extend(grant_succeeded(job, attempt));
+    }
+    // An attempt that ended before its checkpoint command was cut fails
+    // the command, so it never waits on, or claims, another attempt's cut.
+    if !status.may_run()
+        && let Some(op) = checkpoint_of(job, attempt_id)
+    {
+        events.push(ManagedEvent::OperationMarked {
+            operation: op.id,
+            status: OperationMark::Failed,
+        });
     }
     // A cancel that stopped the attempt now ends the job or the task.
     if status == AttemptStatus::Cancelled {
@@ -1191,14 +1282,25 @@ fn derived_attempt(operation: OperationId, generation: Generation) -> AttemptId 
     AttemptId::from_bytes(bytes)
 }
 
-/// The snapshot of the task's latest checkpointed attempt.
+/// The snapshot a continue of `task` starts from: the newest cut of the
+/// task's newest attempt that has one, a checkpoint command's cut
+/// included, else that attempt's own checkpointed end (an M2 suspend
+/// records no cut).
 fn last_checkpoint(job: &ManagedState, task: TaskId) -> Option<crate::id::SnapshotId> {
     job.attempts
         .iter()
         .rev()
-        .find_map(|a| match (a.task == task, &a.status) {
-            (true, AttemptStatus::Checkpointed { snapshot }) => Some(*snapshot),
-            _ => None,
+        .filter(|a| a.task == task)
+        .find_map(|a| {
+            job.cuts
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == a.id)
+                .map(|(_, snapshot)| *snapshot)
+                .or(match a.status {
+                    AttemptStatus::Checkpointed { snapshot } => Some(snapshot),
+                    _ => None,
+                })
         })
 }
 
@@ -1355,6 +1457,7 @@ pub fn apply_batch(
                 operations: vec![op],
                 checkpoints: Vec::new(),
                 requests: Vec::new(),
+                cuts: Vec::new(),
             });
             continue;
         }
@@ -1396,6 +1499,7 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
             kind,
             restart,
             class,
+            program,
         } => {
             if s.task(*task).is_some() {
                 return Err(broken(format!("task {task} registered twice")));
@@ -1413,6 +1517,7 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 restart: *restart,
                 state: TaskState::Open,
                 class: *class,
+                program: program.clone(),
             });
         }
         ManagedEvent::AttemptGranted {
@@ -1669,8 +1774,11 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
         ManagedEvent::ReceiptsRecorded { attempt, .. } => {
             known_attempt(s, *attempt, "receipts")?;
         }
-        ManagedEvent::CheckpointCutRecorded { attempt, .. } => {
+        ManagedEvent::CheckpointCutRecorded {
+            attempt, snapshot, ..
+        } => {
             known_attempt(s, *attempt, "a cut")?;
+            s.cuts.push((*attempt, *snapshot));
         }
         ManagedEvent::HandoffBlocked { attempt, .. } => {
             known_attempt(s, *attempt, "blockers")?;

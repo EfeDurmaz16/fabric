@@ -41,7 +41,9 @@ use fabric_core::managed::{
     RecoveryBlock, RecoveryExclusion, RecoveryPolicy, ResourceRef, StoredResult, TaskId,
     Transition, fence, recovery_decision,
 };
-use fabric_journal::{Answer, Blocker, CommitError, FILE_NAME, Journal, Liveness, OpenError};
+use fabric_journal::{
+    Answer, Blocker, CommitError, FILE_NAME, Journal, KeyedRequest, Liveness, OpenError,
+};
 use fabric_net::wire::{Heartbeat, HeartbeatAnswer};
 use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
@@ -153,11 +155,17 @@ enum Call {
     /// Work on the open journal by the facade and the inspect read (owner
     /// B, M5): the closure answers its own caller. `create` makes the
     /// journal when there is none yet, as a first `CreateJob` does, for a
-    /// token minted before any job.
+    /// token minted before any job. `writes` says whether the work may
+    /// change the journal; only then is the commit counter moved, so a
+    /// read wakes no watcher (one tick per call that changed the journal).
     With {
         create: bool,
+        writes: bool,
         work: JournalWork,
     },
+    /// A command whose body is derived from the job's state, deduplicated
+    /// by the caller's request (`Authority::submit_derived`).
+    Derived(DerivedWork),
 }
 
 /// An accepted operation whose effect the node has not asked for yet: a
@@ -178,6 +186,21 @@ pub(crate) struct PendingEffect {
 /// Work the facade or a read runs inside the authority's thread; it
 /// answers its own caller.
 type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
+
+type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder) + Send>;
+
+/// The digest of a caller's request for [`Authority::submit_derived`]:
+/// blake3 under its own domain over each part, length first, so two
+/// requests that differ in any part differ here.
+pub(crate) fn request_digest(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fabric.managed.request.v1\0");
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    *hasher.finalize().as_bytes()
+}
 
 /// The managed ids as the standalone paths read them, without the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,14 +235,34 @@ enum Writer {
     Idle(StateDir, NodeId, bool),
     /// The thread runs.
     Running {
-        /// The queue it takes calls from.
+        /// The queue it takes calls from. Declared before `thread`, so the
+        /// last handle's drop closes the queue, which ends the thread,
+        /// before it joins it.
         calls: mpsc::Sender<Call>,
         /// The ids it publishes outside the queue.
         ids: watch::Receiver<Ids>,
         /// How many calls have changed the journal; a watcher of the
         /// facade waits on it (M5).
         commits: watch::Receiver<u64>,
+        /// The thread, joined when the last handle drops, so a dropped
+        /// authority has closed its journal: `SQLite` unlinks the WAL and
+        /// shm beside the journal on the last close, and a caller that
+        /// looks at the state directory after the drop must not race it.
+        _thread: JoinOnDrop,
     },
+}
+
+/// A thread joined when dropped.
+#[derive(Debug)]
+struct JoinOnDrop(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for JoinOnDrop {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            // A panic in the thread already failed the call it served.
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Authority {
@@ -281,7 +324,7 @@ impl Authority {
         let (calls, queue) = mpsc::channel(QUEUE);
         let (publish, ids) = watch::channel(Ids::Loading);
         let (committed, commits) = watch::channel(0_u64);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("fabric-authority".into())
             .spawn(move || serve(&place, queue, &publish, &committed))?;
         #[cfg(test)]
@@ -292,6 +335,7 @@ impl Authority {
             calls: calls.clone(),
             ids: ids.clone(),
             commits,
+            _thread: JoinOnDrop(Some(thread)),
         };
         Ok((calls, ids))
     }
@@ -329,8 +373,29 @@ impl Authority {
         create: bool,
         work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
     ) -> Result<T, AuthorityError> {
+        self.journal_call(create, false, work).await
+    }
+
+    /// As [`Authority::with_journal`], for work that writes (a token
+    /// minted or revoked): the commit counter moves after it, so a watch
+    /// sees the write.
+    pub(crate) async fn write_journal<T: Send + 'static>(
+        &self,
+        create: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        self.journal_call(create, true, work).await
+    }
+
+    async fn journal_call<T: Send + 'static>(
+        &self,
+        create: bool,
+        writes: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
         self.call(|reply: Reply<T>| Call::With {
             create,
+            writes,
             work: Box::new(move |journal| {
                 let _ = reply.send(journal.and_then(work));
             }),
@@ -387,6 +452,30 @@ impl Authority {
         envelope: Envelope<Command>,
     ) -> Result<Answer, AuthorityError> {
         self.call(|reply| Call::Submit(envelope, reply)).await
+    }
+
+    /// Applies a command whose body `derive` makes from `job`'s state (a
+    /// checkpoint names the live attempt, a continue its task) once per
+    /// request: `request` is the digest of what the caller asked
+    /// ([`request_digest`]), and it, not the derived body, decides
+    /// sameness under `key`. The same request again answers the stored
+    /// answer as a replay without deriving, however the job moved since;
+    /// another request under the key is `OperationConflict`. The check,
+    /// the derivation and the commit run as one call on the authority's
+    /// thread, so nothing interleaves.
+    pub(crate) async fn submit_derived<E: Send + 'static>(
+        &self,
+        key: OperationKey,
+        request: [u8; 32],
+        job: JobId,
+        derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E> + Send + 'static,
+    ) -> Result<Result<Answer, E>, AuthorityError> {
+        self.call(|reply: Reply<Result<Answer, E>>| {
+            Call::Derived(Box::new(move |place, holder| {
+                let _ = reply.send(derived(place, holder, &key, &request, job, derive));
+            }))
+        })
+        .await
     }
 
     /// Records the authority's own observation of an attempt or an
@@ -710,7 +799,11 @@ fn serve(
     }
     while let Some(call) = queue.blocking_recv() {
         match call {
-            Call::With { create, work } => {
+            Call::With {
+                create,
+                writes,
+                work,
+            } => {
                 if create && matches!(holder, Holder::Absent) {
                     match self::create(place) {
                         Ok(journal) => holder = Holder::Open(journal),
@@ -727,6 +820,12 @@ fn serve(
                     }
                     Holder::Stopped(reason) => Err(AuthorityError::Unavailable(reason.clone())),
                 });
+                if writes {
+                    bump();
+                }
+            }
+            Call::Derived(work) => {
+                work(place, &mut holder);
                 bump();
             }
             Call::Submit(envelope, reply) => {
@@ -1190,6 +1289,54 @@ fn recover(
         *wrote = true;
     }
     Ok(())
+}
+
+/// The body of [`Authority::submit_derived`] on the authority's thread.
+fn derived<E>(
+    place: &Place,
+    holder: &mut Holder,
+    key: &OperationKey,
+    request: &[u8; 32],
+    job: JobId,
+    derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E>,
+) -> Result<Result<Answer, E>, AuthorityError> {
+    let unknown = || -> AuthorityError {
+        if place.standalone(job) {
+            AuthorityError::Standalone(job)
+        } else {
+            CommitError::Domain(DomainError::UnknownJob { job }).into()
+        }
+    };
+    let journal = match holder {
+        Holder::Open(journal) => journal,
+        Holder::Absent => return Err(unknown()),
+        Holder::Stopped(reason) => return Err(AuthorityError::Unavailable(reason.clone())),
+    };
+    match journal.keyed_request(key, request)? {
+        KeyedRequest::Other => {
+            return Err(
+                CommitError::Domain(DomainError::OperationConflict { key: key.clone() }).into(),
+            );
+        }
+        KeyedRequest::Same => {
+            if let Some(answer) = journal.stored_answer(key)? {
+                return Ok(Ok(answer));
+            }
+        }
+        KeyedRequest::New => {}
+    }
+    let Some(state) = journal.job(job)? else {
+        return Err(unknown());
+    };
+    let envelope = match derive(&state) {
+        Ok(envelope) => envelope,
+        Err(e) => return Ok(Err(e)),
+    };
+    if envelope.key != *key || envelope.job != Some(job) {
+        return Err(CommitError::Domain(DomainError::BadEnvelope).into());
+    }
+    journal.record_request(key, request)?;
+    Ok(Ok(submit(place, holder, &envelope)?))
 }
 
 fn submit(

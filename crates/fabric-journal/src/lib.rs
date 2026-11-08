@@ -44,6 +44,7 @@ use fabric_core::managed::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+pub use facade::KeyedRequest;
 pub use provider::{
     AbandonApproval, AbandonRefusal, Acknowledged, Blocker, CleanupRefusal, EffectClass,
     LocatorRecord, MAX_ABANDON_REASON, ProviderAnswer, ProviderDispatch, ProviderError,
@@ -55,6 +56,11 @@ use project::{NewOperation, get_u64, load_state, sql_u64, write_transition};
 
 /// The file name of the journal inside its directory.
 pub const FILE_NAME: &str = "journal.sqlite";
+
+/// The receipts read: one job's receipt and cut events, newest first.
+const RECEIPTS_SQL: &str = "SELECT body FROM events
+     WHERE job_id = ?1 AND kind IN ('receipts_recorded','checkpoint_cut_recorded')
+     ORDER BY seq DESC";
 
 /// An error `SQLite` reported, kept opaque so the binding is not part of this crate's API.
 #[derive(Debug, thiserror::Error)]
@@ -1190,21 +1196,21 @@ impl Journal {
         Ok(out)
     }
 
-    /// The last receipts recorded for `attempt`, by a cut or by a report;
-    /// empty when none were.
-    pub fn receipts(&self, attempt: AttemptId) -> Result<Vec<TaskReceipt>, CommitError> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT job_id, body FROM events
-             WHERE kind IN ('receipts_recorded','checkpoint_cut_recorded')
-             ORDER BY seq DESC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, [u8; 16]>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
+    /// The last receipts recorded for `job`'s `attempt`, by a cut or by a
+    /// report; empty when none were. The read walks the job's own events
+    /// newest first through `events_by_job` and stops at the first match,
+    /// so another job's history costs it nothing.
+    pub fn receipts(
+        &self,
+        job: JobId,
+        attempt: AttemptId,
+    ) -> Result<Vec<TaskReceipt>, CommitError> {
+        let mut stmt = self.conn.prepare_cached(RECEIPTS_SQL)?;
+        let rows = stmt.query_map([job.to_bytes()], |r| r.get::<_, Vec<u8>>(0))?;
         for row in rows {
-            let (job, body) = row?;
+            let body = row?;
             let frame = EventFrame::decode(&body).map_err(|e| CommitError::Corrupt {
-                job: Some(JobId::from_bytes(job)),
+                job: Some(job),
                 reason: e.to_string(),
             })?;
             match frame.event {

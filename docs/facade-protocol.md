@@ -102,7 +102,7 @@ Answered with `accepted`. Refused with reason `not_live` when no attempt of the 
   "fidelity": ["native_session", "new_native_session_with_package"], "pin": null }
 ```
 
-`fidelity` is optional and defaults to the job's allowance; empty is `bad_request`/`empty_fidelity`. `pin` is required and nullable; a pin outside the token's resource scope is `refused`/`scope`/`resource`. Answered with `accepted`.
+`fidelity` is optional and defaults to the job's allowance; a named list is cut to the job's allowance (a token holder never widens it; the owner does, on the socket), and nothing left is `refused`/`fidelity`; empty is `bad_request`/`empty_fidelity`. `pin` is required and nullable; a pin outside the token's resource scope, or no pin under a token limited to listed nodes, is `refused`/`scope`/`resource`. Answered with `accepted`.
 
 ## Messages from the authority
 
@@ -147,7 +147,7 @@ At most 256 events, in sequence order, all after `after`. `next` is the sequence
 | `unsupported_version` | `facade` | the `facade` field is not 1 |
 | `bad_request` | `unknown_variant`, `unknown_field`, `bad_integer`, `bad_id`, `bad_string`, `missing_field`, `source_local`, `empty_fidelity`, `wait_above_limit` | the message does not parse under this document |
 | `unauthorized` | `unknown_token`, `revoked`, `expired` | the token, in the check order |
-| `scope` | `job`, `resource` | the token does not cover the job, or the pin or target node |
+| `scope` | `job`, `resource` | the token does not cover the job, or the pin or target node; a token limited to listed jobs may not `submit` (a new job is in no list), and a token limited to listed nodes may not `submit` or `continue` without a pin to one of them (the authority could choose any node) |
 | `unknown_job` | `job` | the job is not in this authority's journal |
 | `conflict` | `key` | the key was used for another request |
 | `revision_mismatch` | `revision` | `expected_revision` is not the job's current one |
@@ -161,6 +161,18 @@ At most 256 events, in sequence order, all after `after`. `next` is the sequence
 ## As built (M5)
 
 Built on 2026-11-03 by owner B against the text above; the fixtures are unchanged. A message that is not JSON is `bad_request`/`bad_string`. A command's key is stored on the authority under the token's actor (ADR 0027, As built). `events.next` is `null` only when the job has no event after a `null` cursor; a watch with nothing after its cursor on a finished or cancelled job answers `closed: "finished"`. A `checkpoint` of a job with no attempt at all is `refused`/`not_live` without a stored key. A `continue` acts on the live attempt's task, or the primary task when none is live. The local node forwards a facade message over the link with a deadline of the message's `wait_ms` (the default when absent) plus five seconds, and answers `unavailable`/`link` when the link fails.
+
+## Launch path (M5)
+
+Contract of 2026-11-08 (docs/managed-jobs.md, "Launch path (M5, as built)"); the facade's six messages are unchanged, and nothing here is a new client message. What a client sees once an attempt is launched:
+
+- A task of the `inspection`'s job, and of `managed_status` and `managed_inspect`, carries `program` when it has one: `{ "argv": ["cargo", "test"], "cwd": "crates/app", "env_allowlist": ["CARGO_HOME"] }`, with `cwd` absent when the program runs at the root. A harness task has none. A client that does not know the field skips it.
+- A `task_registered` event carries the same `program` (absent when none); an `effect_requested` event has one more form, `{ "spawn": { "task": "<TaskId>" } }`, for a task registered with a program while its parent's attempt runs.
+- The events of a launched attempt arrive in this order, each once: `attempt_observed` with `running` (the node reported `Started`); for a planned handoff `continuation_recorded` with `achieved` and `package`; `receipts_recorded` as the node reports them; `checkpoint_cut_recorded` after a `checkpoint`, or `attempt_observed` with `checkpointed` after a `continue`'s cut; `handoff_blocked` when the cut found blockers; `attempt_observed` with `succeeded`, `failed` or `cancelled` at the end. `stale_observation_refused` records a report the authority refused as stale; a client sees it and nothing changes for the job.
+- `cancel` of a job or task with a live attempt is `accepted` and settles when the node reports the attempt `cancelled`, with every task's receipt `interrupted`; `checkpoint` settles at `checkpoint_cut_recorded` or `handoff_blocked`; `continue` settles at `continuation_recorded`, or fails when the new attempt ends first (`attempt_observed` with `failed`, the harness receipt `blocked` naming why).
+- A domain refusal of a `RegisterTask` is reported on the socket under its name: `program_required`, `program_not_allowed`, `bad_program`. The facade has no `register` form (failure mode 10 stands).
+
+The fixtures `events_launch_path` and `inspection_continued` pin these forms for both clients; they were added with this contract and keep every earlier fixture byte-identical.
 
 ## Fixtures
 

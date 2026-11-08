@@ -1,6 +1,6 @@
 # ADR 0020: The managed authority, its journal and fencing eligibility
 
-Status: proposed, 2026-10-27. Amended 2026-10-29: schema version 2 adds the `provider_operations` table of ADR 0021, which Efe approved that day; version 2 has not shipped in any release.
+Status: proposed, 2026-10-27; as built on `main` since 2026-11-03 (PR #31, schema version 2 in PR #32). Amended 2026-10-29: schema version 2 adds the `provider_operations` table of ADR 0021, which Efe approved that day; version 2 has not shipped in any release.
 
 Adopts the parts of the external draft P02 ("Independent authority and fencing", 2026-10-25) that the M2 campaign needs, with its handoff selection of 2026-10-27, and the M2 boundary of draft P08 ("Versioned promotion, durability and rollback"). ADR 0003 stays the rule for standalone jobs. The managed jobs of ADR 0019 follow this ADR instead. The schema and the replay rules are in [docs/managed-jobs.md](../managed-jobs.md).
 

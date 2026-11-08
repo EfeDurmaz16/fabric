@@ -203,6 +203,16 @@ env FABRIC_AB_ANCHOR="$scratch/anchor/fabric" \
   FABRIC_AB_COUNTED="$counted" \
   ${counters:+FABRIC_AB_COUNTERS=$counters} \
   "$e2e" --ignored --exact ab::paired --nocapture --test-threads=1 >"$out/run.log" 2>&1 || status=$?
+# The paths no anchor has, the facade's, run on the candidate alone when
+# it has them and there are timed pairs (ab/new_paths.rs says why).
+if [ "$status" -eq 0 ] && [ "$pairs" -gt 0 ] && "$scratch/candidate/fabric" facade --help >/dev/null 2>&1; then
+  echo "new paths start: $(date -u +%Y-%m-%dT%H:%M:%SZ), load: $(uptime | sed 's/.*load average[s]*: //')" >>"$out/machine.txt"
+  env FABRIC_AB_CANDIDATE="$scratch/candidate/fabric" \
+    FABRIC_AB_OUT="$out" \
+    FABRIC_AB_PAIRS="$pairs" \
+    ${counters:+FABRIC_AB_COUNTERS=$counters} \
+    "$e2e" --ignored --exact ab::new_paths::run --nocapture --test-threads=1 >>"$out/run.log" 2>&1 || status=$?
+fi
 echo "end: $(date -u +%Y-%m-%dT%H:%M:%SZ), load: $(uptime | sed 's/.*load average[s]*: //')" >>"$out/machine.txt"
 if [ "$status" -ne 0 ]; then
   tail -n 40 "$out/run.log" >&2

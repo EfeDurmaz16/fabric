@@ -1,6 +1,6 @@
 # ADR 0022: Reconciliation of provider operations and cleanup authorization
 
-Status: proposed, 2026-10-29.
+Status: proposed, 2026-10-29; as built on `main` since 2026-11-08 (PR #36).
 
 Adopts the external draft P11 ("Unknown outcomes, reconciliation and cleanup authorization", 2026-10-27, Proposed) with its handoff selection of the same date, for the M4 campaign. It builds on ADR 0020 (the journal records intent before any effect and leaves an unobserved effect `unknown`) and ADR 0021 (the bridge, its `provider_operations` table and protocol v1). The types, the schema, the state machine and the rules are in [docs/managed-jobs.md](../managed-jobs.md), section "Reconciliation and cleanup (M4)"; the wire additions are in [docs/bridge-protocol.md](../bridge-protocol.md), section "Reconciliation (M4)", and in [protocol/bridge/v1](../../protocol/bridge/v1).
 

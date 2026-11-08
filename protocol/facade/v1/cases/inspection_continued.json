@@ -1,0 +1,136 @@
+{
+  "case": "inspection_continued",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "inspection",
+    "facade": 1,
+    "job": {
+      "job": "01K8W3A00000000000000000J1",
+      "revision": "11",
+      "generation": "2",
+      "state": "active",
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "primary_task": "01K8W3A00000000000000000T1",
+      "tasks": [
+        {
+          "task": "01K8W3A00000000000000000T1",
+          "state": "open",
+          "class": "harness"
+        },
+        {
+          "task": "01K8W3A00000000000000000T2",
+          "parent": "01K8W3A00000000000000000T1",
+          "label": "cargo test",
+          "state": "open",
+          "class": "test",
+          "program": {
+            "argv": [
+              "cargo",
+              "test",
+              "--workspace"
+            ],
+            "cwd": "crates/app",
+            "env_allowlist": [
+              "CARGO_HOME"
+            ]
+          },
+          "receipt": {
+            "status": "interrupted",
+            "interrupted": true
+          }
+        }
+      ],
+      "attempts": [
+        {
+          "attempt": "01K8W3A00000000000000000A1",
+          "task": "01K8W3A00000000000000000T1",
+          "generation": "1",
+          "status": "checkpointed",
+          "snapshot": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        {
+          "attempt": "01K8W3A00000000000000000A2",
+          "task": "01K8W3A00000000000000000T1",
+          "generation": "2",
+          "status": "running"
+        }
+      ]
+    },
+    "parked": false,
+    "placements": [
+      {
+        "seq": "3",
+        "kind": "initial",
+        "chosen": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+        "candidates": [
+          {
+            "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+            "verdict": {
+              "eligible": {
+                "rank": [
+                  "identity"
+                ]
+              }
+            }
+          },
+          {
+            "node": "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq",
+            "verdict": {
+              "eligible": {
+                "rank": [
+                  "identity"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      {
+        "seq": "12",
+        "kind": "planned_handoff",
+        "chosen": "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq",
+        "candidates": [
+          {
+            "node": "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq",
+            "verdict": {
+              "eligible": {
+                "rank": [
+                  "bundle_chain",
+                  "identity"
+                ]
+              }
+            }
+          },
+          {
+            "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+            "verdict": {
+              "eligible": {
+                "rank": [
+                  "identity"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "continuations": [
+      {
+        "attempt": "01K8W3A00000000000000000A2",
+        "from": "01K8W3A00000000000000000A1",
+        "achieved": "new_native_session_with_package",
+        "package": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "notes": [],
+    "provider_operations": [],
+    "blockers": [],
+    "residuals": []
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

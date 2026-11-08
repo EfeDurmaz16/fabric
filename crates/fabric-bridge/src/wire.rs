@@ -398,7 +398,16 @@ impl Locator {
             scope.insert(key.clone(), value.to_owned());
         }
         let kind = owned(o.req("kind")?, "locator.kind", MAX_LOCATOR_CHARS)?;
-        let native_id = locator_id(o.req("native_id")?, "locator.native_id")?;
+        let native_id = o.req("native_id")?;
+        // A locator at no resource is refused as a missing field before
+        // any shape rule: a destroy or an exec is never sent at nothing.
+        if native_id.is_null() || native_id.as_str() == Some("") {
+            return Err(bad(
+                "missing_field",
+                format!("{what}.native_id is null or empty"),
+            ));
+        }
+        let native_id = locator_id(native_id, "locator.native_id")?;
         let native_operation_id = o
             .opt("native_operation_id")?
             .map(|v| locator_id(v, "locator.native_operation_id"))
@@ -553,6 +562,8 @@ pub struct ProfileLimits {
     pub max_deadline_ms: u64,
     /// The largest `wait_ms` of an observe.
     pub max_observe_wait_ms: u64,
+    /// The largest `timeout_ms` of an exec.
+    pub max_timeout_ms: u64,
     /// The largest `max_output_bytes` of an exec.
     pub max_output_bytes: u64,
     /// The largest exec `stdin`.
@@ -616,6 +627,7 @@ impl Profile {
         let limits = ProfileLimits {
             max_deadline_ms: int(l.req("max_deadline_ms")?, "max_deadline_ms")?,
             max_observe_wait_ms: int(l.req("max_observe_wait_ms")?, "max_observe_wait_ms")?,
+            max_timeout_ms: int(l.req("max_timeout_ms")?, "max_timeout_ms")?,
             max_output_bytes: int(l.req("max_output_bytes")?, "max_output_bytes")?,
             max_stdin_bytes: int(l.req("max_stdin_bytes")?, "max_stdin_bytes")?,
             max_argv: int(l.req("max_argv")?, "max_argv")?,
@@ -686,6 +698,7 @@ impl Profile {
             object(vec![
                 ("max_deadline_ms", l.max_deadline_ms.into()),
                 ("max_observe_wait_ms", l.max_observe_wait_ms.into()),
+                ("max_timeout_ms", l.max_timeout_ms.into()),
                 ("max_output_bytes", l.max_output_bytes.into()),
                 ("max_stdin_bytes", l.max_stdin_bytes.into()),
                 ("max_argv", l.max_argv.into()),
@@ -882,9 +895,11 @@ pub struct ExecParams {
     pub stdin: Option<String>,
     /// The working directory, or the sandbox's.
     pub cwd: Option<String>,
-    /// The command's own timeout in milliseconds, at least 1.
+    /// The command's own timeout in milliseconds, 1 to the profile's
+    /// `max_timeout_ms`.
     pub timeout_ms: u64,
-    /// The most output bytes kept per stream, at least 1.
+    /// The most output bytes kept per stream, 1 to the profile's
+    /// `max_output_bytes`.
     pub max_output_bytes: u64,
     /// The names of the secrets to give it.
     pub secret_names: Vec<String>,
@@ -1553,11 +1568,26 @@ pub fn fits_request(request: &Request, profile: &Profile) -> Result<(), Refusal>
             .stdin
             .as_ref()
             .map_or(0, |s| u64::try_from(s.len()).unwrap_or(u64::MAX));
-        if argv > l.max_argv
-            || params.max_output_bytes > l.max_output_bytes
-            || stdin > l.max_stdin_bytes
-        {
+        if argv > l.max_argv || stdin > l.max_stdin_bytes {
             return Err(bad("limit", "exec params above the profile's limits").code("invalid"));
+        }
+        // The bounds the profile advertises in `hello_ack` for what an exec
+        // may ask of a command: a request above either is refused before
+        // it is sent, as the worker refuses it on reading, `limit` like
+        // every other value over a profile limit.
+        if params.timeout_ms > l.max_timeout_ms {
+            return Err(bad(
+                "limit",
+                "params.timeout_ms above the profile's max_timeout_ms",
+            )
+            .code("invalid"));
+        }
+        if params.max_output_bytes > l.max_output_bytes {
+            return Err(bad(
+                "limit",
+                "params.max_output_bytes above the profile's max_output_bytes",
+            )
+            .code("invalid"));
         }
     }
     Ok(())
@@ -2591,5 +2621,22 @@ mod tests {
             hex, "45f7bfd0c8e020ecfcfbc887ecb42e3b9578465abdc2d88ef22856cac82d984e",
             "fabric-journal tests/fixtures.rs pins this key for its v2 fixture"
         );
+    }
+
+    /// A locator whose `native_id` is `null` or empty names nothing: it is
+    /// refused as a missing field, before any shape rule, so a destroy or
+    /// an exec can never be sent at no resource.
+    #[test]
+    fn a_locator_with_a_null_or_empty_native_id_is_a_missing_field() {
+        for native_id in [Value::Null, Value::String(String::new())] {
+            let mut value = sandbox(None).to_value();
+            value["native_id"] = native_id.clone();
+            let refusal = Locator::from_value(&value).unwrap_err();
+            assert_eq!(
+                (refusal.code, refusal.reason),
+                ("invalid", "missing_field"),
+                "{native_id}"
+            );
+        }
     }
 }

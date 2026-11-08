@@ -14,8 +14,10 @@ use fabric_core::managed::facade::{
 };
 use rusqlite::{OptionalExtension, params};
 
+use fabric_core::managed::{OperationKey, StoredResult};
+
 use crate::project::{get_u64, sql_u64};
-use crate::{CommitError, Journal};
+use crate::{Answer, CommitError, Journal};
 
 /// `JobScope::AnyOwned` and `ResourceScope::Any`: one byte.
 const TAG_ANY: u8 = 0;
@@ -177,6 +179,85 @@ impl Journal {
             params![id.to_bytes(), sql_u64(at_ms)?],
         )?;
         Ok(changed == 1)
+    }
+}
+
+/// What the journal knows of a key a client's request was made under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyedRequest {
+    /// No request was recorded under the key.
+    New,
+    /// The same request was.
+    Same,
+    /// Another request was.
+    Other,
+}
+
+impl Journal {
+    /// Whether `key` holds the request whose digest is `digest`. A command
+    /// whose body the authority derives from the job's state (a checkpoint
+    /// names the live attempt, a continue its task) is deduplicated by the
+    /// caller's request, not by the derived body, which a retry after the
+    /// job moved would derive anew (ADR 0027: same key, same request).
+    pub fn keyed_request(
+        &self,
+        key: &OperationKey,
+        digest: &[u8; 32],
+    ) -> Result<KeyedRequest, CommitError> {
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT request_digest FROM request_keys WHERE op_key = ?1",
+                [key.as_str()],
+                |r| r.get::<_, [u8; 32]>(0),
+            )
+            .optional()?;
+        Ok(match stored {
+            None => KeyedRequest::New,
+            Some(stored) if stored == *digest => KeyedRequest::Same,
+            Some(_) => KeyedRequest::Other,
+        })
+    }
+
+    /// Records the request `key` was first used for; recorded before the
+    /// command's commit, so a crash between the two leaves the key bound
+    /// to the request, and a retry of it is answered by what then commits.
+    pub fn record_request(
+        &mut self,
+        key: &OperationKey,
+        digest: &[u8; 32],
+    ) -> Result<(), CommitError> {
+        self.conn.execute(
+            "INSERT INTO request_keys (op_key, request_digest) VALUES (?1, ?2)
+             ON CONFLICT (op_key) DO NOTHING",
+            params![key.as_str(), digest],
+        )?;
+        Ok(())
+    }
+
+    /// The answer stored under `key`, as a replay; `None` when no command
+    /// was stored under it.
+    pub fn stored_answer(&self, key: &OperationKey) -> Result<Option<Answer>, CommitError> {
+        let Some(bytes) = self
+            .conn
+            .query_row(
+                "SELECT result FROM operations WHERE op_key = ?1",
+                [key.as_str()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let result = StoredResult::decode(&bytes).map_err(|e| CommitError::Corrupt {
+            job: None,
+            reason: format!("the answer under {key}: {e}"),
+        })?;
+        Ok(Some(Answer {
+            result,
+            bytes,
+            replayed: true,
+        }))
     }
 }
 

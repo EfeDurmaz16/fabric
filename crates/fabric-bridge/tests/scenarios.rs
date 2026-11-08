@@ -579,7 +579,7 @@ async fn fabric_runs_every_scenario_against_a_scripted_worker() {
         names.push(name);
     }
     names.sort();
-    assert_eq!(names.len(), 24, "{names:?}");
+    assert_eq!(names.len(), 25, "{names:?}");
 }
 
 /// The scenarios name their action through the profile; a sanity check

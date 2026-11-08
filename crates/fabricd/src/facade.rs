@@ -33,8 +33,8 @@ use fabric_client::facade::{
 };
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::facade::{
-    Actor, BEARER_BYTES, FacadeTokenRecord, JobScope, ResourceScope, ScopeKind, TokenCheck,
-    TokenId, check_token, token_digest,
+    Actor, BEARER_BYTES, FacadeTokenRecord, JobAsk, JobScope, ResourceAsk, ResourceScope,
+    ScopeKind, TokenCheck, TokenId, check_token, token_digest,
 };
 use fabric_core::managed::placement::{Exclusion, RankReason, Verdict};
 use fabric_core::managed::secret_ref::{AttemptScope, ResourceKind, SecretScope};
@@ -47,11 +47,12 @@ use fabric_core::managed::{
 };
 use fabric_core::managed::{SecretName, SecretRef};
 use fabric_core::path::RelPath;
-use fabric_journal::{Blocker, CommitError, Journal, ProviderOperation, Residual};
+use fabric_journal::{Answer, Blocker, CommitError, Journal, ProviderOperation, Residual};
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
 
 use crate::authority::AuthorityError;
+use crate::authority::request_digest;
 use crate::clock::now_ms;
 use crate::error::NodeError;
 use crate::managed::refusal_code;
@@ -68,18 +69,64 @@ fn refused(reason: Reason, message: impl Into<String>) -> NodeError {
     }
 }
 
+/// The prefix of every facade key in the journal. The owner's socket
+/// refuses a key that starts with it, so an owner's key and an actor's
+/// never share a row.
+pub(crate) const FACADE_KEY_PREFIX: &str = "facade:";
+
 /// The journal's key for a facade command: the client's key under the
-/// token's actor, so two actors never share one (ADR 0027). A pair too
-/// long for one key carries the key's digest instead; both forms are
+/// token's actor, in the facade's namespace, so two actors never share
+/// one and no actor shares one with the owner (ADR 0027). An actor holds
+/// no ':', so the actor ends at the first one after the prefix. A pair
+/// too long for one key carries the key's digest instead; both forms are
 /// deterministic, so a repeat lands on the same row.
 pub(crate) fn journal_key(actor: &Actor, key: &OperationKey) -> OperationKey {
-    let joined = format!("{actor}:{key}");
+    let joined = format!("{FACADE_KEY_PREFIX}{actor}:{key}");
     if let Ok(key) = OperationKey::parse(&joined) {
         return key;
     }
     let digest = blake3::hash(key.as_str().as_bytes());
     let short = hex(&digest.as_bytes()[..16]);
-    OperationKey::parse(&format!("{actor}:h:{short}")).unwrap_or_else(|_| key.clone())
+    OperationKey::parse(&format!("{FACADE_KEY_PREFIX}{actor}:h:{short}"))
+        .unwrap_or_else(|_| key.clone())
+}
+
+/// A stored answer as the facade gives it: `accepted`, or the refusal
+/// the journal stored under the key.
+fn facade_accepted(key: &OperationKey, answer: Answer) -> Result<FacadeAnswer, Refusal> {
+    match answer.result {
+        StoredResult::Accepted(accepted) => Ok(FacadeAnswer::Accepted {
+            operation: accepted.operation,
+            key: key.clone(),
+            replayed: answer.replayed,
+            job: accepted.job,
+            revision: accepted.revision,
+        }),
+        StoredResult::Rejected(refusal) => Err(domain_refusal(&refusal)),
+    }
+}
+
+/// A continue's fidelity list as a request digest's part: which names it
+/// gives, in no order, or that it gives none.
+pub(crate) fn fidelity_bytes(names: Option<&[FidelityName]>) -> Vec<u8> {
+    names.map_or_else(
+        || vec![0xff],
+        |names| {
+            let bit = |name: FidelityName, mask: u8| if names.contains(&name) { mask } else { 0 };
+            vec![
+                bit(FidelityName::NativeSession, 1)
+                    | bit(FidelityName::NewNativeSessionWithPackage, 2)
+                    | bit(FidelityName::WorkspaceOnly, 4),
+            ]
+        },
+    )
+}
+
+/// An expected revision as a request digest's part: empty when none.
+pub(crate) fn revision_bytes(expected: Option<WorkRevision>) -> Vec<u8> {
+    expected
+        .map(|r| r.get().to_be_bytes().to_vec())
+        .unwrap_or_default()
 }
 
 /// 32 bytes from the system's random source, for a bearer; read from the
@@ -224,7 +271,23 @@ pub(crate) fn create_command(submit: &Submit, source: SourceBinding) -> Result<C
     })
 }
 
-/// The allowance a `continue` names, or the job's own.
+/// The allowance a facade `continue` asks for: what it names, cut to what
+/// the job's policy allows, or the policy's own when it names none. A
+/// token holder never widens the allowance (ADR 0024: the owner does);
+/// when nothing is left the domain refuses the continue as `fidelity`.
+pub(crate) fn facade_allowance(names: Option<&[FidelityName]>, job: &JobPolicy) -> AllowedFidelity {
+    let asked = allowance(names, job);
+    let policy = job.allowed_fidelity;
+    AllowedFidelity {
+        native_session: asked.native_session && policy.native_session,
+        new_native_session_with_package: asked.new_native_session_with_package
+            && policy.new_native_session_with_package,
+        workspace_only: asked.workspace_only && policy.workspace_only,
+    }
+}
+
+/// The allowance a `continue` names, or the job's own; the owner's
+/// socket passes it as named, since the owner may widen it.
 pub(crate) fn allowance(names: Option<&[FidelityName]>, job: &JobPolicy) -> AllowedFidelity {
     names.map_or(job.allowed_fidelity, |names| AllowedFidelity {
         native_session: names.contains(&FidelityName::NativeSession),
@@ -256,7 +319,12 @@ impl Node {
             Ok(record) => record,
             Err(refusal) => return FacadeAnswer::Refused(refusal),
         };
-        match check_token(record.as_ref(), now_ms, message.job(), message.pin()) {
+        match check_token(
+            record.as_ref(),
+            now_ms,
+            message.job_ask(),
+            message.resource_ask(),
+        ) {
             TokenCheck::Ok => {}
             TokenCheck::Unknown => {
                 return FacadeAnswer::Refused(Refusal::new(
@@ -323,6 +391,13 @@ impl Node {
     ) -> Result<FacadeAnswer, Refusal> {
         match message {
             ClientMessage::Submit { key, submit, .. } => {
+                // The owner's socket refuses the same before the authority;
+                // a secret in the harness arguments would be journaled and
+                // shown to every token that covers the job.
+                crate::harnesses::refuse_secret_kind(&submit.harness).map_err(|_| {
+                    Refusal::new(RefusalCode::Refused, "credential_like")
+                        .saying("the harness arguments hold what looks like a secret")
+                })?;
                 let source = remote_source(&submit.source)?;
                 let command = create_command(&submit, source)?;
                 self.facade_command(record, &key, None, None, command).await
@@ -340,6 +415,7 @@ impl Node {
                 let bearer = *token.as_bytes();
                 self.facade_watch(
                     bearer,
+                    record.expires_ms,
                     job,
                     after,
                     wait_ms.unwrap_or(DEFAULT_WAIT_MS),
@@ -368,22 +444,22 @@ impl Node {
                 expected_revision,
                 ..
             } => {
-                let state = self.state_for_facade(job).await?;
-                let attempt = state
-                    .live_attempt()
-                    .or_else(|| state.attempts.last())
-                    .map(|a| a.id)
-                    .ok_or_else(|| {
-                        Refusal::new(RefusalCode::Refused, "not_live")
-                            .saying("the job has no attempt to checkpoint")
-                    })?;
-                self.facade_command(
-                    record,
-                    &key,
-                    Some(job),
-                    expected_revision,
-                    Command::Checkpoint { attempt },
-                )
+                let request = request_digest(&[
+                    b"checkpoint",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                ]);
+                self.facade_derived(record, &key, job, request, move |state| {
+                    let attempt = state
+                        .live_attempt()
+                        .or_else(|| state.attempts.last())
+                        .map(|a| a.id)
+                        .ok_or_else(|| {
+                            Refusal::new(RefusalCode::Refused, "not_live")
+                                .saying("the job has no attempt to checkpoint")
+                        })?;
+                    Ok((expected_revision, Command::Checkpoint { attempt }))
+                })
                 .await
             }
             ClientMessage::Continue {
@@ -394,25 +470,24 @@ impl Node {
                 pin,
                 ..
             } => {
-                let state = self.state_for_facade(job).await?;
-                let task = state.live_attempt().map_or(state.job.primary, |a| a.task);
-                let command = Command::Continue {
-                    task,
-                    fidelity: allowance(fidelity.as_deref(), &state.job.policy),
-                    pin,
-                };
-                self.facade_command(record, &key, Some(job), expected_revision, command)
-                    .await
+                let request = request_digest(&[
+                    b"continue",
+                    &job.to_bytes(),
+                    &revision_bytes(expected_revision),
+                    &fidelity_bytes(fidelity.as_deref()),
+                    &pin.map(|p| p.to_bytes().to_vec()).unwrap_or_default(),
+                ]);
+                self.facade_derived(record, &key, job, request, move |state| {
+                    let task = state.live_attempt().map_or(state.job.primary, |a| a.task);
+                    let command = Command::Continue {
+                        task,
+                        fidelity: facade_allowance(fidelity.as_deref(), &state.job.policy),
+                        pin,
+                    };
+                    Ok((expected_revision, command))
+                })
+                .await
             }
-        }
-    }
-
-    /// The job's state for a command that needs it, or `unknown_job`.
-    async fn state_for_facade(&self, job: JobId) -> Result<ManagedState, Refusal> {
-        match self.authority.job(job).await {
-            Ok(Some(state)) => Ok(state),
-            Ok(None) => Err(Refusal::new(RefusalCode::UnknownJob, "job")),
-            Err(e) => Err(authority_refusal(&e)),
         }
     }
 
@@ -437,16 +512,38 @@ impl Node {
             .submit(envelope)
             .await
             .map_err(|e| authority_refusal(&e))?;
-        match answer.result {
-            StoredResult::Accepted(accepted) => Ok(FacadeAnswer::Accepted {
-                operation: accepted.operation,
-                key: key.clone(),
-                replayed: answer.replayed,
-                job: accepted.job,
-                revision: accepted.revision,
-            }),
-            StoredResult::Rejected(refusal) => Err(domain_refusal(&refusal)),
-        }
+        facade_accepted(key, answer)
+    }
+
+    /// Submits a command whose body `derive` makes from the job's state,
+    /// deduplicated by the client's `request` (ADR 0027, failure mode 3:
+    /// the same request repeated under its key is one operation however
+    /// the job moved between the two sends).
+    async fn facade_derived(
+        &self,
+        record: &FacadeTokenRecord,
+        key: &OperationKey,
+        job: JobId,
+        request: [u8; 32],
+        derive: impl FnOnce(&ManagedState) -> Result<(Option<WorkRevision>, Command), Refusal>
+        + Send
+        + 'static,
+    ) -> Result<FacadeAnswer, Refusal> {
+        let stored = journal_key(&record.actor, key);
+        let envelope_key = stored.clone();
+        let answer = self
+            .authority
+            .submit_derived(stored, request, job, move |state| {
+                derive(state).map(|(expected, body)| Envelope {
+                    key: envelope_key,
+                    job: Some(job),
+                    expected,
+                    body,
+                })
+            })
+            .await
+            .map_err(|e| authority_refusal(&e))??;
+        facade_accepted(key, answer)
     }
 
     /// A page of the job's events after `after`: the journal is the queue.
@@ -456,6 +553,7 @@ impl Node {
     async fn facade_watch(
         &self,
         bearer: [u8; BEARER_BYTES],
+        expires_ms: u64,
         job: JobId,
         after: Option<EventSeq>,
         wait_ms: u32,
@@ -463,6 +561,9 @@ impl Node {
     ) -> Result<FacadeAnswer, Refusal> {
         let started = tokio::time::Instant::now();
         let deadline = started + Duration::from_millis(u64::from(wait_ms));
+        // The watch wakes on a commit (a revocation is one) or at the
+        // token's expiry, whichever is first; a read moves no counter.
+        let expiry = started + Duration::from_millis(expires_ms.saturating_sub(now_ms));
         let mut commits = self
             .authority
             .commits()
@@ -530,15 +631,15 @@ impl Node {
                         return Err(Refusal::new(RefusalCode::Unavailable, "authority"));
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => {}
+                () = tokio::time::sleep_until(deadline.min(expiry)) => {}
             }
             let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let live = self.token_record(&bearer).await?;
             let check = check_token(
                 live.as_ref(),
                 now_ms.saturating_add(elapsed),
-                Some(job),
-                None,
+                JobAsk::Existing(job),
+                ResourceAsk::Nothing,
             );
             if check != TokenCheck::Ok {
                 closed = Some("revoked".to_owned());
@@ -621,7 +722,7 @@ impl Node {
         };
         let id = record.id;
         self.authority
-            .with_journal(true, move |journal| {
+            .write_journal(true, move |journal| {
                 journal.token_mint(&record).map_err(AuthorityError::from)
             })
             .await?;
@@ -642,7 +743,7 @@ impl Node {
         let now = now_ms();
         let revoked = match self
             .authority
-            .with_journal(false, move |journal| {
+            .write_journal(false, move |journal| {
                 journal.token_revoke(id, now).map_err(AuthorityError::from)
             })
             .await
@@ -706,7 +807,7 @@ fn read_inspection(journal: &Journal, state: &ManagedState) -> Result<Inspection
     // The last receipt of each task: the newest attempt's receipts first.
     let mut receipts: Vec<(fabric_core::managed::TaskId, TaskReceipt)> = Vec::new();
     for attempt in state.attempts.iter().rev() {
-        for receipt in journal.receipts(attempt.id)? {
+        for receipt in journal.receipts(state.job.id, attempt.id)? {
             if !receipts.iter().any(|(task, _)| *task == receipt.task) {
                 receipts.push((receipt.task, receipt));
             }
@@ -1032,6 +1133,17 @@ fn policy_json(policy: &JobPolicy) -> Value {
     })
 }
 
+/// A task's program as the client API writes it (docs/facade-protocol.md,
+/// "Launch path"): the arguments, the directory under the root and the
+/// variables of the node's environment it may see.
+fn program_json(program: &fabric_core::managed::Program) -> Value {
+    json!({
+        "argv": program.argv,
+        "cwd": program.cwd.as_ref().map(fabric_core::path::RelPath::as_str),
+        "env_allowlist": program.env_allowlist.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+    })
+}
+
 fn blocker_json(blocker: &HandoffBlocker) -> Value {
     match blocker {
         HandoffBlocker::EscapedChild { pid, group } => {
@@ -1110,6 +1222,7 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
             kind,
             restart,
             class,
+            program,
         } => json!({
             "task": task.to_string(),
             "parent": parent.map(|p| p.to_string()),
@@ -1122,6 +1235,7 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
                 RestartPolicy::ExplicitOnly => "explicit_only",
             },
             "class": class.name(),
+            "program": program.as_ref().map(program_json),
         }),
         ManagedEvent::AttemptGranted {
             attempt,
@@ -1298,6 +1412,7 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
                     "fidelity": fidelity_names(*fidelity),
                     "pin": pin.map(|n| n.to_string()),
                 } }),
+                EffectRequest::Spawn { task } => json!({ "spawn": { "task": task.to_string() } }),
             },
         }),
     };
@@ -1341,7 +1456,7 @@ mod tests {
             ..record
         };
         node.authority
-            .with_journal(true, move |j| {
+            .write_journal(true, move |j| {
                 j.token_mint(&record).map_err(AuthorityError::from)
             })
             .await
@@ -1435,11 +1550,38 @@ mod tests {
             RefusalCode::Scope,
             "job",
         );
-        // A pin outside the resource scope is refused before the commit.
-        let mut pinned = submit_json(&hex_of(2), "k-pin", "pinned");
+        // A token limited to listed jobs creates none.
+        refused_as(
+            &submit(&node, &hex_of(2), "k-new", "new").await,
+            RefusalCode::Scope,
+            "job",
+        );
+        // A continue with no pin, from a token limited to listed nodes,
+        // could be placed anywhere: refused.
+        let unpinned = json!({ "type": "continue", "facade": 1, "token": hex_of(2),
+            "key": "k-cont", "job": job.to_string(), "expected_revision": null, "pin": null });
+        refused_as(
+            &node.facade_answer(&unpinned, NOW).await,
+            RefusalCode::Scope,
+            "resource",
+        );
+        let nodes_only = FacadeTokenRecord {
+            jobs: JobScope::AnyOwned,
+            resources: ResourceScope::Nodes(vec![NodeId::from_bytes([9; 32])]),
+            ..any_token(3, "ci-nodes", NOW + 1_000)
+        };
+        seed_token(&node, bearer(3), nodes_only).await;
+        // A pin outside the resource scope is refused before the commit,
+        // and so is no pin at all.
+        let mut pinned = submit_json(&hex_of(3), "k-pin", "pinned");
         pinned["policy"] = json!({ "pin": node.id.to_string() });
         refused_as(
             &node.facade_answer(&pinned, NOW).await,
+            RefusalCode::Scope,
+            "resource",
+        );
+        refused_as(
+            &submit(&node, &hex_of(3), "k-anywhere", "anywhere").await,
             RefusalCode::Scope,
             "resource",
         );
@@ -1609,6 +1751,252 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, all);
+    }
+
+    /// Grants and starts an attempt of `job`'s primary task, as an
+    /// executor's report would, and returns it.
+    async fn live_attempt(node: &Node, job: JobId, key: &str) -> fabric_core::managed::Attempt {
+        let state = node.authority.job(job).await.unwrap().unwrap();
+        let start = Envelope {
+            key: OperationKey::parse(key).unwrap(),
+            job: Some(job),
+            expected: None,
+            body: Command::StartAttempt {
+                task: state.job.primary,
+                resource: ResourceRef::Node { node: node.id },
+                initial_checkpoint: None,
+            },
+        };
+        let answer = node.authority.submit(start).await.unwrap();
+        assert!(
+            matches!(answer.result, StoredResult::Accepted(_)),
+            "{answer:?}"
+        );
+        let attempt = node
+            .authority
+            .job(job)
+            .await
+            .unwrap()
+            .unwrap()
+            .attempts
+            .last()
+            .unwrap()
+            .clone();
+        node.authority
+            .observe_authority(
+                job,
+                fabric_core::managed::Observation::Started {
+                    attempt: attempt.id,
+                    generation: attempt.generation,
+                },
+            )
+            .await
+            .unwrap();
+        attempt
+    }
+
+    /// The same checkpoint request under the same key is one operation,
+    /// though another attempt became the live one between the two sends:
+    /// sameness is the request's, not the body the authority derived.
+    #[tokio::test]
+    async fn a_retried_checkpoint_replays_after_the_job_moved() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k1", "g").await);
+        let first = live_attempt(&node, job, "start-1").await;
+        let checkpoint = json!({ "type": "checkpoint", "facade": 1, "token": hex_of(1),
+            "key": "cp-1", "job": job.to_string(), "expected_revision": null });
+        let FacadeAnswer::Accepted {
+            operation,
+            replayed,
+            ..
+        } = node.facade_answer(&checkpoint, NOW).await
+        else {
+            panic!("not accepted");
+        };
+        assert!(!replayed);
+        node.authority
+            .observe_authority(
+                job,
+                fabric_core::managed::Observation::Exited {
+                    attempt: first.id,
+                    generation: first.generation,
+                    outcome: fabric_core::managed::ExitOutcome::Succeeded,
+                },
+            )
+            .await
+            .unwrap();
+        live_attempt(&node, job, "start-2").await;
+        let FacadeAnswer::Accepted {
+            operation: again,
+            replayed,
+            ..
+        } = node.facade_answer(&checkpoint, NOW).await
+        else {
+            panic!("not accepted");
+        };
+        assert!(replayed);
+        assert_eq!(again, operation);
+        // Another request under the key is still a conflict.
+        let other = json!({ "type": "checkpoint", "facade": 1, "token": hex_of(1),
+            "key": "cp-1", "job": job.to_string(), "expected_revision": "1" });
+        refused_as(
+            &node.facade_answer(&other, NOW).await,
+            RefusalCode::Conflict,
+            "key",
+        );
+    }
+
+    /// The owner's keys and the facade's never share a row: the owner's
+    /// `efe:k1` and actor `efe`'s `k1` are two operations, and the owner
+    /// cannot write a key in the facade's namespace.
+    #[tokio::test]
+    async fn owner_and_facade_keys_never_collide() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k0", "g").await);
+        let owner = node
+            .managed_submit(Envelope {
+                key: OperationKey::parse("efe:k1").unwrap(),
+                job: Some(job),
+                expected: None,
+                body: Command::RecordNote {
+                    note: Note::Question {
+                        text: "from the owner".into(),
+                    },
+                },
+            })
+            .await
+            .unwrap();
+        let cancel = json!({ "type": "cancel", "facade": 1, "token": hex_of(1), "key": "k1",
+            "job": job.to_string(), "expected_revision": null, "task": null, "reason": "stop" });
+        let FacadeAnswer::Accepted {
+            operation,
+            replayed,
+            ..
+        } = node.facade_answer(&cancel, NOW).await
+        else {
+            panic!("not accepted");
+        };
+        assert!(!replayed);
+        assert_ne!(operation, owner.operation);
+        let reserved = node
+            .managed_submit(Envelope {
+                key: journal_key(
+                    &Actor::parse("efe").unwrap(),
+                    &OperationKey::parse("k2").unwrap(),
+                ),
+                job: Some(job),
+                expected: None,
+                body: Command::RecordNote {
+                    note: Note::Question { text: "q".into() },
+                },
+            })
+            .await;
+        assert!(reserved.is_err(), "{reserved:?}");
+    }
+
+    /// A facade `continue` cannot widen the job's fidelity allowance: what
+    /// it names is cut to what the policy allows, and nothing left is a
+    /// refusal, never a lower fidelity. Only the owner widens it.
+    #[tokio::test]
+    async fn a_continue_cannot_widen_the_jobs_fidelity_allowance() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let mut create = submit_json(&hex_of(1), "k1", "g");
+        create["policy"] = json!({ "allowed_fidelity": ["native_session"], "pin": null });
+        let (job, _) = accepted(&node.facade_answer(&create, NOW).await);
+        let widen = json!({ "type": "continue", "facade": 1, "token": hex_of(1),
+            "key": "k-cont", "job": job.to_string(), "expected_revision": null,
+            "pin": null, "fidelity": ["workspace_only"] });
+        refused_as(
+            &node.facade_answer(&widen, NOW).await,
+            RefusalCode::Refused,
+            "fidelity",
+        );
+        let both = json!({ "type": "continue", "facade": 1, "token": hex_of(1),
+            "key": "k-cont-2", "job": job.to_string(), "expected_revision": null,
+            "pin": null, "fidelity": ["workspace_only", "native_session"] });
+        accepted(&node.facade_answer(&both, NOW).await);
+        let state = node.authority.job(job).await.unwrap().unwrap();
+        let requested = state.requests.iter().find_map(|(_, r)| match r {
+            fabric_core::managed::EffectRequest::Continue { fidelity, .. } => Some(*fidelity),
+            _ => None,
+        });
+        assert_eq!(
+            requested,
+            Some(AllowedFidelity {
+                native_session: true,
+                new_native_session_with_package: false,
+                workspace_only: false,
+            })
+        );
+    }
+
+    /// An ACP harness whose arguments carry a secret is refused before the
+    /// authority sees the create, as on the owner's socket: the journal,
+    /// `watch` and `inspect` never hold it.
+    #[tokio::test]
+    async fn a_submit_with_a_secret_in_the_harness_arguments_is_refused() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let message = json!({
+            "type": "submit", "facade": 1, "token": hex_of(1), "key": "k-acp",
+            "intent": { "goal": "g", "harness": { "kind": "acp", "program": "opencode",
+                "args": ["--api-key", "sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"] }, "acceptance": [] },
+            "source": { "kind": "empty" }
+        });
+        let answer = node.facade_answer(&message, NOW).await;
+        refused_as(&answer, RefusalCode::Refused, "credential_like");
+        assert_eq!(jobs_held(&node).await, 0);
+    }
+
+    /// A watch with nothing to deliver waits on commits, not on its own
+    /// reads: the authority's commit counter barely moves while one idle
+    /// watcher holds its wait open, so readers never crowd out a writer.
+    #[tokio::test]
+    async fn an_idle_watch_does_not_spin_the_authority() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k1", "g").await);
+        let FacadeAnswer::Events { next, .. } = watch(&node, &hex_of(1), job, None, 0).await else {
+            panic!("not events");
+        };
+        let commits = node.authority.commits().unwrap();
+        let before = *commits.borrow();
+        let answer = watch(&node, &hex_of(1), job, next.map(EventSeq::get), 500).await;
+        let after = *commits.borrow();
+        assert!(
+            matches!(&answer, FacadeAnswer::Events { events, .. } if events.is_empty()),
+            "{answer:?}"
+        );
+        assert!(
+            after.wrapping_sub(before) <= 2,
+            "the counter moved {} times for one idle watch",
+            after.wrapping_sub(before)
+        );
+    }
+
+    /// A token that expires while its watch waits closes the watch at the
+    /// expiry, not at the end of the wait, though nothing was committed.
+    #[tokio::test]
+    async fn a_token_expiring_during_a_watch_closes_it_at_the_expiry() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 300)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k1", "g").await);
+        let FacadeAnswer::Events { next, .. } = watch(&node, &hex_of(1), job, None, 0).await else {
+            panic!("not events");
+        };
+        let started = tokio::time::Instant::now();
+        let answer = watch(&node, &hex_of(1), job, next.map(EventSeq::get), 20_000).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "closed at the expiry"
+        );
+        let FacadeAnswer::Events { closed, .. } = answer else {
+            panic!("not events: {answer:?}");
+        };
+        assert_eq!(closed.as_deref(), Some("revoked"));
     }
 
     #[tokio::test]

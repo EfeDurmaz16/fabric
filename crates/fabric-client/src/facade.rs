@@ -416,6 +416,30 @@ impl ClientMessage {
         }
     }
 
+    /// What the message asks of the token's job scope: a submit creates a
+    /// job, every other message names one.
+    #[must_use]
+    pub fn job_ask(&self) -> fabric_core::managed::facade::JobAsk {
+        use fabric_core::managed::facade::JobAsk;
+        match self {
+            ClientMessage::Submit { .. } => JobAsk::Create,
+            other => other.job().map_or(JobAsk::Nothing, JobAsk::Existing),
+        }
+    }
+
+    /// What the message asks of the token's resource scope: a submit or a
+    /// continue places work, on its pin or wherever the authority chooses.
+    #[must_use]
+    pub fn resource_ask(&self) -> fabric_core::managed::facade::ResourceAsk {
+        use fabric_core::managed::facade::ResourceAsk;
+        match self {
+            ClientMessage::Submit { .. } | ClientMessage::Continue { .. } => self
+                .pin()
+                .map_or(ResourceAsk::Anywhere, ResourceAsk::Pinned),
+            _ => ResourceAsk::Nothing,
+        }
+    }
+
     /// The node the message names as a resource: a submit's or a continue's pin.
     #[must_use]
     pub fn pin(&self) -> Option<NodeId> {

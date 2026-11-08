@@ -109,6 +109,7 @@ fn a_format_1_frame_decodes_and_widens_to_the_m2_defaults() {
         EventFrame::decode(&registered).unwrap().event,
         ManagedEvent::TaskRegistered {
             class: TaskClass::Harness,
+            program: None,
             ..
         }
     ));

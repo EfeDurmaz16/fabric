@@ -1219,3 +1219,31 @@ async fn bench_m6_paths() {
         std::fs::write(file, out).unwrap();
     }
 }
+
+/// The last handle to drop joins the thread, so the journal is closed when
+/// the drop returns: `SQLite` unlinks the WAL and shm it keeps beside an
+/// open journal on the last close, and whatever looks at the state
+/// directory after the drop (a restart, a backup, the legacy test above)
+/// must not race that unlink. Red without the join: the side files are
+/// still there when the drop returns.
+#[tokio::test]
+async fn the_last_handle_closes_the_journal_before_its_drop_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    authority.submit(create("create-1")).await.unwrap();
+    let mut wal = journal_path(&state).into_os_string();
+    wal.push("-wal");
+    assert!(Path::new(&wal).exists(), "the journal is not in WAL mode");
+    drop(authority);
+    let mut names: Vec<String> = std::fs::read_dir(managed_dir(&state))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [fabric_journal::FILE_NAME],
+        "the journal was still open when the drop returned"
+    );
+}

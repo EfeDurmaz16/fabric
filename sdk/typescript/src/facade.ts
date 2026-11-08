@@ -159,7 +159,7 @@ function isText(value: unknown): value is string {
     typeof value === "string" &&
     new TextEncoder().encode(value).length <= TEXT_MAX_BYTES &&
     // eslint-disable-next-line no-control-regex
-    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(value)
+    !/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(value)
   );
 }
 
