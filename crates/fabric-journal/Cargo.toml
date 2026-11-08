@@ -1,6 +1,6 @@
 [package]
 name = "fabric-journal"
-version = "0.1.0"
+version.workspace = true
 description = "The managed authority's journal: a versioned SQLite record of managed jobs, their operations and their events"
 edition.workspace = true
 license.workspace = true

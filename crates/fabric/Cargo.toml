@@ -1,11 +1,13 @@
 [package]
 name = "fabric"
-version = "0.1.0"
+version.workspace = true
 description = "The fabric command: run the node, pair nodes, and make, run, suspend, move and resume jobs"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 # Named fault points in the node, for the end-to-end test only.
