@@ -1079,13 +1079,17 @@ impl Node {
                     entry.path = Some(file.clone());
                 }
                 if remove {
-                    // The group first, as recovery stops it, then its record.
-                    if group.is_some() {
-                        record.stop(DrainBudget::default()).await;
-                    }
+                    // The group first, as recovery stops it, then its record;
+                    // a group that outlives the stop keeps its record, so a
+                    // later gc or recovery still finds it.
+                    let stopped = match group {
+                        Some(_) => record.stop(DrainBudget::default()).await,
+                        None => Ok(()),
+                    };
                     settle(
                         entry,
-                        crate::local::remove(&file).map_err(|e| e.to_string()),
+                        stopped
+                            .and_then(|()| crate::local::remove(&file).map_err(|e| e.to_string())),
                     );
                 }
             }
