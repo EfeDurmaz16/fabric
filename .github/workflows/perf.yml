@@ -11,7 +11,7 @@ name: perf
 on:
   pull_request:
   push:
-    branches: [main, pr15/perf-in-ci]
+    branches: [main]
   workflow_dispatch:
     inputs:
       candidate:
@@ -39,14 +39,6 @@ jobs:
     # says why there is no Linux port.
     runs-on: macos-15
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        rep: [1, 2, 3, 4]
-        candidate: [176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5]
-        include:
-          - rep: 1
-            candidate: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,7 +74,7 @@ jobs:
       # 15 pairs, the fewest the rule accepts, and 5 counted runs.
       - name: A/B against the anchor
         env:
-          CANDIDATE: ${{ matrix.candidate || inputs.candidate }}
+          CANDIDATE: ${{ inputs.candidate }}
         run: |
           scripts/bench-ab.sh --release --pairs 15 --counted 5 \
             ${CANDIDATE:+--candidate "$CANDIDATE"} "$RUNNER_TEMP/perf"
@@ -105,13 +97,11 @@ jobs:
       # fixtures started in (docs/evidence/perf-ab/README.md, CI section).
       - name: Gate, and confirm a failure
         env:
-          CANDIDATE: ${{ matrix.candidate || inputs.candidate }}
+          CANDIDATE: ${{ inputs.candidate }}
         run: |
           out=$RUNNER_TEMP/perf
           status=0
           scripts/bench-ab.sh --release --gate "$out" || status=$?
-          # Trial only: every run is confirmed.
-          [ "$status" -eq 0 ] && status=1
           [ "$status" -eq 1 ] || exit "$status"
           echo "::notice::the first run fails the gate; both builds run again to confirm"
           scripts/bench-ab.sh --release --pairs 15 --counted 5 --candidate-first \
@@ -148,7 +138,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: perf-ab-${{ github.sha }}-${{ github.run_attempt }}-${{ matrix.rep }}-${{ matrix.candidate || 'head' }}
+          name: perf-ab-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/perf
           if-no-files-found: warn
           retention-days: 90
