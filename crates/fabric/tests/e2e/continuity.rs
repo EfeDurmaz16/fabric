@@ -44,6 +44,10 @@ fn runs(node: &Node, attempt: &str) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the scenario reads best as one script"
+)]
 async fn e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved() -> Fallible {
     let env = Env::new()?;
     env.install_fake_codex()?;

@@ -32,6 +32,10 @@ fn holding(dir: &Path, needle: &[u8], out: &mut Vec<String>) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the scenario reads best as one script"
+)]
 async fn e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log() -> Fallible {
     let env = Env::new()?;
     env.install_fake_codex()?;
