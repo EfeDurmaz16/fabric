@@ -63,6 +63,10 @@ fn abs(path: &Path) -> Result<AbsPath, SourceError> {
 
 /// A git command with no credential helper, no prompt and none of the
 /// caller's `GIT_*` environment, so a clone reads what the URI names or fails.
+/// Auto maintenance is off: since git 2.46 a fetch or commit detaches a
+/// `git maintenance run` that goes on writing under `.git` after the
+/// command returned, a process in the workspace that no task of the job
+/// owns.
 fn git(cwd: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     for (key, _) in std::env::vars_os() {
@@ -73,6 +77,8 @@ fn git(cwd: &Path) -> std::process::Command {
     cmd.current_dir(cwd)
         .args(["-c", "credential.helper="])
         .args(["-c", "core.askPass="])
+        .args(["-c", "maintenance.auto=false"])
+        .args(["-c", "gc.auto=0"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -305,6 +311,13 @@ mod tests {
             .current_dir(cwd)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            // No detached maintenance after a commit: the fixture owns
+            // every process that writes under the checkout it compares.
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "gc.auto")
+            .env("GIT_CONFIG_VALUE_1", "0")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@localhost")
             .env("GIT_COMMITTER_NAME", "t")
@@ -492,6 +505,23 @@ mod tests {
         );
         assert_eq!(tree(&checkout), before);
         assert!(!dir.path().join("work").exists());
+    }
+
+    #[test]
+    fn git_leaves_no_maintenance_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = git(dir.path());
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for setting in ["maintenance.auto=false", "gc.auto=0"] {
+            let at = args
+                .iter()
+                .position(|a| a == setting)
+                .unwrap_or_else(|| panic!("{setting} is not passed: {args:?}"));
+            assert_eq!(args[at - 1], "-c", "{args:?}");
+        }
     }
 
     #[test]
