@@ -168,6 +168,9 @@ struct Running {
     exit: Option<std::process::ExitStatus>,
     /// True once the task is known to have ended, its status known or not.
     gone: bool,
+    /// True once a quiescence or a stop signalled it: it ended interrupted,
+    /// whatever its status says, and every later receipt says so.
+    interrupted: bool,
 }
 
 /// One attempt this node runs.
@@ -470,6 +473,7 @@ impl Executor {
             handle: Handle::Child(child),
             exit: None,
             gone: false,
+            interrupted: false,
         });
         Ok(Spawned {
             pid: pid.get(),
@@ -533,6 +537,7 @@ impl Executor {
             handle: Handle::Adopted,
             exit: None,
             gone: false,
+            interrupted: false,
         });
         Ok(Spawned {
             pid: pid.get(),
@@ -823,6 +828,16 @@ async fn reap(running: &mut Running) -> bool {
 }
 
 fn exited(running: &Running) -> TaskReceipt {
+    if running.interrupted {
+        return TaskReceipt {
+            task: running.task,
+            class: running.class,
+            status: ReceiptStatus::Interrupted,
+            exit: None,
+            interrupted: true,
+            workspace: None,
+        };
+    }
     TaskReceipt {
         task: running.task,
         class: running.class,
@@ -894,6 +909,7 @@ async fn interrupt(running: &mut Running, grace: DrainBudget, signals: &AtomicU6
         return;
     }
     signals.fetch_add(1, Ordering::Relaxed);
+    running.interrupted = !running.gone;
     signal_group(group, Signal::TERM);
     if !wait_group_gone(group, grace.duration()).await {
         signals.fetch_add(1, Ordering::Relaxed);
@@ -1787,5 +1803,30 @@ mod tests {
         // The caller holds the process and reaps it.
         harness.wait().unwrap();
         assert!(!alive(pid), "the stop ended the harness's group");
+    }
+
+    /// A test a checkpoint's quiescence interrupted is still interrupted at
+    /// the next cut of the same attempt, never read as exited: its group
+    /// is gone by then, and the signal that ended it was the executor's.
+    #[tokio::test]
+    async fn an_interrupted_test_stays_interrupted_at_the_next_cut() {
+        let b = bench(Ok(SnapshotId::of(b"x"))).await;
+        b.executor
+            .spawn(b.attempt, task(1), TaskClass::Test, sh("exec sleep 30"))
+            .await
+            .unwrap();
+        let q = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(q.receipts[0].status, ReceiptStatus::Interrupted);
+        b.executor.resume(b.attempt).await.unwrap();
+        let again = b.executor.quiesce(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(
+            again.receipts[0].status,
+            ReceiptStatus::Interrupted,
+            "{again:?}"
+        );
+        assert!(again.receipts[0].interrupted);
+        assert!(!again.receipts[0].passed());
+        let stopped = b.executor.stop(b.attempt, budget(1_000)).await.unwrap();
+        assert_eq!(stopped[0].status, ReceiptStatus::Interrupted);
     }
 }
