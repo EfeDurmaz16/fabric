@@ -223,6 +223,7 @@ fn until_inspection(
 /// this base, docs/evidence/m6), so its silence is that of a node that
 /// holds a grant and does not answer for it.
 #[test]
+#[expect(clippy::too_many_lines, reason = "one scenario, its steps in order")]
 fn block_policy_waits_with_the_state_visible() -> Fallible {
     let env = Env::new()?;
     env.install_fake_codex()?;

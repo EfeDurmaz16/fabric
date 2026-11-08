@@ -1927,6 +1927,7 @@ mod tests {
     /// Every M6 event kind renders with its kind and its fields as text
     /// (ADR 0028), so a facade watch shows a loss and its handling.
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one scenario, its steps in order")]
     fn the_m6_event_kinds_render_with_their_fields() {
         use fabric_core::id::{JobId, NodeId, SnapshotId};
         use fabric_core::managed::{
