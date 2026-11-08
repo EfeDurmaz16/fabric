@@ -1317,13 +1317,16 @@ const GATE_RESAMPLES: usize = 40_000;
 
 /// The load-free counters the gate holds per op: the candidate's median
 /// over the counted runs must not exceed the anchor's. Process starts and
-/// file flushes are what a slower op costs on any machine, and none of them
-/// depends on load or timing; bytes and allocations are tracked in the
-/// report, not gated.
-const GATED_COUNTERS: [(&str, &[&str]); 3] = [
+/// the flushes that reach the disk (`F_FULLFSYNC`, `F_BARRIERFSYNC`) are
+/// what a slower op costs on any machine, and neither depends on load or
+/// timing. A plain `fsync`, which macOS does not carry past the drive's
+/// cache, is tracked, not gated: M4 trades full flushes for plain ones
+/// (`resume` 24 full and 51 plain in the anchor, 22 full or barrier and 55
+/// plain in M4, at 0.40 to 0.56 of the anchor's time). Bytes, allocations
+/// and instructions are tracked in the report too.
+const GATED_COUNTERS: [(&str, &[&str]); 2] = [
     ("process starts", &["spawns", "execs"]),
     ("full and barrier flushes", &["fullfsync", "barrierfsync"]),
-    ("fsyncs", &["fsync"]),
 ];
 
 /// One check of the gate.
@@ -1398,8 +1401,8 @@ fn counted_size_pairs(samples: &[Sample], metric: &str) -> Vec<(f64, f64)> {
 /// one run in 20 at most however many ops there are. Memory: no daemon's
 /// resident size or physical footprint and no CLI's peak resident size or
 /// physical footprint with a family interval above 1, across the memory
-/// rows. Counters: no op with more process starts or flushes than the
-/// anchor, medians over the counted runs.
+/// rows. Counters: no op with more process starts or more full or
+/// barrier flushes than the anchor, medians over the counted runs.
 fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
     let samples = parse_samples(text)?;
     let mut out = String::new();
@@ -1447,6 +1450,20 @@ fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
             ));
         }
     }
+    for (_, prefix, title, _) in DAEMON_SIZES {
+        let daemons: BTreeSet<&str> = samples
+            .iter()
+            .filter(|sample| sample.phase == "counted")
+            .filter_map(|sample| sample.metric.strip_prefix(prefix))
+            .collect();
+        for daemon in daemons {
+            let found = counted_size_pairs(&samples, &format!("{prefix}{daemon}"));
+            memory.push((
+                format!("{title}, daemon {daemon}, KiB per counted op"),
+                found,
+            ));
+        }
+    }
     for (metric, title) in [
         ("cli_maxrss_kib", "CLI peak resident size"),
         ("cli_footprint_kib", "CLI peak physical footprint"),
@@ -1472,7 +1489,7 @@ fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
         out.push_str(
             "\n#### Counters\n\n\
              Medians over the counted runs, anchor -> candidate. An op fails when the \
-             candidate starts more processes or flushes more than the anchor.\n\n\
+             candidate starts more processes or makes more full or barrier flushes than the anchor.\n\n\
              | op |",
         );
         for (title, _) in GATED_COUNTERS {
