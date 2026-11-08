@@ -80,6 +80,9 @@ if [ "$(uname -s)" = Darwin ]; then
     codesign --verify "$bin" || fail "the binary's ad hoc signature does not verify"
     ;;
   esac
+  # Only the attribute is checked: launching a quarantined copy would put
+  # up a Gatekeeper dialog on a headless runner. The CLI checks below run
+  # this same binary after the attribute is gone.
   step "macOS: the README command clears a browser's quarantine"
   xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;" "$bin"
   xattr -p com.apple.quarantine "$bin" >/dev/null || fail "quarantine was not set"

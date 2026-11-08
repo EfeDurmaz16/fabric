@@ -115,7 +115,7 @@ mkdir -p ~/.local/bin && cp "fabric-$target/fabric" ~/.local/bin/
 xattr -d com.apple.quarantine fabric-aarch64-apple-darwin/fabric
 ```
 
-The release smoke checks this on every target before a release is published (`scripts/release-smoke.sh`).
+Before a release is published, the release smoke (`scripts/release-smoke.sh`) checks on both macOS targets that an archive fetched with `curl` carries no quarantine attribute, and that the command above removes one, after which the binary runs. It does not launch a quarantined copy, so the Gatekeeper refusal itself is macOS behaviour, not something the smoke tests.
 
 To build from source instead, with Rust from [rustup.rs](https://rustup.rs): `cargo build --release -p fabric --locked`, then copy `target/release/fabric` to your `PATH` ([docs/start/install.md](docs/start/install.md)).
 
