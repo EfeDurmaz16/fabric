@@ -1592,3 +1592,33 @@ fn an_acknowledgement_that_lands_after_a_regrant_is_stale() {
     );
     kept.replays();
 }
+
+#[test]
+fn a_grant_never_launched_comes_back_granted_and_is_dispatched() {
+    let mut kept = made();
+    let primary = kept.state().job.primary;
+    kept.submit("start-1", start(primary)).unwrap();
+    let a = gone_silent(&mut kept);
+    kept.observe(&Observation::ResourceReachable {
+        attempt: a.id,
+        generation: a.generation,
+    })
+    .unwrap();
+    let back = kept.state().attempt(a.id).unwrap().clone();
+    assert_eq!(back.status, AttemptStatus::Granted);
+    assert!(kept.state().grant_may_dispatch(back.granted_by));
+    kept.mark(back.granted_by, OperationMark::Dispatched)
+        .unwrap();
+    kept.observe(&Observation::Started {
+        attempt: a.id,
+        generation: a.generation,
+    })
+    .unwrap();
+    let s = kept.state();
+    assert_eq!(s.attempt(a.id).unwrap().status, AttemptStatus::Running);
+    assert_eq!(
+        s.operation(back.granted_by).unwrap().status,
+        OperationStatus::Succeeded
+    );
+    kept.replays();
+}

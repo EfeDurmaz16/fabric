@@ -1191,7 +1191,9 @@ pub enum ManagedEvent {
         /// The authority's clock when it decided.
         since_ms: u64,
     },
-    /// A heartbeat returned for an attempt `AttemptUnavailable` made `unknown` (ADR 0028).
+    /// A heartbeat returned for an attempt `AttemptUnavailable` made
+    /// `unknown` (ADR 0028): it is `running` again if its grant succeeded,
+    /// `granted` if it was never seen launched.
     AttemptReachable {
         /// The attempt.
         attempt: AttemptId,

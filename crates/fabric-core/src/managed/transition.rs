@@ -1035,7 +1035,8 @@ fn unavailable(
 }
 
 /// `ResourceReachable`: only an attempt `AttemptUnavailable` made
-/// `unknown` returns to `running`; any other `unknown` is unchanged.
+/// `unknown` returns, to `running` if its grant succeeded and to `granted`
+/// if it was never seen launched; any other `unknown` is unchanged.
 fn reachable(
     job: &ManagedState,
     attempt_id: AttemptId,
@@ -1602,6 +1603,16 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
             attempt,
             generation,
         } => {
+            // Back to what it was: `running` once it was seen launched (its
+            // grant succeeded), `granted` otherwise, so a grant still
+            // waiting for its dispatch is dispatched and its `Started`
+            // settles it. A continue's grant settles on `Continued`, so an
+            // attempt seen started before that returns `granted` until its
+            // next report.
+            let launched = s
+                .attempt(*attempt)
+                .and_then(|a| s.operation(a.granted_by))
+                .is_some_and(|op| op.status == OperationStatus::Succeeded);
             let found = s
                 .attempts
                 .iter_mut()
@@ -1613,7 +1624,11 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
             {
                 return Err(broken(format!("attempt {attempt} cannot become reachable")));
             }
-            found.status = AttemptStatus::Running;
+            found.status = if launched {
+                AttemptStatus::Running
+            } else {
+                AttemptStatus::Granted
+            };
             found.unavailable_since_ms = None;
         }
         ManagedEvent::GrantSuperseded {
