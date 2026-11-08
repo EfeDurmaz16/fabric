@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.60s
+     Running tests/e2e/main.rs (/tmp/m5proof.X1jvPW/target/debug/deps/e2e-5aad294b239a4019)
+
+running 4 tests
+test facade::e2e_a_watch_cursor_holds_across_an_authority_restart ... ok
+test facade::e2e_the_same_job_is_observed_after_a_reconnect_from_another_node ... ok
+test placement::e2e_a_create_accepted_before_a_crash_is_placed_once_after_the_restart ... ok
+test placement::e2e_a_submit_names_no_machine_and_the_decision_is_recorded ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 77 filtered out; finished in 5.43s
+

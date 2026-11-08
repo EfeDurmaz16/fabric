@@ -21,11 +21,17 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Author, LedgerError};
+use fabric_core::managed::GrantToken;
+use fabric_core::managed::launch::{
+    Heartbeat, HeartbeatAnswer, InstructAnswer, Instruction, LaunchAnswer, LaunchRequest, Report,
+    ReportAnswer,
+};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
-use fabric_net::rpc::{JobFuture, Service};
+use fabric_net::rpc::{Advertise, JobFuture, Service};
 use fabric_net::wire::{
-    Appended, Facts, Fault, FaultText, Fenced, KnownWriter, ManifestChunks, MoveRequested,
-    MoveState, Offered, Pulled, RecordBytes, RecordPage, Tools, VersionText,
+    AdvertWire, Appended, FacadeAnswer, FacadeMessage, Facts, Fault, FaultText, Fenced,
+    KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, Pulled, RecordBytes,
+    RecordPage, Tools, VersionText,
 };
 use fabric_store::objects::ObjectError;
 use fabric_store::store::StoreError;
@@ -190,9 +196,74 @@ impl Service for Node {
             Ok(facts.to_wire())
         })
     }
+
+    fn advertise(&self, _peer: NodeId, ask: Advertise) -> BoxFuture<'_, Result<AdvertWire, Fault>> {
+        // What this node offers for one job's placement, measured now
+        // (ADR 0026): the asking authority is a paired peer, and the
+        // answer names no secret value, only which names resolve here.
+        Box::pin(async move { Ok(self.own_advert(&ask).await) })
+    }
+
+    fn facade(
+        &self,
+        _peer: NodeId,
+        message: FacadeMessage,
+    ) -> BoxFuture<'_, Result<FacadeAnswer, Fault>> {
+        // One facade message for this node's authority (ADR 0027): the
+        // token inside it is what authorizes the command, not the peer
+        // that carried it.
+        Box::pin(async move {
+            let answer = self.facade_serve(message.as_bytes()).await;
+            FacadeAnswer::new(answer).map_err(|e| internal(&e))
+        })
+    }
+
+    // The launch path: a grant and its instructions from the authority
+    // that granted it go to the runner; a report and a heartbeat from a
+    // node that runs one of this authority's attempts go to the authority.
+
+    fn launch(
+        &self,
+        peer: NodeId,
+        request: LaunchRequest,
+    ) -> BoxFuture<'_, Result<LaunchAnswer, Fault>> {
+        Box::pin(async move { Ok(self.runner.launch(self.peer_or_own(peer), request).await) })
+    }
+
+    fn instruct(
+        &self,
+        peer: NodeId,
+        token: GrantToken,
+        instruction: Instruction,
+    ) -> BoxFuture<'_, Result<InstructAnswer, Fault>> {
+        Box::pin(async move {
+            Ok(self
+                .runner
+                .instruct(self.peer_or_own(peer), token, instruction)
+                .await)
+        })
+    }
+
+    fn report(&self, peer: NodeId, report: Report) -> BoxFuture<'_, Result<ReportAnswer, Fault>> {
+        Box::pin(async move { Ok(self.accept_report(self.peer_or_own(peer), report).await) })
+    }
+
+    fn heartbeat(
+        &self,
+        peer: NodeId,
+        beat: Heartbeat,
+    ) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>> {
+        Box::pin(async move { Ok(self.accept_heartbeat(self.peer_or_own(peer), &beat).await) })
+    }
 }
 
 impl Node {
+    /// The peer a launch path message came from; `None` when this node's
+    /// own authority or runner sent it through its own `Service`.
+    fn peer_or_own(&self, peer: NodeId) -> Option<NodeId> {
+        (peer != self.id).then_some(peer)
+    }
+
     /// The known writer of the job's session from this node's session
     /// record, at any epoch, while this node owns the job: a node the job
     /// left keeps the record of its own tenure, which the owner may have

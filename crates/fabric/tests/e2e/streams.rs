@@ -35,6 +35,20 @@ const ELSEWHERE: &[(&str, &str)] = &[
         "job repair",
         "main.rs: e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork",
     ),
+    // A checkpoint and a continue need an attempt a node runs.
+    (
+        "managed checkpoint",
+        "launch.rs: e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package",
+    ),
+    (
+        "managed continue",
+        "launch.rs: e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package",
+    ),
+    (
+        "facade checkpoint",
+        "placement.rs: e2e_a_submit_runs_on_the_eligible_node_without_naming_it",
+    ),
+    ("facade continue", "ab/new_paths.rs: the facade continue op"),
     (
         "job import",
         "psf.rs: e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back",
@@ -90,7 +104,12 @@ impl Asked {
     fn json(&mut self, node: &Node, args: &[&str]) -> Fallible<Value> {
         self.note(args);
         let mut args = args.to_vec();
-        args.push("--json");
+        // Before a `--`, after which every word is the task's program.
+        let at = args
+            .iter()
+            .position(|arg| *arg == "--")
+            .unwrap_or(args.len());
+        args.insert(at, "--json");
         let output = node.run(&args)?;
         let what = format!("`fabric {}`", args.join(" "));
         if !output.status.success() {
@@ -206,6 +225,102 @@ fn serve_keeps_its_streams(asked: &mut Asked) -> Fallible {
     Ok(())
 }
 
+/// The M5 commands on the managed job `managed` of `a`: a change prints
+/// the job, a read its data, and a facade message the authority's own JSON
+/// on one line.
+fn m5_commands_keep_their_streams(
+    asked: &mut Asked,
+    a: &Node,
+    managed: &str,
+    repo: &str,
+) -> Fallible {
+    // The M5 operations: a change prints the job, a read its data.
+    let note = ["managed", "note", managed, "--question", "q"];
+    asked.change(a, &note, managed)?;
+    asked.changed(a, &note, "operation", "recorded")?;
+    let status = asked.read(a, &["managed", "status", managed], "job")?;
+    let parent = status["job"]["primary_task"]
+        .as_str()
+        .ok_or("no primary task")?
+        .to_owned();
+    let register = [
+        "managed", "register", managed, "--parent", &parent, "--label", "t", "--class", "test",
+        "--", "true",
+    ];
+    asked.change(a, &register, managed)?;
+    let mut keyed = register.to_vec();
+    keyed.splice(keyed.len() - 2..keyed.len() - 2, ["--operation-key", "r-1"]);
+    asked.changed(a, &keyed, "operation", "registered")?;
+    assert!(!asked.words(a, &["managed", "inspect", managed])?.is_empty());
+    asked.read(a, &["managed", "inspect", managed], "job")?;
+    let imported = asked.words(a, &["managed", "import", repo])?;
+    assert_eq!(imported.lines().count(), 1, "{imported}");
+    asked.changed(a, &["managed", "import", repo], "snapshot", "imported")?;
+
+    // The facade: a mint prints its token and bearer, a facade message the
+    // authority's own JSON on one line.
+    let mint = ["facade", "mint", "--actor", "streams", "--ttl-ms", "600000"];
+    let minted = asked.words(a, &mint)?;
+    let bearer = minted
+        .lines()
+        .find_map(|line| line.strip_prefix("bearer "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .ok_or("no bearer")?
+        .to_owned();
+    let token_id = minted
+        .lines()
+        .find_map(|line| line.strip_prefix("token "))
+        .ok_or("no token")?
+        .to_owned();
+    asked.changed(a, &mint, "token", "minted")?;
+    let to = ["--authority", a.id.as_str(), "--token", bearer.as_str()];
+    let facade = |op: &'static str, rest: &[&str]| -> Vec<String> {
+        ["facade", op]
+            .iter()
+            .chain(to.iter())
+            .chain(rest.iter())
+            .map(|word| (*word).to_owned())
+            .collect()
+    };
+    let submit = facade(
+        "submit",
+        &[
+            "--empty",
+            "--goal",
+            "g",
+            "--harness",
+            "codex",
+            "--operation-key",
+            "f-1",
+        ],
+    );
+    let submit: Vec<&str> = submit.iter().map(String::as_str).collect();
+    let accepted: Value = serde_json::from_str(asked.words(a, &submit)?.trim_end())?;
+    assert_eq!(accepted["type"], "accepted", "{accepted}");
+    let facade_job = accepted["job"].as_str().ok_or("no job")?.to_owned();
+    assert_eq!(asked.json(a, &submit)?["type"], "accepted");
+    for (op, rest) in [
+        ("inspect", vec![facade_job.as_str()]),
+        ("watch", vec![facade_job.as_str(), "--wait-ms", "0"]),
+        (
+            "cancel",
+            vec![facade_job.as_str(), "--operation-key", "f-2"],
+        ),
+    ] {
+        let args = facade(op, &rest);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let said: Value = serde_json::from_str(asked.words(a, &args)?.trim_end())?;
+        assert!(said["type"].is_string(), "{said}");
+        assert_eq!(asked.json(a, &args)?["type"], said["type"]);
+    }
+    // A revoke prints its sentence on stderr; under `--json` a second one is unchanged.
+    let revoke = ["facade", "revoke", token_id.as_str()];
+    assert_eq!(asked.words(a, &revoke)?, "");
+    asked.changed(a, &revoke, "token", "unchanged")?;
+
+    Ok(())
+}
+
 #[test]
 fn e2e_every_answer_keeps_its_streams_in_words_and_as_json() -> Fallible {
     let mut asked = Asked::default();
@@ -290,6 +405,8 @@ fn e2e_every_answer_keeps_its_streams_in_words_and_as_json() -> Fallible {
     asked.read(a, &["managed", "status", &managed], "job")?;
     assert!(!asked.words(a, &["managed", "ls"])?.is_empty());
     asked.json(a, &["managed", "ls"])?;
+    m5_commands_keep_their_streams(&mut asked, a, &managed, repo)?;
+
     let cancel = ["managed", "cancel", &managed, "--operation-key", "x-1"];
     asked.change(a, &cancel, &managed)?;
     asked.changed(a, &cancel, "operation", "unchanged")?;

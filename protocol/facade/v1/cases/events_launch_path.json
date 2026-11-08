@@ -1,0 +1,212 @@
+{
+  "case": "events_launch_path",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "events",
+    "facade": 1,
+    "job": "01K8W3A00000000000000000J1",
+    "events": [
+      {
+        "seq": "5",
+        "revision": "3",
+        "at_ms": 1762128000000,
+        "event": {
+          "kind": "task_registered",
+          "task": "01K8W3A00000000000000000T2",
+          "parent": "01K8W3A00000000000000000T1",
+          "label": "cargo test",
+          "restart": "block",
+          "class": "test",
+          "program": {
+            "argv": [
+              "cargo",
+              "test",
+              "--workspace"
+            ],
+            "cwd": "crates/app",
+            "env_allowlist": [
+              "CARGO_HOME"
+            ]
+          }
+        }
+      },
+      {
+        "seq": "6",
+        "revision": "3",
+        "at_ms": 1762128000000,
+        "event": {
+          "kind": "effect_requested",
+          "operation": "01K8W3A0000000000000000P02",
+          "request": {
+            "spawn": {
+              "task": "01K8W3A00000000000000000T2"
+            }
+          }
+        }
+      },
+      {
+        "seq": "7",
+        "revision": "4",
+        "at_ms": 1762128001000,
+        "event": {
+          "kind": "attempt_observed",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1",
+          "status": "running"
+        }
+      },
+      {
+        "seq": "8",
+        "revision": "5",
+        "at_ms": 1762128002000,
+        "event": {
+          "kind": "receipts_recorded",
+          "attempt": "01K8W3A00000000000000000A1",
+          "receipts": [
+            {
+              "task": "01K8W3A00000000000000000T1",
+              "class": "harness",
+              "status": "running",
+              "interrupted": false
+            },
+            {
+              "task": "01K8W3A00000000000000000T2",
+              "class": "test",
+              "status": "running",
+              "interrupted": false
+            }
+          ]
+        }
+      },
+      {
+        "seq": "9",
+        "revision": "6",
+        "at_ms": 1762128003000,
+        "event": {
+          "kind": "checkpoint_cut_recorded",
+          "attempt": "01K8W3A00000000000000000A1",
+          "snapshot": "2222222222222222222222222222222222222222222222222222222222222222",
+          "cut": "3333333333333333333333333333333333333333333333333333333333333333",
+          "receipts": [
+            {
+              "task": "01K8W3A00000000000000000T1",
+              "class": "harness",
+              "status": "checkpointed",
+              "interrupted": false,
+              "snapshot": "2222222222222222222222222222222222222222222222222222222222222222"
+            },
+            {
+              "task": "01K8W3A00000000000000000T2",
+              "class": "test",
+              "status": "interrupted",
+              "interrupted": true
+            }
+          ]
+        }
+      },
+      {
+        "seq": "10",
+        "revision": "7",
+        "at_ms": 1762128004000,
+        "event": {
+          "kind": "handoff_blocked",
+          "attempt": "01K8W3A00000000000000000A1",
+          "blockers": [
+            {
+              "escaped_child": {
+                "pid": 4242,
+                "group": 4200
+              }
+            },
+            {
+              "opaque": {
+                "task": "01K8W3A00000000000000000T2"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "seq": "11",
+        "revision": "8",
+        "at_ms": 1762128005000,
+        "event": {
+          "kind": "attempt_observed",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1",
+          "status": "checkpointed",
+          "snapshot": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      {
+        "seq": "12",
+        "revision": "9",
+        "at_ms": 1762128006000,
+        "event": {
+          "kind": "attempt_granted",
+          "attempt": "01K8W3A00000000000000000A2",
+          "task": "01K8W3A00000000000000000T1",
+          "node": "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq",
+          "generation": "2",
+          "initial_checkpoint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "operation": "01K8W3A0000000000000000P03"
+        }
+      },
+      {
+        "seq": "13",
+        "revision": "10",
+        "at_ms": 1762128007000,
+        "event": {
+          "kind": "attempt_observed",
+          "attempt": "01K8W3A00000000000000000A2",
+          "generation": "2",
+          "status": "running"
+        }
+      },
+      {
+        "seq": "14",
+        "revision": "11",
+        "at_ms": 1762128008000,
+        "event": {
+          "kind": "continuation_recorded",
+          "attempt": "01K8W3A00000000000000000A2",
+          "from": "01K8W3A00000000000000000A1",
+          "requested": [
+            "native_session",
+            "new_native_session_with_package"
+          ],
+          "achieved": "new_native_session_with_package",
+          "package": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      {
+        "seq": "15",
+        "revision": "12",
+        "at_ms": 1762128009000,
+        "event": {
+          "kind": "stale_observation_refused",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1",
+          "current": "2"
+        }
+      },
+      {
+        "seq": "16",
+        "revision": "13",
+        "at_ms": 1762128010000,
+        "event": {
+          "kind": "attempt_observed",
+          "attempt": "01K8W3A00000000000000000A2",
+          "generation": "2",
+          "status": "succeeded"
+        }
+      }
+    ],
+    "next": "16",
+    "lagged": false,
+    "closed": null
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

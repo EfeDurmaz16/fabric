@@ -465,9 +465,37 @@ pub fn row(row: &PreflightRow) -> String {
     line
 }
 
+/// A task's last receipt as one line: its class when known, the status,
+/// then the exit code, whether it was cut short, the snapshot it left and
+/// why it is blocked, each when there is one.
+fn receipt_line(class: Option<&str>, receipt: &crate::api::ReceiptWire) -> String {
+    use std::fmt::Write as _;
+    let mut line = String::from("  ");
+    if let Some(class) = class {
+        line.push_str(class);
+        line.push_str(", ");
+    }
+    line.push_str("last receipt: ");
+    line.push_str(&receipt.status);
+    if let Some(code) = receipt.exit {
+        let _ = write!(line, " with code {code}");
+    }
+    if receipt.interrupted && receipt.status != "interrupted" {
+        line.push_str(", interrupted");
+    }
+    if let Some(snapshot) = &receipt.snapshot {
+        let _ = write!(line, " at {snapshot}");
+    }
+    if let Some(reason) = &receipt.reason {
+        line.push_str(": ");
+        line.push_str(reason);
+    }
+    line
+}
+
 /// The lines a managed job reads as: its id, revision, state and goal,
-/// then one line per task and per attempt, each with its control
-/// characters escaped.
+/// then one line per task (with its last receipt, when the reply carries
+/// one) and per attempt, each with its control characters escaped.
 #[must_use]
 pub fn managed_job(job: &ManagedJob) -> Vec<String> {
     let mut lines = vec![
@@ -483,6 +511,26 @@ pub fn managed_job(job: &ManagedJob) -> Vec<String> {
             Some(label) => format!("task {} ({label}): {}", task.task, task.state),
             None => format!("task {} (primary): {}", task.task, task.state),
         });
+        if let Some(program) = &task.program {
+            // Each argument as JSON text, so a space or a quote in one reads
+            // as what it is.
+            let argv: Vec<String> = program
+                .argv
+                .iter()
+                .map(|arg| serde_json::to_string(arg).unwrap_or_default())
+                .collect();
+            lines.push(format!(
+                "  runs {}{}",
+                argv.join(" "),
+                program
+                    .cwd
+                    .as_ref()
+                    .map_or(String::new(), |cwd| format!(" in {}", cwd.as_str()))
+            ));
+        }
+        if let Some(receipt) = &task.receipt {
+            lines.push(receipt_line(task.class.as_deref(), receipt));
+        }
     }
     for attempt in &job.attempts {
         lines.push(format!(
@@ -563,6 +611,59 @@ mod tests {
         assert_eq!(
             row(&equal),
             "ok      macos_sdk        here: 26.0 / /sdk  peer: 26.0 / /sdk"
+        );
+    }
+
+    /// An inspection's task receipt is printed under its task, so an
+    /// interrupted, blocked or exited test does not read as just `open`.
+    #[test]
+    fn a_task_s_last_receipt_is_printed_under_it() {
+        let job: crate::api::ManagedJob = serde_json::from_value(serde_json::json!({
+            "job": fabric_core::id::JobId::from_bytes([1; 16]).to_string(),
+            "revision": "4",
+            "generation": "2",
+            "state": "active",
+            "goal": "make it work",
+            "harness": { "kind": "codex" },
+            "primary_task": fabric_core::managed::TaskId::from_bytes([2; 16]).to_string(),
+            "tasks": [
+                {
+                    "task": fabric_core::managed::TaskId::from_bytes([3; 16]).to_string(),
+                    "label": "slow test",
+                    "state": "open",
+                    "class": "test",
+                    "receipt": { "status": "interrupted", "interrupted": true }
+                },
+                {
+                    "task": fabric_core::managed::TaskId::from_bytes([4; 16]).to_string(),
+                    "label": "build",
+                    "state": "open",
+                    "class": "build",
+                    "receipt": { "status": "blocked", "interrupted": false, "reason": "no cargo\n" }
+                },
+                {
+                    "task": fabric_core::managed::TaskId::from_bytes([5; 16]).to_string(),
+                    "label": "lint",
+                    "state": "open",
+                    "class": "test",
+                    "receipt": { "status": "exited", "exit": 1, "interrupted": false }
+                }
+            ],
+            "attempts": []
+        }))
+        .unwrap();
+        let lines = managed_job(&job);
+        assert!(
+            lines.contains(&"  test, last receipt: interrupted".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  build, last receipt: blocked: no cargo\\n".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  test, last receipt: exited with code 1".to_owned()),
+            "{lines:?}"
         );
     }
 }

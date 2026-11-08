@@ -61,6 +61,9 @@ fabric = { path = ".", features = ["counted-tools", "faults", "fixtures"] }
 # controlling terminal; rustix is already a dependency of this package.
 rustix = { version = "1.1", features = ["fs", "process", "pty", "termios"] }
 tempfile = "3.27"
+# The provider read-surface test seeds a stopped daemon's managed journal
+# with provider operations, which only the bridge path writes.
+fabric-journal = { path = "../fabric-journal" }
 # The time budget reads its limits from budget.toml; fabricd and fabric-env
 # already build this crate.
 toml = { version = "1.1", default-features = false, features = ["std", "parse"] }

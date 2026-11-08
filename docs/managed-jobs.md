@@ -1,6 +1,6 @@
 # Managed jobs: identity, journal v1, operation states and replay
 
-Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day; on `main` since 2026-11-03 (PR #31), with schema version 2 (PR #32) beside it. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; it is on `main` since 2026-11-08 (PR #36), and its "As built (M4)" notes record where the code differs.
+Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day; on `main` since 2026-11-03 (PR #31), with schema version 2 (PR #32) beside it. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; it is on `main` since 2026-11-08 (PR #36), and its "As built (M4)" notes record where the code differs. The section "Placement and planned continuity (M5)" was added 2026-11-03 with ADRs 0023 to 0027 and implemented on the M5 branch; its "As built (M5)" notes record where the code differs.
 
 ## Identity
 
@@ -841,3 +841,963 @@ M4 exposes provider operations as library calls only (ADR 0022, selection 6). Ef
 | Acceptance (M5) | Surfaces | Tests |
 |---|---|---|
 | A client reads, for one managed job, every provider operation as the journal holds it (its status, with `unknown`, `attached`, `observed` and `abandoned` shown as they are and never folded into another; its action, effect class, purpose and the create a cleanup cleans; its target and locator; the scope its last absent attach searched; its abandonment reason), the job's replacement blockers (`CreateUnresolved`, `ExecMayRun`, `StopNotConfirmed`, each with its operation and status, from `Journal::replacement_blockers`) and its residuals (each create's locator, or the scope an absent attach searched, from `Journal::residuals`). The read writes nothing and sends nothing to a worker. | one read op of the node's client API beside `managed_status`; the matching `fabric-client` method; the TypeScript SDK method beside `managedStatus`; a `fabric managed` subcommand beside `status` | written first and failing on the M4 code: a node test over a journal seeded with an operation in each of `unknown` (with and without a searched scope), `attached`, `observed` and `abandoned`, a blocker of each kind and a residual of each kind, answered through the client API with each value as the journal holds it and the journal unchanged after the read; the TypeScript SDK test of the same op against the node built in the same run; a CLI test of the subcommand's sentences for each status, blocker and residual |
+
+## Placement and planned continuity (M5)
+
+Status: proposed with ADRs 0023 to 0027, 2026-11-03; parts P03 to P05 built on 2026-11-03 (see "As built (M5): P03 to P05" below). This section is the M5 contract: the types and signatures the two implementation owners build against, written before any M5 code. Its selections were selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02 and are recorded in each ADR; none was approved by Efe. The code is the authority on signatures once it lands, and each part gains an "As built (M5)" note where the code differs. The facade's wire contract is [docs/facade-protocol.md](facade-protocol.md) with its fixtures in [protocol/facade/v1](../protocol/facade/v1).
+
+Acceptance (roadmap M5): submit without choosing a machine; the same job observed after a reconnect; a planned handoff with child-task outcomes and the fidelity actually achieved.
+
+### What M2 to M4 already provide
+
+M5 adds only what is missing. These exist, are tested, and do not change:
+
+| Need | Existing mechanism | Where |
+| --- | --- | --- |
+| Durable job, task, attempt and operation identity; dedupe by key; expected revision; replay | ADR 0019 domain, `accept_command`, `dedupe`, `apply_batch`, `replay` | `crates/fabric-core/src/managed/`, `managed_rules.rs` |
+| `JobPolicy` (restart policy), `Intent`, `SourceBinding` (`Repository`, `Snapshot`), `TaskKind`, `RestartPolicy` | ADR 0019 model | `crates/fabric-core/src/managed/model.rs` |
+| One authority, one writer; grants with a `Generation`; `StaleGeneration` refused; no grant while an attempt may run | ADR 0020 | `crates/fabricd/src/authority.rs`, `fabric-journal` |
+| The journal: versioned SQLite, hash-chained events, projections, `verify`, `recover`, `events(job, after, limit)` with `EventSeq` | ADR 0020, schema versions 1 and 2 | `crates/fabric-journal/` |
+| Provider effects fenced on the live grant, `unknown` on loss, attach, the replacement barrier, cleanup with fresh approval, residuals | ADR 0021, ADR 0022 | `crates/fabric-bridge`, `fabric-journal/src/provider.rs` |
+| Capture of a workspace and a harness session into a content-addressed snapshot (bundle chain, private index, carry keys), restore in place or fresh, the `Clean`/`Dirty`/`Suspending`/`Restoring` marker | ADR 0004, ADR 0012, ADR 0014 | `crates/fabric-store/src/capture.rs`, `restore.rs`; `fabric-harness` adapters' `capture` and `restore` |
+| The suspend path that stops a harness cleanly and publishes a snapshot; Claude Code and Codex tombstones; headless launch and hold | ADR 0006, ADR 0015, M2 group A | `crates/fabricd/src/job.rs`, `local.rs`, `fabric-harness` |
+| A harness process group the node records and signals; what leaves the group is out of reach and reported | `local.rs`, the harness record | `crates/fabricd/src/local.rs` |
+| Facts a node measures about itself per operation, with no cache: user, home, os, arch, tool versions, logins as yes or no; a peer asks with `FactsFor { harness, tools }` within a budget | ADR 0008, ADR 0013 amended | `crates/fabricd/src/facts.rs`, `fabric-net/src/wire.rs` |
+| Known-writer rule: the newest harness version that wrote a session, compared with the target's | ADR 0006 | `fabric-core/src/version.rs`, `fabricd/src/doctor.rs` |
+| Same root and home on every node | ADR 0011 | `fabric-harness` restore refusals, `doctor.rs` |
+| Peers: the peer book of paired node ids and addresses, pinned identities on QUIC and TCP with TLS, one stream per request, budgets, per-peer caps, protocol 4 (unshipped) | ADR 0005, ADR 0013 | `crates/fabric-net/src/peers.rs`, `endpoint.rs`, `rpc.rs`, `wire.rs` |
+| Snapshot transfer between nodes: `WantSnapshot`, `WantChunks`, chunks trusted after hashing | ADR 0013 | `fabric-net`, `fabricd/src/transfer.rs` |
+| Secret paths that never leave a node, growing per job, with consent for a tracked secret (`TrackedSecrets`); credential-shaped text detection | ADR 0004, ADR 0007 | `fabric-core/src/secret.rs`, `credential.rs` |
+| The client API: length-prefixed JSON, api 1 additive, fixtures under `protocol/fixtures`, `managed_create`, `managed_cancel`, `managed_status`, `managed_list` with operation keys; the Rust client and the TypeScript SDK | ADR 0018, M2 | `crates/fabric-client`, `sdk/typescript` |
+| The bridge fixture discipline: a fixture set shared by two implementations, a sorted `manifest.sha256`, a pin test on each side | ADR 0021 | `protocol/bridge/v1`, `crates/fabric-client/tests/bridge_fixtures.rs` |
+
+What is missing, and which part adds it:
+
+| Gap after M4 | M5 addition | Part |
+| --- | --- | --- |
+| A task has no behavioral class; an interrupted test is indistinguishable from a finished one | `TaskClass`, `OutcomePolicy`, `TaskReceipt` with `interrupted` | P03 |
+| Nothing bounds quiescence or reports an escaped child or a foreign writer | the executor, `DrainBudget`, `Quiescence`, `HandoffBlocker` | P03 |
+| A checkpoint is a snapshot without receipts, facts or evidence | `CheckpointCut`, `CheckpointCutRecorded` | P03 |
+| Nothing portable survives a harness change | `WorkPackage`, `Note`, `RecordNote` | P04 |
+| Continuation has one fidelity and no record of it | `Fidelity`, `AllowedFidelity`, `ContinuationRecorded` | P04 |
+| A source must be a path on the authority | `SourceBinding::Git`, `Empty`, import through capture | P05 |
+| A task cannot say which secret it needs; nothing checks it before launch | `SecretRef`, the local resolver, the `Secret` exclusion | P05 |
+| Secret paths leave or stay by pattern alone | `export_allowlist` as the capture's consent | P05 |
+| The user names the machine | `NodeAdvert`, `place`, `PlacementDecision`, `PlacementDecided`, parking | P06 |
+| The authority answers only its local socket | the facade over the node link, `FacadeTokenRecord`, `facade_call` | P07 |
+| Provider operations have no read surface (ADR 0022, selection 6) | `managed_inspect` and the facade's `inspect` | P07 |
+
+### Codec and schema version 3
+
+Every shape below that is stored in the journal is carried by codec format byte `2`. The frame reader dispatches on the byte: `1` decodes with the M2 shapes, frozen in `fabric_core::managed::frame::v1`, and widens them with the M2 defaults (`JobPolicy::m2_defaults`, `TaskClass::Harness` for every task, `acceptance` empty); `2` decodes the shapes below. A format 1 frame keeps its bytes and its digest, so no chain changes, and `v1.sqlite` and `v2.sqlite` still verify. `request_digest` is computed over the format 2 bytes of a command; a key stored under a format 1 digest answers a repeat of that command as `OperationConflict`, which no shipped journal can hold. New command and event kinds are new `kind` strings.
+
+Schema version 3 (migration `2 -> 3`, one transaction, tested from `tests/fixtures/v2.sqlite`; `tests/fixtures/v3.sqlite` is the new fixture):
+
+```sql
+PRAGMA user_version = 3;
+
+ALTER TABLE tasks ADD COLUMN class TEXT NOT NULL DEFAULT 'harness'
+  CHECK (class IN ('build','test','harness','opaque'));
+
+-- operations.kind is checked against the command kinds; SQLite cannot widen a
+-- CHECK in place, so the migration rebuilds the table with the kinds
+-- 'record_note', 'checkpoint', 'continue' and 'cancel_task' added and copies
+-- every row.
+
+CREATE TABLE facade_tokens (
+  token_id   BLOB PRIMARY KEY CHECK (length(token_id) = 16),
+  digest     BLOB NOT NULL UNIQUE CHECK (length(digest) = 32),
+  actor      TEXT NOT NULL,
+  jobs       BLOB NOT NULL,        -- framed JobScope
+  resources  BLOB NOT NULL,        -- framed ResourceScope
+  minted_ms  INTEGER NOT NULL,
+  expires_ms INTEGER NOT NULL,
+  revoked_ms INTEGER
+) STRICT;
+
+CREATE TABLE placements (
+  seq        INTEGER PRIMARY KEY REFERENCES events(seq),
+  job_id     BLOB NOT NULL REFERENCES jobs(job_id),
+  task_id    BLOB NOT NULL REFERENCES tasks(task_id),
+  kind       TEXT NOT NULL CHECK (kind IN ('initial','planned_handoff','failover')),
+  chosen     BLOB CHECK (chosen IS NULL OR length(chosen) = 32),
+  decided_ms INTEGER NOT NULL
+) STRICT;
+CREATE INDEX placements_by_job ON placements (job_id, seq);
+
+CREATE TABLE continuations (
+  attempt_id   BLOB PRIMARY KEY REFERENCES attempts(attempt_id),
+  from_attempt BLOB NOT NULL REFERENCES attempts(attempt_id),
+  achieved     TEXT NOT NULL CHECK (achieved IN ('native_session','new_native_session_with_package','workspace_only')),
+  package      BLOB CHECK (package IS NULL OR length(package) = 32),
+  seq          INTEGER NOT NULL REFERENCES events(seq)
+) STRICT;
+```
+
+`placements` and `continuations` are projections of the events `PlacementDecided` and `ContinuationRecorded`, written by `write_transition` in the same transaction, and `verify` rebuilds them as it does the others. `facade_tokens` is authority state, not job history: it has no event, and a backup carries it as it is. Notes are read from the events (`NoteRecorded`), with no projection.
+
+### Shared types in fabric-core (`managed` module)
+
+Pure: no IO, no clock, no randomness. Everything below is additive to the M2 types of this page; a type named there and not here is unchanged.
+
+```rust
+// model.rs (owner A)
+
+pub struct Intent {
+    pub goal: String,                       // M2
+    pub harness: HarnessKind,               // M2
+    pub acceptance: Vec<String>,            // M5: each at most TEXT_MAX_BYTES
+}
+
+pub enum SourceBinding {
+    Repository { path: AbsPath },           // M2; local socket only
+    Snapshot { snapshot: SnapshotId },      // M2; also what an import becomes
+    Git { uri: GitUri, commit: CommitId },   // M5
+    Empty,                                  // M5
+}
+
+pub struct JobPolicy {
+    pub restart: RestartPolicy,             // M2
+    pub drain_budget_ms: u32,               // DrainBudget::MIN_MS ..= MAX_MS; default DEFAULT_MS
+    pub allowed_fidelity: AllowedFidelity,  // default AllowedFidelity::DEFAULT
+    pub secrets: Vec<SecretRef>,            // default empty; at most 32
+    pub export_allowlist: Vec<RelPath>,     // default empty; at most 256
+    pub placement: PlacementPolicy,         // default PlacementPolicy::DEFAULT
+}
+impl JobPolicy {
+    pub fn m2_defaults(restart: RestartPolicy) -> JobPolicy;
+    pub fn check(&self) -> Result<(), DomainError>;   // BadPolicy { field } on any bound broken
+}
+
+pub struct PlacementPolicy {
+    pub platform: Option<Platform>,         // None: any; a snapshot source fills it from the manifest when the caller gave none
+    pub disk_bytes: u64,                    // default DEFAULT_DISK_BYTES (2 GiB)
+    pub pin: Option<NodeId>,
+}
+
+pub struct Task {
+    // M2 fields, and:
+    pub class: TaskClass,
+}
+
+pub enum Command {
+    CreateJob { intent: Intent, source: SourceBinding, policy: JobPolicy },   // M2; in M5 its dispatch is the initial placement
+    StartAttempt { task: TaskId, resource: ResourceRef, initial_checkpoint: Option<SnapshotId> }, // M2
+    RegisterTask { parent: TaskId, kind: TaskKind, restart: RestartPolicy, class: TaskClass },   // class added
+    FinishTask { task: TaskId, outcome: TaskOutcome },                        // M2
+    CancelJob { reason: String },            // M2; in M5 accepted while an attempt is live and dispatched to stop it
+    CancelTask { task: TaskId, reason: String },                              // M5
+    RecordNote { note: Note },                                                // M5
+    Checkpoint { attempt: AttemptId },                                        // M5: quiescence and a cut, the attempt stays live
+    Continue { task: TaskId, fidelity: AllowedFidelity, pin: Option<NodeId> }, // M5: the planned handoff
+}
+
+pub enum Observation {
+    // M2 kinds, with Checkpointed widened:
+    Checkpointed { attempt: AttemptId, generation: Generation, snapshot: SnapshotId, cut: CheckpointCut },
+    Receipts { attempt: AttemptId, generation: Generation, receipts: Vec<TaskReceipt> },
+    HandoffBlocked { attempt: AttemptId, generation: Generation, blockers: Vec<HandoffBlocker> },
+    Placed { operation: OperationId, task: TaskId, decision: PlacementDecision },
+    Continued { attempt: AttemptId, generation: Generation, from: AttemptId, achieved: Fidelity, package: Option<PackageDigest> },
+}
+
+pub enum ManagedEvent {
+    // M2 kinds, and:
+    NoteRecorded { note: Note },
+    ReceiptsRecorded { attempt: AttemptId, receipts: Vec<TaskReceipt> },
+    CheckpointCutRecorded { attempt: AttemptId, snapshot: SnapshotId, cut: CutDigest, receipts: Vec<TaskReceipt> },
+    HandoffBlocked { attempt: AttemptId, blockers: Vec<HandoffBlocker> },
+    PlacementDecided { task: TaskId, decision: PlacementDecision },
+    ContinuationRecorded { attempt: AttemptId, from: AttemptId, requested: AllowedFidelity, achieved: Fidelity, package: Option<PackageDigest> },
+}
+
+pub enum DomainError {
+    // M2 and M4 kinds, and:
+    BadPolicy { field: &'static str },
+    UnsupportedSource { reason: &'static str },   // "adoption", "repository_over_facade"
+    FidelityRefused { allowed: AllowedFidelity, offered: Vec<Fidelity> },
+    NotLive { attempt: AttemptId },                // Checkpoint of an attempt that is not granted or running
+    NoteTooLong { bytes: usize },
+}
+
+pub enum Note {
+    Decision { what: String, reason: String },     // reason required, non-empty
+    Question { text: String },
+    Answer { question: WorkRevision, text: String }, // the revision the question was recorded at
+}
+```
+
+Rules the transition functions keep:
+
+- `CreateJob` is `accepted` at commit and `dispatched` when the authority starts the initial placement; `Placed` records the decision and, when a node was chosen, grants the primary task's first attempt there in the same batch (`AttemptGranted`, generation 1, `initial_checkpoint` from a snapshot source). With no chosen node the job is parked: active, primary open, no attempt, the decision recorded; the operation is `succeeded`.
+- `Continue` is refused `UnknownTask` or `TaskClosed` as `StartAttempt` is, and `FidelityRefused` when `fidelity` allows nothing. Its dispatch: a quiescence and a cut of the live attempt (a `Checkpointed` observation, the attempt ends `checkpointed`), then `Placed` with kind `planned_handoff`; when a node is chosen, `AttemptGranted` at the next generation with the cut's snapshot as `initial_checkpoint`; `Continued` once the new attempt's executor reports what it achieved. `HandoffBlocked` ends the dispatch with the operation `failed` and the old attempt still live. The replacement barrier of ADR 0022 applies to the new grant as to any.
+- `Checkpoint` needs a live attempt (`NotLive` otherwise); its dispatch is a quiescence and a cut after which the attempt continues; the operation is `succeeded` at `Checkpointed` and `failed` at `HandoffBlocked`.
+- `CancelJob` and `CancelTask` with a live attempt are `accepted` and `dispatched`; the executor stops the attempt's groups (SIGTERM, the drain budget, SIGKILL) and reports `Exited` with `Cancelled` and the receipts `interrupted`; the job or task is then `cancelled` and the operation `succeeded`. With no live attempt they are `succeeded` at commit as in M2. A cancel never writes an outcome for a provider operation (ADR 0022).
+- `RecordNote` is `succeeded` at commit; a text over `TEXT_MAX_BYTES` is `NoteTooLong`.
+- A parent task cannot `FinishTask` while a registered child of it is `open` (`BadParent` is reused with the child named).
+
+```rust
+// lifecycle.rs (owner A), P03
+
+pub enum TaskClass { Build, Test, Harness, Opaque }
+pub enum OutcomePolicy { CancelAndRestart, Checkpoint, Block }
+impl TaskClass { pub fn outcome_policy(self) -> OutcomePolicy; }
+
+pub struct DrainBudget(u32);
+impl DrainBudget {
+    pub const MIN_MS: u32 = 1_000;
+    pub const DEFAULT_MS: u32 = 30_000;
+    pub const MAX_MS: u32 = 600_000;
+    pub fn new(ms: u32) -> Result<Self, DomainError>;
+}
+
+pub enum ReceiptStatus {
+    Running,
+    Exited,
+    Interrupted,                              // cut by a cancel or a quiescence; never passed, never failed
+    Checkpointed { snapshot: SnapshotId },
+    Blocked { reason: String },
+}
+pub struct TaskReceipt {
+    pub task: TaskId,
+    pub class: TaskClass,
+    pub status: ReceiptStatus,
+    pub exit: Option<i32>,                    // Some only for Exited
+    pub interrupted: bool,                    // true exactly for Interrupted and for a harness Checkpointed mid-turn
+    pub workspace: Option<WorkspaceRevision>,
+}
+
+pub struct WorkspaceRevision {
+    pub bundle_head: SnapshotId,              // the snapshot whose manifest names the bundle chain head
+    pub ledger_head: EventDigest,             // the digest of the job's latest journal event at the cut
+}
+pub struct EventDigest(pub [u8; 32]);
+
+pub enum EvidenceKind { Checkpoint, Exit, Receipt }
+pub struct EvidenceRef { pub digest: [u8; 32], pub attempt: AttemptId, pub kind: EvidenceKind }
+
+pub struct CheckpointCut {
+    pub snapshot: SnapshotId,
+    pub receipts: Vec<TaskReceipt>,
+    pub facts: Vec<(String, String)>,         // the node's facts for the job, as `NodeFacts::iter` gives them
+    pub evidence: Vec<EvidenceRef>,
+}
+pub struct CutDigest(pub [u8; 32]);
+impl CheckpointCut {
+    pub fn canonical_json(&self) -> Vec<u8>;  // keys sorted, counters as decimal strings
+    pub fn digest(&self) -> CutDigest;        // blake3 of "fabric.managed.cut.v1\0" and the canonical JSON
+}
+
+pub enum HandoffBlocker {
+    EscapedChild { pid: u32, group: u32 },
+    UncontrolledWriter { pid: u32, path: RelPath },
+    CheckpointFailed { task: TaskId, reason: String },
+    Opaque { task: TaskId },
+    UnknownEffect { operation: OperationId },  // a provider operation dispatched or unknown (ADR 0022)
+}
+```
+
+```rust
+// package.rs (owner A), P04
+
+pub const PACKAGE_VERSION: u32 = 1;
+pub const PACKAGE_MAX_BYTES: usize = 256 * 1024;
+pub const TEXT_MAX_BYTES: usize = 16 * 1024;
+
+pub struct WorkPackage {
+    pub version: u32,
+    pub job: JobId,
+    pub revision: WorkRevision,
+    pub intent: Intent,
+    pub decisions: Vec<Decision>,
+    pub tasks: Vec<TaskSummary>,
+    pub workspace: WorkspaceRevision,
+    pub evidence: Vec<EvidenceRef>,          // this attempt's accepted evidence, then prior attempts' by digest
+    pub questions: Vec<Question>,            // open questions: each Question with no Answer naming its revision
+    pub artifacts: Vec<ArtifactRef>,
+    pub next_actions: Vec<NextAction>,
+}
+pub struct Decision { pub what: String, pub reason: String, pub revision: WorkRevision }
+pub struct Question { pub text: String, pub revision: WorkRevision }
+pub struct TaskSummary { pub task: TaskId, pub class: TaskClass, pub state: TaskState, pub receipt: Option<TaskReceipt> }
+pub struct ArtifactRef { pub name: String, pub digest: [u8; 32], pub bytes: u64 }
+pub enum NextAction { Continue, Checkpoint, Cancel, FinishTask { task: TaskId }, RegisterTask { parent: TaskId } }
+pub struct PackageDigest(pub [u8; 32]);
+
+pub enum PackageError {
+    TooLarge { bytes: usize },
+    TextTooLong { field: &'static str, bytes: usize },
+    CredentialLike { field: &'static str },  // fabric_core::credential::looks_like_credential on any text
+}
+pub struct PackageInput<'a> {
+    pub state: &'a ManagedState,
+    pub notes: &'a [(WorkRevision, Note)],
+    pub receipts: &'a [TaskReceipt],
+    pub workspace: WorkspaceRevision,
+    pub evidence: &'a [EvidenceRef],
+    pub artifacts: &'a [ArtifactRef],
+}
+pub fn build_package(input: &PackageInput<'_>) -> Result<WorkPackage, PackageError>;
+impl WorkPackage {
+    pub fn canonical_json(&self) -> Vec<u8>;
+    pub fn digest(&self) -> PackageDigest;    // blake3 of "fabric.managed.package.v1\0" and the canonical JSON
+}
+
+pub enum Fidelity { NativeSession, NewNativeSessionWithPackage, WorkspaceOnly, Unsupported }
+pub struct AllowedFidelity {
+    pub native_session: bool,
+    pub new_native_session_with_package: bool,
+    pub workspace_only: bool,                // opt-in
+}
+impl AllowedFidelity {
+    pub const DEFAULT: AllowedFidelity = AllowedFidelity { native_session: true, new_native_session_with_package: true, workspace_only: false };
+    pub fn is_empty(&self) -> bool;
+    /// The highest fidelity both allowed and offered; `Unsupported` is never allowed.
+    pub fn highest(&self, offered: &[Fidelity]) -> Result<Fidelity, FidelityRefusal>;
+}
+pub struct FidelityRefusal { pub allowed: AllowedFidelity, pub offered: Vec<Fidelity> }
+
+/// What a target can offer for a session captured under `source`:
+/// `NativeSession` when the target has the same harness kind, version-compatible under the
+/// known-writer rule, and the same layout; `NewNativeSessionWithPackage` when it has any
+/// harness that launches with a prompt; `WorkspaceOnly` always. Pure; the adapter's own
+/// restore refusals still apply at launch.
+pub fn offered_fidelity(source: &HarnessKind, known_writer: Option<&HarnessVersion>, target: &NodeAdvert, same_layout: bool) -> Vec<Fidelity>;
+```
+
+```rust
+// source.rs and secret_ref.rs (owner A), P05
+
+pub struct GitUri(String);      // 1 to 2048 bytes; scheme https, ssh, git+ssh or file; no userinfo (CredentialInUri); no control character
+pub struct CommitId(String);    // 40 or 64 lowercase hex characters; never a ref name
+pub enum SourceError { BadUri { reason: &'static str }, CredentialInUri, NotACommitId, Adoption, RepositoryOverFacade }
+impl GitUri { pub fn parse(text: &str) -> Result<Self, SourceError>; pub fn as_str(&self) -> &str; }
+impl CommitId { pub fn parse(text: &str) -> Result<Self, SourceError>; pub fn as_str(&self) -> &str; }
+
+pub struct SecretName(String);  // 1 to 64 characters of [A-Z0-9_]
+pub enum AttemptScope { Any, Current }
+pub enum ResourceKind { Node }  // grows with ResourceRef
+pub struct SecretScope { pub attempt: AttemptScope, pub resource_kinds: Vec<ResourceKind> }
+pub struct SecretRef { pub name: SecretName, pub scope: SecretScope }
+pub const SECRET_ENV_PREFIX: &str = "FABRIC_SECRET_";
+
+/// A resolved value. No Serialize, no Clone; Debug and Display print "<redacted>";
+/// the bytes are overwritten with zero on drop (by hand, no new crate).
+pub struct SecretValue(Vec<u8>);
+impl SecretValue { pub fn expose(&self) -> &[u8]; }
+```
+
+```rust
+// placement.rs (owner A: the types; owner B: place.rs with the function), P06
+
+pub const PROBE_BOUND_MS: u32 = 5_000;
+pub const MAX_CANDIDATES: usize = 64;
+pub const DEFAULT_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+pub struct HarnessInventory { pub kind: HarnessKind, pub version: HarnessVersion }
+pub struct PathLayout { pub home: AbsPath, pub root: AbsPath }
+pub struct Capacity { pub load_1m_milli: u32, pub free_disk_bytes: u64 }
+pub struct Warmth { pub bundle_chain: bool, pub workspace: bool }
+pub struct NodeAdvert {
+    pub node: NodeId,
+    pub platform: Platform,
+    pub harnesses: Vec<HarnessInventory>,
+    pub layout: PathLayout,
+    pub capacity: Capacity,
+    pub warmth: Warmth,
+    pub measured_at_ms: u64,
+}
+
+pub enum PlacementKind { Initial, PlannedHandoff, Failover }
+pub struct CurrentPlacement { pub node: NodeId, pub healthy: bool }
+pub struct Probe {
+    pub node: NodeId,
+    pub advert: Option<NodeAdvert>,          // None: no answer within PROBE_BOUND_MS
+    pub secrets_unresolved: Vec<SecretName>, // from the node's own resolver, asked in the same probe
+    pub probe_ms: u32,
+}
+pub struct PlacementInput<'a> {
+    pub job: &'a ManagedJob,
+    pub task: TaskId,
+    pub kind: PlacementKind,
+    pub required_layout: Option<PathLayout>, // the captured root and home when native_session is allowed
+    pub current: Option<CurrentPlacement>,
+    pub candidates: Vec<Probe>,              // at most MAX_CANDIDATES
+    pub now_ms: u64,
+}
+pub enum Exclusion {
+    NoAnswer { within_ms: u32 },
+    Stale { age_ms: u64 },                   // measured_at_ms older than now_ms minus PROBE_BOUND_MS; fabricd stamps measured_at_ms with its own clock when the answer arrives and decides no later than the round's bound, so neither a silent peer nor a peer's clock makes an answer stale
+    Platform { need: Platform, have: Platform },
+    HarnessMissing { kind: HarnessKind },
+    HarnessVersion { kind: HarnessKind, need: HarnessVersion, have: HarnessVersion },
+    Layout { need: PathLayout, have: PathLayout },
+    Secret { name: SecretName },
+    Disk { need: u64, free: u64 },
+    Pin { pinned: NodeId },
+}
+pub enum RankReason { CurrentHealthy, BundleChain, Workspace, Load { milli: u32 }, Identity }
+pub enum Verdict { Eligible { rank: Vec<RankReason> }, Excluded { reasons: Vec<Exclusion> } }
+pub struct Candidate { pub node: NodeId, pub verdict: Verdict }
+pub struct PlacementDecision {
+    pub kind: PlacementKind,
+    pub decided_at_ms: u64,
+    pub candidates: Vec<Candidate>,          // every probe, in rank order then exclusions, each with every reason
+    pub chosen: Option<NodeId>,
+}
+
+// place.rs (owner B)
+/// Deterministic: the same input gives the same decision. Filters first, every
+/// exclusion of a node listed; then ranks the eligible set by CurrentHealthy,
+/// BundleChain, Workspace, lowest Load, then Identity.
+pub fn place(input: &PlacementInput<'_>) -> PlacementDecision;
+```
+
+```rust
+// facade.rs (owner A: token types and the check; owner B: everything on the wire), P07
+
+pub struct TokenId([u8; 16]);               // a ULID; the revocation id
+pub struct TokenDigest([u8; 32]);
+pub struct Actor(String);                   // 1 to 64 characters of [A-Za-z0-9._-]
+pub enum JobScope { AnyOwned, Jobs(Vec<JobId>) }
+pub enum ResourceScope { Any, Nodes(Vec<NodeId>) }
+pub struct FacadeTokenRecord {
+    pub id: TokenId,
+    pub digest: TokenDigest,
+    pub actor: Actor,
+    pub jobs: JobScope,
+    pub resources: ResourceScope,
+    pub minted_ms: u64,
+    pub expires_ms: u64,
+    pub revoked_ms: Option<u64>,
+}
+pub const BEARER_BYTES: usize = 32;
+pub fn token_digest(bearer: &[u8; BEARER_BYTES]) -> TokenDigest;  // blake3 of "fabric.facade.token.v1\0" and the bearer
+pub enum TokenCheck { Ok, Unknown, Revoked, Expired, OutOfScope { what: ScopeKind } }
+pub enum ScopeKind { Job, Resource }
+/// In this order: unknown, revoked, expired, job scope, resource scope.
+pub fn check_token(record: Option<&FacadeTokenRecord>, now_ms: u64, job: Option<JobId>, resource: Option<NodeId>) -> TokenCheck;
+
+pub const WATCH_WINDOW: usize = 256;
+pub const WATCH_MAX_WAIT_MS: u32 = 25_000;
+pub const WATCH_DEFAULT_WAIT_MS: u32 = 10_000;
+```
+
+### Journal (owner A, `fabric-journal`)
+
+```rust
+impl Journal {
+    // M2 to M4, unchanged, and:
+    pub fn notes(&self, job: JobId) -> Result<Vec<(WorkRevision, Note)>, CommitError>;
+    pub fn placements(&self, job: JobId) -> Result<Vec<(EventSeq, PlacementDecision)>, CommitError>;
+    pub fn continuations(&self, job: JobId) -> Result<Vec<(AttemptId, AttemptId, Fidelity, Option<PackageDigest>)>, CommitError>;
+    pub fn receipts(&self, attempt: AttemptId) -> Result<Vec<TaskReceipt>, CommitError>;
+}
+// src/facade.rs (owner B), rows of facade_tokens
+impl Journal {
+    pub fn token_mint(&mut self, record: &FacadeTokenRecord) -> Result<(), CommitError>;  // refuses a known id or digest
+    pub fn token_by_digest(&self, digest: &TokenDigest) -> Result<Option<FacadeTokenRecord>, CommitError>;
+    pub fn token_revoke(&mut self, id: TokenId, at_ms: u64) -> Result<bool, CommitError>;  // false when unknown or already revoked
+}
+```
+
+`Journal::events(job, after, limit)` is the watch's cursor read; `limit` is at most `WATCH_WINDOW`.
+
+### fabricd (owner A: executor, secrets, sources; owner B: placement, facade)
+
+```rust
+// executor.rs (owner A)
+pub struct Executor { /* the attempts this node runs, their groups and registered children */ }
+pub struct Spawned { pub pid: u32, pub group: u32, pub task: TaskId }
+pub enum ExecutorError { Spawn(std::io::Error), NotRunning { attempt: AttemptId }, Frozen { attempt: AttemptId }, Secret(SecretError), Source(SourceError) }
+pub struct Quiescence { pub receipts: Vec<TaskReceipt>, pub blockers: Vec<HandoffBlocker> }
+impl Executor {
+    /// Spawns `command` for `task` in a group of its own, with the job's secrets in its
+    /// environment under their names, and registers it. Refused while the attempt is frozen.
+    pub fn spawn(&self, attempt: AttemptId, task: TaskId, class: TaskClass, command: std::process::Command) -> Result<Spawned, ExecutorError>;
+    /// Freezes spawning for the attempt, settles leaves before parents under each task's
+    /// policy within `budget`, and reports receipts and blockers. Never kills a harness task:
+    /// it goes through the suspend path and comes back Checkpointed or CheckpointFailed.
+    /// (As built: `quiesce(attempt, budget, then: AfterCut)`; under `End` the harness is
+    /// stopped before its capture, see "As built (owner B)".)
+    pub async fn quiesce(&self, attempt: AttemptId, budget: DrainBudget) -> Result<Quiescence, ExecutorError>;
+    /// Stops every group of the attempt: SIGTERM, `budget`, SIGKILL; every receipt Interrupted.
+    pub async fn stop(&self, attempt: AttemptId, budget: DrainBudget) -> Result<Vec<TaskReceipt>, ExecutorError>;
+    /// Processes in the attempt's groups that no registered task owns, and writers under the
+    /// root outside every group (lsof, where the facts found it).
+    pub fn blockers(&self, attempt: AttemptId, root: &AbsPath) -> Vec<HandoffBlocker>;
+    /// The cut: the capture through the existing path, then the document and its digest.
+    pub async fn cut(&self, attempt: AttemptId, quiescence: &Quiescence) -> Result<CheckpointCut, ExecutorError>;
+}
+
+// secrets.rs (owner A)
+pub struct LocalResolver { /* the daemon's environment and <config>/secrets */ }
+pub enum SecretError { Missing { name: SecretName }, FileMode { name: SecretName, mode: u32 }, FileOwner { name: SecretName }, NotUtf8 { name: SecretName }, OutOfScope { name: SecretName } }
+impl LocalResolver {
+    pub fn open(config_dir: &Path) -> LocalResolver;
+    /// Which refs this node cannot resolve right now; read anew every call, cached never.
+    pub fn unresolved(&self, refs: &[SecretRef]) -> Vec<SecretName>;
+    pub fn resolve(&self, job: JobId, attempt: AttemptId, secret: &SecretRef) -> Result<SecretValue, SecretError>;
+}
+
+// sources.rs (owner A)
+pub enum Prepared { Cloned { root: AbsPath, commit: CommitId }, Restored { root: AbsPath, snapshot: SnapshotId }, Empty { root: AbsPath } }
+pub async fn prepare(node: &Node, job: JobId, source: &SourceBinding) -> Result<Prepared, SourceError>;
+/// Captures `directory` into a snapshot through the existing capture path without touching it.
+pub async fn import(node: &Node, directory: &AbsPath, allowlist: &[RelPath]) -> Result<SnapshotId, SourceError>;
+
+// placement.rs (owner B)
+pub struct Placer { /* the peer book, the endpoint, this node's own advert */ }
+impl Placer {
+    /// This node's advert for `job`, measured now.
+    pub fn own_advert(&self, job: &ManagedJob, root: &AbsPath) -> NodeAdvert;
+    /// Asks every peer with `Advertise` within PROBE_BOUND_MS, in parallel, and runs `place`.
+    pub async fn place(&self, input_without_candidates: PlacementInput<'_>, secrets: &[SecretRef]) -> PlacementDecision;
+}
+
+// facade.rs (owner B)
+pub struct Facade { /* the authority handle, the journal's token rows, one bounded broadcast of WATCH_WINDOW events per watched job */ }
+impl Facade {
+    /// Checks version, token and scope in that order, then serves one message; never blocks the authority's writer.
+    pub async fn serve(&self, message: FacadeRequest, now_ms: u64) -> FacadeResponse;
+    pub fn mint(&self, actor: Actor, jobs: JobScope, resources: ResourceScope, expires_ms: u64, now_ms: u64) -> Result<(TokenId, [u8; BEARER_BYTES]), NodeError>;
+    pub fn revoke(&self, id: TokenId, now_ms: u64) -> Result<bool, NodeError>;  // ends open watches of the token
+}
+```
+
+### fabric-net (owner B), protocol 4, additive
+
+```rust
+pub enum RequestBody {
+    // existing, and:
+    /// Asks the peer for its advert for a job; answered with `Advert`.
+    Advertise { job: JobId, harness: HarnessKind, root: AbsPath, snapshot: Option<SnapshotId>, secrets: Vec<SecretName> },
+    /// One facade message, JSON, at most MAX_REQUEST bytes; answered with `Facade`.
+    Facade(FacadeBytes),
+}
+pub enum ResponseBody {
+    // existing, and:
+    Advert(AdvertWire),   // NodeAdvert plus `secrets_unresolved: Vec<SecretName>`
+    Facade(FacadeBytes),  // at most MAX_FRAME bytes
+}
+pub struct FacadeBytes(Vec<u8>);
+```
+
+A facade request runs under the per-peer caps of ADR 0013 like a per-job request; a watch holds one of them for at most `WATCH_MAX_WAIT_MS`.
+
+### Client API (owner B), api 1, additive
+
+| Op | Request fields | Reply |
+| --- | --- | --- |
+| `managed_create` | M2 fields, and optional `source` (`repository`, `snapshot`, `git`, `empty`, or `directory { path }`, which the node imports first), `acceptance`, `policy` (the `JobPolicy` fields, each optional) | `ManagedOperation`, whose job carries the placement decision |
+| `managed_cancel` | M2 fields, and optional `task` | `ManagedOperation` |
+| `managed_note` | `operation_key`, `job`, optional `expected_revision`, `note` | `ManagedOperation` |
+| `managed_checkpoint` | `operation_key`, `job`, optional `expected_revision` | `ManagedOperation` |
+| `managed_continue` | `operation_key`, `job`, optional `expected_revision`, optional `fidelity`, optional `pin` | `ManagedOperation` |
+| `managed_inspect` | `job` | `Inspection`: the `ManagedJob` of M2 with each task's `class` and last receipt, `placements`, `continuations`, `provider_operations`, `blockers`, `residuals`, `notes`, `parked: bool`; the read writes nothing and sends nothing to a worker (ADR 0022, selection 6) |
+| `managed_import` | `path`, optional `export_allowlist` | `{ snapshot }` |
+| `facade_mint` | `actor`, `jobs`, `resources`, `expires_ms` | `{ token_id, bearer }`; the bearer is shown once and never stored |
+| `facade_revoke` | `token_id` | `{ revoked }` |
+| `facade_call` | `authority` (a node id; this node's own is allowed), `message` (one facade request as docs/facade-protocol.md defines it) | `{ message }`: the authority's answer, unchanged |
+
+The same `Inspection` object is the body of the facade's `inspection`. Every counter travels as a canonical decimal string. CLI: `fabric managed create` gains `--git <uri> --commit <id>`, `--snapshot <id>`, `--empty`, `--import <dir>`, `--acceptance <text>` (repeatable), `--drain-budget <ms>`, `--allow-fidelity <name>` (repeatable), `--secret <NAME>` (repeatable), `--export <path>` (repeatable), `--pin <node>`; `fabric managed cancel [--task <id>]`, `note`, `checkpoint`, `continue`, `inspect`; `fabric facade mint|revoke|submit|inspect|watch|cancel|checkpoint|continue --authority <node>`.
+
+### M5 acceptance mapped to tests
+
+Each test is written first and fails on the M4 code. Names are what the implementation uses; a name below that the code changes is recorded under "As built (M5)".
+
+| Acceptance | Tests |
+| --- | --- |
+| Submit without choosing a machine | `fabricd` `placement::tests::{two_eligible_nodes_rank_the_same_every_time, no_eligible_node_parks_the_submit_with_every_exclusion, a_pin_to_an_ineligible_node_parks_naming_the_pin, a_silent_or_stale_node_is_excluded_for_this_placement_only, a_healthy_current_placement_is_never_moved_for_a_warmer_node, an_unresolvable_secret_excludes_before_launch, warmth_never_admits_an_incompatible_node}`; `fabric-core` `managed_place.rs` property test (`place` is a pure function of its input); e2e `managed::e2e_a_submit_runs_on_the_eligible_node_without_naming_it` (two daemons on this host, separate state roots, the submit on one, the attempt on the other, the decision in `inspect`) |
+| The same job observed after a reconnect | `fabricd` `facade::tests::{a_token_out_of_scope_is_refused_before_the_authority_is_asked, an_unknown_expired_or_revoked_token_is_refused_in_that_order, a_revoked_token_ends_an_open_watch_within_one_delivery, a_duplicate_key_reconciles_one_operation, the_same_key_with_another_request_is_a_conflict, a_lagged_reader_gets_a_resume_cursor_and_the_authority_holds_no_more_than_the_window, a_disconnect_leaves_the_operation_running, a_cancel_is_a_command_with_its_own_outcome, an_authority_restart_keeps_the_cursor}`; `fabric-client` `facade_fixtures.rs` and the TypeScript `facade_fixtures.test.ts` (the pins, this contract step), later each side's parser against every case; e2e `facade::e2e_the_same_job_is_observed_after_a_reconnect_from_another_node` (watch, kill the client, resume from the cursor, every event once); the TypeScript `facade.test.ts` against the node built in the same run; `e2e_a_socket_only_op_on_a_managed_job_is_refused_as_managed_job` |
+| A planned handoff with child-task outcomes and the fidelity achieved | `fabricd` `executor::tests::{an_interrupted_test_is_recorded_interrupted_never_passed, an_interrupted_build_is_restarted_not_resumed, a_harness_task_is_checkpointed_by_the_suspend_path, a_failed_harness_checkpoint_blocks_the_handoff, an_opaque_task_blocks, an_escaped_child_blocks_a_strong_handoff_and_fails_nothing, an_uncontrolled_writer_blocks, a_parent_waits_for_its_leaves, the_drain_budget_bounds_quiescence_not_the_task, a_client_killed_at_each_launch_boundary_leaves_no_task_running}` (crash points `managed_launch.before_record`, `managed_launch.after_record`); `fabric-core` `managed_package.rs::{a_package_over_a_limit_is_refused_naming_the_field, planted_credentials_and_approvals_never_enter_a_package, evidence_is_by_digest_only, a_refusal_is_never_lowered, the_highest_allowed_and_offered_fidelity_wins}`; e2e `continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved` (a Claude Code job with a registered test task, continued under the fake ACP agent with the package: different native session ids, the same intent, decisions, evidence refs and open tasks, the test recorded `interrupted`, `achieved: new_native_session_with_package`), `e2e_a_native_session_continues_on_a_node_with_the_same_layout` (`achieved: native_session`) |
+| Source bindings and secrets | `fabricd` `sources::tests::{a_git_source_is_cloned_at_its_exact_revision, an_import_leaves_the_directory_untouched, an_empty_source_is_empty, adoption_is_refused_with_its_reason, a_credential_in_a_uri_is_refused, a_secret_path_leaves_only_when_the_allowlist_names_it}`; `secrets::tests::{env_then_file_then_missing, a_file_not_0600_or_not_owned_is_refused, a_value_reaches_the_task_environment_and_nothing_else, eligibility_is_read_anew_every_call}`; e2e `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log` |
+| Codec and schema | `fabric-core` `managed_frame.rs::a_format_1_frame_decodes_and_widens_to_the_m2_defaults`; `fabric-journal` `tests/fixtures.rs` opens `v1`, `v2` and the new `v3.sqlite`, migrates `v2 -> 3` and verifies; `crash_tests` at the new fault points (`placement.after_commit`, `continue.after_cut`) |
+| The read surface for provider operations (carried from M4) | as the row under "Carried to M5": the node test over a seeded journal, the TypeScript test of `managedInspect`, the CLI test of `fabric managed inspect` |
+| Counters, not time | the facade: one journal read per `inspect` and `watch`, one commit per command; a placement: one probe round per decision; the executor: no fsync beyond the capture's own; `tests/off_runtime.rs` unchanged. Time is the Perf step's alone |
+
+### As built (M5): the review fixes
+
+Made after the M5 review of 2026-11-08; each fix has a regression test that failed on the code before it. The selections below stand as selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe.
+
+- Placement: every advert is stamped with the authority's own clock when its answer arrives, all asks of a round start together, and the decision's time is never later than the round's bound, so a silent peer makes no answer stale and a peer's clock does not matter (`placement::tests::{a_silent_peer_does_not_make_the_answering_nodes_stale, a_peer_with_a_skewed_clock_is_not_stale}`). The rank keys on the node the probe reached, never on the id the advert claims.
+- Facade scope, deny by default (selected): a token limited to listed jobs may not `submit`, and a token limited to listed nodes may not `submit` or `continue` without a pin to one of them (`check_token` takes `JobAsk` and `ResourceAsk`; fixtures `submit_job_list_token`, `submit_unpinned_with_node_list`, `continue_unpinned_with_node_list`).
+- Facade `continue`: a named fidelity list is cut to the job's `allowed_fidelity` (selected: only the owner widens it, on the socket); nothing left is `refused`/`fidelity`. A facade `submit` whose ACP arguments hold a secret is `refused`/`credential_like`, and the domain's credential guard covers the ACP arguments on every path.
+- Keys: facade keys are `facade:<actor>:<key>` and the owner's socket refuses that prefix. `checkpoint` and `continue` are deduplicated by the caller's request through `Authority::submit_derived` and the `request_keys` table, so a retry after the job moved replays.
+- The authority's commit counter moves only for calls that write (`with_journal` reads, `write_journal` writes), so an idle watch costs no authority work; a watch also wakes at its token's expiry. `Journal::receipts(job, attempt)` searches `events_by_job` for the one job.
+- Domain: the state keeps every cut (`ManagedState.cuts`) and a continue starts from the newest cut of its task; a `Checkpointed` observation settles only the checkpoint command that names its attempt, and an attempt that ends first fails that command; a cut must hold a receipt for every open task of its attempt (`MissingReceipt`); `new_native_session_with_package` needs a package (`MissingPackage`); an accepted, not yet dispatched checkpoint or continue counts as in flight.
+- Executor: no `FABRIC_SECRET_*` variable reaches a task but the declared ones under their bare names; each attempt has its own lock, so one attempt's drain does not stall another; `resume` lifts a quiescence's freeze after a checkpoint command's cut; a spawn that fails after its process exists kills the group before it returns.
+- The TypeScript free-text rule refuses a carriage return, as the Rust parser does (fixture `submit_text_carriage_return`).
+
+### As built (M5): the initial placement's dispatch and what the acceptance runs prove
+
+Added in the acceptance step, after both owners merged. The selections stand as selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe.
+
+- `fabricd::dispatch` places every accepted `CreateJob` whose source is `snapshot`, `git` or `empty` (an imported directory is a snapshot by then): `Node::place_job` with `PlacementKind::Initial`, then the `Placed` observation, which records the decision and grants the primary task's first attempt on the chosen node in one batch, or parks the job. The list is `Authority::pending()`, read anew after every commit the authority counts, so a create accepted before a crash is placed after the restart, once. A create with a `repository` source is the M2 form and is still settled by its explicit `StartAttempt`; the loop leaves it alone, so the M2 tests and journals see no new event. The loop waits on `Authority::started()` and never starts the authority's thread itself, so a node with no managed job still starts none. A placement whose observation is refused is logged and not tried again in that process. Fault point `before_placement` (after the create's commit, before any decision) is the crash test's.
+- A harness version is advertised as the version in the harness's `--version` output (`codex-cli 0.155.1` is `0.155.1`); before this, every real Codex and Claude Code was advertised in a form the asking node could not parse and every node was excluded `harness_missing`.
+- Not built: the launch of a granted attempt, on this node or another. fabric-net protocol 4 carries `Advertise` and the facade, and no message that asks the chosen node to run a grant or carries its observations (`Started`, `Exited`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`) back to the authority; the node has no `Capturer` but the tests' fake; `RegisterTask` names no program for a build or test task, so the executor has nothing to spawn for one; and no work package is built or carried. So a `Continue` stays `accepted` and the M5 rows "A planned handoff with child-task outcomes and the fidelity achieved" and the e2e tests the table names for it (`continuity::*`, `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log`, and the attempt half of `e2e_a_submit_runs_on_the_eligible_node_without_naming_it`) are not run end to end. The question this needs is in docs/evidence/m5/README.md, "Blocked". Answered 2026-11-08 by the selection "M5 launch path" (option (a), under the delegation): the contract is "Launch path (M5, as built)" below.
+
+The acceptance tests that ran through real daemons (two `fabricd` on one host, separate state roots, a TCP and TLS node link):
+
+| Acceptance | Test |
+| --- | --- |
+| Submit without choosing a machine: two eligible nodes, the decision recorded, the grant on the first ranked | `placement::e2e_a_submit_names_no_machine_and_the_decision_is_recorded` |
+| A secret only one node resolves; no eligible node parks the submit; a pin | the same test |
+| A create accepted before a crash is placed once after the restart | `placement::e2e_a_create_accepted_before_a_crash_is_placed_once_after_the_restart` |
+| The same job observed after a client reconnect, from another node | `facade::e2e_the_same_job_is_observed_after_a_reconnect_from_another_node` |
+| The watch cursor across an authority restart | `facade::e2e_a_watch_cursor_holds_across_an_authority_restart` |
+
+### As built (M5): P03 to P05
+
+Owner A's parts landed in two commits, the model (`fabric-core`, format byte 2, schema version 3) and the node modules (`fabricd` executor, secrets, sources). The code is the authority on signatures; this note lists where it differs from the contract above and why. The selections stand as selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe.
+
+Model and transition rules (owner A, shared):
+
+- `ManagedEvent::CommandAccepted` carries `effect: bool`: whether an executor is asked for an effect after the commit. `apply_batch` reads the operation's first status from it, not from the kind, so a format 1 history (where only a grant had an effect) and an M5 history (where a cancel has one only while an attempt is live) replay to the status the journal stored. `CommandKind::has_effect` says whether a kind may have one.
+- An accepted M5 effect is kept in the history: `ManagedEvent::EffectRequested { operation, request: EffectRequest }` follows `CommandAccepted` for a `CancelJob` or `CancelTask` with a live attempt, a `Checkpoint` and a `Continue`. `ManagedState.requests` holds them (the journal reads them from the events, no projection), so a restart dispatches an accepted command with what it was asked with, and the observations that settle a cancel or a continue read the reason and the requested fidelity from state. `ManagedState::request`, `in_flight(kind)` and `parked()` are the reads.
+- `DomainError::BadPolicy` and `UnsupportedSource` carry a `String`, not a `&'static str`, so a stored refusal decodes. `CredentialLike { field }` and `EffectInFlight { operation }` are added: a goal, an acceptance text or a note that looks like a credential (`fabric_core::credential::looks_like_credential`) is refused before the journal records it, and a second `Checkpoint` or `Continue` while one is dispatched waits. An acceptance text over `TEXT_MAX_BYTES` is `BadPolicy { field: "acceptance" }`; a decision with an empty reason is `BadPolicy { field: "note.reason" }`. An answer's `question` revision is recorded, not checked against the notes.
+- The initial placement: `Placed` on an `accepted` create marks it `dispatched` in the same batch as the decision and the grant, so a crash after that commit recovers it as `unknown` with the attempt `granted`, never placed or launched again (`crash_tests::a_placement_killed_after_its_commit_never_places_or_launches_again`). With no chosen node the operation is `succeeded` and the job parked, for a create and for a continue alike. The attempt a placement grants takes an id derived from the operation and the generation (`blake3` under `fabric.managed.attempt.v1`), because an observation carries no fresh id. An explicit `StartAttempt` on a job whose create still awaits its placement settles the create (`dispatched`, then `succeeded`): the grant stood in for the placement, and a v1 history, where every create was complete at its commit, replays unchanged.
+- The planned handoff: the authority marks the `Continue` `dispatched` before the quiescence, so the cut is an effect under a recorded dispatch; the `Checkpointed` observation ends the attempt (`crash_tests::a_continue_killed_after_its_cut_is_retried_from_the_cut` shows the owner's retry placing from the cut); `Placed` with kind `planned_handoff` grants at the next generation with the task's last checkpoint as `initial_checkpoint`; `Started` never settles a continue's grant, `Continued` does, and a `Continued` whose `achieved` the continue did not allow is `FidelityRefused`, never recorded lower. A `Continue` of a task with no live attempt skips the cut and places from the last checkpoint.
+- `Checkpointed` while a `Checkpoint` command is dispatched records `CheckpointCutRecorded` and the attempt goes on; otherwise (a continue in flight, or an M2-style suspend) the attempt ends `checkpointed` and the cut is recorded beside it. `HandoffBlocked` records the blockers and fails the dispatched checkpoint or continue; the attempt stays live.
+- `Exited` with `Cancelled` while a `CancelJob` is dispatched appends `JobCancelled` with the request's reason and marks the cancel `succeeded`; while a `CancelTask` of that task is dispatched it appends `TaskFinished { Cancelled }`. `CancelTask` and `FinishTask` of a task with an open registered child are `BadParent` naming the child.
+- `lifecycle.rs` reuses `ids::EventDigest` for `WorkspaceRevision.ledger_head` instead of a second type. `SecretScope::node_any()` is a function (a `Vec` cannot sit in a `const`). `SourceError` gained `BadSecretName` and `Unavailable { reason }`. `canon.rs` is the private canonical JSON writer the cut and the package share.
+
+Journal (owner A):
+
+- Version 3 is applied with foreign keys off, as `SQLite`'s table rebuild needs, and `open` runs `foreign_key_check` after the commit and refuses the file on any dangling reference. `facade_tokens` is in the version 3 DDL for owner B's `src/facade.rs`.
+- `Recovery.to_effect` lists every M5 command still `accepted` (a create awaiting placement among them); `Authority::pending()` answers the same list from the journal at any time.
+- `receipts(attempt)` is the last receipts a cut or a report recorded for the attempt. `verify` checks that `placements` and `continuations` hold one row per event of their kind.
+- The v1 fixture's old keys answer a repeat with `OperationConflict`, as the codec section says; `the_v1_fixture_holds_what_it_was_made_with` pins it.
+
+fabricd (owner A):
+
+- `Executor::new(records, resolver, capturer)` with `begin(attempt, job, root, secrets)` and `end(attempt)`; `spawn` is `async` and takes a `std::process::Command`; `blockers` is `async`. The capture side is the `Capturer` trait (the harness checkpoint through the suspend path, the workspace capture, the node's facts), which the node implements in its own files and the tests fake. Leaves before parents is the newest spawned task first: a child is spawned after its parent, and the executor keeps no parent map. The launch boundaries `managed_launch.before_record` and `after_record` are the two states of the durable launch record (an intent with no pid; a pid and start time), both cleared by `Executor::recover`, which stops a recorded group only when its pid still starts when the record says; the test exercises both by record state rather than by stopping a process. `Counters` are spawns, signals and captures.
+- `LocalResolver::resolve(job, attempt, ref)` checks the ref's resource scope; the attempt scope (`Current`) is the executor's check: `Executor::begin` takes the attempt's generation, the executor keeps each job's current generation (the newest attempt begun on the node, or what `Executor::supersede` reports), and a superseded attempt's tasks get no `Current` secret. A file value's trailing newline is dropped.
+- `sources::prepare_in(root, source, store)` and `import_from(store, node, dir, allowlist)` are the blocking cores; `prepare(node, job, source)` and `import(node, dir, allowlist)` wrap them with the node's home and store. The root of a managed attempt on a node is `paths::job_root(home, job)`. `Repository { path }` prepares as `SourceError::Adoption`: the M2 form is accepted by the authority on the local socket and never adopted by an executor. The clone runs `git` with no credential helper, no askpass and no prompt. `fabric-store`'s `IgnorePolicy::allow_export(path)` is the export allowlist: a named path, or one under it, is not denied by a secret pattern and gets a negation line in the excludes file.
+
+### As built (M5): P06 and P07
+
+Owner B's parts landed in five commits: the client API and the facade parsers (`fabric-client`, the TypeScript SDK), the node link's two messages (`fabric-net`), the pure placement function (`fabric-core`), the token rows (`fabric-journal`), and the node modules with the CLI (`fabricd` facade, placement and the M5 client ops; `fabric managed` and `fabric facade`). The code is the authority on signatures; this note lists where it differs from the contract above and why. The selections stand as selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe.
+
+Client API (owner B):
+
+- `managed_create` keeps its required `repo`: `protocol/required.txt` pins it under api 1, and making it optional is a change `scripts/check-fixtures.sh` refuses without a bump. A source that is not a repository on the node (`git`, `snapshot`, `empty`, `directory`) travels in a new op, `managed_submit`, whose body is the facade's `submit` (`goal`, `harness`, `acceptance`, `source`, `policy`). `managed_create` gains `acceptance` and `policy`, `managed_cancel` gains `task`, and a task of `ManagedJob` gains `class` and `receipt`, all optional on the wire.
+- `managed_inspect` and the facade's `inspection` are one object (`fabric_client::api::Inspection`): the job with each task's class and last receipt (the CLI prints the receipt under its task: status, exit code, cut, snapshot and reason), `parked`, `placements`, `continuations`, `notes`, `provider_operations`, `blockers` and `residuals`. A rank reason and an exclusion reason are kept by a client as they came (a name, or an object keyed by the reason's name), so a reason a newer node sends still shows; their forms are in docs/facade-protocol.md, "Placements in an inspection".
+- The nine new ops are `managed_note`, `managed_checkpoint`, `managed_continue`, `managed_inspect`, `managed_submit`, `managed_import`, `facade_mint`, `facade_revoke` and `facade_call`; `facade_call` carries the facade message and its answer as JSON values the node never rewrites.
+
+Placement (owner B, P06):
+
+- `place` is a pure function of its input, with a property test over the order of the probes (`crates/fabric-core/tests/managed_place.rs`). The eligible set is ordered by one total key, the current healthy placement, the bundle chain, the workspace, the lowest 1-minute load, the node identity; the excluded set keeps the order it was probed in. A node probed twice counts once.
+- The known-writer version check is not a placement filter: `PlacementInput` carries no writer, and the fidelity a target can offer is decided at the continuation (`offered_fidelity`). `Exclusion::HarnessVersion` is defined and `place` never emits it. A harness is matched by adapter, and for an ACP agent by program; an agent found on the target's `PATH` is advertised at the placeholder version `0.0.0`.
+- `fabricd::placement` is functions on `Node`, not a `Placer` struct: `own_advert` measures now, `probe_candidates` asks every paired peer in parallel within `PROBE_BOUND`, and `place_job(&ManagedJob, &PlacementAsk)` decides. The secrets a node cannot resolve are asked of the executor's own `LocalResolver`, so the exclusion and the launch agree. The load is read from `/proc/loadavg` or `sysctl -n vm.loadavg`; a node whose load cannot be read ranks last. The authority's dispatch of a create's and a continue's placement through `place_job` is owner A's wiring and had not landed when this was written.
+- On the wire (`fabric-net`), `Advertise` carries the job, its harness, its root on the asking node, the snapshot for warmth and the secret names; `Advert` carries the advert in bounded forms (`AdvertWire`) plus `secrets_unresolved`, and versions travel as text the asking node parses.
+
+Facade (owner B, P07):
+
+- The parsers are shared by the two clients: `fabric_client::facade` and `sdk/typescript/src/facade.ts`, each tested against every case of `protocol/facade/v1` on both directions. A message that is not JSON is `bad_request`/`bad_string`.
+- A command's key is stored under the token's actor as `facade:<actor>:<key>`; a pair longer than an operation key carries the key's digest instead (`facade:<actor>:h:<16 bytes of blake3, hex>`). Both forms are deterministic, so a repeat lands on the same row and two actors never share one. The owner's socket refuses a key that starts with `facade:`, so the owner's keys and an actor's never share a row. A `checkpoint` or `continue`, whose body the authority derives from the job's state (the live attempt, the task), is deduplicated by the client's request instead of the derived body: `Authority::submit_derived` keeps the request's digest in the journal's `request_keys` table (schema version 3) and answers the same request under the same key with the stored answer, however the job moved since; the owner's socket ops `managed_checkpoint` and `managed_continue` go the same way.
+- The watch keeps no per-job broadcast buffer. The journal is the queue: a watch reads up to the window plus one after its cursor, answers at most the window with `lagged` when more was behind, and with nothing after the cursor waits on the authority's commit counter (one tick per call that changed the journal) and reads again when it moves, until its wait is over. A revoke moves the counter, so an open watch under a revoked token re-checks and closes `revoked` within one delivery; a read moves nothing (`Authority::with_journal` reads, `write_journal` writes), and a token that expires during the wait closes the watch at its expiry. With nothing after the cursor on a finished or cancelled job the answer closes `finished`. `next` is `null` only when the job has no event after a `null` cursor.
+- `checkpoint` on a job with no attempt at all is refused `not_live` without a stored key; with an attempt that is not live the domain refuses it under the key. `continue` names the live attempt's task, or the primary task when none is live.
+- The bearer is 32 bytes read from `/dev/urandom`, shown once. A mint before any managed job makes the journal, as a first create does. `facade_revoke` on a node without a journal answers `revoked: false`.
+- The authority gained two small additions for this part, in owner A's `authority.rs`: `with_journal`, which runs a closure in the authority's thread (the token rows, the inspect read, the watch read), and a `watch::Receiver<u64>` commit counter. `fabric-journal` gained `provider_operations(job)` beside `residuals`, for the inspection.
+
+### Launch path (M5, as built)
+
+Status: contract written 2026-11-08, before the code, under the selection "M5 launch path, selected 2026-11-08" of the decisions file (option (a): M5 adds the launch path). The selection was made by the implementation agent under Efe's delegation of 2026-11-02 and is not approved by Efe. The shared types below are in `crates/fabric-core/src/managed/launch.rs` and the amended `model.rs` since this contract's commit; the fabric-net messages, the authority side and the node side follow, each owner appending an "as built" paragraph here where the code differs. The gap this closes is docs/evidence/m5/README.md, "Blocked": M5 placed and granted attempts and never launched one.
+
+Failure modes first:
+
+1. **A node acts on a grant only while it is the job's live grant.** Every message from a node carries a `GrantToken { job, attempt, generation }`. A `Report` whose generation is not the job's is refused `StaleGeneration { current }`, recorded as `StaleObservationRefused` (replay rule 7) and never applied; a heartbeat for it is answered `Stale`, and the node stops the attempt's groups. This is M6's fence shape: M6 widens `GrantVerdict` and adds `Captured` to the observations a report may carry, and changes nothing else here.
+2. **A launch is idempotent by attempt.** The node answers a second `Launch` of an attempt it runs `AlreadyLaunched`; so an authority that restarts after it sent one sends it again, and nothing is launched twice. The authority keeps no "launch sent" event: the grant is the durable fact, the node's record is the other half.
+3. **An answer says the node took the message, never what came of it.** `Launch` and `Instruct` are answered at once (`Accepted` or `Refused { reason }`) inside the link's reply window; a clone, a pull or a drain budget takes longer than that window. Every outcome (`Started`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`, `Exited`) is a `Report`, in order, one at a time per attempt.
+4. **A refusal is never lowered.** A target that can offer no allowed fidelity starts nothing: it reports the harness receipt `Blocked { reason }` and `Exited { Failed }`; the continue fails and the task stays open. Nothing starts at `workspace_only` because `native_session` was asked.
+5. **A report that cannot reach the authority is kept, in order, and retried after the node's next heartbeat answer.** The attempt runs on; disconnect is not cancel (facade failure mode 5). A node restart loses the queue: `Executor::recover` stops what the launch records name, and the attempt's fate is M6's (`unknown` for want of heartbeats).
+6. **Nothing a node reads from a message is trusted past its check.** `Program::check`, `JobPolicy::check`, `WorkPackage` size and digest, `tasks.len() <= MAX_TASK_LAUNCHES` and `attempts.len() <= MAX_HEARTBEAT_ATTEMPTS` run on the receiving side before anything is served, on top of the frame bound.
+
+#### Shared types (fabric-core, `managed::launch`, landed with this contract)
+
+```rust
+pub const MAX_ARGV: usize = 64;
+pub const MAX_ARG_BYTES: usize = 4096;
+pub const MAX_ENV_ALLOWLIST: usize = 64;
+pub const MAX_TASK_LAUNCHES: usize = 256;
+pub const MAX_HEARTBEAT_ATTEMPTS: usize = 64;
+pub const HEARTBEAT_MS: u64 = 2_000;
+
+/// What a build or test task runs; a harness task has none.
+pub struct Program { pub argv: Vec<String>, pub cwd: Option<RelPath>, pub env_allowlist: Vec<EnvVarName> }
+pub enum ProgramError { EmptyArgv, TooManyArgs { count }, ArgTooLong { index, bytes }, ControlCharacter { index }, TooManyEnv { count }, CredentialLike { index } }
+impl Program { pub fn check(&self) -> Result<(), ProgramError>; }
+
+pub struct GrantToken { pub job: JobId, pub attempt: AttemptId, pub generation: Generation }   // M6's token
+pub struct TaskLaunch { pub task: TaskId, pub class: TaskClass, pub program: Program }
+pub struct ContinuationAsk { pub from: AttemptId, pub allowed: AllowedFidelity }
+
+pub struct LaunchRequest {
+    pub token: GrantToken,
+    pub task: TaskId,                         // the harness task the attempt runs
+    pub intent: Intent,
+    pub source: SourceBinding,
+    pub policy: JobPolicy,
+    pub initial_checkpoint: Option<SnapshotId>,
+    pub snapshot_at: Option<NodeId>,          // whose store holds the chain; required with initial_checkpoint
+    pub tasks: Vec<TaskLaunch>,               // open build and test tasks under `task` with a program
+    pub continuation: Option<ContinuationAsk>,
+    pub package: Option<WorkPackage>,         // Some exactly when continuation is
+}
+pub enum LaunchAnswer { Accepted, Refused { reason: LaunchRefusal } }
+pub enum LaunchRefusal { AlreadyLaunched, Superseded { current: Generation }, HarnessMissing { harness: HarnessKind }, SecretUnresolved { name: SecretName }, BadProgram { task: TaskId, error: ProgramError }, Inconsistent { reason: String }, Internal { reason: String } }
+
+pub enum Instruction { Spawn(TaskLaunch), Checkpoint { then: AfterCut }, Stop { reason: String } }
+pub enum AfterCut { Resume, End }
+pub enum InstructAnswer { Accepted, Refused { reason: InstructRefusal } }
+pub enum InstructRefusal { NotRunning, Superseded { current: Generation }, Frozen, Busy { what: String }, BadProgram(ProgramError), Internal { reason: String } }
+
+pub struct Report { pub token: GrantToken, pub observation: Observation }
+pub enum ReportAnswer { Recorded { revision: WorkRevision }, Refused { reason: ReportRefusal } }
+pub enum ReportRefusal { StaleGeneration { current: Generation }, UnknownJob, UnknownAttempt, WrongNode, TokenMismatch, NotReportable, Domain { reason: String }, Unavailable }
+impl Report {
+    /// The attempt and generation of a reportable observation (Started, Receipts, Checkpointed, HandoffBlocked, Continued, Exited); None for Placed, Lost, Unknown.
+    pub fn reported(observation: &Observation) -> Option<(AttemptId, Generation)>;
+    pub fn check(&self) -> Result<(), ReportRefusal>;   // NotReportable, then TokenMismatch
+}
+
+pub struct Heartbeat { pub attempts: Vec<GrantToken> }
+pub struct HeartbeatAnswer { pub verdicts: Vec<(AttemptId, GrantVerdict)> }
+pub enum GrantVerdict { Live, Stale { current: Generation }, Unknown }
+```
+
+Model amendments (fabric-core `model.rs`, codec format 2 amended in place, unshipped):
+
+```rust
+pub enum Command {
+    // and:
+    RegisterTask { parent: TaskId, kind: TaskKind, restart: RestartPolicy, class: TaskClass, program: Option<Program> },
+}
+pub enum ManagedEvent {
+    // and:
+    TaskRegistered { task: TaskId, parent: Option<TaskId>, kind: TaskKind, restart: RestartPolicy, class: TaskClass, program: Option<Program> },
+}
+pub struct Task { /* M5 fields, and */ pub program: Option<Program> }
+pub enum EffectRequest { /* and */ Spawn { task: TaskId } }
+pub enum DomainError { /* and */ ProgramRequired { class: TaskClass }, ProgramNotAllowed { class: TaskClass }, BadProgram { error: ProgramError } }
+```
+
+Rules (owner A, `transition.rs`, each with a test in `managed_rules.rs` that fails on this commit):
+
+- `RegisterTask` with class `Build` or `Test` needs `Some(program)` (`ProgramRequired`); with `Harness` or `Opaque` it refuses one (`ProgramNotAllowed`); `program.check()` failing is `BadProgram`. All three are refused before the journal records anything, like `BadPolicy`.
+- `RegisterTask` with a program is `accepted` with `effect: true` and `EffectRequested { Spawn { task } }` when the parent task has a live attempt (`granted` or `running`); its dispatch is `Instruct(Spawn)` to that attempt's node, `succeeded` on `Accepted`, `failed` on `Refused`. With no live attempt it is `succeeded` at commit as in M2, and the task rides in the next `LaunchRequest.tasks`. `CommandKind::has_effect(RegisterTask)` is `true`.
+- A granted attempt of a continue that ends (`Exited`, any outcome) before `Continued` marks the continue `failed`: the target could not offer an allowed fidelity or could not start, and the task stays open for another `Continue`.
+- Format 1 widens `TaskRegistered` with `program: None` (`frame::v1`, done). The `tasks` projection gains `program BLOB` (framed `Program`, null for none) in the version 3 DDL, amended in place; `tests/fixtures/v3.sqlite` is made again by `make_v3_fixture` and `the_v3_fixture_holds_what_it_was_made_with` pins a child with a program. A version 3 file without the column was written by the earlier draft and is refused at `open` as `DraftSchema { version: 3 }`, the refusal M6 adds for the same reason, so the two branches converge on it.
+
+#### fabric-net, protocol 4 (owner A), additive
+
+```rust
+pub enum RequestBody {
+    // M5 so far, and:
+    Launch(Box<LaunchRequest>),                              // authority to the chosen node
+    Instruct { token: GrantToken, instruction: Instruction }, // authority to the node that runs the attempt
+    Report(Box<Report>),                                      // node to the authority
+    Heartbeat(Heartbeat),                                     // node to the authority, every HEARTBEAT_MS while it runs an attempt
+}
+pub enum ResponseBody {
+    // and:
+    Launch(LaunchAnswer), Instruct(InstructAnswer), Report(ReportAnswer), Heartbeat(HeartbeatAnswer),
+}
+pub trait Service {
+    // and, each with a default that refuses (`Fault::BadRequest`), as `advertise` and `facade` have:
+    fn launch(&self, peer: NodeId, request: LaunchRequest) -> BoxFuture<'_, Result<LaunchAnswer, Fault>>;
+    fn instruct(&self, peer: NodeId, token: GrantToken, instruction: Instruction) -> BoxFuture<'_, Result<InstructAnswer, Fault>>;
+    fn report(&self, peer: NodeId, report: Report) -> BoxFuture<'_, Result<ReportAnswer, Fault>>;
+    fn heartbeat(&self, peer: NodeId, beat: Heartbeat) -> BoxFuture<'_, Result<HeartbeatAnswer, Fault>>;
+}
+impl Session {
+    pub async fn launch(&self, request: LaunchRequest, deadline: Duration) -> Result<LaunchAnswer, RpcError>;
+    pub async fn instruct(&self, token: GrantToken, instruction: Instruction, deadline: Duration) -> Result<InstructAnswer, RpcError>;
+    pub async fn report(&self, report: Report, deadline: Duration) -> Result<ReportAnswer, RpcError>;
+    pub async fn heartbeat(&self, beat: Heartbeat, deadline: Duration) -> Result<HeartbeatAnswer, RpcError>;
+}
+```
+
+All four travel in a control frame (`MAX_CONTROL_FRAME`, which holds a 1 MiB record page): a `LaunchRequest` is at most `PACKAGE_MAX_BYTES` of package plus the job's own fields, and a `Report` carries one `CheckpointCut` at most. They run under the per-peer job work cap like `Advertise`. The fixtures are [protocol/net/v4](../protocol/net/v4) (docs/net.md, "Launch path fixtures"); `crates/fabric-net/tests/launch_fixtures.rs` pins the manifest and builds every case.
+
+#### fabricd, the authority side (owner A)
+
+```rust
+// dispatch.rs (extend): one loop, read anew after every commit, as now for creates
+pub(crate) async fn run(node: Arc<Node>);
+// For each job, in this order, each at most once per process until the journal moves:
+//   CreateJob accepted            -> place (as built), the Placed grants or parks
+//   Continue dispatched/accepted  -> live attempt: mark Dispatched, Instruct(Checkpoint { then: End }) to its node;
+//                                    no live attempt: place with PlannedHandoff from the task's last cut (domain, as built)
+//   Checkpoint accepted           -> mark Dispatched, Instruct(Checkpoint { then: Resume })
+//   CancelJob, CancelTask accepted with a live attempt -> mark Dispatched, Instruct(Stop { reason })
+//   RegisterTask accepted with Spawn requested -> mark Dispatched, Instruct(Spawn(TaskLaunch)); Accepted: Succeeded,
+//                                    Refused Busy or Frozen: sent again on a later pass, any other refusal: Failed
+//   a cancel's Stop that did not reach its node or was answered Busy is sent again until its node takes it (a restart
+//     sends each unsettled one once more); NotRunning ends the attempt Exited { Cancelled } here, which settles the cancel
+//   a grant with a cancel pending is not launched; its Stop ends it unlaunched
+//   every attempt `granted` on a remote node -> launch::plan then launch::send; Accepted and AlreadyLaunched record nothing
+//     (Started comes by report); Superseded records nothing; any other refusal is observed as Receipts (harness receipt
+//     Blocked { reason }) then Exited { Failed { code: None } }, so the attempt fails and the task is free
+// Fault points: `before_launch` (after the grant's commit, before Launch is sent), `after_launch_accepted`.
+
+// launch.rs (new)
+pub(crate) struct LaunchPlan { pub request: LaunchRequest, pub node: NodeId }
+/// Builds the request from the journal: intent, source and policy from the job; `initial_checkpoint` from the grant;
+/// `snapshot_at` the node of the attempt that cut it (an import's snapshot: this node); `tasks` the open Build and Test
+/// tasks under `task` with a program; `continuation` and `package` for a grant a Continue made.
+pub(crate) fn plan(journal: &Journal, state: &ManagedState, attempt: AttemptId) -> Result<LaunchPlan, AuthorityError>;
+/// This node: `Node::runner_launch(None, request)` (owner B); a peer: `Session::launch` with the link's deadline.
+pub(crate) async fn send(node: &Arc<Node>, plan: LaunchPlan) -> Result<LaunchAnswer, NodeError>;
+pub(crate) async fn instruct(node: &Arc<Node>, target: NodeId, token: GrantToken, instruction: Instruction) -> Result<InstructAnswer, NodeError>;
+
+// package.rs (new): the package of a planned handoff, from journal state at the cut
+pub(crate) fn build_for_continue(journal: &Journal, state: &ManagedState, from: AttemptId) -> Result<WorkPackage, PackageError>;
+// PackageInput: notes = Journal::notes(job); receipts = Journal::receipts(job, from); workspace = { bundle_head: the cut's
+// snapshot, ledger_head: the digest of the job's latest event }; evidence = the cut's; artifacts = none in M5.
+
+// report.rs (new): what a node sends, accepted into the journal
+impl Node {
+    /// `Report::check`, then the grant's node against `from` (`None` is this node; another node is `WrongNode`), then
+    /// `Authority::observe`; `DomainError::StaleGeneration` answers `StaleGeneration { current }` (the domain recorded it),
+    /// another domain refusal answers `Domain { reason }` by its snake-case name, a closed authority `Unavailable`.
+    pub(crate) async fn accept_report(&self, from: Option<NodeId>, report: Report) -> ReportAnswer;
+    /// One verdict per token: `Live` when the token is the job's live grant on `from`, `Stale { current }` when the job's
+    /// generation is newer, `Unknown` otherwise. Writes nothing.
+    pub(crate) async fn accept_heartbeat(&self, from: Option<NodeId>, beat: &Heartbeat) -> HeartbeatAnswer;
+}
+```
+
+#### As built (owner A)
+
+Where the code differs from the shapes above, or adds to them:
+
+- `LaunchRequest::check` (fabric-core) is the receiving side's check of a launch: at most `MAX_TASK_LAUNCHES` tasks, every program through `Program::check` (`BadProgram`), `snapshot_at` with an initial checkpoint, a package exactly with a continuation, for the token's job and at most `PACKAGE_MAX_BYTES` (`Inconsistent`). The authority runs it on every plan; the runner runs it again before it records a launch.
+- fabric-net: `RequestBody::check_bounds` refuses a launch past `MAX_TASK_LAUNCHES` tasks and a heartbeat past `MAX_HEARTBEAT_ATTEMPTS` grants when a request is parsed (`Request::from_control_payload`) and before `Session::launch` or `Session::heartbeat` sends one. The four messages are served under the per-peer job work cap like a facade message: the work runs to its end, only the answer races the budget.
+- `launch::send` and `launch::instruct` are the `Link` trait, which the dispatch takes so its tests can record what is sent; `NodeLink` is the node's. A grant on this node is sent through the node's own `Service::launch` with its own id as the peer, not by calling `Node::runner_launch(None, ..)`: owner B's service maps its own id to `None`, so the runner takes a launch from its own authority by the same path as from a peer, and this branch builds without the runner. `plan` answers `PlanError::{Authority, Blocked}`: a journal that cannot be read is tried again, a grant that cannot be launched as recorded (no package, a failing check) is failed like a refused launch.
+- `package::build_for_continue` answers `BuildError::{Journal, NoCut, Package}`. It reads two journal reads added for it: `Journal::head` (the job's newest event digest, the ledger head) and `Journal::last_cut` (the newest cut's snapshot and digest, the evidence; the cut's own evidence list is not journaled).
+- `report::accept` and `report::heartbeat` take the `Authority` and the node's id, so their tests need no daemon; `Node::accept_report` and `Node::accept_heartbeat` call them. A report the domain answers with `StaleObservationRefused` is answered `StaleGeneration { current }`; one that names a generation newer than the job's is the domain's `StaleGeneration` refusal and answered the same.
+- The dispatch launches only grants a `CreateJob` or a `Continue` made; a `StartAttempt` grant stays the CLI's to start, as in M2. One pass launches the grants first, then dispatches the pending effects, then places every dispatched continue whose attempt ended at its cut, then launches what that granted. A launch that does not reach its node is tried again after the next commit or `RETRY` (2 s); a checkpoint or a spawn that does not reach its node marks its command `Unknown`, since the node may have taken it; a cancel's stop that does not reach its node, or finds it busy, is sent again until taken, and one answered `NotRunning` ends the attempt cancelled; a spawn answered `Busy` or `Frozen` is sent again on a later pass; any other refusal marks the command `Failed`; a cancel is settled by any exit of its attempt, not only a cancelled one; an effect whose attempt ended before it was dispatched is marked `Dispatched` then `Failed`.
+- `crash_tests::a_launch_killed_after_the_node_accepted_is_not_launched_twice` is `dispatch::crash_tests`, a restart simulated by a dispatch that remembers nothing over the same journal; the kill at `after_launch_accepted` with two daemons needs owner B's runner and belongs with the e2e acceptance.
+- The v3 fixture's test child is registered while the first job's grant may still run, so it asks for a spawn, marked dispatched then succeeded. `tests/fixtures/v3-draft.sqlite` is the v3 fixture before the `program` column, for the `DraftSchema { version: 3 }` test.
+
+#### fabricd, the node side (owner B)
+
+```rust
+// runner.rs (new): the attempts this node runs for an authority
+impl Node {
+    /// Takes a grant: checks (`Superseded`, `HarnessMissing`, `SecretUnresolved`, `BadProgram`, `Inconsistent`), writes
+    /// the launch record, answers, and runs the attempt in a task of its own. `from` is the authority (`None`: this node).
+    pub(crate) async fn runner_launch(self: &Arc<Self>, from: Option<NodeId>, request: LaunchRequest) -> LaunchAnswer;
+    pub(crate) async fn runner_instruct(self: &Arc<Self>, token: GrantToken, instruction: Instruction) -> InstructAnswer;
+}
+// The runner loop of one attempt:
+//   1. Executor::begin(attempt, job, generation, paths::job_root(home, job), policy.secrets)
+//   2. the root: initial_checkpoint Some -> transfer::fetch_snapshot from snapshot_at when the store lacks it, restore the
+//      workspace, and the harness state too when the continuation allows native_session and the adapter can; None ->
+//      sources::prepare(node, job, &source). A failure here is reported Receipts (the harness receipt Blocked { reason })
+//      then Exited { Failed { code: None } }; nothing was started.
+//   3. a continuation: offered_fidelity(&intent.harness, the restored manifest's known writer, own advert, same layout),
+//      then allowed.highest(offered); Err -> the Blocked and Exited reports of step 2 with the refusal as the reason.
+//   4. the harness task through its adapter: Launch::Headless { resume: the restored session for native_session, else None;
+//      prompt: the goal, and the package's canonical JSON written beside the root for new_native_session_with_package },
+//      the job's secrets in its environment under their names; the process is registered with the executor
+//      (Executor::adopt, below). workspace_only starts no harness.
+//   5. Report Started; for a continuation then Report Continued { from, achieved, package: Some(digest) when used };
+//      workspace_only then reports Exited { Succeeded } and ends.
+//   6. Executor::spawn each TaskLaunch (class Build or Test) in the root, cwd under it, env_allowlist applied; one that
+//      does not start is reported in Receipts as Blocked { reason }.
+//   7. Heartbeat every HEARTBEAT_MS with every token this node runs; Stale or Unknown -> Executor::stop(budget), end,
+//      no report; a failed heartbeat, or an answer with no verdict for the grant (the authority could not read the
+//      job), is retried next interval and flushes the report queue when it answers.
+//   8. the harness process exits -> Report Receipts (every task as it stands) then Exited { Succeeded | Failed { code } }; end.
+//   9. Instruct Checkpoint { then }: Executor::quiesce(budget); blockers -> Report HandoffBlocked, Executor::resume;
+//      none -> Executor::cut; End -> Executor::stop(budget) of what still runs before the cut is reported, since the
+//      authority places the replacement once it is recorded; Report Checkpointed { snapshot, cut }; Recorded and
+//      Resume -> Executor::resume; Recorded and End -> Executor::end; End refused -> Report Receipts then
+//      Exited { Failed { code: None } }; Refused StaleGeneration -> stop, end.
+//  10. Instruct Stop { reason }: Executor::stop(budget) -> Report Receipts (interrupted) then Exited { Cancelled }; end.
+//  11. Instruct Spawn(t): Executor::spawn; Frozen or Busy are refused as such.
+//  Reports go out in order per attempt; one in flight; a link failure or `Unavailable` keeps the queue for the next
+//  heartbeat answer. Counters: launches taken, reports sent, reports refused, heartbeats, stale verdicts obeyed.
+
+// executor.rs (owner B this step): one addition
+impl Executor {
+    /// Registers a harness process the adapter spawned, in its own group, as the attempt's harness task; the launch
+    /// record is written as for `spawn`. Refused while the attempt is frozen.
+    pub async fn adopt(&self, attempt: AttemptId, task: TaskId, pid: u32, started: Option<String>) -> Result<Spawned, ExecutorError>;
+}
+
+// capturer.rs (new): the real `Capturer`
+pub(crate) struct NodeCapturer { /* the node, the job, the root, the harness adapter and env, the store, the export allowlist */ }
+impl Capturer for NodeCapturer {
+    // checkpoint_harness: the adapter's suspend path (`capture`, the marker, the manifest) into the store, as `job suspend` does
+    // capture: fabric-store capture of the root with IgnorePolicy::allow_export for the allowlist
+    // facts: NodeFacts::measure for the job's harness, as `NodeFacts::iter` gives them
+}
+
+// service.rs (owner B): the four Service methods, each one line, launch and instruct to the runner, report and
+// heartbeat to owner A's accept_report and accept_heartbeat with `Some(peer)`.
+```
+
+The client surfaces (owner B): the client API gains `managed_register` (api 1, additive): `operation_key`, `job`, optional `expected_revision`, `parent`, `label`, `class` (`build` or `test`), `program { argv, cwd?, env_allowlist }`, answered with `ManagedOperation` like `managed_note`; its fixtures `protocol/fixtures/request/managed_register.json`, `managed_register_minimal.json` and `reply/managed_register.json` are in this contract's commit, and `protocol/required.txt` is regenerated by the contract test once the parsers land. `fabric managed register <job> --parent <task> --label <text> --class build|test [--cwd <rel>] [--env NAME]... -- <argv...>`. A task in `managed_status`, `managed_inspect` and the facade's `inspection` carries `program` when it has one; the `task_registered` event carries it too and `effect_requested` has the form `{ "spawn": { "task" } }` (docs/facade-protocol.md, "Launch path"). The TypeScript SDK gains `managedRegister`. A `managed_finish` for a child task is not in this step: the acceptance needs an open, interrupted task, not a finished one.
+
+The provider read-surface row, carried from M4, closes in this step on owner B's side: `fabricd::facade::tests::an_inspection_lists_every_provider_status` over a journal seeded with one provider operation per status and the blockers and residuals they make, and `managed::e2e_the_cli_inspects_provider_operations_blockers_and_residuals` in the e2e suite for `fabric managed inspect`.
+
+#### As built (owner B)
+
+Where the code differs from the shapes above, or adds to them:
+
+- The runner is `runner::Runner`, held by the node beside its executor: `Runner::launch(from, request)` and `Runner::instruct(from, token, instruction)`. There is no `Node::runner_launch` or `Node::runner_instruct`; the four `Service` methods are the entry, and each maps the node's own id to `None`, so a grant from this node's authority, sent through `NodeLink` with its own id, takes the same path as one from a peer. An instruction from another authority than the one that launched the attempt is answered `NotRunning`.
+- The node's effects (the root, the harness, the task command, the report and heartbeat links, the capturer's attempt) are the `runner::Host` trait; `NodeHost` is the node's, and `runner::tests` runs the loop against a fake host and a real executor.
+- A launch taken is recorded in `runs/taken/<attempt>.json` before it is answered `Accepted`, so a launch sent again, after either side restarted, is `AlreadyLaunched`. The executor's launch records are under `runs/records`, and the node stops what they name at start-up (`Executor::recover`) before anything new is launched.
+- The root is prepared (step 2) before `Executor::begin` (step 1): a failed preparation begins nothing. A root a previous attempt of the job left on this node is set aside as `<root>.before-<attempt>`, never removed.
+- A heartbeat names one grant: each attempt runs its own heartbeat loop. A `Live` answer, or one that names nothing of the grant, lets a waiting report go again.
+- Native session continuity (selection "M5 native session continue", made 2026-11-08 by the implementation agent under Efe's delegation of 2026-11-02 and not approved by Efe). The cut carries the harness state: `NodeCapturer::capture` puts the state the same quiescence's harness checkpoint captured through the adapter's suspend path into the cut's snapshot, once, so a later cut without a checkpoint carries none. On a continuation that allows `native_session`, `NodeHost::prepare` restores the cut's harness state with the workspace into the node's own copy (`runs/restored/<attempt>`, removed once used) and reads its manifest. The layout is the same when the harness, the physical job root and the home all equal the ones the manifest was captured under (ADR 0011): then `offered_fidelity` is asked with the same layout and the manifest's writer as the known writer, the adapter's `restore` places the state as `job resume` does for Claude Code and Codex, and the harness starts with `resume` set to the captured session; `Continued` records `native_session` and no package. Any other layout, or a cut with no harness state, offers `new_native_session_with_package` as before. A restore the adapter refuses is the launch's failure: the harness receipt `Blocked { reason }` and `Exited { Failed }`, never a lower fidelity. The decision is the pure `runner::continuation_offer` (`runner::tests::a_native_session_is_restored_only_for_the_same_layout`); the cut's state is `capturer::tests::a_cut_after_a_harness_checkpoint_holds_its_state`.
+- The harness runs with the daemon's environment less every `FABRIC_SECRET_*` variable, plus the job's secrets under their names, as a CLI run passes the user's environment; its output is read for the session (`read_headless_line`, or an ACP agent's turn feed) and dropped. A build or test task gets `PATH`, `HOME` and its allowlist only, the job's secrets from the executor, and no terminal.
+- `NodeCapturer` captures the harness's state through its adapter once its session is known, and the workspace alone before that; the facts a cut records are measured at its capture. `Executor::adopt` refuses a pid that leads no group (`NotAGroupLeader`).
+- The executor marks a task it signalled, so a test a checkpoint interrupted is still `Interrupted` at the next cut (`an_interrupted_test_stays_interrupted_at_the_next_cut`), not read as exited.
+- `managed_register` registers with the `explicit_only` restart. A program in a request or a reply skips a field it does not know, like any object outside a run plan; the node checks it again. The provider read surface adds `purpose`, `target`, `searched` and `abandon_reason` to a provider operation and `searched` to a residual, each optional; the fixtures are `reply/managed_inspect_provider_operations.json` and `hello_answer/welcome_with_the_launch_path.json`.
+- The e2e fake codex gains `FAKE_CODEX_HOLD`, one process that holds its turn open: its `FAKE_CODEX_WAIT` loop forks a `sleep` per tick, an escaped child that rightly blocks a strong handoff. Under `FAKE_CODEX_HOLD` it keeps its rollout open until it is stopped, as a Codex with the thread loaded does, so the adapter's `lsof` check refuses a capture of it while it runs, as it refuses a real one.
+- The harness's own state is captured only from a harness that has stopped, as `job suspend` stops it before its capture (ADR 0015): a running Claude Code refuses with `HarnessRunning`, and a running Codex holds its writer lock and its rollout open. `Executor::quiesce(attempt, budget, then)` takes the `AfterCut`: under `End` it settles every other task and computes the group blockers first, and only when nothing blocks the handoff stops the harness task (`SIGTERM`, the drain budget left, at least the minimum, `SIGKILL`) before `Capturer::checkpoint_harness(attempt, task, HarnessRun::Stopped)`; a blocked handoff leaves the harness running, its receipt `Blocked` and nothing captured. Under `Resume` the harness is never signalled and `HarnessRun::Running` captures the workspace alone, so a checkpoint that resumes offers no native session from its cut. A capture that fails after the stop reports `HandoffBlocked`, and the harness's exit then ends the attempt `Failed`, as a `job suspend` whose capture fails after its stop fails (`executor::tests::{a_cut_that_ends_the_attempt_stops_the_harness_before_its_capture, a_blocked_cut_that_would_end_the_attempt_leaves_the_harness_running, a_cut_that_resumes_leaves_the_harness_running_and_its_state_alone}`; e2e `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout` with the rollout held open).
+- A cut's departure is confirmed once the authority records it: `Capturer::confirm_departure(attempt)`, after the `Checkpointed` report is answered `Recorded`, reads the manifest of the state the cut carried and calls the adapter's `confirm_departure`, as `job suspend` does after `SnapshotPublished` (ADR 0015). A refused cut confirms nothing, so its state never counts at a restore here; a confirmation that fails is logged, and the next restore of a rewritten file on this node then refuses (`StateDiverged`) rather than overwrite it. So a Claude Code session that continues natively to another node and back takes the project memory and task files it rewrote there (`capturer::tests::a_recorded_cut_confirms_its_departure_so_a_rewritten_session_comes_back`, which fails with `StateDiverged` on `MEMORY.md` without the confirmation).
+- A restore failure is never a lower fidelity: `runner::offer_restoring` reads the cut's state, asks `continuation_offer` and restores through the adapter; an unreadable state or a refused restore is an error that fails the launch (`runner::tests::a_restore_failure_fails_the_launch_never_a_lower_fidelity`, over a real Codex capture refused as divergence after this node's copy of the thread grew, and a manifest that does not parse). The continuity test runs the fake codex, not the fake ACP agent, and follows the handoff's placement. A continue's `pin` now reaches `dispatch::place_handoff`, which places the handoff with it in place of the job's pin (`dispatch::tests::a_continue_s_pin_places_the_handoff_where_it_names`).
+- Counters: launches taken, reports sent, reports refused, heartbeats answered, stale verdicts obeyed (`Runner::counters`).
+
+#### Acceptance mapped to tests, the launch path
+
+Each test is written first and fails on this contract's commit.
+
+| Item | Tests |
+| --- | --- |
+| The program rules and the Spawn effect (owner A) | `fabric-core` `managed_rules::{a_build_or_test_task_needs_a_program, a_harness_or_opaque_task_takes_no_program, a_bad_program_is_refused_before_the_journal, a_program_registered_under_a_live_attempt_asks_for_a_spawn, a_continue_s_grant_that_ends_before_continued_fails_the_continue}`; `fabric-journal` `fixtures::the_v3_fixture_holds_what_it_was_made_with` (a child with a program), `a_draft_v3_without_the_program_column_is_refused` |
+| Protocol 4 carries the launch path (owner A) | `fabric-net` `tests/launch_fixtures.rs::{the_manifest_is_the_pinned_one, every_case_builds_and_round_trips_in_a_control_frame, a_case_marked_reject_is_refused_where_it_says}`; `wire::tests` property round trips widened to the four messages |
+| The authority dispatches and fences (owner A) | `fabricd` `report::tests::{a_report_at_an_older_generation_is_refused_and_recorded, a_report_from_another_node_than_the_grant_is_refused, a_report_whose_token_and_observation_differ_is_refused_before_the_journal, a_heartbeat_names_each_grant_live_stale_or_unknown}`; `dispatch::tests::{a_granted_remote_attempt_is_launched_once_per_process, an_already_launched_answer_is_not_a_failure, a_refused_launch_fails_the_attempt_and_frees_the_task, a_continue_with_a_live_attempt_asks_for_its_cut_then_places_from_it, a_checkpoint_and_a_cancel_are_instructed_to_the_live_node, a_spawn_is_instructed_and_settled_by_the_answer}`; `package::tests::a_package_is_built_from_the_journal_at_the_cut`; `crash_tests::a_launch_killed_after_the_node_accepted_is_not_launched_twice` |
+| The node runs, heartbeats, cuts and reports (owner B) | `fabricd` `runner::tests::{a_launch_is_idempotent_by_attempt, a_launch_of_a_superseded_generation_is_refused, a_stale_or_unknown_heartbeat_verdict_stops_the_attempt, a_checkpoint_instruction_cuts_then_resumes_or_ends, a_stop_instruction_reports_every_task_interrupted_then_cancelled, a_report_refused_stale_stops_the_attempt, a_preparation_failure_is_reported_blocked_then_failed, an_unallowed_fidelity_starts_nothing, reports_leave_in_order_and_wait_for_the_link}`; `executor::tests::an_adopted_harness_process_is_in_its_own_group_and_recorded`; `capturer::tests::{a_harness_checkpoint_goes_through_the_suspend_path, a_capture_honours_the_export_allowlist}` |
+| The client surfaces (owner B) | `fabric-client` `contract.rs` and the TypeScript `contract.test.ts` over the three new fixtures; `fabric-client` `facade_fixtures.rs` and `facade_fixtures.test.ts` over `events_launch_path` and `inspection_continued` (the pins moved in this contract's commit); `fabric` CLI test `managed::e2e_the_cli_registers_a_test_task_with_its_program` |
+| The provider read surface (owner B, carried from M4) | `fabricd` `facade::tests::an_inspection_lists_every_provider_status`; e2e `managed::e2e_the_cli_inspects_provider_operations_blockers_and_residuals` |
+| M5 acceptance end to end (both owners, two daemons on one host) | `placement::e2e_a_submit_runs_on_the_eligible_node_without_naming_it` (the attempt half: `Started` on the chosen node, the inspection's attempt `running`); `continuity::e2e_a_planned_handoff_records_child_outcomes_and_the_fidelity_achieved` (a registered test task with a program `sleep`, continued under the fake agent with the package: the test recorded `interrupted`, `achieved: new_native_session_with_package`, the package digest in the inspection); `continuity::e2e_a_native_session_continues_on_a_node_with_the_same_layout` (two daemons sharing one home, so the same user, home and job root; the first turn on `b`, a continue pinned to `a`, every rollout removed from the home before `a` launches: the resumed thread holds the first turn, which the fake harness answers from, `achieved: native_session` in the inspection and in `fabric managed inspect`); `continuity::e2e_a_continue_on_a_node_with_another_layout_starts_a_new_session_with_the_package` (the same with a home per daemon: `new_native_session_with_package`, a package digest, no resume); `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log`; `managed::e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted`; `managed::e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on` |
+| Counters, not time | launches taken, reports sent and refused, heartbeats and stale verdicts (the runner's counters); one commit per report; one probe round per placement as before. Time is the Perf step's alone |
+
+#### Owners and files, the launch path
+
+Two owners, disjoint files. Owner A lands the fabric-net messages first; owner B's first commit that uses them merges `m5` after that commit. Merge commits only. The shared types are in `fabric-core` since this contract's commit; a change to them is owner A's, announced in the commit.
+
+| Owner | Scope | Files |
+| --- | --- | --- |
+| A | the program rules and the Spawn effect; protocol 4's four messages; the authority side: launch planning and sending, the dispatch of Checkpoint, Continue, CancelJob, CancelTask and Spawn, the package build, report and heartbeat acceptance with the fence; the journal's `program` column and the v3 fixture | `crates/fabric-core/src/managed/{launch,model,transition,frame}.rs`, `crates/fabric-core/tests/managed_rules.rs`; `crates/fabric-net/*` (new `tests/launch_fixtures.rs`); `crates/fabric-journal/*`; `crates/fabricd/src/{dispatch,authority}.rs`, `authority/*`, new `{launch,package,report}.rs`, `faults.rs`, `managed.rs`; `protocol/net/v4/*`; this subsection's "as built" for A and docs/net.md |
+| B | the runner loop, the real `Capturer`, `Executor::adopt`, the four `Service` methods; `managed_register` on the client API, the CLI and the TypeScript SDK; the provider read-surface tests; the e2e acceptance tests | `crates/fabricd/src/{executor,service,node,ops,managed_ops,control,error,facade,harnesses}.rs`, new `{runner,capturer}.rs`; `crates/fabric-harness/*`; `crates/fabric-store/*`; `crates/fabric-client/*`; `sdk/typescript/*`; `crates/fabric/*`; `protocol/fixtures/*`, `protocol/required.txt`, `protocol/facade/v1/*`; docs/facade-protocol.md and this subsection's "as built" for B |
+
+`crates/fabricd/src/lib.rs` gains the five `mod` lines (`launch`, `package`, `report` by A; `runner`, `capturer` by B); each owner adds its own and the merge keeps both. A file not listed is touched by neither without a note in the commit saying why.
+
+### Owners and files
+
+Two owners, disjoint files. Owner A lands the model commit (`fabric-core` types, format byte 2, schema version 3 DDL) first; owner B's first commit that uses it merges `m5` after that commit. Merge commits only.
+
+| Owner | Scope | Files |
+| --- | --- | --- |
+| A | P03 task lifecycle and executor, P04 work package and fidelity, P05 source bindings and the local secret resolver | `crates/fabric-core/src/managed/{mod,model,transition,frame,ids}.rs`, new `{lifecycle,package,source,secret_ref,placement,facade}.rs` (the last two: types only), `crates/fabric-core/tests/managed_*.rs` except `managed_place.rs`; `crates/fabric-journal/*` except `src/facade.rs`; `crates/fabricd/src/{executor,secrets,sources}.rs` (new), `authority.rs`, `authority/*`, `managed.rs`, `harnesses.rs`, `local.rs`; `crates/fabric-harness/*`; `crates/fabric-store/*`; ADRs 0023 to 0025 and this section's parts P03 to P05 for their "As built (M5)" notes |
+| B | P06 placement, P07 facade, the client surfaces for every M5 op | `crates/fabric-core/src/managed/place.rs` (new) and `tests/managed_place.rs`, plus the one `pub mod place;` line; `crates/fabric-journal/src/facade.rs` (new) plus its `mod` line; `crates/fabric-net/*`; `crates/fabricd/src/{placement,facade}.rs` (new), `ops.rs`, `control.rs`, `node.rs`, `error.rs`, `service.rs`; `crates/fabric-client/*`; `sdk/typescript/*`; `crates/fabric/*`; `protocol/fixtures/*`, `protocol/required.txt`, `protocol/facade/v1/*`; `docs/facade-protocol.md`, `docs/net.md`, ADRs 0026 and 0027 and this section's parts P06 and P07 |
+
+A file not listed is touched by neither without a note in the commit saying why.

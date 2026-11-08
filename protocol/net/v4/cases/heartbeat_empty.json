@@ -1,0 +1,11 @@
+{
+  "case": "heartbeat_empty",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "heartbeat",
+    "attempts": []
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

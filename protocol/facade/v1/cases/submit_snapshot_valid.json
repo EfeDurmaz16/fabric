@@ -1,0 +1,68 @@
+{
+  "case": "submit_snapshot_valid",
+  "direction": "client_to_authority",
+  "given": {
+    "now_ms": 1762128000000,
+    "tokens": [
+      {
+        "token_id": "01K8W3A0000000000000000K01",
+        "bearer": "1111111111111111111111111111111111111111111111111111111111111111",
+        "actor": "efe-laptop",
+        "jobs": "any",
+        "resources": "any",
+        "expires_ms": 1762131600000,
+        "revoked_ms": null
+      }
+    ],
+    "jobs": [],
+    "operations": []
+  },
+  "message": {
+    "type": "submit",
+    "facade": 1,
+    "token": "1111111111111111111111111111111111111111111111111111111111111111",
+    "key": "key-submit-2",
+    "intent": {
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "acceptance": [
+        "cargo test passes"
+      ]
+    },
+    "source": {
+      "kind": "snapshot",
+      "snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "policy": {
+      "drain_budget_ms": 30000,
+      "allowed_fidelity": [
+        "native_session",
+        "new_native_session_with_package"
+      ],
+      "secrets": [
+        {
+          "name": "API_TOKEN",
+          "attempt": "any",
+          "resource_kinds": [
+            "node"
+          ]
+        }
+      ],
+      "export_allowlist": [],
+      "disk_bytes": 2147483648,
+      "pin": null
+    }
+  },
+  "expect": {
+    "outcome": "accept",
+    "answer": {
+      "type": "accepted",
+      "facade": 1,
+      "key": "key-submit-2",
+      "replayed": false,
+      "revision": "1"
+    }
+  }
+}

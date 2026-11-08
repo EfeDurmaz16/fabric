@@ -1,0 +1,16 @@
+{
+  "case": "events_closed_revoked",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "events",
+    "facade": 1,
+    "job": "01K8W3A00000000000000000J1",
+    "events": [],
+    "next": "7",
+    "lagged": false,
+    "closed": "revoked"
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

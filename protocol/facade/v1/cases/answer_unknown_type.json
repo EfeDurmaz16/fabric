@@ -1,0 +1,14 @@
+{
+  "case": "answer_unknown_type",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "progress",
+    "facade": 1,
+    "job": "01K8W3A00000000000000000J1"
+  },
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "unknown_variant"
+  }
+}

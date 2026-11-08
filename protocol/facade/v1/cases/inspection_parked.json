@@ -1,0 +1,73 @@
+{
+  "case": "inspection_parked",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "inspection",
+    "facade": 1,
+    "job": {
+      "job": "01K8W3A00000000000000000J1",
+      "revision": "2",
+      "generation": "1",
+      "state": "active",
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "primary_task": "01K8W3A00000000000000000T1",
+      "tasks": [
+        {
+          "task": "01K8W3A00000000000000000T1",
+          "state": "open",
+          "class": "harness"
+        }
+      ],
+      "attempts": []
+    },
+    "parked": true,
+    "placements": [
+      {
+        "seq": "2",
+        "kind": "initial",
+        "chosen": null,
+        "candidates": [
+          {
+            "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+            "verdict": {
+              "excluded": {
+                "reasons": [
+                  {
+                    "secret": {
+                      "name": "API_TOKEN"
+                    }
+                  },
+                  {
+                    "disk": {
+                      "need": 2147483648,
+                      "free": 1073741824
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "continuations": [],
+    "notes": [
+      {
+        "revision": "2",
+        "decision": {
+          "what": "Wait for the laptop",
+          "reason": "only it holds the secret"
+        }
+      }
+    ],
+    "provider_operations": [],
+    "blockers": [],
+    "residuals": []
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}
