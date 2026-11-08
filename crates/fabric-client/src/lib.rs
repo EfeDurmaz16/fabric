@@ -24,6 +24,7 @@
 
 pub mod api;
 mod client;
+pub mod facade;
 pub mod frame;
 pub mod sentences;
 mod text;

@@ -1176,6 +1176,21 @@ impl Journal {
         blockers(&self.conn, job)
     }
 
+    /// Every provider operation of `job`, oldest dispatch first: the read
+    /// surface of ADR 0022, selection 6, which `managed_inspect` and the
+    /// facade's `inspection` show (owner B, M5; added here because the row
+    /// reader is this module's).
+    pub fn provider_operations(&self, job: JobId) -> Result<Vec<ProviderOperation>, CommitError> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM provider_operations WHERE job_id = ?1
+             ORDER BY dispatched_ms, operation_id"
+        ))?;
+        let rows = stmt
+            .query_map([job.to_bytes()], read_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(RawRow::check).collect()
+    }
+
     /// What the job's creates may have left, oldest dispatch first: every
     /// create `succeeded`, `attached`, `observed`, `unknown` or
     /// `abandoned`, and every create `failed` with a locator, whose

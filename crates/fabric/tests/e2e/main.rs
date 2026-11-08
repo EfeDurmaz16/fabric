@@ -15,26 +15,33 @@
 //! `fabric-sync` moves for a dirty tree, and `footprint` holds the CLI's
 //! start to an allocation budget. `acp_cli` and `preflight` hold the
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
-//! acceptance tests, `legacy` loads a state directory frozen from main, and
-//! `streams` holds every command's answer to the CLI contract's streams
-//! and JSON shape against a live node. `opencode`, `pi`, `gemini` and
-//! `cursor` hold one row per PR 5 adapter (docs/harness-adapters.md).
+//! acceptance tests, `facade` the M5 facade and placement acceptance tests,
+//! `launch` the M5 launch path across two daemons with homes of their own,
+//! `legacy` loads a state directory frozen from main, and `streams` holds
+//! every command's answer to the CLI contract's streams and JSON shape
+//! against a live node. `opencode`, `pi`, `gemini` and `cursor` hold one
+//! row per PR 5 adapter (docs/harness-adapters.md).
 
 mod ab;
 mod acp_cli;
 mod bench;
 mod budget;
 mod client;
+mod continuity;
 mod cursor;
+mod facade;
 mod footprint;
 mod gemini;
 mod headless;
+mod launch;
 mod legacy;
 mod managed;
 mod opencode;
 mod pi;
+mod placement;
 mod preflight;
 mod psf;
+mod secrets;
 mod streams;
 mod sync_bench;
 mod terminal;

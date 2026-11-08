@@ -86,9 +86,12 @@ enum Command {
     /// Make, run, suspend, move and resume jobs.
     #[command(subcommand)]
     Job(JobCommand),
-    /// Make, cancel and read managed jobs (experimental).
+    /// Make, cancel and read managed jobs, and the M5 operations on them (experimental).
     #[command(subcommand)]
     Managed(managed::ManagedCommand),
+    /// Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental).
+    #[command(subcommand)]
+    Facade(managed::FacadeCommand),
     /// Read Portable Session Format containers.
     #[command(subcommand)]
     Psf(psf::PsfCommand),
@@ -617,6 +620,11 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
         Command::Job(command) => job(&state, &home, command, run).await,
         Command::Managed(command) => {
             let reply = managed::run(&client, command, run).await?;
+            answer(run, &reply, None)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Facade(command) => {
+            let reply = managed::run_facade(&client, command, run).await?;
             answer(run, &reply, None)?;
             Ok(ExitCode::SUCCESS)
         }

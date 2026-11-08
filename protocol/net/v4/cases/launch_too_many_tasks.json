@@ -1,0 +1,70 @@
+{
+  "case": "launch_too_many_tasks",
+  "direction": "authority_to_node",
+  "message": {
+    "type": "launch",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "task": "01K8W3A00000000000000000T1",
+    "intent": {
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "acceptance": [
+        "cargo test passes"
+      ]
+    },
+    "source": {
+      "kind": "empty"
+    },
+    "policy": {
+      "drain_budget_ms": 30000,
+      "allowed_fidelity": [
+        "native_session",
+        "new_native_session_with_package"
+      ],
+      "secrets": [
+        {
+          "name": "API_TOKEN",
+          "attempt": "any",
+          "resource_kinds": [
+            "node"
+          ]
+        }
+      ],
+      "export_allowlist": [],
+      "disk_bytes": 2147483648,
+      "pin": null
+    },
+    "initial_checkpoint": null,
+    "snapshot_at": null,
+    "tasks": {
+      "repeat": {
+        "task": "01K8W3A00000000000000000T2",
+        "class": "test",
+        "program": {
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ],
+          "cwd": "crates/app",
+          "env_allowlist": [
+            "CARGO_HOME"
+          ]
+        }
+      },
+      "count": 257
+    },
+    "continuation": null,
+    "package": null
+  },
+  "expect": {
+    "outcome": "reject",
+    "reason": "too_many_tasks"
+  }
+}

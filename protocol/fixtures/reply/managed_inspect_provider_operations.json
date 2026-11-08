@@ -1,0 +1,139 @@
+{
+  "kind": "managed_inspect",
+  "job": {
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "revision": "8",
+    "generation": "2",
+    "state": "active",
+    "goal": "fix the flaky test",
+    "harness": {
+      "kind": "codex"
+    },
+    "primary_task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+    "tasks": [
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "state": "open",
+        "class": "harness"
+      },
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+        "parent": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "label": "cargo test",
+        "state": "open",
+        "class": "test",
+        "receipt": {
+          "status": "interrupted",
+          "interrupted": true
+        }
+      }
+    ],
+    "attempts": [
+      {
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "generation": "1",
+        "status": "checkpointed",
+        "snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "generation": "2",
+        "status": "granted"
+      }
+    ]
+  },
+  "parked": false,
+  "placements": [],
+  "continuations": [],
+  "notes": [],
+  "provider_operations": [
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY10",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "generation": "2",
+      "profile": "fixture",
+      "action": "sandbox.create",
+      "effect": "create",
+      "status": "unknown",
+      "purpose": "effect",
+      "searched": "{\"kind\":\"sandbox\",\"provider\":\"fixture\",\"scope\":{\"project\":\"p-1\"}}"
+    },
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY11",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "generation": "2",
+      "profile": "fixture",
+      "action": "sandbox.create",
+      "effect": "create",
+      "status": "attached",
+      "purpose": "effect",
+      "locator": "{\"kind\":\"sandbox\",\"native_id\":\"sb-1\",\"provider\":\"fixture\",\"scope\":{\"project\":\"p-1\"}}"
+    },
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY12",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "generation": "2",
+      "profile": "fixture",
+      "action": "sandbox.exec",
+      "effect": "mutate",
+      "status": "observed",
+      "purpose": "effect",
+      "target": "{\"kind\":\"sandbox\",\"native_id\":\"sb-1\",\"provider\":\"fixture\",\"scope\":{\"project\":\"p-1\"}}"
+    },
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY13",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "generation": "2",
+      "profile": "fixture",
+      "action": "sandbox.exec",
+      "effect": "mutate",
+      "status": "abandoned",
+      "purpose": "effect",
+      "target": "{\"kind\":\"sandbox\",\"native_id\":\"sb-1\",\"provider\":\"fixture\",\"scope\":{\"project\":\"p-1\"}}",
+      "abandon_reason": "the provider's console shows it ended"
+    },
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY14",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "generation": "2",
+      "profile": "fixture",
+      "action": "sandbox.destroy",
+      "effect": "destroy",
+      "status": "dispatched",
+      "purpose": "cleanup",
+      "cleans": "01JABCDEFGHJKMNPQRSTVWXY11",
+      "target": "{\"kind\":\"sandbox\",\"native_id\":\"sb-1\",\"provider\":\"fixture\",\"scope\":{\"project\":\"p-1\"}}"
+    }
+  ],
+  "blockers": [
+    {
+      "kind": "create_unresolved",
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY10",
+      "status": "unknown"
+    },
+    {
+      "kind": "exec_may_run",
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY13",
+      "status": "abandoned"
+    },
+    {
+      "kind": "stop_not_confirmed",
+      "operation": "01JABCDEFGHJKMNPQRSTVWXY14",
+      "status": "dispatched"
+    }
+  ],
+  "residuals": [
+    {
+      "creating": "01JABCDEFGHJKMNPQRSTVWXY10",
+      "status": "unknown",
+      "searched": "{\"kind\":\"sandbox\",\"provider\":\"fixture\",\"scope\":{\"project\":\"p-1\"}}"
+    },
+    {
+      "creating": "01JABCDEFGHJKMNPQRSTVWXY11",
+      "status": "attached",
+      "locator": "{\"kind\":\"sandbox\",\"native_id\":\"sb-1\",\"provider\":\"fixture\",\"scope\":{\"project\":\"p-1\"}}"
+    }
+  ]
+}

@@ -62,7 +62,7 @@ const GLOBALS: &[(&str, &str, Option<char>, &str)] = &[
 const GROUPS: &[(&str, &[&str])] = &[
     ("Set up a node", &["serve", "node", "doctor"]),
     ("Work on jobs", &["job", "psf"]),
-    ("Managed jobs", &["managed"]),
+    ("Managed jobs", &["managed", "facade"]),
 ];
 
 /// The examples each command's help shows, by command path. A placeholder
@@ -268,12 +268,113 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
         )],
     ),
     (
+        "managed note",
+        &[
+            (
+                "Record a decision and why",
+                "fabric managed note <JOB> --decision <TEXT> --reason <TEXT>",
+            ),
+            (
+                "Leave a question open",
+                "fabric managed note <JOB> --question <TEXT>",
+            ),
+        ],
+    ),
+    (
+        "managed register",
+        &[(
+            "Register a test task under a task of the job",
+            "fabric managed register <JOB> --parent <TASK> --label <TEXT> --class test -- cargo test",
+        )],
+    ),
+    (
+        "managed checkpoint",
+        &[(
+            "Cut the live attempt and let it go on",
+            "fabric managed checkpoint <JOB>",
+        )],
+    ),
+    (
+        "managed continue",
+        &[(
+            "Continue the job on a named node",
+            "fabric managed continue <JOB> --pin <NODE>",
+        )],
+    ),
+    (
+        "managed inspect",
+        &[(
+            "Read the job's placements and continuations",
+            "fabric managed inspect <JOB>",
+        )],
+    ),
+    (
+        "managed import",
+        &[(
+            "Capture a directory into a snapshot",
+            "fabric managed import <PATH>",
+        )],
+    ),
+    (
         "managed status",
         &[("Read a managed job", "fabric managed status <JOB>")],
     ),
     (
         "managed ls",
         &[("List the managed jobs", "fabric managed ls")],
+    ),
+    (
+        "facade mint",
+        &[(
+            "Mint a token that works for an hour",
+            "fabric facade mint --actor <ACTOR> --ttl-ms 3600000",
+        )],
+    ),
+    (
+        "facade revoke",
+        &[("Revoke a token", "fabric facade revoke <TOKEN_ID>")],
+    ),
+    (
+        "facade submit",
+        &[(
+            "Submit a job from nothing to an authority",
+            "fabric facade submit --authority <NODE> --token <BEARER> --empty --goal <TEXT>",
+        )],
+    ),
+    (
+        "facade inspect",
+        &[(
+            "Inspect a job at its authority",
+            "fabric facade inspect --authority <NODE> --token <BEARER> <JOB>",
+        )],
+    ),
+    (
+        "facade watch",
+        &[(
+            "Wait up to 20 seconds for the job's next events",
+            "fabric facade watch --authority <NODE> --token <BEARER> <JOB> --wait-ms 20000",
+        )],
+    ),
+    (
+        "facade cancel",
+        &[(
+            "Cancel a job at its authority",
+            "fabric facade cancel --authority <NODE> --token <BEARER> <JOB>",
+        )],
+    ),
+    (
+        "facade checkpoint",
+        &[(
+            "Checkpoint a job at its authority",
+            "fabric facade checkpoint --authority <NODE> --token <BEARER> <JOB>",
+        )],
+    ),
+    (
+        "facade continue",
+        &[(
+            "Continue a job on a named node",
+            "fabric facade continue --authority <NODE> --token <BEARER> <JOB> --pin <NODE>",
+        )],
     ),
     (
         "help",

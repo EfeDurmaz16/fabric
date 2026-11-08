@@ -1,0 +1,20 @@
+{
+  "case": "instruct_checkpoint_resume",
+  "direction": "authority_to_node",
+  "message": {
+    "type": "instruct",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "instruction": {
+      "checkpoint": {
+        "then": "resume"
+      }
+    }
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

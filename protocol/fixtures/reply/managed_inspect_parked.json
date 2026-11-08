@@ -1,0 +1,51 @@
+{
+  "kind": "managed_inspect",
+  "job": {
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "revision": "2",
+    "generation": "1",
+    "state": "active",
+    "goal": "fix the flaky test",
+    "harness": {
+      "kind": "codex"
+    },
+    "primary_task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+    "tasks": [
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "state": "open",
+        "class": "harness"
+      }
+    ],
+    "attempts": []
+  },
+  "parked": true,
+  "placements": [
+    {
+      "seq": "2",
+      "kind": "initial",
+      "chosen": null,
+      "candidates": [
+        {
+          "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+          "verdict": {
+            "excluded": {
+              "reasons": [
+                {
+                  "secret": {
+                    "name": "API_TOKEN"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "continuations": [],
+  "notes": [],
+  "provider_operations": [],
+  "blockers": [],
+  "residuals": []
+}

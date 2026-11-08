@@ -15,8 +15,8 @@ use fabric_client::api::{
 };
 use fabric_core::id::JobId;
 use fabric_core::managed::{
-    Command, DomainError, Envelope, Intent, JobPolicy, OperationKey, RestartPolicy, SourceBinding,
-    StoredResult,
+    Command, DomainError, Envelope, Intent, JobPolicy, ManagedState, OperationKey, RestartPolicy,
+    SourceBinding, StoredResult,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::{Answer, CommitError};
@@ -57,6 +57,18 @@ pub(crate) fn refusal_code(error: &DomainError) -> &'static str {
         DomainError::Exhausted => "exhausted",
         DomainError::Broken { .. } => "broken",
         DomainError::ReplacementBlocked { .. } => "replacement_blocked",
+        DomainError::BadPolicy { .. } => "bad_policy",
+        DomainError::UnsupportedSource { .. } => "unsupported_source",
+        DomainError::FidelityRefused { .. } => "fidelity_refused",
+        DomainError::NotLive { .. } => "not_live",
+        DomainError::NoteTooLong { .. } => "note_too_long",
+        DomainError::CredentialLike { .. } => "credential_like",
+        DomainError::EffectInFlight { .. } => "effect_in_flight",
+        DomainError::MissingReceipt { .. } => "missing_receipt",
+        DomainError::MissingPackage { .. } => "missing_package",
+        DomainError::ProgramRequired { .. } => "program_required",
+        DomainError::ProgramNotAllowed { .. } => "program_not_allowed",
+        DomainError::BadProgram { .. } => "bad_program",
     }
 }
 
@@ -114,6 +126,7 @@ impl Node {
                 repo,
                 goal,
                 harness,
+                ..
             } => {
                 // As for a standalone job: a secret in an ACP argument is
                 // refused before the append-only journal records it.
@@ -123,11 +136,13 @@ impl Node {
                     job: None,
                     expected: None,
                     body: Command::CreateJob {
-                        intent: Intent { goal, harness },
-                        source: source(&repo)?,
-                        policy: JobPolicy {
-                            restart: RestartPolicy::ExplicitOnly,
+                        intent: Intent {
+                            goal,
+                            harness,
+                            acceptance: Vec::new(),
                         },
+                        source: source(&repo)?,
+                        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
                     },
                 };
                 let operation = self.managed_submit(envelope).await?;
@@ -138,6 +153,7 @@ impl Node {
                 job,
                 expected_revision,
                 reason,
+                ..
             } => {
                 let envelope = Envelope {
                     key: operation_key,
@@ -182,7 +198,7 @@ impl Node {
         }
     }
 
-    async fn managed_job(&self, job: JobId) -> Result<ManagedJob, NodeError> {
+    pub(crate) async fn managed_job(&self, job: JobId) -> Result<ManagedJob, NodeError> {
         match self.authority.job(job).await? {
             Some(state) => Ok(ManagedJob::from(&state)),
             None if self.cfg.state.job(job).ledger().exists() => {
@@ -192,15 +208,44 @@ impl Node {
         }
     }
 
-    async fn managed_submit(
+    pub(crate) async fn managed_submit(
         &self,
         envelope: Envelope<Command>,
     ) -> Result<ManagedOperation, NodeError> {
         let key: OperationKey = envelope.key.clone();
+        refuse_facade_key(&key)?;
         let named = envelope.job;
+        let answer = self.authority.submit(envelope).await?;
+        self.managed_answer(key, named, answer).await
+    }
+
+    /// Applies an owner's command whose body is derived from the job's
+    /// state, deduplicated by `request` (`Authority::submit_derived`), so
+    /// the same request under the same key replays after the job moved.
+    pub(crate) async fn managed_submit_derived(
+        &self,
+        key: OperationKey,
+        request: [u8; 32],
+        job: JobId,
+        derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, NodeError> + Send + 'static,
+    ) -> Result<ManagedOperation, NodeError> {
+        refuse_facade_key(&key)?;
+        let answer = self
+            .authority
+            .submit_derived(key.clone(), request, job, derive)
+            .await??;
+        self.managed_answer(key, Some(job), answer).await
+    }
+
+    async fn managed_answer(
+        &self,
+        key: OperationKey,
+        named: Option<JobId>,
+        answer: Answer,
+    ) -> Result<ManagedOperation, NodeError> {
         let Answer {
             result, replayed, ..
-        } = self.authority.submit(envelope).await?;
+        } = answer;
         match result {
             StoredResult::Accepted(accepted) => Ok(ManagedOperation {
                 operation: accepted.operation,
@@ -235,4 +280,20 @@ impl Node {
             Err(e) => Some(e.into()),
         }
     }
+}
+
+/// Refuses an owner's key in the facade's namespace, so an owner's key and
+/// an actor's never share a journal row (ADR 0027: two principals never
+/// share one key).
+fn refuse_facade_key(key: &OperationKey) -> Result<(), NodeError> {
+    if key.as_str().starts_with(crate::facade::FACADE_KEY_PREFIX) {
+        return Err(refused(
+            Reason::BadRequest,
+            format!(
+                "operation key {key} starts with {:?}, which the facade's keys use",
+                crate::facade::FACADE_KEY_PREFIX
+            ),
+        ));
+    }
+    Ok(())
 }

@@ -294,6 +294,9 @@ pub struct IgnorePolicy {
     /// The built-in list and the job's patterns as gitignore patterns, for the exclude file only.
     secret_lines: Vec<Pattern>,
     excludes: Vec<Pattern>,
+    /// Paths the job's export allowlist names (ADR 0025): a secret pattern
+    /// that matches one of them, or a path under one, does not deny it.
+    allowed: Vec<RelPath>,
 }
 
 /// A directory name the policy treats as a cache, with the files that make it one.
@@ -323,6 +326,7 @@ impl Default for IgnorePolicy {
             secrets: SecretPolicy::default(),
             secret_lines: patterns(SECRET_PATTERNS),
             excludes: Vec::new(),
+            allowed: Vec::new(),
         }
     }
 }
@@ -389,7 +393,26 @@ impl IgnorePolicy {
     /// directory the policy found by its name, the full list applies to the
     /// path up to that directory and the narrow list to the whole path, so
     /// a dependency's `credentials.js` travels and its `.env` does not.
+    /// Lets `path`, and everything under it, leave although a secret
+    /// pattern matches it: the job's export allowlist (ADR 0025). An
+    /// exclude still applies.
+    pub fn allow_export(&mut self, path: RelPath) {
+        if !self.allowed.contains(&path) {
+            self.allowed.push(path);
+        }
+    }
+
+    /// Whether the export allowlist names `path` or a directory above it.
+    fn exported(&self, path: &RelPath) -> bool {
+        self.allowed
+            .iter()
+            .any(|allowed| path == allowed || path.starts_with(allowed))
+    }
+
     fn denies_secret(&self, path: &RelPath, cache: Option<&RelPath>) -> bool {
+        if self.exported(path) {
+            return false;
+        }
         match cache {
             None => self.secrets.denies(path, Scope::Work).is_some(),
             Some(cache) => {
@@ -489,14 +512,22 @@ impl IgnorePolicy {
             text.push_str(&pattern.gitignore_line());
             text.push('\n');
         }
+        // A negation after the patterns lets git see an allowed path again.
+        for allowed in &self.allowed {
+            text.push('!');
+            text.push('/');
+            text.push_str(allowed.as_str());
+            text.push('\n');
+        }
         text
     }
 
     /// True when the full secret list denies the path, as the core's
-    /// `SecretPolicy::denies` does in `Scope::Work`.
+    /// `SecretPolicy::denies` does in `Scope::Work`, and the export
+    /// allowlist does not name it.
     #[must_use]
     pub fn is_secret(&self, path: &RelPath) -> bool {
-        self.secrets.denies(path, Scope::Work).is_some()
+        !self.exported(path) && self.secrets.denies(path, Scope::Work).is_some()
     }
 
     /// True when a path matches the full secret list or an exclude, whatever lies above it.

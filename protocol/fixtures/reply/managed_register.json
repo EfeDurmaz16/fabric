@@ -1,0 +1,50 @@
+{
+  "kind": "managed_register",
+  "operation": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "replayed": false,
+  "job": {
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "revision": "4",
+    "generation": "1",
+    "state": "active",
+    "goal": "fix the flaky test",
+    "harness": {
+      "kind": "codex"
+    },
+    "primary_task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+    "tasks": [
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "state": "open",
+        "class": "harness"
+      },
+      {
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+        "parent": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "label": "cargo test",
+        "state": "open",
+        "class": "test",
+        "program": {
+          "argv": [
+            "cargo",
+            "test",
+            "--workspace"
+          ],
+          "cwd": "crates/app",
+          "env_allowlist": [
+            "CARGO_HOME"
+          ]
+        }
+      }
+    ],
+    "attempts": [
+      {
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "generation": "1",
+        "status": "running"
+      }
+    ]
+  }
+}

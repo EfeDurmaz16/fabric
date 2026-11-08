@@ -1,0 +1,313 @@
+   Compiling tokio v1.54.1
+   Compiling num-traits v0.2.19
+   Compiling rand_xorshift v0.5.0
+   Compiling core_detect v1.0.0
+   Compiling unarray v0.1.4
+   Compiling fabric-psf v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-psf)
+   Compiling proptest v1.12.0
+   Compiling fabric-env v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-env)
+   Compiling fabric-client v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-client)
+   Compiling fabric-harness v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-harness)
+   Compiling tokio-rustls v0.26.6
+   Compiling quinn v0.11.12
+   Compiling fabric-net v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-net)
+   Compiling fabric-bridge v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-bridge)
+   Compiling fabricd v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabricd)
+   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric)
+   Compiling fabric-core v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-core)
+   Compiling fabric-store v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-store)
+   Compiling fabric-journal v0.1.0 (/private/tmp/fabric-wt/m5/crates/fabric-journal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.10s
+     Running unittests src/lib.rs ($CARGO_TARGET_DIR/debug/deps/fabric-ea8abb94f371c57e)
+
+running 28 tests
+test contract::tests::color_follows_the_precedence_of_the_guide ... ok
+test contract::tests::a_sentence_names_its_recovery_commands ... ok
+test contract::tests::a_word_is_quoted_only_when_a_shell_needs_it ... ok
+test render::contract_tests::a_ledger_time_prints_as_iso_8601_in_utc ... ok
+test psf::tests::a_pre_release_version_line_names_its_version ... ok
+test render::tests::doctor_fails_on_a_refused_path_as_the_move_would ... ok
+test render::contract_tests::an_empty_list_prints_nothing_but_its_hint ... ok
+test render::contract_tests::a_change_answers_with_its_bare_id ... ok
+test managed::tests::a_facade_command_carries_its_message_unchanged ... ok
+test managed::tests::a_facade_submit_takes_no_path ... ok
+test terminal::tests::a_hand_over_that_fails_is_an_error ... ok
+test render::tests::ledger_text_prints_with_its_control_characters_escaped ... ok
+test tests::the_report_names_what_was_carried_and_what_was_not ... ok
+test managed::tests::a_changing_command_carries_the_key_given_or_a_fresh_one ... ok
+test tests::named_sessions_wait_in_order_and_in_bounds ... ok
+test tests::a_launch_under_another_home_than_the_nodes_is_refused ... ok
+test contract::tests::a_failure_under_a_made_key_names_the_key_and_the_safe_retry ... ok
+test managed::tests::a_create_names_one_source_and_its_policy ... ok
+setup: mkdir -p ran
+setup: mkdir -p ran
+test tests::a_client_command_runs_on_two_workers_and_serve_on_every_core ... ok
+cache out: missing
+setup: sh -c echo ran >> ran.log; mkdir -p out; echo x > out/f
+test tests::a_missing_declared_variable_stops_a_launch_with_no_setup_step ... ok
+test tests::a_spec_this_node_has_not_run_does_not_run_unapproved ... ok
+test tests::a_launch_asks_the_node_again_before_any_setup_step ... ok
+test tests::an_approval_is_not_written_through_a_link_at_a_temporary_name ... ok
+setup: mkdir -p ran
+setup: mkdir -p other
+test tests::an_approval_holds_for_its_spec_only ... ok
+cache out: installed from other lockfiles than the workspace has now
+setup: sh -c echo ran >> ran.log; mkdir -p out; echo x > out/f
+test tests::a_changed_install_input_asks_again ... ok
+test tests::a_line_past_the_bound_is_dropped_without_holding_it ... ok
+interrupted by signal 1 while the node recorded the session; `fabric job status 01M5EBB2BWY97N3YEKD6CDN2EM` shows what it holds
+test tests::a_signal_while_the_node_records_the_session_ends_the_turn_with_it ... ok
+interrupted by signal 1 while telling the node the harness exited; `fabric job status 01M5EBB2BWY97N3YEKD6CDN2EM` shows what it holds
+test tests::a_signal_ends_the_wait_for_the_node_after_the_harness_exited ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+     Running unittests src/main.rs ($CARGO_TARGET_DIR/debug/deps/fabric-81210e5060f75760)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli_contract.rs ($CARGO_TARGET_DIR/debug/deps/cli_contract-16315afc5f8e6983)
+
+running 8 tests
+test every_example_parses_and_every_leaf_has_one ... ok
+test a_stray_word_is_a_usage_error_that_names_it ... ok
+test an_unknown_option_is_a_usage_error_with_a_hint ... ok
+test the_command_reference_is_up_to_date ... ok
+test a_failure_is_one_document_under_json_and_stdout_stays_empty ... ok
+test the_version_prints_alone_at_any_depth ... ok
+test no_color_removes_every_escape_sequence ... ok
+test every_help_has_the_layout_and_prints_on_stdout ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.65s
+
+     Running tests/e2e/main.rs ($CARGO_TARGET_DIR/debug/deps/e2e-ee3581d7d8d4902f)
+
+running 18 tests
+test ab::analyze ... ignored, reads the samples of an A/B run; scripts/bench-ab.sh runs it
+test ab::new_paths::run ... ignored, benchmark of the candidate's M5 paths; scripts/bench-ab.sh runs it
+test ab::paired ... ignored, benchmark of two builds; scripts/bench-ab.sh runs it
+test bench::m2_paths ... ignored, benchmark; scripts/bench-m2.sh runs it
+test budget::hot_paths ... ignored, takes minutes; CI runs it in a step of its own
+test budget::a_named_platform_replaces_this_machines ... ok
+test budget::ci_enforces_the_budget ... ok
+test ab::a_spawn_line_reads_as_its_command ... ok
+test ab::a_counter_page_reads_back ... ok
+test budget::the_budget_file_holds_every_op ... ok
+test budget::every_op_has_a_baseline_on_linux_and_macos ... ok
+test budget::the_budget_names_the_programs_it_counts ... ok
+test ab::a_run_reports_the_daemons_physical_footprint ... ok
+test budget::the_verdicts_follow_the_rules ... ok
+test ab::a_counted_run_reports_the_daemons_resident_size ... ok
+test ab::the_bootstrap_interval_holds_the_median_and_repeats ... ok
+test budget::the_counter_counts_a_fake_and_puts_it_back ... ok
+test world::a_killed_command_whose_child_keeps_its_pipes_fails_in_time ... ok
+
+test result: ok. 13 passed; 0 failed; 5 ignored; 0 measured; 86 filtered out; finished in 10.22s
+
+     Running unittests src/lib.rs ($CARGO_TARGET_DIR/debug/deps/fabric_bridge-1360a773e6696517)
+
+running 2 tests
+test wire::tests::a_locator_with_a_null_or_empty_native_id_is_a_missing_field ... ok
+test wire::tests::a_locator_record_is_its_canonical_text_and_the_key_of_its_identity ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bench.rs ($CARGO_TARGET_DIR/debug/deps/bench-b3a973ed77e9a970)
+
+running 2 tests
+test bridge_latencies ... ignored, a bench; run by scripts/bench-bridge.sh with FABRIC_BRIDGE_BENCH_OUT set
+test capsule_worker_latencies ... ignored, a bench; run by scripts/bench-bridge.sh with FABRIC_BRIDGE_BENCH_OUT and CAPSULE_BRIDGE_WORKER set
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/capsule_worker.rs ($CARGO_TARGET_DIR/debug/deps/capsule_worker-622f0fab75be1039)
+
+running 13 tests
+test a_create_lost_with_its_worker_is_attached_and_never_made_twice ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test a_create_whose_frame_never_left_stays_unknown_after_an_absent_attach_until_abandoned ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test a_destroy_lost_with_its_worker_blocks_a_replacement_until_a_stop_is_confirmed ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test a_docker_create_lost_with_its_worker_is_attached_and_never_made_twice ... ignored, needs the Capsule worker and a local Docker engine: set CAPSULE_BRIDGE_WORKER and CAPSULE_BRIDGE_DOCKER_IMAGE, run with --ignored
+test a_docker_destroy_lost_with_its_worker_blocks_a_replacement_until_no_container_is_left ... ignored, needs the Capsule worker and a local Docker engine: set CAPSULE_BRIDGE_WORKER and CAPSULE_BRIDGE_DOCKER_IMAGE, run with --ignored
+test a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test a_repeated_idempotency_key_is_never_sent_again ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test create_exec_observe_destroy_keep_the_scoped_locator ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test denied_and_unsupported_requests_fail_before_any_effect ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test every_shared_scenario_over_the_workers_stdio ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test observe_reads_only_the_operations_own_resource ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+test the_docker_profile_on_the_local_engine ... ignored, needs the Capsule worker and a local Docker engine: set CAPSULE_BRIDGE_WORKER and CAPSULE_BRIDGE_DOCKER_IMAGE, run with --ignored
+test the_handshake_negotiates_the_fixture_profile_and_refuses_another_version ... ignored, needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored
+
+test result: ok. 0 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden.rs ($CARGO_TARGET_DIR/debug/deps/golden-77bf01b89f2cb743)
+
+running 5 tests
+test a_negative_zero_or_a_float_is_not_an_integer ... ok
+test every_profile_parses_and_writes_back_the_same_document ... ok
+test every_frame_is_read_or_refused_as_it_says ... ok
+test every_case_is_accepted_or_refused_as_it_says_and_writes_back_unchanged ... ok
+test every_scenario_message_decodes_and_writes_back_unchanged ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/off_runtime.rs ($CARGO_TARGET_DIR/debug/deps/off_runtime-c6d0d56a2084fd97)
+
+running 3 tests
+test a_call_is_counted_before_its_caller_hears_its_result ... ok
+test every_log_call_runs_on_the_log_thread_and_each_step_makes_its_pinned_calls ... ok
+test a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+
+     Running tests/process.rs ($CARGO_TARGET_DIR/debug/deps/process-4609d4bbb65871d3)
+
+running 35 tests
+test a_handshake_answer_over_1_mib_is_refused_from_its_length ... ok
+test a_handshake_that_raises_a_limit_or_names_another_profile_is_refused ... ok
+test a_dropped_bridge_takes_the_workers_group ... ok
+test a_create_is_recorded_dispatched_then_succeeded_with_its_locator ... ok
+test a_stale_generation_is_fenced_before_anything_is_sent ... ok
+test a_worker_crash_mid_request_leaves_the_operation_unknown ... ok
+test a_denied_request_records_rejected_and_no_effect ... ok
+test a_shutdown_refused_for_a_lost_worker_leaves_later_requests_lost ... ok
+test a_worker_without_a_common_version_refuses_and_says_which_it_speaks ... ok
+test a_terminal_only_action_answered_before_terminal_is_unknown_and_ends_the_worker ... ok
+test a_worker_frame_over_the_cap_is_refused_unread_and_the_worker_terminated ... ok
+test a_locator_reported_before_a_crash_is_kept_with_unknown ... ok
+test a_crashed_worker_takes_its_group_and_not_what_runs_outside_it ... ok
+test a_create_lost_with_its_worker_is_attached_and_never_made_twice ... ok
+test a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_restart ... ok
+test a_cancel_after_the_worker_is_lost_is_refused_as_lost_not_not_found ... ok
+test the_double_has_run_to_its_exit_before_a_test_can_start_it ... ok
+test a_worker_that_does_not_answer_hello_or_exits_is_not_a_bridge ... ok
+test a_request_refused_when_it_registers_has_recorded_the_late_locator ... ok
+test an_answer_under_another_operation_breaks_the_protocol ... ok
+test a_refused_request_records_no_late_locator ... ok
+test an_exec_answered_running_is_settled_by_observe ... ok
+test a_cleanup_without_a_named_resource_is_refused_before_anything_is_written ... ok
+test a_timeout_leaves_unknown_and_the_operation_is_never_sent_again ... ok
+test an_observe_of_an_unknown_operation_settles_it_and_a_refused_one_changes_nothing ... ok
+test a_worker_that_breaks_the_protocol_is_terminated_with_its_group ... ok
+test exec_and_destroy_round_trip_with_their_targets ... ok
+test the_in_flight_limit_refuses_before_the_journal_and_shutdown_lists_the_rest ... ok
+test a_worker_that_stops_reading_is_lost_and_terminated_at_the_deadline ... ok
+test fabric_refuses_before_sending_what_the_profile_or_the_cap_refuses ... ok
+test an_attach_is_a_read_refused_where_the_profile_or_the_journal_says ... ok
+test the_worker_leads_its_own_group_and_close_ends_what_it_left_there ... ok
+test progress_is_bounded_to_sixteen_frames_in_order ... ok
+test a_late_answer_records_the_locator_it_names_and_not_its_status ... ok
+test observe_reads_only_the_operations_own_action_and_resource ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running tests/scenarios.rs ($CARGO_TARGET_DIR/debug/deps/scenarios-2d0a833e79f23746)
+
+running 2 tests
+test the_scenarios_negotiate_the_fixture_profile ... ok
+test fabric_runs_every_scenario_against_a_scripted_worker ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+     Running tests/stream.rs ($CARGO_TARGET_DIR/debug/deps/stream-e9a7ed6f22600a38)
+
+running 14 tests
+test a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lost ... ok
+test a_request_admitted_before_a_shutdown_is_never_written_after_it ... ok
+test an_observe_that_learned_nothing_leaves_a_dispatched_request_to_its_answer ... ok
+test a_request_above_the_profile_bounds_or_at_no_resource_is_refused_before_sending ... ok
+test a_caller_that_gives_up_leaves_no_partial_frame ... ok
+test an_observe_after_a_shutdown_is_refused_as_shutting_down ... ok
+test a_request_that_fails_validation_after_a_shutdown_is_refused_as_shutting_down ... ok
+test a_request_outside_the_profile_at_the_in_flight_limit_is_refused_as_busy ... ok
+test a_request_the_journal_would_refuse_after_a_shutdown_is_refused_as_shutting_down ... ok
+test a_request_outside_the_profile_after_a_shutdown_is_refused_as_shutting_down ... ok
+test an_attach_and_a_cleanup_after_a_shutdown_are_refused_as_shutting_down ... ok
+test an_absent_observe_of_another_scope_does_not_settle_a_not_found_destroy ... ok
+test a_not_found_destroy_is_unknown_until_an_observe_finds_its_resource_absent ... ok
+test a_not_found_destroy_keeps_the_barrier_while_nothing_finds_its_resource_absent ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running unittests src/lib.rs ($CARGO_TARGET_DIR/debug/deps/fabric_client-fff4ce18e6caba51)
+
+running 18 tests
+test client::tests::a_directory_above_the_socket_only_this_user_or_root_may_own ... ok
+test sentences::tests::a_preflight_row_prints_in_columns ... ok
+test client::tests::a_socket_under_a_missing_directory_is_no_daemon ... ok
+test client::tests::a_socket_that_is_a_symlink_is_not_trusted ... ok
+test facade::tests::a_bearer_reads_its_hex_and_prints_redacted ... ok
+test facade::tests::a_message_writes_back_what_it_read ... ok
+test facade::tests::the_generations_of_the_event_body_stay_strings ... ok
+test client::tests::a_state_directory_others_can_enter_is_not_trusted ... ok
+test api::tests::an_absolute_entry_that_is_not_utf8_fails_instead_of_vanishing ... ok
+test sentences::tests::event_lines_print_with_their_control_characters_escaped ... ok
+test api::tests::the_client_env_keeps_every_absolute_entry_and_root_as_written ... ok
+test frame::tests::a_lower_cap_is_inclusive_and_refuses_from_the_header ... ok
+test frame::tests::a_frame_over_the_cap_is_refused_from_its_header ... ok
+test frame::tests::a_connection_closed_between_frames_is_not_an_error_and_one_closed_inside_a_header_is ... ok
+test client::tests::a_directory_above_the_socket_group_or_others_may_write_is_not_trusted_unless_sticky ... ok
+test sentences::tests::a_task_s_last_receipt_is_printed_under_it ... ok
+test client::tests::the_path_dialed_goes_through_no_symlink ... ok
+test frame::tests::a_writer_bounds_an_integer_no_reader_takes ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bridge_fixtures.rs ($CARGO_TARGET_DIR/debug/deps/bridge_fixtures-86ff0b5a8955bc64)
+
+running 4 tests
+test sha256_matches_the_fips_known_answers ... ok
+test the_manifest_is_the_pinned_one ... ok
+test framed_fixtures_agree_with_the_framing_caps_and_the_message_cases ... ok
+test every_fixture_matches_the_manifest_and_none_is_missing_or_extra ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/client.rs ($CARGO_TARGET_DIR/debug/deps/client-d2bd4e556ee7794e)
+
+running 9 tests
+test a_directory_above_the_socket_others_may_write_gets_no_connection ... ok
+test a_node_that_closes_after_the_hello_reads_as_an_older_node ... ok
+test a_welcome_of_another_api_version_gets_no_request ... ok
+test an_op_the_node_does_not_list_is_not_sent ... ok
+test an_incompatible_node_gets_no_request ... ok
+test a_reply_for_another_op_is_refused ... ok
+test a_refusal_arrives_typed_with_the_nodes_sentence ... ok
+test events_reach_the_caller_in_order_and_unknown_kinds_are_skipped ... ok
+test a_root_the_node_does_not_list_is_not_sent ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/contract.rs ($CARGO_TARGET_DIR/debug/deps/contract-9df005e42abaab2d)
+
+running 13 tests
+test the_hello_fixture_pins_the_api_version ... ok
+test a_hello_frames_to_the_fixture_bytes_and_back ... ok
+test the_welcome_fixtures_list_every_op_and_every_root ... FAILED
+test a_message_from_a_newer_node_reads_as_the_compatibility_rule_says ... ok
+test every_refusal_reason_has_a_fixture_with_its_kind ... ok
+test every_invalid_message_is_refused_at_the_boundary ... ok
+test every_event_kind_has_a_fixture ... ok
+test every_op_has_a_request_and_a_reply_fixture_tagged_with_its_name ... ok
+test every_fixture_parses_and_writes_back_to_the_same_json ... ok
+test every_variant_of_every_nested_enum_has_a_fixture ... ok
+test every_closed_enum_has_exactly_the_variants_its_api_version_pins ... ok
+test every_object_skips_a_field_it_does_not_know_outside_what_a_client_launches ... ok
+test every_message_needs_exactly_the_fields_its_api_version_pins ... ok
+
+failures:
+
+---- the_welcome_fixtures_list_every_op_and_every_root stdout ----
+
+thread 'the_welcome_fixtures_list_every_op_and_every_root' (403202650) panicked at crates/fabric-client/tests/contract.rs:119:5:
+no welcome fixture lists ["node_id", "node_add", "node_list", "node_ping", "job_new", "job_list", "job_status", "job_log", "job_run", "job_resume", "job_suspend", "job_move", "job_steal", "job_decide", "doctor", "harness_started", "harness_session", "harness_exited", "launch_check", "managed_create", "managed_cancel", "managed_status", "managed_list", "job_repair", "job_export", "managed_note", "managed_checkpoint", "managed_continue", "managed_inspect", "managed_submit", "managed_import", "facade_mint", "facade_revoke", "facade_call", "managed_register", "job_export_psf", "harness_started.planned", "harness_started.version", "env.roots.cargo_home", "env.roots.rustup_home", "env.roots.pnpm_home", "env.roots.xdg_data_home"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    the_welcome_fixtures_list_every_op_and_every_root
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+error: test failed, to rerun pass `-p fabric-client --test contract`

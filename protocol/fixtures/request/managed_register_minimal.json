@@ -1,0 +1,14 @@
+{
+  "op": "managed_register",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "parent": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+  "label": "build",
+  "class": "build",
+  "program": {
+    "argv": [
+      "cargo",
+      "build"
+    ]
+  }
+}

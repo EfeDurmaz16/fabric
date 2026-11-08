@@ -1,0 +1,49 @@
+{
+  "case": "watch_lagged",
+  "direction": "client_to_authority",
+  "given": {
+    "now_ms": 1762128000000,
+    "tokens": [
+      {
+        "token_id": "01K8W3A0000000000000000K01",
+        "bearer": "1111111111111111111111111111111111111111111111111111111111111111",
+        "actor": "efe-laptop",
+        "jobs": "any",
+        "resources": "any",
+        "expires_ms": 1762131600000,
+        "revoked_ms": null
+      }
+    ],
+    "jobs": [
+      {
+        "job": "01K8W3A00000000000000000J1",
+        "revision": "600",
+        "state": "active",
+        "live_attempt": false
+      }
+    ],
+    "operations": [],
+    "events": {
+      "head": "600"
+    }
+  },
+  "message": {
+    "type": "watch",
+    "facade": 1,
+    "token": "1111111111111111111111111111111111111111111111111111111111111111",
+    "job": "01K8W3A00000000000000000J1",
+    "after": "1",
+    "wait_ms": 0
+  },
+  "expect": {
+    "outcome": "accept",
+    "answer": {
+      "type": "events",
+      "facade": 1,
+      "job": "01K8W3A00000000000000000J1",
+      "next": "257",
+      "lagged": true,
+      "closed": null
+    }
+  }
+}

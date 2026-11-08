@@ -1,0 +1,15 @@
+{
+  "op": "managed_submit",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "goal": "Work on the repo",
+  "harness": {
+    "kind": "codex"
+  },
+  "source": {
+    "kind": "repository",
+    "path": "/Users/me/oss/some-repo"
+  },
+  "policy": {
+    "pin": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq"
+  }
+}

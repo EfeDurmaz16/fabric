@@ -1,0 +1,28 @@
+{
+  "case": "events_valid",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "events",
+    "facade": 1,
+    "job": "01K8W3A00000000000000000J1",
+    "events": [
+      {
+        "seq": "7",
+        "revision": "3",
+        "at_ms": 1762128000000,
+        "event": {
+          "kind": "attempt_observed",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1",
+          "status": "running"
+        }
+      }
+    ],
+    "next": "7",
+    "lagged": false,
+    "closed": null
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

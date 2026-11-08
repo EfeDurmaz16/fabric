@@ -1,0 +1,23 @@
+{
+  "case": "report_continued",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "report",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A2",
+      "generation": "2"
+    },
+    "observation": {
+      "kind": "continued",
+      "attempt": "01K8W3A00000000000000000A2",
+      "generation": "2",
+      "from": "01K8W3A00000000000000000A1",
+      "achieved": "new_native_session_with_package",
+      "package": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

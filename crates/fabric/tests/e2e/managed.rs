@@ -274,3 +274,498 @@ fn e2e_the_cli_makes_reads_and_cancels_managed_jobs_under_their_keys() -> Fallib
     assert!(cancelled.contains("cancelled"), "{cancelled}");
     Ok(())
 }
+
+/// The launch path's client surface (docs/managed-jobs.md, "Launch path"):
+/// `fabric managed register` records a test task with its program under
+/// the job's primary task, the answer and `managed status` show it with
+/// what it runs, and a program that carries a credential is refused
+/// `bad_program` before the journal records anything.
+#[test]
+fn e2e_the_cli_registers_a_test_task_with_its_program() -> Fallible {
+    let env = Env::new()?;
+    let mut node = Node::new(&env, "a", Wire::TcpTls)?;
+    node.start(None)?;
+    let repo = env.repo.to_str().ok_or("the repository is not UTF-8")?;
+    let made = node.ok(&[
+        "managed",
+        "create",
+        "--repo",
+        repo,
+        "--goal",
+        "make the tests pass",
+        "--harness",
+        "codex",
+        "--operation-key",
+        "make-1",
+    ])?;
+    let job = made.lines().next().ok_or("nothing printed")?.to_owned();
+    let primary = made
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("task ")?
+                .strip_suffix(" (primary): open")
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| format!("no open primary task in {made}"))?;
+
+    let registered = node.ok(&[
+        "managed",
+        "register",
+        &job,
+        "--parent",
+        &primary,
+        "--label",
+        "unit tests",
+        "--class",
+        "test",
+        "--cwd",
+        "src",
+        "--env",
+        "CARGO_HOME",
+        "--operation-key",
+        "register-1",
+        "--",
+        "sh",
+        "-c",
+        "exit 0",
+    ])?;
+    assert!(
+        registered.contains("(unit tests): open"),
+        "the answer names the task: {registered}"
+    );
+    let runs = r#"  runs "sh" "-c" "exit 0" in src"#;
+    assert!(registered.contains(runs), "{registered}");
+    let status = node.ok(&["managed", "status", &job])?;
+    assert!(status.contains(runs), "status shows the program: {status}");
+
+    let again = node.ok(&[
+        "managed",
+        "register",
+        &job,
+        "--parent",
+        &primary,
+        "--label",
+        "unit tests",
+        "--class",
+        "test",
+        "--cwd",
+        "src",
+        "--env",
+        "CARGO_HOME",
+        "--operation-key",
+        "register-1",
+        "--",
+        "sh",
+        "-c",
+        "exit 0",
+    ])?;
+    assert!(
+        again.contains("answered again for key register-1"),
+        "{again}"
+    );
+
+    let token = format!("ghp_{}", "a".repeat(36));
+    let refused = node.fails(&[
+        "managed", "register", &job, "--parent", &primary, "--label", "leaky", "--class", "build",
+        "--", "curl", "-H", &token,
+    ])?;
+    assert!(refused.contains("bad program"), "{refused}");
+    assert!(
+        !refused.contains(&token),
+        "the refusal echoes no credential: {refused}"
+    );
+    let wrong = node.fails(&[
+        "managed", "register", &job, "--parent", &primary, "--label", "x", "--class", "harness",
+        "--", "true",
+    ])?;
+    assert!(wrong.contains("build or test"), "{wrong}");
+    Ok(())
+}
+
+/// The provider read surface carried from M4, through the CLI: a job's
+/// journal seeded, while its daemon is down, with provider operations in
+/// `unknown` (with and without the scope an absent attach searched),
+/// `attached`, `observed`, `abandoned` and a destroy `dispatched`, which the
+/// restarted daemon reconciles to `unknown`; `fabric managed
+/// inspect` prints each status as it is, each blocker kind and each
+/// residual kind, with the target, the search and the abandonment reason.
+#[test]
+#[expect(clippy::too_many_lines, reason = "the seed reads best as one script")]
+fn e2e_the_cli_inspects_provider_operations_blockers_and_residuals() -> Fallible {
+    use fabric_core::id::NodeId;
+    use fabric_core::managed::{
+        AttemptId, Command, Envelope, NewIds, OperationId, RequestDigest, ResourceRef, TaskId,
+    };
+    use fabric_journal::{
+        AbandonApproval, Acknowledged, EffectClass, Journal, LocatorRecord, ProviderAnswer,
+        ProviderDispatch, ProviderStatus, Purpose, ResourceKey,
+    };
+
+    let env = Env::new()?;
+    let mut node = Node::new(&env, "a", Wire::TcpTls)?;
+    node.start(None)?;
+    // Pinned to a node that is not paired: the job is parked and no
+    // attempt of it runs anywhere while the journal is seeded.
+    let elsewhere = "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq";
+    let made = node.ok(&[
+        "managed",
+        "create",
+        "--empty",
+        "--goal",
+        "provision a sandbox",
+        "--harness",
+        "codex",
+        "--pin",
+        elsewhere,
+        "--operation-key",
+        "make-1",
+    ])?;
+    let job: JobId = made.lines().next().ok_or("nothing printed")?.parse()?;
+    node.kill()?;
+
+    let path = node.state().join("managed").join(fabric_journal::FILE_NAME);
+    let mut journal = Journal::open(&path)?;
+    let state = journal.job(job)?.ok_or("the job is not in the journal")?;
+    let at = 1_762_128_000_000;
+    journal.submit(
+        &Envelope {
+            key: key("start-seeded")?,
+            job: Some(job),
+            expected: None,
+            body: Command::StartAttempt {
+                task: state.job.primary,
+                resource: ResourceRef::Node {
+                    node: elsewhere.parse::<NodeId>()?,
+                },
+                initial_checkpoint: None,
+            },
+        },
+        NewIds {
+            job,
+            task: TaskId::from_bytes([0x61; 16]),
+            attempt: AttemptId::from_bytes([0x62; 16]),
+            operation: OperationId::from_bytes([0x63; 16]),
+            at_ms: at,
+        },
+    )?;
+    let attempt = journal
+        .job(job)?
+        .and_then(|s| s.attempts.last().cloned())
+        .ok_or("no attempt was granted")?;
+    let locator = LocatorRecord {
+        text: r#"{"kind":"sandbox","native_id":"sb-1","provider":"fixture"}"#.into(),
+        key: ResourceKey::from_bytes([0x45; 32]),
+    };
+    let searched = r#"{"kind":"sandbox","provider":"fixture"}"#;
+    let op = |n: u8| OperationId::from_bytes([0x40 + n; 16]);
+    let dispatch =
+        |n: u8, action: &str, target: Option<LocatorRecord>| -> Fallible<ProviderDispatch> {
+            Ok(ProviderDispatch {
+                operation: op(n),
+                key: key(&format!("provider-{n}"))?,
+                digest: RequestDigest::from_bytes([n; 32]),
+                job,
+                task: attempt.task,
+                attempt: attempt.id,
+                generation: attempt.generation,
+                profile: "fixture".into(),
+                action: action.into(),
+                effect: match action {
+                    "sandbox.create" => EffectClass::Create,
+                    "sandbox.destroy" => EffectClass::Destroy,
+                    _ => EffectClass::Mutate,
+                },
+                purpose: Purpose::Effect,
+                target,
+            })
+        };
+    let lost = ProviderAnswer {
+        code: Some("timeout".into()),
+        reason: Some("timeout".into()),
+        effect: Some("unknown".into()),
+    };
+    let empty = ProviderAnswer::default();
+    for n in [1, 2, 3] {
+        journal.provider_begin(&dispatch(n, "sandbox.create", None)?, None, at)?;
+    }
+    journal.provider_record(op(1), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_record(op(2), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_searched(op(2), &lost, searched, at)?;
+    journal.provider_record(op(3), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_record(op(3), ProviderStatus::Attached, &empty, Some(&locator), at)?;
+    journal.provider_begin(
+        &dispatch(4, "sandbox.exec", Some(locator.clone()))?,
+        None,
+        at,
+    )?;
+    journal.provider_record(op(4), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_record(op(4), ProviderStatus::Observed, &empty, None, at)?;
+    journal.provider_begin(
+        &dispatch(5, "sandbox.exec", Some(locator.clone()))?,
+        None,
+        at,
+    )?;
+    journal.provider_record(op(5), ProviderStatus::Unknown, &lost, None, at)?;
+    journal.provider_abandon(
+        &AbandonApproval {
+            operation: op(5),
+            expected: ProviderStatus::Unknown,
+            acknowledged: Acknowledged::Resource(locator.key),
+            reason: "the console shows it ended".into(),
+        },
+        at,
+    )?;
+    journal.provider_begin(
+        &dispatch(6, "sandbox.destroy", Some(locator.clone()))?,
+        None,
+        at,
+    )?;
+    drop(journal);
+
+    node.start(None)?;
+    let shown = node.ok(&["managed", "inspect", &job.to_string()])?;
+    for (n, status) in [
+        (1, "unknown"),
+        (2, "unknown"),
+        (3, "attached"),
+        (4, "observed"),
+        (5, "abandoned"),
+        // Recorded dispatched; the daemon's start-up reconciliation made it
+        // unknown, since nobody can tell whether it reached the provider.
+        (6, "unknown"),
+    ] {
+        let line = format!("provider operation {}: ", op(n));
+        let at = shown
+            .find(&line)
+            .ok_or_else(|| format!("no line for {}: {shown}", op(n)))?;
+        let line = shown[at..].lines().next().unwrap_or_default();
+        assert!(
+            line.ends_with(&format!("({status})")) || line.contains(&format!("({status}) at ")),
+            "{line}"
+        );
+    }
+    assert!(shown.contains(&format!("  searched {searched}")), "{shown}");
+    assert!(
+        shown.contains(&format!("  sent to {}", locator.text)),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("  abandoned: the console shows it ended"),
+        "{shown}"
+    );
+    for (kind, n, status) in [
+        ("create_unresolved", 1, "unknown"),
+        ("exec_may_run", 5, "abandoned"),
+        ("stop_not_confirmed", 6, "unknown"),
+    ] {
+        let line = format!("blocks a replacement: {kind} {} ({status})", op(n));
+        assert!(shown.contains(&line), "{line} in {shown}");
+    }
+    assert!(
+        shown.contains(&format!(
+            "may remain: the resource of {} (attached) at {}",
+            op(3),
+            locator.text
+        )),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!(
+            "may remain: the resource of {} (unknown), not found in {searched}",
+            op(2)
+        )),
+        "{shown}"
+    );
+    Ok(())
+}
+
+/// A job whose harness, the fake codex, keeps its turn open on one daemon,
+/// with its attempt running; the node, the client, the job and its primary task.
+async fn running_job(env: &std::sync::Arc<Env>) -> Fallible<(Node, Client, JobId, String)> {
+    env.install_fake_codex()?;
+    let mut node = Node::new(env, "a", Wire::TcpTls)?;
+    // One process that holds its turn open: a harness that forks nothing,
+    // so a quiescence finds no escaped child in its group.
+    node.daemon_env("FAKE_CODEX_HOLD", std::ffi::OsString::from("1"));
+    node.start(None)?;
+    let client = Client::new(node.state().join("fabric.sock"));
+    let made = node.ok(&[
+        "managed",
+        "create",
+        "--empty",
+        "--goal",
+        "keep working",
+        "--harness",
+        "codex",
+        "--drain-budget",
+        "1000",
+        "--operation-key",
+        "make-1",
+    ])?;
+    let job: JobId = made.lines().next().ok_or("nothing printed")?.parse()?;
+    let primary = made
+        .lines()
+        .find_map(|line| line.strip_prefix("task ")?.strip_suffix(" (primary): open"))
+        .ok_or_else(|| format!("no primary task in {made}"))?
+        .to_owned();
+    attempt_status(&node, &client, job, "running").await?;
+    Ok((node, client, job, primary))
+}
+
+/// Waits until the job's newest attempt is `status`; the inspection then.
+async fn attempt_status(
+    node: &Node,
+    client: &Client,
+    job: JobId,
+    status: &str,
+) -> Fallible<fabric_client::api::Inspection> {
+    let started = std::time::Instant::now();
+    loop {
+        let inspection = client.managed_inspect(job, |_| {}).await?;
+        if inspection.job.attempts.last().map(|a| a.status.as_str()) == Some(status) {
+            return Ok(inspection);
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(format!(
+                "the attempt is not {status}: {inspection:?}\n{}",
+                node.log()
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// The launch records the node's executor holds for the job's newest attempt.
+fn launch_records(node: &Node, attempt: &str) -> usize {
+    std::fs::read_dir(node.state().join("runs").join("records").join(attempt))
+        .map_or(0, Iterator::count)
+}
+
+/// The launch path's cancel of a live attempt: a test task registered
+/// while the attempt runs is spawned on its node, a cancel stops every
+/// group, the test is recorded interrupted, never passed, and the
+/// attempt and the job end cancelled.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_a_cancel_stops_a_live_attempt_and_records_the_tasks_interrupted() -> Fallible {
+    let env = Env::new()?;
+    let (node, client, job, primary) = running_job(&env).await?;
+    let job_text = job.to_string();
+    let registered = node.ok(&[
+        "managed",
+        "register",
+        &job_text,
+        "--parent",
+        &primary,
+        "--label",
+        "slow test",
+        "--class",
+        "test",
+        "--operation-key",
+        "register-1",
+        "--",
+        "sleep",
+        "30",
+    ])?;
+    let test_task = registered
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("task ")?
+                .strip_suffix(" (slow test): open")
+        })
+        .ok_or_else(|| format!("no test task in {registered}"))?
+        .to_owned();
+    let inspection = client.managed_inspect(job, |_| {}).await?;
+    let attempt = inspection
+        .job
+        .attempts
+        .last()
+        .ok_or("no attempt")?
+        .attempt
+        .to_string();
+    let started = std::time::Instant::now();
+    while launch_records(&node, &attempt) < 2 {
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(format!("the test task was not spawned:\n{}", node.log()).into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    node.ok(&[
+        "managed",
+        "cancel",
+        &job_text,
+        "--reason",
+        "stop now",
+        "--operation-key",
+        "cancel-1",
+    ])?;
+    let inspection = attempt_status(&node, &client, job, "cancelled").await?;
+    let test = inspection
+        .job
+        .tasks
+        .iter()
+        .find(|t| t.task.to_string() == test_task)
+        .ok_or("the test task is gone")?;
+    let receipt = test.receipt.as_ref().ok_or("the test has no receipt")?;
+    assert_eq!(receipt.status, "interrupted", "{inspection:?}");
+    assert!(receipt.interrupted);
+    assert_eq!(inspection.job.state, "cancelled", "{inspection:?}");
+    let started = std::time::Instant::now();
+    while launch_records(&node, &attempt) > 0 {
+        if started.elapsed() > std::time::Duration::from_secs(10) {
+            return Err("the stopped attempt's records were left".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// The launch path's checkpoint of a live attempt: the node quiesces and
+/// cuts it, the cut is recorded with the harness's receipt, and the same
+/// attempt goes on running.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_a_checkpoint_cuts_a_live_attempt_and_it_goes_on() -> Fallible {
+    let env = Env::new()?;
+    let (node, client, job, _primary) = running_job(&env).await?;
+    let before = client.managed_inspect(job, |_| {}).await?;
+    let attempt = before.job.attempts.last().ok_or("no attempt")?.attempt;
+    let job_text = job.to_string();
+    node.ok(&[
+        "managed",
+        "checkpoint",
+        &job_text,
+        "--operation-key",
+        "cp-1",
+    ])?;
+    let started = std::time::Instant::now();
+    let primary_receipt = loop {
+        let inspection = client.managed_inspect(job, |_| {}).await?;
+        let receipt = inspection
+            .job
+            .tasks
+            .iter()
+            .find(|t| t.task == inspection.job.primary_task)
+            .and_then(|t| t.receipt.clone());
+        if let Some(receipt) = receipt {
+            break (inspection, receipt);
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(format!("no cut was recorded: {inspection:?}\n{}", node.log()).into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let (inspection, receipt) = primary_receipt;
+    assert_eq!(receipt.status, "checkpointed", "{inspection:?}");
+    let last = inspection.job.attempts.last().ok_or("no attempt")?;
+    assert_eq!(last.attempt, attempt, "the same attempt: {inspection:?}");
+    assert_eq!(last.status, "running", "it goes on: {inspection:?}");
+    node.ok(&[
+        "managed",
+        "cancel",
+        &job_text,
+        "--operation-key",
+        "cancel-1",
+    ])?;
+    attempt_status(&node, &client, job, "cancelled").await?;
+    Ok(())
+}
