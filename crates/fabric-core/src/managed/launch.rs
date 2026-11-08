@@ -585,4 +585,38 @@ mod tests {
         assert_eq!(lost.check(), Err(ReportRefusal::NotReportable));
         Ok(())
     }
+
+    /// M6's `Captured` is a node's report; the two presence observations
+    /// are the authority's own and never come from a node (ADR 0028).
+    #[test]
+    fn a_report_carries_captured_and_never_a_presence_observation() -> Result<(), ParseIdError> {
+        let job: JobId = "01K8W3A00000000000000000J1".parse()?;
+        let attempt: AttemptId = "01K8W3A00000000000000000A1".parse()?;
+        let token = GrantToken {
+            job,
+            attempt,
+            generation: Generation::FIRST,
+        };
+        let report = |observation| Report { token, observation };
+        let captured = report(Observation::Captured {
+            attempt,
+            generation: Generation::FIRST,
+            snapshot: SnapshotId::of(b"captured"),
+            cut: super::super::lifecycle::CutDigest::from_bytes([1; 32]),
+        });
+        assert_eq!(captured.check(), Ok(()));
+        let unavailable = report(Observation::ResourceUnavailable {
+            attempt,
+            generation: Generation::FIRST,
+            last_heartbeat_ms: None,
+            at_ms: 1,
+        });
+        assert_eq!(unavailable.check(), Err(ReportRefusal::NotReportable));
+        let reachable = report(Observation::ResourceReachable {
+            attempt,
+            generation: Generation::FIRST,
+        });
+        assert_eq!(reachable.check(), Err(ReportRefusal::NotReportable));
+        Ok(())
+    }
 }

@@ -1639,3 +1639,54 @@ fn a_grant_never_launched_comes_back_granted_and_is_dispatched() {
     );
     kept.replays();
 }
+
+/// A spawn the superseded attempt was asked to run under its task can no
+/// longer be run by it: the supersede fails the operation, as it does a
+/// checkpoint of the attempt (ADR 0028). No command makes a `Spawn` until
+/// the launch path lands (M5), so the request is put in the state by hand.
+#[test]
+fn a_supersede_fails_a_spawn_under_the_old_attempt() {
+    let mut kept = running();
+    let primary = kept.state().job.primary;
+    kept.submit(
+        "register-child",
+        Command::RegisterTask {
+            parent: primary,
+            kind: TaskKind::Child {
+                label: "build".into(),
+            },
+            restart: RestartPolicy::ExplicitOnly,
+            class: TaskClass::Opaque,
+            program: None,
+        },
+    )
+    .unwrap();
+    let child = kept.state().tasks.last().unwrap().id;
+    let a = gone_silent(&mut kept);
+    let spawn = OperationId::from_bytes([0x5a; 16]);
+    let state = kept.state.as_mut().unwrap();
+    state.operations.push(OperationProgress {
+        id: spawn,
+        key: OperationKey::parse("spawn-child").unwrap(),
+        digest: RequestDigest::from_bytes([0x5a; 32]),
+        kind: CommandKind::RegisterTask,
+        revision: state.job.revision,
+        status: OperationStatus::Dispatched,
+    });
+    state
+        .requests
+        .push((spawn, EffectRequest::Spawn { task: child }));
+    let t = kept
+        .submit(
+            "s-1",
+            Command::Supersede {
+                attempt: a.id,
+                reason: "operator".into(),
+            },
+        )
+        .unwrap();
+    assert!(t.events.iter().any(|e| matches!(
+        e,
+        ManagedEvent::OperationMarked { operation, status: OperationMark::Failed } if *operation == spawn
+    )));
+}
