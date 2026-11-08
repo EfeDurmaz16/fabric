@@ -79,7 +79,7 @@ sequenceDiagram
 - **One live copy.** Every job has an append-only, hash-chained ledger. A move is a short protocol over that ledger, so at most one machine can run the job at a time, even when a machine is killed in the middle of a move.
 - **Content-addressed snapshots.** The workspace is stored as blake3 chunks in a local store with a SQLite catalog. A move sends only the chunks the other machine lacks. Git state goes as a bundle plus the index and the working tree.
 - **Carry or rebuild.** Dependency caches and build output travel when the other machine can use them, and are made again there by their setup step or the next build when it cannot. Untracked secret-shaped files stay on the machine; tracked and stashed ones travel inside the git state and are named, not hidden (ADR 0014).
-- **Harness adapters.** Claude Code, Codex, any Agent Client Protocol agent, OpenCode and pi, with Gemini CLI and Cursor Agent CLI under way (PR 5). Each adapter captures the agent's session files and restores them on the other machine, and declares how faithfully the conversation continues there (the table under Harness fidelity).
+- **Harness adapters.** Claude Code, Codex, any Agent Client Protocol agent, OpenCode, pi, Gemini CLI and Cursor Agent CLI (PR 5). Each adapter captures the agent's session files and restores them on the other machine, and declares how faithfully the conversation continues there (the table under Harness fidelity).
 - **Pinned peers.** Machines pair by ed25519 node id and talk over QUIC with TLS pinned to that id, or TCP with TLS when UDP is blocked. No central server.
 - **Client API.** A versioned JSON API on the node's local socket, with a Rust client crate and a TypeScript SDK checked against the same message fixtures.
 
