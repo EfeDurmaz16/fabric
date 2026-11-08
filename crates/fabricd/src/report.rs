@@ -417,7 +417,10 @@ mod tests {
             attempt: fabric_core::managed::AttemptId::from_bytes([8; 16]),
             generation: fabric_core::managed::Generation::FIRST,
         };
-        assert!(authority.job(token.job).await.is_err(), "the journal is refused");
+        assert!(
+            authority.job(token.job).await.is_err(),
+            "the journal is refused"
+        );
         let answer = heartbeat(
             &authority,
             OWN,

@@ -29,8 +29,7 @@ use std::time::Duration;
 
 use fabric_core::id::{JobId, SnapshotId};
 use fabric_core::managed::launch::{
-    AfterCut, InstructAnswer, InstructRefusal, Instruction, LaunchAnswer, LaunchRefusal,
-    TaskLaunch,
+    AfterCut, InstructAnswer, InstructRefusal, Instruction, LaunchAnswer, LaunchRefusal, TaskLaunch,
 };
 use fabric_core::managed::placement::PlacementKind;
 use fabric_core::managed::{
@@ -386,7 +385,10 @@ async fn instruct(
     seen: &mut Seen,
     key: (JobId, OperationId),
     request: &EffectRequest,
-    (target, token): (fabric_core::id::NodeId, fabric_core::managed::launch::GrantToken),
+    (target, token): (
+        fabric_core::id::NodeId,
+        fabric_core::managed::launch::GrantToken,
+    ),
     instruction: Instruction,
 ) -> Result<(), AuthorityError> {
     let (job, operation) = key;
@@ -503,7 +505,16 @@ async fn resend(authority: &Authority, link: &dyn Link, seen: &mut Seen) {
             });
             let outcome = match target {
                 Some((node, token, instruction)) => {
-                    instruct(authority, link, seen, key, request, (node, token), instruction).await
+                    instruct(
+                        authority,
+                        link,
+                        seen,
+                        key,
+                        request,
+                        (node, token),
+                        instruction,
+                    )
+                    .await
                 }
                 None if op.kind == CommandKind::RegisterTask => {
                     seen.respawn.remove(&key);
@@ -1070,13 +1081,13 @@ mod tests {
                 reason: "no".into(),
             },
         };
-        let lint = world
+        let refused = world
             .register(job, "lint", TaskClass::Test, &["cargo", "clippy"])
             .await;
         pass(&world.authority, &link, &mut seen).await;
         let state = world.state(job).await;
-        assert_eq!(spawned(&state, lint), Some(OperationStatus::Failed));
-        assert_eq!(state.task(lint).unwrap().state, TaskState::Open);
+        assert_eq!(spawned(&state, refused), Some(OperationStatus::Failed));
+        assert_eq!(state.task(refused).unwrap().state, TaskState::Open);
     }
 
     /// A cancel whose stop did not reach the node stays dispatched and its
@@ -1144,7 +1155,10 @@ mod tests {
         let mut seen = Seen::default();
         pass(&world.authority, &link, &mut seen).await;
         let state = world.state(job).await;
-        assert_eq!(state.attempt(first).unwrap().status, AttemptStatus::Cancelled);
+        assert_eq!(
+            state.attempt(first).unwrap().status,
+            AttemptStatus::Cancelled
+        );
         assert_eq!(state.job.state, JobState::Cancelled);
         assert_eq!(
             state.operation(cancel).unwrap().status,

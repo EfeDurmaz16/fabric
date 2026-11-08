@@ -469,6 +469,7 @@ pub fn row(row: &PreflightRow) -> String {
 /// then the exit code, whether it was cut short, the snapshot it left and
 /// why it is blocked, each when there is one.
 fn receipt_line(class: Option<&str>, receipt: &crate::api::ReceiptWire) -> String {
+    use std::fmt::Write as _;
     let mut line = String::from("  ");
     if let Some(class) = class {
         line.push_str(class);
@@ -477,13 +478,13 @@ fn receipt_line(class: Option<&str>, receipt: &crate::api::ReceiptWire) -> Strin
     line.push_str("last receipt: ");
     line.push_str(&receipt.status);
     if let Some(code) = receipt.exit {
-        line.push_str(&format!(" with code {code}"));
+        let _ = write!(line, " with code {code}");
     }
     if receipt.interrupted && receipt.status != "interrupted" {
         line.push_str(", interrupted");
     }
     if let Some(snapshot) = &receipt.snapshot {
-        line.push_str(&format!(" at {snapshot}"));
+        let _ = write!(line, " at {snapshot}");
     }
     if let Some(reason) = &receipt.reason {
         line.push_str(": ");
@@ -652,8 +653,17 @@ mod tests {
         }))
         .unwrap();
         let lines = managed_job(&job);
-        assert!(lines.contains(&"  test, last receipt: interrupted".to_owned()), "{lines:?}");
-        assert!(lines.contains(&"  build, last receipt: blocked: no cargo\\n".to_owned()), "{lines:?}");
-        assert!(lines.contains(&"  test, last receipt: exited with code 1".to_owned()), "{lines:?}");
+        assert!(
+            lines.contains(&"  test, last receipt: interrupted".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  build, last receipt: blocked: no cargo\\n".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  test, last receipt: exited with code 1".to_owned()),
+            "{lines:?}"
+        );
     }
 }

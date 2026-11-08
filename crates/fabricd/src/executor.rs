@@ -1874,6 +1874,9 @@ mod tests {
                 rustix::process::Signal::KILL,
             );
         }
-        assert!(!still, "the harness's child outlived the stop: {receipts:?}");
+        assert!(
+            !still,
+            "the harness's child outlived the stop: {receipts:?}"
+        );
     }
 }

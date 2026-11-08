@@ -770,7 +770,12 @@ impl Runner {
         // reported: the authority places the replacement as soon as the
         // cut is recorded, so nothing of this attempt may run by then.
         let stopped = match then {
-            AfterCut::End => Some(self.executor.stop(attempt, budget).await.unwrap_or_default()),
+            AfterCut::End => Some(
+                self.executor
+                    .stop(attempt, budget)
+                    .await
+                    .unwrap_or_default(),
+            ),
             AfterCut::Resume => None,
         };
         let answer = reporter
