@@ -1,6 +1,18 @@
 --- a/.github/workflows/release.yml
 +++ b/.github/workflows/release.yml
-@@ -61,10 +61,11 @@
+@@ -14,8 +14,10 @@
+ # title/body based on your changelogs.
+ 
+ name: Release
++# Read only by default; host, the one job that writes (gh release create),
++# asks for contents: write itself.
+ permissions:
+-  "contents": "write"
++  "contents": "read"
+ 
+ # This task will run whenever you push a git tag that looks like a version
+ # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
+@@ -61,10 +63,11 @@
            persist-credentials: false
            submodules: recursive
        - name: Install dist
@@ -16,7 +28,7 @@
        - name: Cache dist
          uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
          with:
-@@ -124,19 +125,12 @@
+@@ -124,19 +127,12 @@
          with:
            persist-credentials: false
            submodules: recursive
@@ -37,7 +49,7 @@
        # Get the dist-manifest
        - name: Fetch local artifacts
          uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-@@ -198,10 +192,7 @@
+@@ -198,10 +194,7 @@
            path: ~/.cargo/bin/
        - run: chmod +x ~/.cargo/bin/dist
        - name: Install cargo-cyclonedx
@@ -49,3 +61,12 @@
        # Get all the local artifacts for the global tasks to use (for e.g. checksums)
        - name: Fetch local artifacts
          uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+@@ -260,6 +253,8 @@
+       - custom-release-smoke
+     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
+     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-release-smoke.result == 'skipped' || needs.custom-release-smoke.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
++    permissions:
++      "contents": "write"
+     env:
+       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+     runs-on: "ubuntu-22.04"
