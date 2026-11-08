@@ -472,7 +472,9 @@ impl Authority {
     ) -> Result<Result<Answer, E>, AuthorityError> {
         self.call(|reply: Reply<Result<Answer, E>>| {
             Call::Derived(Box::new(move |place, holder, presence| {
-                let _ = reply.send(derived(place, holder, presence, &key, &request, job, derive));
+                let _ = reply.send(derived(
+                    place, holder, presence, &key, &request, job, derive,
+                ));
             }))
         })
         .await
