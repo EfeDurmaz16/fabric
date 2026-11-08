@@ -1247,3 +1247,47 @@ async fn the_last_handle_closes_the_journal_before_its_drop_returns() {
         "the journal was still open when the drop returned"
     );
 }
+
+/// A grant a derived command makes (a continue's new attempt) is tracked
+/// like one `submit` makes: its silence is seen without a restart.
+#[tokio::test]
+async fn a_grant_made_by_a_derived_command_is_tracked_for_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let made = authority
+        .submit(create_with("create-1", RecoveryPolicy::Block))
+        .await
+        .unwrap();
+    let job = job_of(&made);
+    let key = OperationKey::parse("start-derived").unwrap();
+    let answer = authority
+        .submit_derived(
+            key.clone(),
+            super::request_digest(&[b"start"]),
+            job,
+            move |s: &ManagedState| {
+                Ok::<_, ()>(Envelope {
+                    key,
+                    job: Some(job),
+                    expected: None,
+                    body: Command::StartAttempt {
+                        task: s.job.primary,
+                        resource: ResourceRef::Node { node: RUNNER },
+                        initial_checkpoint: None,
+                    },
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(answer.result, StoredResult::Accepted(_)));
+    let overdue = authority
+        .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(overdue.len(), 1, "the derived grant is tracked");
+    let s = authority.job(job).await.unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+}

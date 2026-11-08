@@ -187,7 +187,7 @@ pub(crate) struct PendingEffect {
 /// answers its own caller.
 type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
 
-type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder) + Send>;
+type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder, &mut Presence) + Send>;
 
 /// The digest of a caller's request for [`Authority::submit_derived`]:
 /// blake3 under its own domain over each part, length first, so two
@@ -471,8 +471,8 @@ impl Authority {
         derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E> + Send + 'static,
     ) -> Result<Result<Answer, E>, AuthorityError> {
         self.call(|reply: Reply<Result<Answer, E>>| {
-            Call::Derived(Box::new(move |place, holder| {
-                let _ = reply.send(derived(place, holder, &key, &request, job, derive));
+            Call::Derived(Box::new(move |place, holder, presence| {
+                let _ = reply.send(derived(place, holder, presence, &key, &request, job, derive));
             }))
         })
         .await
@@ -825,7 +825,7 @@ fn serve(
                 }
             }
             Call::Derived(work) => {
-                work(place, &mut holder);
+                work(place, &mut holder, &mut presence);
                 bump();
             }
             Call::Submit(envelope, reply) => {
@@ -1295,6 +1295,7 @@ fn recover(
 fn derived<E>(
     place: &Place,
     holder: &mut Holder,
+    presence: &mut Presence,
     key: &OperationKey,
     request: &[u8; 32],
     job: JobId,
@@ -1336,7 +1337,13 @@ fn derived<E>(
         return Err(CommitError::Domain(DomainError::BadEnvelope).into());
     }
     journal.record_request(key, request)?;
-    Ok(Ok(submit(place, holder, &envelope)?))
+    let answer = submit(place, holder, &envelope)?;
+    // A continue grants the new attempt: it is tracked like any grant, so
+    // its silence is seen (ADR 0028).
+    if let StoredResult::Accepted(accepted) = &answer.result {
+        note(place, presence, job, &accepted.events, mono_ms());
+    }
+    Ok(Ok(answer))
 }
 
 fn submit(
