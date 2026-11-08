@@ -97,11 +97,14 @@ fabric --version
 Or download the archive for your platform from [GitHub Releases](https://github.com/EfeDurmaz16/fabric/releases), check it and put the binary on your `PATH`:
 
 ```sh
+tag=v0.1.0                    # the release to install
 target=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
-base=https://github.com/EfeDurmaz16/fabric/releases/latest/download
+base=https://github.com/EfeDurmaz16/fabric/releases/download/$tag
 curl -LO "$base/fabric-$target.tar.gz" -LO "$base/fabric-$target.tar.gz.sha256"
 shasum -a 256 -c "fabric-$target.tar.gz.sha256"
-gh attestation verify "fabric-$target.tar.gz" -R EfeDurmaz16/fabric   # optional: built by this repo's release workflow
+# Optional: built by this repository's release workflow from that tag.
+gh attestation verify "fabric-$target.tar.gz" -R EfeDurmaz16/fabric \
+  --signer-workflow EfeDurmaz16/fabric/.github/workflows/release.yml --source-ref "refs/tags/$tag"
 tar -xzf "fabric-$target.tar.gz"
 mkdir -p ~/.local/bin && cp "fabric-$target/fabric" ~/.local/bin/
 ```

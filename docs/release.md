@@ -22,11 +22,12 @@ Linux is gnu, not musl: musl's allocator is measurably slower for a daemon that 
 
 Nothing is signed. There is no Apple Developer ID, so the macOS binaries are not code signed or notarized; on Apple silicon they carry only the ad hoc signature the linker adds, which lets them run but says nothing about who built them. Gatekeeper and the one command that clears a browser's quarantine are in the [README](https://github.com/EfeDurmaz16/fabric#install).
 
-What is attested is provenance. Each archive gets a GitHub artifact attestation when it is built: a SLSA build provenance statement, signed through Sigstore with a short-lived certificate for this repository's `release.yml` run, and logged in the public Rekor transparency log. It ties the archive's sha256 to the commit, the tag and the workflow that built it. Check one with the GitHub CLI:
+What is attested is provenance. Each archive a tag builds gets a GitHub artifact attestation; pull request builds are not attested, so nothing unpublished verifies as a release. The attestation is a SLSA build provenance statement, signed through Sigstore with a short-lived certificate for this repository's `release.yml` run, and logged in the public Rekor transparency log. It ties the archive's sha256 to the commit, the tag and the workflow that built it. Check one with the GitHub CLI:
 
 ```sh
 gh attestation verify fabric-aarch64-apple-darwin.tar.gz -R EfeDurmaz16/fabric \
-  --signer-workflow EfeDurmaz16/fabric/.github/workflows/release.yml
+  --signer-workflow EfeDurmaz16/fabric/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0
 ```
 
 The attestation proves where an archive was built, not that the code is safe; the SBOM says what went into it.

@@ -148,7 +148,11 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # Only a tag build is attested: a pull request build is never
+      # published, so it must not leave a provenance statement that verifies
+      # as this repository's release.
       - name: Attest
+        if: ${{ needs.plan.outputs.publishing == 'true' }}
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
