@@ -171,6 +171,8 @@ pub(crate) struct Authority {
     /// How many threads this authority started, for the tests.
     #[cfg(test)]
     spawned: Arc<std::sync::atomic::AtomicUsize>,
+    /// Where its command and observation spans go (ADR 0031).
+    trace: crate::otel::Tracer,
 }
 
 /// The authority's thread, or where it would work.
@@ -225,11 +227,18 @@ impl Authority {
             started: Arc::new(watch::channel(None).0),
             #[cfg(test)]
             spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            trace: crate::otel::Tracer::off(),
         };
         if journal {
             authority.running()?;
         }
         Ok(authority)
+    }
+
+    /// The authority with its spans going to `trace`.
+    pub(crate) fn traced(mut self, trace: crate::otel::Tracer) -> Authority {
+        self.trace = trace;
+        self
     }
 
     /// How many threads this authority started.
@@ -379,7 +388,16 @@ impl Authority {
         &self,
         envelope: Envelope<Command>,
     ) -> Result<Answer, AuthorityError> {
-        self.call(|reply| Call::Submit(envelope, reply)).await
+        let span = self
+            .trace
+            .on()
+            .then(|| crate::otel::hooks::command_begin(&envelope));
+        let answer = self.call(|reply| Call::Submit(envelope, reply)).await;
+        if let Some(mut span) = span {
+            crate::otel::hooks::command_end(&mut span, answer.as_ref());
+            self.trace.emit(span);
+        }
+        answer
     }
 
     /// Applies a command whose body `derive` makes from `job`'s state (a
@@ -398,12 +416,32 @@ impl Authority {
         job: JobId,
         derive: impl FnOnce(&ManagedState) -> Result<Envelope<Command>, E> + Send + 'static,
     ) -> Result<Result<Answer, E>, AuthorityError> {
-        self.call(|reply: Reply<Result<Answer, E>>| {
-            Call::Derived(Box::new(move |place, holder| {
-                let _ = reply.send(derived(place, holder, &key, &request, job, derive));
-            }))
-        })
-        .await
+        let span = self
+            .trace
+            .on()
+            .then(|| crate::otel::hooks::derived_begin(&key, job));
+        let answer = self
+            .call(|reply: Reply<Result<Answer, E>>| {
+                Call::Derived(Box::new(move |place, holder| {
+                    let _ = reply.send(derived(place, holder, &key, &request, job, derive));
+                }))
+            })
+            .await;
+        if let Some(mut span) = span {
+            // A derivation the caller refused wrote nothing: no span.
+            match &answer {
+                Ok(Ok(answer)) => {
+                    crate::otel::hooks::command_end(&mut span, Ok(answer));
+                    self.trace.emit(span);
+                }
+                Ok(Err(_)) => {}
+                Err(error) => {
+                    crate::otel::hooks::command_end(&mut span, Err(error));
+                    self.trace.emit(span);
+                }
+            }
+        }
+        answer
     }
 
     /// Records what an executor reports about an attempt or an operation.
@@ -412,8 +450,18 @@ impl Authority {
         job: JobId,
         observation: Observation,
     ) -> Result<Transition, AuthorityError> {
-        self.call(|reply| Call::Observe(job, observation, reply))
-            .await
+        let span = self
+            .trace
+            .on()
+            .then(|| crate::otel::hooks::observation_begin(job, &observation));
+        let recorded = self
+            .call(|reply| Call::Observe(job, observation, reply))
+            .await;
+        if let Some(mut span) = span {
+            crate::otel::hooks::observation_end(&mut span, recorded.as_ref());
+            self.trace.emit(span);
+        }
+        recorded
     }
 
     /// Marks an operation, `Dispatched` right before its effect is asked

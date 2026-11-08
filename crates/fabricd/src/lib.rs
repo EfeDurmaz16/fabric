@@ -34,6 +34,7 @@ mod managed;
 mod managed_ops;
 pub mod node;
 mod ops;
+pub mod otel;
 mod package;
 pub mod paths;
 mod placement;

@@ -54,8 +54,9 @@ Usage: fabric serve [OPTIONS]
 Run the node daemon in the foreground
 
 Options:
-      --listen <ADDR>  Where both transports listen [default: 0.0.0.0:7777]
-      --wire <WIRE>    Which wires this node dials: QUIC then TCP+TLS, or only one of them [default: auto] [possible values: auto, quic, tcp-tls]
+      --listen <ADDR>        Where both transports listen [default: 0.0.0.0:7777]
+      --otlp-endpoint <URL>  Export one OpenTelemetry span per operation as OTLP/HTTP JSON to this collector, `http://host:port` (spans go to /v1/traces). Without it, `OTEL_EXPORTER_OTLP_ENDPOINT` is read; without both, nothing is exported
+      --wire <WIRE>          Which wires this node dials: QUIC then TCP+TLS, or only one of them [default: auto] [possible values: auto, quic, tcp-tls]
 
 Global Options: See `fabric --help`
 

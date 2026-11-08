@@ -405,6 +405,29 @@ fn an_unknown_option_is_a_usage_error_with_a_hint() {
     }
 }
 
+/// An OTLP endpoint `serve` cannot post to is a usage error before any
+/// node starts: an `https` URL, or no URL at all.
+#[test]
+fn serve_refuses_an_otlp_endpoint_it_cannot_post_to() {
+    let sandbox = Sandbox::new();
+    for (value, says) in [
+        ("https://collector:4318", "https is not supported"),
+        ("collector:4318", "not an http://host[:port] URL"),
+    ] {
+        let mut args = words(&["serve", "--otlp-endpoint", value]);
+        let output = sandbox.run(&args);
+        let err = stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{value}: {err}");
+        assert_eq!(stdout(&output), "", "{value}");
+        assert!(err.contains(says), "{value}: {err}");
+        args.push("--json".to_owned());
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{value} --json");
+        let doc = error_document(&output, value);
+        assert_eq!(doc["reason"], "invalid_arguments", "{value}: {doc}");
+    }
+}
+
 /// A word no argument takes is a usage error that calls it an argument, not an option.
 #[test]
 fn a_stray_word_is_a_usage_error_that_names_it() {

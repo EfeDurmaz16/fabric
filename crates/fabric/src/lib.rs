@@ -56,6 +56,7 @@ use fabric_harness::{
 use fabric_net::endpoint::DialOrder;
 use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
+use fabricd::otel::OtlpEndpoint;
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
 use fabricd::tool_env::ToolEnv;
 use std::sync::Arc;
@@ -114,6 +115,12 @@ struct ServeArgs {
     /// Which wires this node dials: QUIC then TCP+TLS, or only one of them.
     #[arg(long, value_enum, default_value_t = Wire::Auto)]
     wire: Wire,
+    /// Export one OpenTelemetry span per operation as OTLP/HTTP JSON to
+    /// this collector, `http://host:port` (spans go to /v1/traces). Without
+    /// it, `OTEL_EXPORTER_OTLP_ENDPOINT` is read; without both, nothing is
+    /// exported.
+    #[arg(long, value_name = "URL")]
+    otlp_endpoint: Option<OtlpEndpoint>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -643,12 +650,17 @@ async fn serve(
         Wire::Quic => DialOrder::QuicOnly,
         Wire::TcpTls => DialOrder::TcpOnly,
     };
+    let otlp = match args.otlp_endpoint {
+        Some(endpoint) => Some(endpoint),
+        None => otlp_from_env(run)?,
+    };
     let node = Node::start(NodeConfig {
         state,
         home,
         listen: args.listen,
         dial,
         env: ToolEnv::current(),
+        otlp,
     })?;
     // The node runs until stopped, so its identity is context, on
     // standard error; under `--json` it is the one document.
@@ -672,6 +684,28 @@ async fn serve(
     }
     node.stopping().await;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` names, as OpenTelemetry's
+/// exporters read it. Unset or empty exports nothing; a value this node
+/// cannot post to (an `https` URL) is said once on standard error and
+/// exports nothing, so a variable set for other tools never stops a node.
+fn otlp_from_env(run: &contract::Run) -> Result<Option<OtlpEndpoint>> {
+    let Some(value) = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT") else {
+        return Ok(None);
+    };
+    let Some(text) = value.to_str().filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    match text.parse::<OtlpEndpoint>() {
+        Ok(endpoint) => Ok(Some(endpoint)),
+        Err(e) => {
+            run.notes().print(&[format!(
+                "OTEL_EXPORTER_OTLP_ENDPOINT is not used: {e}; no spans are exported"
+            )])?;
+            Ok(None)
+        }
+    }
 }
 
 async fn job(

@@ -222,6 +222,10 @@ pub struct Executor {
     spawns: AtomicU64,
     signals: AtomicU64,
     captures: AtomicU64,
+    /// Whether each process an attempt spawns gets the attempt's W3C
+    /// `TRACEPARENT`, so a provider worker it starts links its spans to the
+    /// attempt's trace (ADR 0031); only while the node exports spans.
+    traceparent: std::sync::atomic::AtomicBool,
     /// Fails the launch record's completion once, for the test of a
     /// spawn that fails after its process exists.
     #[cfg(test)]
@@ -251,9 +255,16 @@ impl Executor {
             spawns: AtomicU64::new(0),
             signals: AtomicU64::new(0),
             captures: AtomicU64::new(0),
+            traceparent: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_completion: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Gives every process an attempt spawns from now on the attempt's
+    /// `TRACEPARENT`.
+    pub(crate) fn set_traceparent(&self, on: bool) {
+        self.traceparent.store(on, Ordering::Relaxed);
     }
 
     /// The attempt's run, or `NotRunning`; the map's lock is released
@@ -459,6 +470,12 @@ impl Executor {
             command.env(key, value);
         }
         drop(env);
+        if self.traceparent.load(Ordering::Relaxed) {
+            command.env(
+                "TRACEPARENT",
+                crate::otel::traceparent(crate::otel::attempt_context(attempt)),
+            );
+        }
         let child = tokio::process::Command::from(command)
             .kill_on_drop(false)
             .spawn()

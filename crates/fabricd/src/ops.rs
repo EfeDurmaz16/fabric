@@ -4349,6 +4349,7 @@ pub(crate) mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
             env,
+            otlp: None,
         })
         .unwrap()
     }
@@ -5887,6 +5888,7 @@ pub(crate) mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
             env: ToolEnv::current(),
+            otlp: None,
         })
         .unwrap();
         paired(&a, &b).await;
@@ -8507,6 +8509,7 @@ pub(crate) mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
             env: ToolEnv::current(),
+            otlp: None,
         })
         .unwrap();
         let repo = repo(&root);

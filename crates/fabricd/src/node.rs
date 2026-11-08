@@ -70,6 +70,9 @@ pub struct NodeConfig {
     /// asked for and for a request that sends none, until a local client
     /// sends one.
     pub env: ToolEnv,
+    /// Where the node exports its spans; `None` exports nothing and
+    /// builds no span (ADR 0031).
+    pub otlp: Option<crate::otel::OtlpEndpoint>,
 }
 
 /// A running node.
@@ -106,6 +109,8 @@ pub struct Node {
     pub(crate) authority: crate::authority::Authority,
     /// The attempts this node runs for an authority (the launch path).
     pub(crate) runner: Arc<crate::runner::Runner>,
+    /// The span exporter, off unless `NodeConfig::otlp` names an endpoint.
+    pub(crate) trace: crate::otel::Tracer,
     _lock: File,
 }
 
@@ -161,8 +166,15 @@ impl Node {
         // One stat on the start path. The authority's thread starts only
         // for an existing journal, which it opens and recovers on its own,
         // or with the first managed command; it makes no journal.
+        let trace = cfg
+            .otlp
+            .clone()
+            .map_or_else(crate::otel::Tracer::off, |endpoint| {
+                crate::otel::Tracer::start(endpoint, identity.node_id())
+            });
         let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
-            .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
+            .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?
+            .traced(trace.clone());
         // The launch path's runner: its executor's launch records, and the
         // records of the launches taken, live under the state directory.
         let runs = cfg.state.root().join("runs");
@@ -178,6 +190,7 @@ impl Node {
             crate::secrets::LocalResolver::open(cfg.state.root()),
             capturer.clone(),
         ));
+        executor.set_traceparent(trace.on());
         let runner = Arc::new(crate::runner::Runner::new(executor, runs.join("taken")));
         let node = Arc::new(Self {
             id: identity.node_id(),
@@ -200,6 +213,7 @@ impl Node {
             client_env: Mutex::new(client_env),
             authority,
             runner,
+            trace,
             _lock: lock_file,
         });
         capturer.bind(
@@ -230,6 +244,7 @@ impl Node {
     /// the end-to-end test, which can arm the `while_stopping` fault point
     /// here to make the stop slow.
     pub async fn stopping(&self) {
+        self.trace.flush(crate::otel::FLUSH_DEADLINE).await;
         crate::faults::hit(crate::faults::Point::WhileStopping).await;
     }
 
@@ -282,7 +297,17 @@ impl Node {
     /// Runs one client request and answers with its reply or its refusal;
     /// the events go to `out` as the command makes them.
     pub(crate) async fn handle(self: &Arc<Self>, request: Request, mut out: Out) -> Answer {
-        match Box::pin(self.dispatch(request, &mut out)).await {
+        let span = if self.trace.on() {
+            crate::otel::hooks::request_begin(&request)
+        } else {
+            None
+        };
+        let answer = Box::pin(self.dispatch(request, &mut out)).await;
+        if let Some(mut span) = span {
+            crate::otel::hooks::request_end(&mut span, &answer);
+            self.trace.emit(span);
+        }
+        match answer {
             Ok(reply) => Answer::Done { reply },
             Err(e) => Answer::Refused {
                 refusal: e.to_refusal(),
@@ -977,6 +1002,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
             env: ToolEnv::current(),
+            otlp: None,
         });
         stopped.join().unwrap();
         assert!(started.is_ok(), "{started:?}");

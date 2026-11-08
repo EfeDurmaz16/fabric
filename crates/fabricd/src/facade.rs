@@ -2190,6 +2190,7 @@ mod tests {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 dial: fabric_net::endpoint::DialOrder::TcpOnly,
                 env: crate::tool_env::ToolEnv::current(),
+                otlp: None,
             })
             .unwrap()
         };
