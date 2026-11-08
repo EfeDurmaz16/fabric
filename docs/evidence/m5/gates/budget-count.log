@@ -1,5 +1,5 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
-     Running tests/e2e/main.rs (/tmp/m5proof.X1jvPW/target/debug/deps/e2e-5aad294b239a4019)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running tests/e2e/main.rs (/var/folders/7x/672w195d6vqbvcnwq1hm7tkc0000gn/T/tmp.VZ5tnLUXAc/debug/deps/e2e-6dc48f9637c0464f)
 
 running 1 test
 ### Time budget, macos-aarch64, count
@@ -27,5 +27,5 @@ Count mode: only the warm-up runs ran, and no op was timed.
 
 test budget::hot_paths ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 25.53s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 46.06s
 
