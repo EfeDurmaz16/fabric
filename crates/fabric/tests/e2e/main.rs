@@ -21,6 +21,7 @@ mod acp_cli;
 mod bench;
 mod budget;
 mod client;
+mod continuity;
 mod facade;
 mod headless;
 mod legacy;
