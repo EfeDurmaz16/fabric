@@ -492,6 +492,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-sync"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "fabric-core",
+ "fabric-store",
+ "fabric-sync",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
 name = "fabricd"
 version = "0.1.0"
 dependencies = [
