@@ -1,0 +1,61 @@
+# Releases
+
+A release is a git tag `v<version>` on a commit on `main`; the `plan` job refuses a tag anywhere else, and the tap checks again before it takes a formula. The tag starts `.github/workflows/release.yml`, which builds, checks and publishes everything below. Nothing is published by hand, and nothing in the workflow uses a secret other than the repository's own `GITHUB_TOKEN`.
+
+## What a release contains
+
+| Asset | What it is |
+|---|---|
+| `fabric-aarch64-apple-darwin.tar.gz` | macOS on Apple silicon |
+| `fabric-x86_64-apple-darwin.tar.gz` | macOS on Intel |
+| `fabric-x86_64-unknown-linux-gnu.tar.gz` | Linux on x86_64, built on Ubuntu 22.04, so it needs glibc 2.35 or newer |
+| `fabric-sync-<target>.tar.gz` | The same three targets for `fabric-sync` ([sync alone](guides/sync-alone.md)) |
+| `*.tar.gz.sha256`, `sha256.sum` | The sha256 of each archive, and all of them in one file |
+| `fabric.cdx.xml`, `fabric-sync.cdx.xml` | A CycloneDX SBOM of each shipped crate's dependency tree, made by `cargo-cyclonedx` from `Cargo.lock` |
+| `fabric-node.rb` | The Homebrew formula: a url and a sha256 for each archive. It is not `fabric.rb` because homebrew-core has a `fabric` formula (the Python SSH tool), and two formulae with one name cannot both be installed; the binary is still `fabric` |
+| `fabric-sync.rb` | The Homebrew formula of `fabric-sync`, named for its binary |
+| `source.tar.gz` | The source at the tag |
+
+Each archive holds one binary, `fabric` or `fabric-sync`, with `README.md` and `LICENSE`. The test doubles that `crates/fabric` also builds are not shipped.
+
+Linux is gnu, not musl: musl's allocator is measurably slower for a daemon that hashes and copies snapshots, and the time budget is measured on gnu.
+
+## What is signed and what is attested
+
+Nothing is signed. There is no Apple Developer ID, so the macOS binaries are not code signed or notarized; on Apple silicon they carry only the ad hoc signature the linker adds, which lets them run but says nothing about who built them. Gatekeeper and the one command that clears a browser's quarantine are in the [README](https://github.com/EfeDurmaz16/fabric#install).
+
+What is attested is provenance. Each archive a tag builds gets a GitHub artifact attestation; pull request builds are not attested, so nothing unpublished verifies as a release. The attestation is a SLSA build provenance statement, signed through Sigstore with a short-lived certificate for this repository's `release.yml` run, and logged in the public Rekor transparency log. It ties the archive's sha256 to the commit, the tag and the workflow that built it. Check one with the GitHub CLI:
+
+```sh
+gh attestation verify fabric-aarch64-apple-darwin.tar.gz -R EfeDurmaz16/fabric \
+  --signer-workflow EfeDurmaz16/fabric/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0
+```
+
+The attestation proves where an archive was built, not that the code is safe; the SBOM says what went into it.
+
+## How a release is cut
+
+1. On a branch, bump `version` in `[workspace.package]` in `Cargo.toml`, the one place it lives; every crate, `fabric --version` and the tag follow it. Update the version in `docs/cli-contract.md`'s examples if they name it. Merge the PR once its checks pass, including the `Release` workflow, which builds every archive on a pull request too.
+2. Tag the merge commit on `main` and push the tag:
+
+   ```sh
+   git tag v0.1.0 && git push origin v0.1.0
+   ```
+
+3. The workflow runs `plan`, builds the archives of both apps on one runner per target (`macos-15`, `macos-15-intel`, `ubuntu-22.04`) and attests them, builds the formulae, the checksums and the SBOMs, then runs `release-smoke.yml`: each archive is downloaded to a clean runner that did not build it and `scripts/release-smoke.sh` runs the checksum, `--version`, the CLI contract, then for `fabric` the commands against a node it starts and for `fabric-sync` a push and a pull through a directory, and on macOS the quarantine behaviour. Only when every smoke passes does `host` create the GitHub Release with every asset. A version with a suffix, such as `v0.2.0-rc.1`, is published as a prerelease.
+4. Within the hour, the tap's `update-formula` workflow pulls `fabric-node.rb` and `fabric-sync.rb` into `EfeDurmaz16/homebrew-tap` after checking every archive against the checksums, its formula and its attestation, then installs both with `brew` on a clean Mac. To pull it at once, run that workflow by hand. Prereleases are not pulled.
+
+## Changing the pipeline
+
+`dist-workspace.toml` is the configuration. `release.yml` is what [cargo-dist](https://axodotdev.github.io/cargo-dist/) 0.34.0 generates from it, with `scripts/release-workflow.patch` applied: the hand edits dist cannot express. The patch installs dist and `cargo-cyclonedx` with `scripts/install-release-tool.sh`, which downloads a pinned version and checks its sha256 before anything runs, instead of piping an installer to a shell. After editing the configuration, run `scripts/release-workflow.sh`; never edit `release.yml` alone, because the `plan` job runs `scripts/release-workflow.sh --check` and fails when the file is not dist's output plus the patch. To move to a new dist version, change `cargo-dist-version` and the pins in `scripts/install-release-tool.sh` together. `dist plan` shows what a tag would publish, and `dist build --artifacts=local --target=<host target>` followed by `scripts/release-smoke.sh target/distrib <host target> fabric` (and `fabric-sync`) runs the build and the smoke on your machine.
+
+The tap's files are in `packaging/homebrew-tap`; its README says how the formula gets there and why the tap pulls instead of the release pushing. The release pipeline reads each name from these places, so renaming one is one commit across them:
+
+- `name` and the `[[bin]]` in `crates/fabric/Cargo.toml` or `crates/fabric-sync/Cargo.toml`, and its `[package.metadata.dist.binaries]` table, which lists the one shipped binary per target so the test doubles stay out of the archive. The archive names follow the crate name, and `release-smoke.yml` passes every `app_name` of the plan to the smoke script, which picks the `fabric-sync` checks by that name.
+- `formula` in the same crate's `[package.metadata.dist]`, then `scripts/release-workflow.sh`.
+- `FORMULAS` at the top of the tap's `update-formula.yml`.
+- `scripts/docs/names.env`, which the docs site reads.
+- The install commands in `README.md`, `docs/start/install.md` and the tap's `TAP.md`.
+
+The binary's own names, such as `FABRIC_HOME`, are in the code and change with it, not with the pipeline.

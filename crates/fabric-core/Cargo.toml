@@ -1,6 +1,6 @@
 [package]
 name = "fabric-core"
-version = "0.1.0"
+version.workspace = true
 description = "Core types of Fabric: ids, the job ledger, the lease, snapshot manifests, the environment spec and the secret policy"
 edition.workspace = true
 license.workspace = true

@@ -84,6 +84,43 @@ sequenceDiagram
 - **Pinned peers.** Machines pair by ed25519 node id and talk over QUIC with TLS pinned to that id, or TCP with TLS when UDP is blocked. No central server.
 - **Client API.** A versioned JSON API on the node's local socket, with a Rust client crate and a TypeScript SDK checked against the same message fixtures.
 
+## Install
+
+There is no release yet. From the first tag on (`v0.1.0`, [docs/release.md](docs/release.md)), every release ships unsigned `fabric` and `fabric-sync` binaries for macOS on Apple silicon, macOS on Intel and Linux on x86_64 (glibc 2.35 or newer), with sha256 checksums, a CycloneDX SBOM and a GitHub build attestation for each archive.
+
+With Homebrew, on a Mac or on Linux:
+
+```sh
+brew install EfeDurmaz16/tap/fabric-node
+fabric --version
+brew install EfeDurmaz16/tap/fabric-sync   # optional: the store alone, see Sync alone
+```
+
+Or download the archive for your platform from [GitHub Releases](https://github.com/EfeDurmaz16/fabric/releases), check it and put the binary on your `PATH`:
+
+```sh
+tag=v0.1.0                    # the release to install
+target=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
+base=https://github.com/EfeDurmaz16/fabric/releases/download/$tag
+curl -LO "$base/fabric-$target.tar.gz" -LO "$base/fabric-$target.tar.gz.sha256"
+shasum -a 256 -c "fabric-$target.tar.gz.sha256"
+# Optional: built by this repository's release workflow from that tag.
+gh attestation verify "fabric-$target.tar.gz" -R EfeDurmaz16/fabric \
+  --signer-workflow EfeDurmaz16/fabric/.github/workflows/release.yml --source-ref "refs/tags/$tag"
+tar -xzf "fabric-$target.tar.gz"
+mkdir -p ~/.local/bin && cp "fabric-$target/fabric" ~/.local/bin/
+```
+
+**macOS Gatekeeper.** The binaries are not signed by an Apple Developer ID or notarized. Homebrew and `curl` do not mark what they download as quarantined, so both ways above run without a prompt. A file downloaded with a web browser is quarantined, and macOS refuses to open it with a message that Apple could not verify it. Clear the attribute on the extracted binary and run it again:
+
+```sh
+xattr -d com.apple.quarantine fabric-aarch64-apple-darwin/fabric
+```
+
+Before a release is published, the release smoke (`scripts/release-smoke.sh`) checks on both macOS targets that an archive fetched with `curl` carries no quarantine attribute, and that the command above removes one, after which the binary runs. It does not launch a quarantined copy, so the Gatekeeper refusal itself is macOS behaviour, not something the smoke tests.
+
+To build from source instead, with Rust from [rustup.rs](https://rustup.rs): `cargo build --release -p fabric --locked`, then copy `target/release/fabric` to your `PATH` ([docs/start/install.md](docs/start/install.md)).
+
 ## One Mac, first run
 
 This is the walk a new checkout of `main` was taken through on 2026-11-03 on one Mac, and again on 2026-11-08 after M4 merged ([docs/evidence/usable-from-main/walk.md](docs/evidence/usable-from-main/walk.md) has every command and what it printed). It needs `git` on the `PATH`, and Codex or Claude Code logged in for a real turn.

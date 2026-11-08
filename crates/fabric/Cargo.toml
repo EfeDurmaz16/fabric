@@ -1,11 +1,27 @@
 [package]
 name = "fabric"
-version = "0.1.0"
+version.workspace = true
 description = "The fabric command: run the node, pair nodes, and make, run, suspend, move and resume jobs"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# A crate cargo-dist ships (dist-workspace.toml), with the one binary users
+# install; the fixtures stay out of the archive. The formula is fabric-node,
+# not fabric: homebrew-core has a fabric (the Python SSH tool, binary fab),
+# and two formulae with one name share Cellar/fabric, so a user with it
+# installed could not install this one. The binary is still fabric.
+[package.metadata.dist]
+dist = true
+formula = "fabric-node"
+
+[package.metadata.dist.binaries]
+aarch64-apple-darwin = ["fabric"]
+x86_64-apple-darwin = ["fabric"]
+x86_64-unknown-linux-gnu = ["fabric"]
 
 [features]
 # Named fault points in the node, for the end-to-end test only.

@@ -1,6 +1,6 @@
 [package]
 name = "fabric-bridge"
-version = "0.1.0"
+version.workspace = true
 description = "The bridge to a provider worker (ADR 0021): protocol v1 messages, and a client that runs a worker over stdio and records each effect in the managed journal"
 edition.workspace = true
 license.workspace = true
