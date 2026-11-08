@@ -14,8 +14,11 @@ import { z } from "zod";
 
 import { EnvError } from "./errors.ts";
 
-/** The version of the client API this SDK speaks; a node answers only the same number. */
-export const API_VERSION = 1;
+/**
+ * The version of the client API this SDK speaks; a node answers only the same number. 2 since PR 5
+ * (2026-11-08): the closed set of harness kinds grew by `opencode`, `pi`, `gemini_cli` and `cursor_agent`.
+ */
+export const API_VERSION = 2;
 
 /** Every op of this api version, in the order of `Op::ALL` in the Rust crate. */
 export const OPS = [
@@ -54,6 +57,7 @@ export const OPS = [
   "facade_revoke",
   "facade_call",
   "managed_register",
+  "job_export_psf",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -332,6 +336,10 @@ export const Harness = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("claude_code") }),
   z.strictObject({ kind: z.literal("codex") }),
   z.strictObject({ kind: z.literal("acp"), program: ProgramName, args: z.array(UnicodeText) }),
+  z.strictObject({ kind: z.literal("opencode") }),
+  z.strictObject({ kind: z.literal("pi") }),
+  z.strictObject({ kind: z.literal("gemini_cli") }),
+  z.strictObject({ kind: z.literal("cursor_agent") }),
 ]);
 export type Harness = z.infer<typeof Harness>;
 
@@ -1183,6 +1191,7 @@ export const Request = z.discriminatedUnion("op", [
     class: z.enum(["build", "test"]),
     program: Program,
   }),
+  z.object({ op: z.literal("job_export_psf"), job: JobId, dir: SystemPath }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -1366,6 +1375,16 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("facade_revoke"), revoked: z.boolean() }),
   z.object({ kind: z.literal("facade_call"), message: FacadeJson }),
   z.object({ kind: z.literal("managed_register"), ...managedOperation }),
+  /** A Portable Session Format container the node wrote (ADR 0029). */
+  z.object({
+    kind: z.literal("job_export_psf"),
+    dir: Path,
+    digest: UnicodeText,
+    fidelity: UnicodeText,
+    snapshot: SnapshotId,
+    attachments: z.array(UnicodeText),
+    left_behind: z.array(UnicodeText),
+  }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -1400,6 +1419,7 @@ export type ManagedStatus = ReplyTo<"managed_status">;
 export type ManagedJobs = ReplyTo<"managed_list">;
 export type Repaired = ReplyTo<"job_repair">;
 export type Exported = ReplyTo<"job_export">;
+export type PsfExported = ReplyTo<"job_export_psf">;
 
 // The exchange.
 

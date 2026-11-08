@@ -10,7 +10,7 @@ use std::error::Error;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use fabric_client::api::{ClientEnv, Event, PathDir, Request, Roots, SystemPath};
+use fabric_client::api::{API_VERSION, ClientEnv, Event, PathDir, Request, Roots, SystemPath};
 use fabric_client::{Client, ClientError, frame};
 use serde_json::{Value, json};
 use tokio::net::UnixListener;
@@ -68,7 +68,7 @@ fn node(script: Script) -> Fallible<Node> {
 }
 
 fn welcome(ops: &[&str]) -> Value {
-    json!({"type": "welcome", "api": 1, "node": NODE, "node_version": "0.1.0", "capabilities": ops})
+    json!({"type": "welcome", "api": API_VERSION, "node": NODE, "node_version": "0.1.0", "capabilities": ops})
 }
 
 fn status_request() -> Fallible<Request> {
@@ -119,14 +119,14 @@ async fn a_reply_for_another_op_is_refused() {
 #[tokio::test]
 async fn an_incompatible_node_gets_no_request() {
     let (_dir, socket, served) = node(Script::Hello(
-        json!({"type": "incompatible", "api": 2, "node_version": "0.2.0"}),
+        json!({"type": "incompatible", "api": API_VERSION + 1, "node_version": "0.2.0"}),
     ))
     .unwrap();
     let got = Client::new(&socket)
         .call(&status_request().unwrap(), |_| {})
         .await;
     assert!(
-        matches!(&got, Err(ClientError::Incompatible { client: 1, node: 2, node_version }) if node_version == "0.2.0"),
+        matches!(&got, Err(ClientError::Incompatible { client, node, node_version }) if *client == API_VERSION && *node == API_VERSION + 1 && node_version == "0.2.0"),
         "{got:?}"
     );
     assert_eq!(served.await.unwrap().unwrap(), None);
@@ -138,13 +138,13 @@ async fn an_incompatible_node_gets_no_request() {
 #[tokio::test]
 async fn a_welcome_of_another_api_version_gets_no_request() {
     let mut answer = welcome(&["job_status"]);
-    answer["api"] = json!(2);
+    answer["api"] = json!(API_VERSION + 1);
     let (_dir, socket, served) = node(Script::Hello(answer)).unwrap();
     let got = Client::new(&socket)
         .call(&status_request().unwrap(), |_| {})
         .await;
     assert!(
-        matches!(&got, Err(ClientError::Incompatible { client: 1, node: 2, node_version }) if node_version == "0.1.0"),
+        matches!(&got, Err(ClientError::Incompatible { client, node, node_version }) if node_version == "0.1.0"),
         "{got:?}"
     );
     assert_eq!(served.await.unwrap().unwrap(), None);

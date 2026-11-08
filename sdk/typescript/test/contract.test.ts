@@ -211,7 +211,15 @@ function isPlan(value: unknown): boolean {
 /** Whether `value` is a harness, by its kind. */
 function isHarness(value: unknown): boolean {
   const kind: unknown = typeof value === "object" && value !== null ? Reflect.get(value, "kind") : undefined;
-  return kind === "claude_code" || kind === "codex" || kind === "acp";
+  return (
+    kind === "claude_code" ||
+    kind === "codex" ||
+    kind === "acp" ||
+    kind === "opencode" ||
+    kind === "pi" ||
+    kind === "gemini_cli" ||
+    kind === "cursor_agent"
+  );
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

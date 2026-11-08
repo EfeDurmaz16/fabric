@@ -383,6 +383,10 @@ impl Seen {
                 HarnessKind::ClaudeCode,
                 HarnessKind::Codex,
                 HarnessKind::Acp { .. },
+                HarnessKind::OpenCode,
+                HarnessKind::Pi,
+                HarnessKind::GeminiCli,
+                HarnessKind::CursorAgent,
             ]
         );
         self.tagged("Harness", harness_tag(harness), index);
@@ -1007,7 +1011,7 @@ fn carried(message: &Value, pointer: &str) -> bool {
 fn is_harness(value: &Value) -> bool {
     matches!(
         value.get("kind").and_then(Value::as_str),
-        Some("claude_code" | "codex" | "acp")
+        Some("claude_code" | "codex" | "acp" | "opencode" | "pi" | "gemini_cli" | "cursor_agent")
     )
 }
 

@@ -9,6 +9,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 
 import {
+  API_VERSION,
   clientEnvFromProcess,
   ClosedBeforeAnswerError,
   ClosedBeforeWelcomeError,
@@ -41,7 +42,7 @@ const JOB = JobId.parse("01JABCDEFGHJKMNPQRSTVWXYZ0");
 const SNAPSHOT = SnapshotId.parse("ab".repeat(32));
 
 function welcome(capabilities: readonly string[] = OPS): unknown {
-  return { type: "welcome", api: 1, node: NODE, node_version: "0.1.0", capabilities };
+  return { type: "welcome", api: API_VERSION, node: NODE, node_version: "0.1.0", capabilities };
 }
 
 /** One accepted connection, as the fake node sees it. */
@@ -168,7 +169,7 @@ describe("the client", () => {
     const node = await fakeNode(answers({ type: "done", reply: { kind: "job_list", jobs: [], closed: [] } }));
     await new FabricClient({ socketPath: node.socketPath }).jobList();
     const [received] = await Promise.all(node.connections);
-    expect(received?.[0]).toStrictEqual({ api: 1, client: `fabric-sdk-typescript/${SDK_VERSION}` });
+    expect(received?.[0]).toStrictEqual({ api: API_VERSION, client: `fabric-sdk-typescript/${SDK_VERSION}` });
     expect(received?.[1]).toStrictEqual({ op: "job_list" });
     const manifest: unknown = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     expect(manifest).toMatchObject({ version: SDK_VERSION });
@@ -248,11 +249,11 @@ describe("the client", () => {
   test("rejects an incompatible node with Incompatible and sends no request", async () => {
     const node = await fakeNode(async (connection) => {
       await connection.read();
-      connection.send({ type: "incompatible", api: 2, node_version: "0.2.0" });
+      connection.send({ type: "incompatible", api: API_VERSION + 1, node_version: "0.2.0" });
     });
     const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobList());
     expect(error).toBeInstanceOf(IncompatibleError);
-    expect(error).toMatchObject({ client: 1, node: 2, nodeVersion: "0.2.0" });
+    expect(error).toMatchObject({ client: API_VERSION, node: API_VERSION + 1, nodeVersion: "0.2.0" });
     const [received] = await Promise.all(node.connections);
     expect(received).toHaveLength(1);
   });
@@ -260,11 +261,11 @@ describe("the client", () => {
   test("rejects a welcome of another api version with Incompatible and sends no request", async () => {
     const node = await fakeNode(async (connection) => {
       await connection.read();
-      connection.send({ type: "welcome", api: 2, node: NODE, node_version: "0.2.0", capabilities: OPS });
+      connection.send({ type: "welcome", api: API_VERSION + 1, node: NODE, node_version: "0.2.0", capabilities: OPS });
     });
     const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobList());
     expect(error).toBeInstanceOf(IncompatibleError);
-    expect(error).toMatchObject({ client: 1, node: 2, nodeVersion: "0.2.0" });
+    expect(error).toMatchObject({ client: API_VERSION, node: API_VERSION + 1, nodeVersion: "0.2.0" });
     const [received] = await Promise.all(node.connections);
     expect(received).toHaveLength(1);
   });

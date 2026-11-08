@@ -17,7 +17,8 @@
 //! `launch` the M5 launch path across two daemons with homes of their own,
 //! `legacy` loads a state directory frozen from main, and `streams` holds
 //! every command's answer to the CLI contract's streams and JSON shape
-//! against a live node.
+//! against a live node. `opencode`, `pi`, `gemini` and `cursor` hold one
+//! row per PR 5 adapter (docs/harness-adapters.md).
 
 mod ab;
 mod acp_cli;
@@ -25,13 +26,18 @@ mod bench;
 mod budget;
 mod client;
 mod continuity;
+mod cursor;
 mod facade;
+mod gemini;
 mod headless;
 mod launch;
 mod legacy;
 mod managed;
+mod opencode;
+mod pi;
 mod placement;
 mod preflight;
+mod psf;
 mod secrets;
 mod streams;
 mod terminal;

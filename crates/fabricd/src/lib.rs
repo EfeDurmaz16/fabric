@@ -37,6 +37,7 @@ mod ops;
 mod package;
 pub mod paths;
 mod placement;
+mod psf;
 mod report;
 mod runner;
 pub mod secrets;

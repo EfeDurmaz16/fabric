@@ -19,6 +19,7 @@ Set up a node:
 
 Work on jobs:
   job      Make, run, suspend, move and resume jobs
+  psf      Read Portable Session Format containers
 
 Managed jobs:
   managed  Make, cancel and read managed jobs, and the M5 operations on them (experimental)
@@ -197,7 +198,8 @@ Commands:
   approve  Record an approval in the ledger
   reject   Record a rejection in the ledger
   repair   Settle a job frozen after a fork by the fork rule: take the peer's chain when it wins, keeping this node's ledger and its snapshots
-  export   Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot
+  export   Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot; with --psf, write the job's latest snapshot as a Portable Session Format container instead
+  import   Check a Portable Session Format container against the job it names on this node, and say what this node can continue
 
 Global Options: See `fabric --help`
 
@@ -212,7 +214,7 @@ Make a job from a repository, rooted at ~/fabric/jobs/<id>/work
 
 Options:
       --goal <TEXT>        The goal in your words
-      --harness <HARNESS>  The harness: claude, codex or acp:<program> [default: claude]
+      --harness <HARNESS>  The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program> [default: claude]
       --repo <PATH>        The repository to clone into the job's root
 
 Global Options: See `fabric --help`
@@ -282,7 +284,7 @@ Arguments:
 
 Options:
       --force              Waive the preflight refusals that can be waived when pulling
-      --harness <HARNESS>  Continue under another harness: claude, codex or acp:<program>
+      --harness <HARNESS>  Continue under another harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>
       --headless           Run one turn without a terminal, print the answer and the session, and exit
       --on <NODE>          The node that holds the job, when this node has never seen it
       --prompt <TEXT>      The first message to send
@@ -467,13 +469,14 @@ Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.m
 
 ```text
 Usage: fabric job export [OPTIONS] <JOB>
-Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot
+Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot; with --psf, write the job's latest snapshot as a Portable Session Format container instead
 
 Arguments:
   <JOB>  The job
 
 Options:
       --path <PATH>  A workspace a restore set aside under orphan/ beside the job's root; the workspace at the root when left out
+      --psf <DIR>    The container directory to write, which must not exist
 
 Global Options: See `fabric --help`
 
@@ -484,7 +487,60 @@ Examples:
   Keep an orphan workspace
     fabric job export <JOB> --path <PATH>
 
+  Write the job as a portable session and keep its digest
+    fabric job export <JOB> --psf <DIR>
+
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-export
+```
+
+#### `fabric job import`
+
+```text
+Usage: fabric job import --psf <DIR>
+Check a Portable Session Format container against the job it names on this node, and say what this node can continue
+
+Options:
+      --psf <DIR>  The container directory
+
+Global Options: See `fabric --help`
+
+Examples:
+  Check a portable session against this node
+    fabric job import --psf <DIR>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-job-import
+```
+
+### `fabric psf`
+
+```text
+Usage: fabric psf <COMMAND>
+Read Portable Session Format containers
+
+Commands:
+  inspect  Check a container or a manifest and print its digest, the fidelity it offers and the attachments it lacks
+
+Global Options: See `fabric --help`
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-psf
+```
+
+#### `fabric psf inspect`
+
+```text
+Usage: fabric psf inspect <CONTAINER>
+Check a container or a manifest and print its digest, the fidelity it offers and the attachments it lacks
+
+Arguments:
+  <CONTAINER>  A container directory, or a `manifest.json`
+
+Global Options: See `fabric --help`
+
+Examples:
+  Read a portable session's digest and fidelity
+    fabric psf inspect <CONTAINER>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-psf-inspect
 ```
 
 ### `fabric managed`
@@ -536,7 +592,7 @@ Options:
       --goal <TEXT>
           The goal in your words
       --harness <HARNESS>
-          The harness: claude, codex or acp:<program> [default: claude]
+          The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program> [default: claude]
       --import <PATH>
           A directory on this node the node imports into a snapshot first, untouched
       --operation-key <KEY>

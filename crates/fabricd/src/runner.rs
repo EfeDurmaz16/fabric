@@ -1296,6 +1296,16 @@ impl Host for NodeHost {
                         Some(fabric_harness::claude::ClaudeCode::read_headless_line)
                     }
                     HarnessKind::Codex => Some(fabric_harness::codex::Codex::read_headless_line),
+                    HarnessKind::OpenCode => {
+                        Some(fabric_harness::opencode::OpenCode::read_headless_line)
+                    }
+                    HarnessKind::Pi => Some(fabric_harness::pi::Pi::read_headless_line),
+                    HarnessKind::GeminiCli => {
+                        Some(fabric_harness::gemini::GeminiCli::read_headless_line)
+                    }
+                    HarnessKind::CursorAgent => {
+                        Some(fabric_harness::cursor::CursorAgent::read_headless_line)
+                    }
                     HarnessKind::Acp { .. } => None,
                 };
             let capturer = Arc::clone(&self.capturer);

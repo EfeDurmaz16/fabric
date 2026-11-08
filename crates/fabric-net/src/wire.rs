@@ -1668,6 +1668,10 @@ mod tests {
         prop_oneof![
             Just(HarnessKind::ClaudeCode),
             Just(HarnessKind::Codex),
+            Just(HarnessKind::OpenCode),
+            Just(HarnessKind::Pi),
+            Just(HarnessKind::GeminiCli),
+            Just(HarnessKind::CursorAgent),
             ("[a-z][a-z0-9._-]{0,15}", vec("[ -~]{0,16}", 0..3)).prop_map(|(program, args)| {
                 HarnessKind::Acp {
                     program: fabric_core::harness::ProgramName::parse(&program)

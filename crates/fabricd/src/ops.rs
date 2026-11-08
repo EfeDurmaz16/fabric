@@ -255,6 +255,10 @@ impl Node {
                 let path = path.map(|path| PathBuf::from(path.as_str()));
                 Reply::JobExport(self.job_export(job, path, &env, out).await?)
             }
+            Request::JobExportPsf { job, dir } => Reply::JobExportPsf(
+                self.job_export_psf(job, PathBuf::from(dir.as_str()))
+                    .await?,
+            ),
         })
     }
 
@@ -2869,19 +2873,44 @@ impl Node {
         };
         session_ahead(Some(continued), launching, root, out);
         let harness = adapter_with_installed(state.kind(), &self.harness_env(env)?, None, ahead)?;
-        harness.restore(root, &state_dir).await?;
+        let restored = harness.restore(root, &state_dir).await?;
+        // The session the harness continues here is the captured one unless
+        // the harness minted another when the adapter handed it the state
+        // (`Restored::session`); the job records the one it will run, so
+        // the next capture takes that session and not a stale id.
+        let session = restored.session;
+        if session == *state.session() {
+            // Until the job's record holds it (M5b), the log says what this
+            // restore reached, such as workspace_only for Cursor.
+            tracing::info!(
+                harness = %state.kind(),
+                %session,
+                fidelity = %restored.fidelity,
+                "restored {} session {session} at fidelity {}",
+                state.kind(),
+                restored.fidelity
+            );
+        } else {
+            tracing::info!(
+                harness = %state.kind(),
+                captured = %state.session(),
+                continues = %session,
+                fidelity = %restored.fidelity,
+                "the harness continues the restored state under a new session id"
+            );
+        }
         let previous = job
             .session()?
             .filter(|record| record.harness == *state.kind() && record.session == *state.session())
             .and_then(|record| record.known_writer);
         job.set_session(&SessionRecord {
             harness: state.kind().clone(),
-            session: state.session().clone(),
+            session: session.clone(),
             known_writer: writer_after(previous, &state),
         })?;
         out.emit(Event::SessionRestored {
             harness: state.kind().clone(),
-            session: state.session().clone(),
+            session,
         });
         Ok(())
     }
@@ -3300,7 +3329,12 @@ pub(crate) fn for_harness(probes: Probes, harness: &HarnessKind) -> Probes {
     let others: &[Tool] = match harness {
         HarnessKind::ClaudeCode => &[Tool::Codex, Tool::CodexLogin],
         HarnessKind::Codex => &[Tool::Claude, Tool::ClaudeLogin],
-        HarnessKind::Acp { .. } => &[
+        // The PR 5 harnesses have no doctor rows yet (docs/harness-adapters.md).
+        HarnessKind::Acp { .. }
+        | HarnessKind::OpenCode
+        | HarnessKind::Pi
+        | HarnessKind::GeminiCli
+        | HarnessKind::CursorAgent => &[
             Tool::Claude,
             Tool::ClaudeLogin,
             Tool::Codex,
@@ -3346,7 +3380,11 @@ pub(crate) fn preflight_probes(
     let (version, login) = match harness {
         HarnessKind::ClaudeCode => (Some(Tool::Claude), Some(Tool::ClaudeLogin)),
         HarnessKind::Codex => (Some(Tool::Codex), Some(Tool::CodexLogin)),
-        HarnessKind::Acp { .. } => (None, None),
+        HarnessKind::Acp { .. }
+        | HarnessKind::OpenCode
+        | HarnessKind::Pi
+        | HarnessKind::GeminiCli
+        | HarnessKind::CursorAgent => (None, None),
     };
     let mut both = Probes::of(&[Tool::User, Tool::Git]).union(carry);
     if let Some(version) = version {
@@ -3590,17 +3628,30 @@ pub(crate) fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeErr
         .and_then(|record| record.known_writer))
 }
 
+/// True for a harness whose session does not record every version that
+/// wrote it, so the job carries the newest writer: Codex, which writes its
+/// version only into the rollout it creates, OpenCode, whose export names
+/// the version that created the session, and Gemini CLI, whose chat
+/// records none.
+fn carries_known_writer(kind: &HarnessKind) -> bool {
+    matches!(
+        kind,
+        HarnessKind::Codex | HarnessKind::OpenCode | HarnessKind::GeminiCli
+    )
+}
+
 /// The newest harness version known to have written the session a
-/// capture holds, read from its manifest, for a Codex session only; `None`,
-/// logged, when a Codex manifest records none that parses, and the session
-/// record then keeps the known writer it held (`writer_after`). A Codex
-/// resume writes no version into the rollout, so the job carries this
-/// one. A Claude transcript records the version of every Claude that
+/// capture holds, read from its manifest, for a Codex, OpenCode or
+/// Gemini CLI session only (`carries_known_writer`); `None`, logged, when such a
+/// manifest records none that parses, and the session record then keeps
+/// the known writer it held (`writer_after`). A Codex resume writes no
+/// version into the rollout, and a Gemini chat records none, so the job
+/// carries this one. A Claude transcript records the version of every Claude that
 /// wrote a line, and an ACP agent's state is opaque, so for them the
 /// version a capture records is only the one installed where it ran,
 /// which no guard reads (ADR 0006).
 fn known_writer(manifest: &StateManifest) -> Option<HarnessVersion> {
-    if *manifest.kind() != HarnessKind::Codex {
+    if !carries_known_writer(manifest.kind()) {
         return None;
     }
     let text = manifest.harness_version()?;
@@ -3616,7 +3667,7 @@ fn known_writer(manifest: &StateManifest) -> Option<HarnessVersion> {
 /// The known writer the session record keeps after a capture or a
 /// restore of `manifest`: the version the manifest records, or, when it
 /// records none that parses, `previous`, the one the record held for the
-/// same session; `None` for any harness but Codex. A version that does not
+/// same session; `None` for a harness `carries_known_writer` rejects. A version that does not
 /// parse is ignored and the job's previous known writer stays the floor:
 /// it cannot be ordered, so it cannot raise one, and failing the capture
 /// would keep the job from being suspended or moved off the node for the
@@ -3627,7 +3678,7 @@ fn writer_after(
     previous: Option<HarnessVersion>,
     manifest: &StateManifest,
 ) -> Option<HarnessVersion> {
-    if *manifest.kind() != HarnessKind::Codex {
+    if !carries_known_writer(manifest.kind()) {
         return None;
     }
     known_writer(manifest).or(previous)

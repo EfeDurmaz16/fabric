@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 use fabric_client::facade::{ClientMessage, FacadeAnswer, RefusalCode};
 use serde_json::Value;
 
-mod support;
-use support::sha256;
+mod common;
+use common::sha256;
 
 /// The sha256 of `protocol/facade/v1/manifest.sha256`. Change it only with
 /// the same change in `sdk/typescript/test/facade_fixtures.test.ts`

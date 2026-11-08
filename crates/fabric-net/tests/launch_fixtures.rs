@@ -39,9 +39,9 @@ use fabric_core::path::{AbsPath, RelPath};
 use fabric_net::wire::{Request, RequestBody, RequestId, WireError};
 use serde_json::Value;
 
-#[path = "../../fabric-client/tests/support/mod.rs"]
-mod support;
-use support::sha256;
+#[path = "../../fabric-client/tests/common/mod.rs"]
+mod common;
+use common::sha256;
 
 /// The sha256 of `protocol/net/v4/manifest.sha256`. It moves only with the
 /// fixtures, in the same commit, and docs/net.md records the same value.

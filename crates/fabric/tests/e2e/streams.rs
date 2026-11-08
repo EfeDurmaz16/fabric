@@ -49,6 +49,18 @@ const ELSEWHERE: &[(&str, &str)] = &[
         "placement.rs: e2e_a_submit_runs_on_the_eligible_node_without_naming_it",
     ),
     ("facade continue", "ab/new_paths.rs: the facade continue op"),
+    (
+        "job import",
+        "psf.rs: e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back",
+    ),
+    (
+        "psf inspect",
+        "psf.rs: e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back",
+    ),
+    (
+        "psf verdicts",
+        "sdk/typescript/test/psf.test.ts: the verdict lines every reader prints",
+    ),
 ];
 
 /// The commands this run asked, by command path, such as `job new`.

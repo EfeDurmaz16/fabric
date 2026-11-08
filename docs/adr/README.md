@@ -4,7 +4,7 @@
 
 Every architecture decision record on `main`, with the status line the ADR itself carries. An ADR that says `proposed` and `as built on main` records code that is on `main` while the decision is still open for amendment; the status line says which parts.
 
-No ADR on `main` has the number 0017.
+No ADR on `main` has the number 0017, 0023, 0024, 0025, 0026, 0027, 0028.
 
 How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions).
 
@@ -36,3 +36,4 @@ How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions
 | [0025](0025-source-bindings-and-secret-references.md) | Source bindings, secret references and the export policy | proposed 2026-11-03, built 2026-11-03 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). |
 | [0026](0026-resource-placement.md) | Resource placement among registered nodes | proposed, 2026-11-03. |
 | [0027](0027-job-facade-protocol.md) | The job facade: authenticated remote job operations over the node link | proposed, 2026-11-03. |
+| [0029](0029-portable-session-format.md) | The Portable Session Format v1 | proposed 2026-11-08 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 4 of the 2026-11-08 roadmap. |

@@ -45,6 +45,10 @@ use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome, VersionAhead};
 use fabric_harness::codex::Codex;
+use fabric_harness::cursor::CursorAgent;
+use fabric_harness::gemini::GeminiCli;
+use fabric_harness::opencode::OpenCode;
+use fabric_harness::pi::Pi;
 use fabric_harness::{
     Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnEvent, TurnFeed,
     TurnReport,
@@ -60,6 +64,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub mod contract;
 mod managed;
+mod psf;
 mod render;
 mod terminal;
 
@@ -87,6 +92,9 @@ enum Command {
     /// Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental).
     #[command(subcommand)]
     Facade(managed::FacadeCommand),
+    /// Read Portable Session Format containers.
+    #[command(subcommand)]
+    Psf(psf::PsfCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
     Doctor {
         /// The node to compare with.
@@ -148,7 +156,7 @@ enum JobCommand {
         /// The goal in your words.
         #[arg(long, value_name = "TEXT")]
         goal: String,
-        /// The harness: claude, codex or acp:<program>.
+        /// The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
         #[arg(long, default_value = "claude", value_parser = harness_arg, value_name = "HARNESS")]
         harness: HarnessKind,
     },
@@ -178,7 +186,7 @@ enum JobCommand {
         /// The node that holds the job, when this node has never seen it.
         #[arg(long, value_name = "NODE")]
         on: Option<NodeId>,
-        /// Continue under another harness: claude, codex or acp:<program>.
+        /// Continue under another harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
         #[arg(long, value_parser = harness_arg, value_name = "HARNESS")]
         harness: Option<HarnessKind>,
         /// The first message to send.
@@ -251,14 +259,25 @@ enum JobCommand {
         job: JobId,
     },
     /// Snapshot an orphan workspace of the job without making it the job's
-    /// head, and keep the snapshot.
+    /// head, and keep the snapshot; with --psf, write the job's latest
+    /// snapshot as a Portable Session Format container instead.
     Export {
         /// The job.
         job: JobId,
         /// A workspace a restore set aside under orphan/ beside the job's
         /// root; the workspace at the root when left out.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "psf")]
         path: Option<PathBuf>,
+        /// The container directory to write, which must not exist.
+        #[arg(long, value_name = "DIR")]
+        psf: Option<PathBuf>,
+    },
+    /// Check a Portable Session Format container against the job it names
+    /// on this node, and say what this node can continue.
+    Import {
+        /// The container directory.
+        #[arg(long, value_name = "DIR")]
+        psf: PathBuf,
     },
 }
 
@@ -609,6 +628,7 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
             answer(run, &reply, None)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Psf(command) => psf::run(command, run),
     }
 }
 
@@ -661,6 +681,9 @@ async fn job(
     run: &contract::Run,
 ) -> Result<ExitCode> {
     let client = client(state);
+    if let JobCommand::Import { psf } = &command {
+        return psf::import(&client, home, psf, run).await;
+    }
     let (request, mode, yes) = job_request(command)?;
     let job = request_job(&request);
     let mut ahead = GuardAhead::default();
@@ -726,7 +749,12 @@ impl GuardAhead {
             HarnessKind::Codex => {
                 Codex::new(env.home, env.path_var).ask_guard_ahead(root, &launch_env)
             }
-            HarnessKind::Acp { .. } => return,
+            // No resume guard asks ahead for these yet (docs/harness-adapters.md).
+            HarnessKind::Acp { .. }
+            | HarnessKind::OpenCode
+            | HarnessKind::Pi
+            | HarnessKind::GeminiCli
+            | HarnessKind::CursorAgent => return,
         };
         // A probe that cannot start, as without the binary, is left to
         // the guard, which reports it in its own words.
@@ -832,12 +860,9 @@ fn job_request(command: JobCommand) -> Result<(Request, Mode, bool)> {
             false,
         ),
         JobCommand::Repair { job } => (Request::JobRepair { job }, Mode::Interactive(None), false),
-        JobCommand::Export { job, path } => (
-            Request::JobExport {
-                job,
-                path: path.as_deref().map(system_path).transpose()?,
-                env: env()?,
-            },
+        JobCommand::Import { .. } => bail!("job import runs without a node request"),
+        JobCommand::Export { job, path, psf } => (
+            export_request(job, path.as_deref(), psf.as_deref())?,
             Mode::Interactive(None),
             false,
         ),
@@ -854,7 +879,8 @@ fn request_job(request: &Request) -> Option<JobId> {
         | Request::JobRepair { job }
         | Request::JobStatus { job }
         | Request::JobLog { job }
-        | Request::JobExport { job, .. } => Some(*job),
+        | Request::JobExport { job, .. }
+        | Request::JobExportPsf { job, .. } => Some(*job),
         _ => None,
     }
 }
@@ -862,6 +888,43 @@ fn request_job(request: &Request) -> Option<JobId> {
 /// The repository `fabric job new` names, as the absolute path the client API carries.
 fn repository(repo: &Path) -> Result<SystemPath> {
     system_path(repo).with_context(|| format!("repository {}", repo.display()))
+}
+
+/// `job export`: an orphan snapshot, or with `psf` a container at that path.
+fn export_request(job: JobId, path: Option<&Path>, psf: Option<&Path>) -> Result<Request> {
+    Ok(match psf {
+        Some(dir) => Request::JobExportPsf {
+            job,
+            dir: new_system_path(dir)?,
+        },
+        None => Request::JobExport {
+            job,
+            path: path.map(system_path).transpose()?,
+            env: Some(ClientEnv::current()?),
+        },
+    })
+}
+
+/// A path that does not exist yet, under its parent's physical path, as
+/// the client API carries it.
+fn new_system_path(path: &Path) -> Result<SystemPath> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} names no directory to create", path.display()))?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let parent = std::fs::canonicalize(parent).with_context(|| parent.display().to_string())?;
+    let full = parent.join(name);
+    full.to_str()
+        .and_then(|text| SystemPath::parse(text).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} is not a UTF-8 path, which the client API cannot carry",
+                full.display()
+            )
+        })
 }
 
 /// `path`, resolved to its physical path, as the client API carries it.
@@ -915,6 +978,20 @@ const DRAIN: Duration = Duration::from_secs(2);
 /// Reads one line a headless harness printed into a report; true when it named a new session.
 type ReadLine = fn(&mut TurnReport, &str) -> bool;
 
+/// What reads the lines a headless run of `harness` prints; `None` for a
+/// terminal run, and for an ACP agent, whose output its protocol client holds.
+fn headless_reader(mode: &Mode, harness: &HarnessKind) -> Option<ReadLine> {
+    match (mode, harness) {
+        (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
+        (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
+        (Mode::Headless(_), HarnessKind::OpenCode) => Some(OpenCode::read_headless_line),
+        (Mode::Headless(_), HarnessKind::Pi) => Some(Pi::read_headless_line),
+        (Mode::Headless(_), HarnessKind::GeminiCli) => Some(GeminiCli::read_headless_line),
+        (Mode::Headless(_), HarnessKind::CursorAgent) => Some(CursorAgent::read_headless_line),
+        _ => None,
+    }
+}
+
 /// Runs the plan's setup steps, launches the harness, registers it, and waits for it.
 async fn launch(
     state: &StateDir,
@@ -925,12 +1002,7 @@ async fn launch(
     approval: &Approval<'_>,
 ) -> Result<ExitCode> {
     let notes = mode.notes();
-    let read_line: Option<ReadLine> = match (&mode, &plan.harness) {
-        (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
-        (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
-        // The protocol client holds an ACP agent's output.
-        _ => None,
-    };
+    let read_line = headless_reader(&mode, &plan.harness);
     let (tree, setup_ran) = prepare(state, home, client, plan, notes, approval).await?;
     // A setup step may have installed or switched the harness, so the
     // guard asks it again rather than take an answer from before.
@@ -1116,6 +1188,34 @@ async fn adapter_for(
             };
             (Box::new(agent), launch)
         }
+        HarnessKind::OpenCode => (
+            Box::new(
+                OpenCode::new(harness_env.home.clone(), harness_env.path_var.clone())
+                    .with_known_writer(plan.known_writer.clone()),
+            ),
+            launch,
+        ),
+        HarnessKind::Pi => (
+            Box::new(Pi::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
+        HarnessKind::GeminiCli => (
+            Box::new(
+                GeminiCli::new(harness_env.home.clone(), harness_env.path_var.clone())
+                    .with_known_writer(plan.known_writer.clone()),
+            ),
+            launch,
+        ),
+        HarnessKind::CursorAgent => (
+            Box::new(CursorAgent::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
     })
 }
 

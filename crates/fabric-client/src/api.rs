@@ -29,8 +29,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::text;
 
-/// The version of the client API this crate speaks; a node answers only the same number.
-pub const API_VERSION: u32 = 1;
+/// The version of the client API this crate speaks; a node answers only
+/// the same number. 2 since PR 5 (2026-11-08): the closed set of harness
+/// kinds grew by `opencode`, `pi`, `gemini_cli` and `cursor_agent`.
+pub const API_VERSION: u32 = 2;
 
 /// The client's first frame on a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,11 +161,13 @@ pub enum Op {
     FacadeCall,
     /// [`Request::ManagedRegister`].
     ManagedRegister,
+    /// [`Request::JobExportPsf`].
+    JobExportPsf,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 35] = [
+    pub const ALL: [Op; 36] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -199,6 +203,7 @@ impl Op {
         Op::FacadeRevoke,
         Op::FacadeCall,
         Op::ManagedRegister,
+        Op::JobExportPsf,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -240,6 +245,7 @@ impl Op {
             Op::FacadeRevoke => "facade_revoke",
             Op::FacadeCall => "facade_call",
             Op::ManagedRegister => "managed_register",
+            Op::JobExportPsf => "job_export_psf",
         }
     }
 }
@@ -251,7 +257,9 @@ impl fmt::Display for Op {
 }
 
 /// The harness kinds as the client API writes them: `{ "kind": "claude_code" }`,
-/// `{ "kind": "codex" }` or `{ "kind": "acp", "program": ..., "args": [...] }`.
+/// `{ "kind": "codex" }`, `{ "kind": "acp", "program": ..., "args": [...] }`,
+/// and since api 2 `{ "kind": "opencode" }`, `{ "kind": "pi" }`,
+/// `{ "kind": "gemini_cli" }` and `{ "kind": "cursor_agent" }`.
 ///
 /// A field this client does not know is refused, not skipped: a harness
 /// says what a client launches, and a client that dropped a field would
@@ -273,6 +281,11 @@ pub(crate) enum HarnessDef {
         program: fabric_core::harness::ProgramName,
         args: Vec<String>,
     },
+    #[serde(rename = "opencode")]
+    OpenCode {},
+    Pi {},
+    GeminiCli {},
+    CursorAgent {},
 }
 
 /// Reads a field that has a default, taking `null` as absent: ADR 0018
@@ -882,6 +895,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<ClientEnv>,
     },
+    /// Writes the job's latest snapshot as a Portable Session Format v1
+    /// container (ADR 0029): the manifest naming the revision, the cache
+    /// rows and what was left behind, and the captured harness state as
+    /// one attachment. No workspace byte and no secret goes into it, and
+    /// nothing in the job changes.
+    JobExportPsf {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The container directory to create; it must not exist.
+        dir: SystemPath,
+    },
 }
 
 /// Every capability a node of this api version lists in its welcome, in
@@ -968,7 +993,8 @@ impl Request {
             | Request::FacadeMint { .. }
             | Request::FacadeRevoke { .. }
             | Request::FacadeCall { .. }
-            | Request::JobRepair { .. } => None,
+            | Request::JobRepair { .. }
+            | Request::JobExportPsf { .. } => None,
         }
     }
 
@@ -1011,6 +1037,7 @@ impl Request {
             Request::FacadeRevoke { .. } => Op::FacadeRevoke,
             Request::FacadeCall { .. } => Op::FacadeCall,
             Request::ManagedRegister { .. } => Op::ManagedRegister,
+            Request::JobExportPsf { .. } => Op::JobExportPsf,
         }
     }
 }
@@ -1400,6 +1427,8 @@ pub enum Reply {
     FacadeCall(FacadeEnvelope),
     /// For [`Request::ManagedRegister`].
     ManagedRegister(Box<ManagedOperation>),
+    /// For [`Request::JobExportPsf`].
+    JobExportPsf(PsfExported),
 }
 
 impl Reply {
@@ -1442,6 +1471,7 @@ impl Reply {
             Reply::FacadeRevoke(_) => Op::FacadeRevoke,
             Reply::FacadeCall(_) => Op::FacadeCall,
             Reply::ManagedRegister(_) => Op::ManagedRegister,
+            Reply::JobExportPsf(_) => Op::JobExportPsf,
         }
     }
 }
@@ -1492,6 +1522,24 @@ pub struct Exported {
     /// It and each bundle base it needs, all pinned.
     #[serde(with = "text::list")]
     pub chain: Vec<SnapshotId>,
+}
+
+/// What a Portable Session Format export wrote (ADR 0029).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PsfExported {
+    /// The container directory.
+    pub dir: PathBuf,
+    /// The document digest: sha256 of `manifest.json`, lowercase hex.
+    pub digest: String,
+    /// The fidelity the document offers, as the format spells it.
+    pub fidelity: String,
+    /// The snapshot the document names as its bundle head.
+    #[serde(with = "text")]
+    pub snapshot: SnapshotId,
+    /// The attachments written, by name.
+    pub attachments: Vec<String>,
+    /// The workspace paths left behind on this node, which the reader must recreate.
+    pub left_behind: Vec<String>,
 }
 
 /// A managed job as the client API shows it (ADR 0019).

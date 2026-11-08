@@ -56,6 +56,18 @@ impl Sandbox {
         };
         private(dir.path().join("home"));
         private(dir.path().join("state"));
+        // A portable session that reads, so a command that reads one gets
+        // as far as the node: the manifest of a fixture, with no attachment.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../protocol/psf/v1/cases/valid_workspace_only.json");
+        let case: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+        std::fs::create_dir(dir.path().join("psf")).unwrap();
+        std::fs::write(
+            dir.path().join("psf/manifest.json"),
+            case["input"].as_str().unwrap(),
+        )
+        .unwrap();
         Self { dir }
     }
 
@@ -139,6 +151,7 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "class" => "build".to_owned(),
         "argv" => "true".to_owned(),
         "ttl_ms" => "60000".to_owned(),
+        "psf" | "container" | "DIR" | "CONTAINER" => sandbox.path("psf").display().to_string(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
 }
@@ -419,6 +432,12 @@ fn does_no_work(path: &[String]) -> bool {
     path == ["help"]
 }
 
+/// The commands that read only files and never ask a node, so no node
+/// is missing for them; their failure is input that does not read.
+fn asks_no_node(path: &[String]) -> bool {
+    matches!(path, [group, _] if group == "psf")
+}
+
 /// The commands that run a harness; `--json` there is a usage error,
 /// because the harness owns standard output.
 fn runs_a_harness(path: &[String]) -> bool {
@@ -463,6 +482,21 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
 
         // `serve` is the node, so it is the one command no node is missing for.
         if path == ["serve"] {
+            continue;
+        }
+        // A command that asks no node fails on input that does not read.
+        if asks_no_node(&path) {
+            let mut args = path.clone();
+            args.push(sandbox.path("repo").display().to_string());
+            args.push("--json".to_owned());
+            let output = sandbox.run(&args);
+            let doc = error_document(&output, &format!("{name} (not a container)"));
+            assert_eq!(output.status.code(), Some(1), "{name}: {doc}");
+            assert_eq!(doc["reason"], "invalid_container", "{name}: {doc}");
+            args.pop();
+            let output = sandbox.run(&args);
+            assert_eq!(stdout(&output), "", "{name}: stdout is not empty");
+            assert!(stderr(&output).starts_with("Error: "), "{name}");
             continue;
         }
         let output = sandbox.run(&args);
@@ -516,8 +550,9 @@ fn no_color_removes_every_escape_sequence() {
             .env("FORCE_COLOR", "1")
             .output()
             .unwrap();
-        // Only an error is colored, and `fabric help` does not fail.
-        if !does_no_work(&path) {
+        // Only an error is colored; `fabric help` does not fail, and a
+        // command that asks no node succeeds on its sample.
+        if !does_no_work(&path) && !asks_no_node(&path) {
             assert!(escapes(&forced), "{name}: FORCE_COLOR shows no color");
         }
         let off = sandbox

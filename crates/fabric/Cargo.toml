@@ -25,6 +25,7 @@ fabric-core = { path = "../fabric-core" }
 fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
 fabric-net = { path = "../fabric-net" }
+fabric-psf = { path = "../fabric-psf" }
 fabricd = { path = "../fabricd" }
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 rustix = { version = "1.1", features = ["process", "termios"] }
