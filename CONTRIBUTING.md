@@ -29,7 +29,11 @@ cargo deny check
 scripts/check-hygiene.sh origin/main
 scripts/check-fixtures.sh origin/main
 scripts/check-budget.sh origin/main
+scripts/check-docs.sh
 ```
+
+`scripts/check-docs.sh` needs mdBook at the version CI pins; [Docs](#docs)
+says how to install it.
 
 The TypeScript SDK in `sdk/typescript` needs Bun, and Node 22 with npm on
 `PATH` for its package test. Its end-to-end test runs against a node built
@@ -70,6 +74,13 @@ date, and license. Dependabot opens a weekly PR for a stale action pin or
 crate; it goes through the same gates.
 
 ## Performance rule
+
+Where it is measured changed on 2026-11-08: Efe decided that performance is
+measured in GitHub Actions, as a paired A/B of the anchor and the candidate
+on one runner, with an interval, not on a developer's Mac. That CI job is
+roadmap PR 15 and is not on `main` yet. Until it lands, a pull request runs
+no local timed benchmark; it says in its body that its timing waits for the
+CI job. The rule below, and the tool it names, stay as they are.
 
 No hot path may be slower, or use more memory, than the anchor: `main`
 before the durable job campaign, commit `176622e`. A tolerance per pull
@@ -249,6 +260,185 @@ scripts/budget-baselines.sh linux-x86_64 run-*.log
 
 It prints the `[baseline.<platform>]` table; the `[[change]]` entry names
 the runs.
+
+## Writing a harness adapter
+
+A harness adapter is the code that knows how to detect, capture, restore
+and launch one coding agent (ADR 0006, ADR 0015). There are two ways to add
+one, and the first is the one a day is enough for.
+
+### An ACP agent: no Rust code
+
+An agent that speaks the Agent Client Protocol and can continue a session
+(`session/resume`, or `session/load` with `loadSession: true`) runs under
+the generic `Acp` adapter. Tell the node where it keeps its sessions, in
+`$FABRIC_HOME/harness.toml`, read once when `fabric serve` starts:
+
+```toml
+[acp.opencode]
+state_dir = ".local/share/opencode/sessions"   # relative to the home
+```
+
+Then make a job with `--harness acp:<program>`. Capture takes only the
+files under `state_dir` with a path component that is the session id, or
+the id plus an extension. The directory may not be the home itself, lie
+under `~/.fabric`, or be reached through a link. The adapter cannot see
+whether a generic agent is writing its session, so the node's own handle
+on the process it launched is the guard. A push or a pull of an ACP job
+checks that the target has the agent on its `PATH` and a `state_dir` for
+it before the job changes hands.
+
+What to bring in the pull request: a run of suspend, move and resume of a
+real session of that agent, with the commands and what they printed, under
+`docs/evidence/`, and a row for it in the sessions table (the fidelity
+declaration, below). If the agent needs a fake of its own for CI, the fake
+ACP agent is the pattern (below).
+
+### A native adapter: an implementation of `Harness`
+
+An agent that does not speak ACP needs an adapter in `crates/fabric-harness`,
+behind a cargo feature of its own, as `claude` and `codex` are. The trait is
+`fabric_harness::Harness` in `crates/fabric-harness/src/harness.rs`:
+
+- `kind`, and `detect`: find the binary and its version, `None` when it is
+  not installed.
+- `capture`: copy everything the session needs to continue into a state
+  tree, redacted, with a manifest; refuse while the harness may be writing
+  the session.
+- `confirm_departure`: record that the capture has left this node.
+- `restore`: place a state tree where the harness expects it; refuse a
+  workspace or home other than the captured ones, any file outside the
+  places the adapter itself captures, and a restore while the harness
+  writes the same session; place it all or nothing.
+- `launch`: start the harness in the workspace, without the markers of a
+  Claude Code or Codex session this process runs under.
+
+Around the trait, a native adapter touches more than its own module:
+
+- a `HarnessKind` variant in `crates/fabric-core/src/harness.rs`, with its
+  text form for `--harness`, and the harness kind of the client API, which
+  grows only as ADR 0018, Compatibility, allows, with fixtures under
+  `protocol/fixtures` for the messages that carry it;
+- the dispatch in `crates/fabricd/src/harnesses.rs` (`adapter`,
+  `ask_installed_ahead`, `adapter_with_installed`), and the facts `doctor`
+  measures for it (its version and whether it is logged in);
+- the denylist in `crates/fabric-harness/src/denylist.rs`, for its
+  credentials and host state, which must never enter a state tree;
+- `crates/fabric-harness/src/markers.rs`, for the environment variables
+  that mark a process as running inside it;
+- a `read_headless_line` for its headless output, which
+  `crates/fabric/src/lib.rs` picks by harness, as it does for Claude and
+  Codex.
+
+This is several days of work, not one, and it needs an ADR (below) when
+the agent's session store raises a question the existing adapters did not
+answer. Read the Claude and Codex modules first: the lock and version
+rules in ADR 0015, Running harnesses, are where adapters went wrong before.
+
+### The fake harness pattern
+
+No test runs a real agent. Each adapter is tested against a fake binary
+that behaves as the real one does in the ways the adapter depends on:
+
+- `crates/fabric-harness/src/fake_tool.rs` writes a fake executable and runs
+  it once, so the operating system's first-run check is paid when
+  the fake is made, not inside a timed probe.
+- `crates/fabric-harness/tests/common/mod.rs` is the fake `claude`: it
+  reports a version, stays alive on `hold` so the running-process check
+  sees it, and writes its arguments, home, pid and environment to a log.
+- `crates/fabric-harness/tests/fake_acp_agent/mod.rs` is a fake ACP agent
+  whose capabilities the tests shape through variables (`FAKE_LOAD=0`,
+  `FAKE_RESUME=1`, `FAKE_ASK_PERMISSION=1`, `FAKE_PROMPT_ERROR=1`,
+  `FAKE_LINGER=1`).
+- `crates/fabric/fixtures/fake_agent.rs` is built as the
+  `fabric-fake-agent` binary, the harness of most end-to-end tests
+  (`--harness acp:fabric-fake-agent`).
+
+### The fixtures and the tests to add
+
+- A round trip in `crates/fabric-harness/tests/<name>_roundtrip.rs`, as
+  `claude_roundtrip.rs`, `codex_roundtrip.rs` and `acp_roundtrip.rs` do:
+  capture a session made by the fake, restore it onto a fresh home with
+  the same workspace path, launch the fake there, and check that it
+  continues the same session. Add the refusals: a session that holds a
+  secret, a file outside the adapter's places, a harness that still writes.
+- A crash test in `crates/fabric-harness/tests/crash.rs`: `SIGKILL` at
+  each named crash point of capture and restore (feature `crashpoints`),
+  then the invariant: nothing half placed.
+- End-to-end rows in `crates/fabric/tests/e2e/`: an `install_fake_<name>`
+  in `world.rs` beside `install_fake_claude` and `install_fake_codex`, and
+  a job under the new harness that is suspended on one node, moved, and
+  resumed on the other, over both wires. The end-to-end test runs two
+  daemons on one machine.
+- A new op in the time budget brings its process counts (Time budget).
+
+### The fidelity declaration
+
+Every adapter says what of a session survives a move. Until roadmap PR 5
+adds the fidelity table to the README, the declaration is a row in the
+sessions table of `docs/start/what-moves.md`: what is captured, how the
+session continues on the target, and what proves it on `main` (fakes end
+to end, or a real run between two machines with its evidence). Say what is
+lost, too, such as a tool call in flight or approvals. A row claims only
+what a test or a recorded run shows.
+
+## Docs
+
+The docs site is built by mdBook from `docs/`, with `docs/SUMMARY.md` as
+its table of contents. mdBook is the one tool the docs add: it is a Rust
+tool, it renders the Markdown that GitHub already shows, and the site is
+the same files. It is not a dependency of any crate. CI pins its version
+in `.github/workflows/docs.yml` and publishes the site from `main` to
+GitHub Pages.
+
+`scripts/check-docs.sh` needs mdBook and `python3`. Install the mdBook
+version CI pins (`MDBOOK_VERSION` in `.github/workflows/docs.yml`), or set
+`MDBOOK` to a binary of it; the build script names the version when it
+finds none:
+
+```sh
+cargo install mdbook --version 0.5.4 --locked
+```
+
+```sh
+cargo build -p fabric --locked
+scripts/docs/cli-reference.sh   # docs/reference/cli.md, from the binary's --help
+python3 scripts/docs/gen.py     # ADR index, evidence index, the matrix copies
+scripts/check-docs.sh           # what CI runs: the above with --check, links, the build
+```
+
+Some pages are generated and say so in their first line: the CLI
+reference, the ADR index, the ADR list in `SUMMARY.md`, the evidence
+index, and the "what moves" matrix in `README.md` and `docs/README.md`,
+which is written once in `docs/start/what-moves.md`. Edit the source and
+run the script; CI fails when a generated page is out of date. A relative
+link must name a file the repository has; on the site, a link to anything
+that is not a page goes to the file on GitHub. The product's names, which
+are not final, live in `scripts/docs/names.env`.
+
+Every claim in the docs must be true on `main`. Where something is proved
+only on a branch, say which branch and that it is not on `main`.
+
+## Decisions
+
+Any choice that a future reader would ask "why" about gets an ADR in
+`docs/adr/` (ADR 0009):
+
+1. Take the next number. Numbers are never reused or renumbered.
+2. Name the file `NNNN-short-title.md`. The first line is
+   `# ADR NNNN: Title`, and a line under it is
+   `Status: proposed, YYYY-MM-DD`; the ADR index reads both.
+3. Write Context, Decision, Alternatives considered (with evidence paths),
+   Consequences and Open questions.
+4. Open it in the pull request that needs it. Efe decides its status. A
+   merged ADR can stay `proposed` while parts of it are open, as 0019 to
+   0022 do; when its code lands, the status line says so: `as built on
+   main since YYYY-MM-DD (PR #N)`.
+5. Until the first release, amend an ADR in place with a dated note under
+   the status line that says what changed, why, and which PR or review
+   found it. After the first release, supersede it with a new ADR.
+
+Run `python3 scripts/docs/gen.py` to add it to the index and the site.
 
 ## Workspace rules
 

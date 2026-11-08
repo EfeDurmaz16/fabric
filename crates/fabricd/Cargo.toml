@@ -20,6 +20,7 @@ fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
 fabric-journal = { path = "../fabric-journal" }
 fabric-net = { path = "../fabric-net" }
+fabric-psf = { path = "../fabric-psf" }
 fabric-store = { path = "../fabric-store" }
 rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }

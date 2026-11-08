@@ -1,0 +1,9 @@
+{
+  "container": "blob_mismatch",
+  "summary": "A blob file whose bytes do not hash to its name.",
+  "expect": {
+    "outcome": "refuse",
+    "code": "blob_mismatch",
+    "path": "blobs/dbafac6ded35bb7c0ff3331704a8a26dfc9b4260ab1048f3f8ce96a7351f5548"
+  }
+}
