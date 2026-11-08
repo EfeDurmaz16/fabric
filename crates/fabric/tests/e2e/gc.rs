@@ -35,8 +35,11 @@ fn gc(node: &crate::world::Node, args: &[&str]) -> Fallible<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-/// What a report lists, as (kind, path, job, epoch, node).
-fn listed(report: &Value) -> Vec<(String, Option<PathBuf>, String, Option<u64>, Option<String>)> {
+/// One residual as (kind, path, job, epoch, node).
+type Listed = (String, Option<PathBuf>, String, Option<u64>, Option<String>);
+
+/// What a report lists.
+fn listed(report: &Value) -> Vec<Listed> {
     report["residuals"]
         .as_array()
         .into_iter()
@@ -53,8 +56,10 @@ fn listed(report: &Value) -> Vec<(String, Option<PathBuf>, String, Option<u64>, 
         .collect()
 }
 
-#[test]
-fn e2e_gc_after_a_kill_lists_and_removes_only_what_superseded_tenures_left() -> Fallible {
+/// Two jobs moved from b to a, a killed mid capture of the first and mid
+/// restore of the second, then both stolen by b while a is down; a runs
+/// again, and knows it no longer owns them.
+fn crashed() -> Fallible<(crate::Pair, String, String)> {
     let mut p = setup(Wire::TcpTls, None, None)?;
     // b dials a too, so a job moves from b to a.
     p.b.ok(&["node", "add", &p.a.id, &p.a.addr()])?;
@@ -102,6 +107,12 @@ fn e2e_gc_after_a_kill_lists_and_removes_only_what_superseded_tenures_left() -> 
         assert_eq!((lease.owner.as_str(), lease.epoch), (p.b.id.as_str(), 3));
     }
 
+    Ok((p, cut, staged))
+}
+
+#[test]
+fn e2e_gc_after_a_kill_lists_and_removes_only_what_superseded_tenures_left() -> Fallible {
+    let (p, cut, staged) = crashed()?;
     // The live attempt: a's own job, its harness held running.
     let live = new_job(&p.env, &p.a, AGENT)?;
     let (running, pid) = p.a.run_lingering(&live)?;

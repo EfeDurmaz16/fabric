@@ -566,7 +566,7 @@ impl Node {
             found.live("launch", attempt_label(token));
         }
         let managed = self.gc_read_journal().await?;
-        let providers = self.gc_providers(&managed, &running, &mut found);
+        let providers = gc_providers(&managed, &running, &mut found);
         let mut approved = Vec::new();
         for approval in approvals {
             let Some(at) = providers
@@ -657,54 +657,6 @@ impl Node {
             .await?)
     }
 
-    /// The live attempts, and the provider creates of attempts that may no
-    /// longer run; one with no locator is kept.
-    fn gc_providers(
-        &self,
-        managed: &Managed,
-        running: &Running,
-        found: &mut Found,
-    ) -> Vec<Provider> {
-        for (label, live) in managed.attempts.values() {
-            if *live {
-                found.live("attempt", label.clone());
-            }
-        }
-        let mut providers = Vec::new();
-        for (residual, dispatch) in &managed.creates {
-            let named = GcLabel {
-                task: Some(dispatch.task),
-                attempt: Some(dispatch.attempt),
-                generation: Some(dispatch.generation),
-                ..label(dispatch.job)
-            };
-            // An attempt the journal does not hold has no verdict here, so
-            // its create is live as well: nothing is removed on a guess.
-            if !matches!(
-                managed.verdict(dispatch.attempt, running),
-                Verdict::Ended(_)
-            ) {
-                continue;
-            }
-            if residual.locator.is_none() || residual.status == ProviderStatus::Dispatched {
-                found.kept.push(GcKept {
-                    kind: Kind::ProviderResource.name().to_owned(),
-                    path: None,
-                    operation: Some(residual.creating),
-                    label: Some(named),
-                    reason: Keep::Unlocated.name().to_owned(),
-                });
-                continue;
-            }
-            providers.push(Provider {
-                residual: residual.clone(),
-                label: named,
-                profile: dispatch.profile.clone(),
-            });
-        }
-        providers
-    }
-
     /// Judges, and with `remove` removes, what each standalone job left.
     async fn gc_jobs(&self, remove: bool, found: &mut Found) -> Result<(), NodeError> {
         let jobs: Vec<(JobId, Arc<tokio::sync::Mutex<Job>>)> = self
@@ -716,15 +668,14 @@ impl Node {
             .collect();
         let known: BTreeSet<JobId> = jobs.iter().map(|(id, _)| *id).collect();
         for (id, job) in jobs {
-            match job.try_lock() {
-                Ok(job) => self.gc_job(&job, remove, found).await?,
-                Err(_) => {
-                    found.live("busy", label(id));
-                    for path in self.candidates(id, None) {
-                        if exists(&path) {
-                            found.keep(Kind::Unknown, Some(path), Some(label(id)), Keep::Busy);
-                        }
-                    }
+            if let Ok(job) = job.try_lock() {
+                self.gc_job(&job, remove, found).await?;
+                continue;
+            }
+            found.live("busy", label(id));
+            for path in self.candidates(id, None) {
+                if exists(&path) {
+                    found.keep(Kind::Unknown, Some(path), Some(label(id)), Keep::Busy);
                 }
             }
         }
@@ -777,13 +728,13 @@ impl Node {
             _ => None,
         };
         let marker = job.marker()?;
-        let marked = marker.as_ref().map(|m| m.epoch);
+        let tenure_epoch = marker.as_ref().map(|m| m.epoch);
         if let Some(epoch) = owned {
             found.live("tenure", tenure(id, Some(epoch)));
         }
         let dir = job.dir().clone();
         if matches!(view, LeaseView::Departing { .. }) {
-            found.live("moving", tenure(id, marked));
+            found.live("moving", tenure(id, tenure_epoch));
             for path in self.candidates(id, marker.as_ref().map(|m| m.root.as_path())) {
                 if exists(&path) {
                     found.keep(Kind::Unknown, Some(path), Some(label(id)), Keep::Moving);
@@ -791,49 +742,7 @@ impl Node {
             }
             return Ok(());
         }
-        // A capture writes `.next` and renames it into place under this
-        // lock; found here, it was cut short, whatever the tenure.
-        let next = dir.harness_state_next();
-        if exists(&next) {
-            if is_dir(&next) {
-                let entry = found.residual(Kind::HarnessStateNext, tenure(id, marked));
-                entry.path = Some(next.clone());
-                if remove {
-                    settle(entry, remove_tree(&next));
-                }
-            } else {
-                found.keep(
-                    Kind::HarnessStateNext,
-                    Some(next.clone()),
-                    Some(label(id)),
-                    Keep::Unlabeled,
-                );
-            }
-        }
-        let old = dir.harness_state_old();
-        if exists(&old) {
-            if !is_dir(&old) {
-                found.keep(
-                    Kind::HarnessStateOld,
-                    Some(old.clone()),
-                    Some(label(id)),
-                    Keep::Unlabeled,
-                );
-            } else if exists(&dir.harness_state()) {
-                let entry = found.residual(Kind::HarnessStateOld, tenure(id, marked));
-                entry.path = Some(old.clone());
-                if remove {
-                    settle(entry, remove_tree(&old));
-                }
-            } else {
-                found.keep(
-                    Kind::HarnessStateOld,
-                    Some(old.clone()),
-                    Some(tenure(id, marked)),
-                    Keep::OnlyCopy,
-                );
-            }
-        }
+        let (next, old) = gc_states(&dir, id, tenure_epoch, remove, found);
         let stagings: Vec<PathBuf> = self
             .candidates(id, marker.as_ref().map(|m| m.root.as_path()))
             .into_iter()
@@ -882,6 +791,21 @@ impl Node {
                 settle(entry, remove_tree(&staging));
             }
         }
+        self.gc_harness(job, owned, remove, found).await?;
+        self.gc_copies(id, found);
+        Ok(())
+    }
+
+    /// The harness record of a tenure this node no longer owns: its group
+    /// while it runs, the record once it is gone.
+    async fn gc_harness(
+        &self,
+        job: &Job,
+        owned: Option<Epoch>,
+        remove: bool,
+        found: &mut Found,
+    ) -> Result<(), NodeError> {
+        let (id, dir) = (job.id(), job.dir());
         if let Some(record) = job.harness_record()?
             && owned != Some(record.epoch)
         {
@@ -915,6 +839,12 @@ impl Node {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The departed and orphan copies beside the job's roots: kept by design.
+    fn gc_copies(&self, id: JobId, found: &mut Found) {
+        let dir = self.cfg.state.job(id);
         for root in [paths::job_root(&self.cfg.home, id), dir.fallback_root()] {
             let Some(parent) = root.parent() else {
                 continue;
@@ -941,7 +871,6 @@ impl Node {
                 }
             }
         }
-        Ok(())
     }
 
     /// The staging directories under the home of jobs this node does not
@@ -1075,7 +1004,7 @@ impl Node {
             match entry.file_name().to_str() {
                 Some(RECORDS) => {
                     self.gc_records(remove, &path, managed, running, found)
-                        .await
+                        .await;
                 }
                 Some(RESTORED) => {
                     gc_attempt_dirs(remove, &path, Kind::RestoredState, managed, running, found);
@@ -1138,28 +1067,26 @@ impl Node {
                     task: Some(record.task),
                     ..named.clone()
                 };
-                match record.group().await {
-                    Some(pid) => {
-                        let entry = found.residual(Kind::LaunchGroup, task_label);
-                        entry.pid = Some(pid);
-                        if remove {
-                            record.stop(DrainBudget::default()).await;
-                            settle(
-                                entry,
-                                crate::local::remove(&file).map_err(|e| e.to_string()),
-                            );
-                        }
+                let group = record.group().await;
+                let kind = if group.is_some() {
+                    Kind::LaunchGroup
+                } else {
+                    Kind::LaunchRecord
+                };
+                let entry = found.residual(kind, task_label);
+                entry.pid = group;
+                if group.is_none() {
+                    entry.path = Some(file.clone());
+                }
+                if remove {
+                    // The group first, as recovery stops it, then its record.
+                    if group.is_some() {
+                        record.stop(DrainBudget::default()).await;
                     }
-                    None => {
-                        let entry = found.residual(Kind::LaunchRecord, task_label);
-                        entry.path = Some(file.clone());
-                        if remove {
-                            settle(
-                                entry,
-                                crate::local::remove(&file).map_err(|e| e.to_string()),
-                            );
-                        }
-                    }
+                    settle(
+                        entry,
+                        crate::local::remove(&file).map_err(|e| e.to_string()),
+                    );
                 }
             }
             if remove {
@@ -1208,6 +1135,105 @@ impl Node {
             }
         }
     }
+}
+
+/// The live attempts, and the provider creates of attempts that may no
+/// longer run; one with no locator is kept.
+fn gc_providers(managed: &Managed, running: &Running, found: &mut Found) -> Vec<Provider> {
+    for (label, live) in managed.attempts.values() {
+        if *live {
+            found.live("attempt", label.clone());
+        }
+    }
+    let mut providers = Vec::new();
+    for (residual, dispatch) in &managed.creates {
+        let named = GcLabel {
+            task: Some(dispatch.task),
+            attempt: Some(dispatch.attempt),
+            generation: Some(dispatch.generation),
+            ..label(dispatch.job)
+        };
+        // An attempt the journal does not hold has no verdict here, so
+        // its create is live as well: nothing is removed on a guess.
+        if !matches!(
+            managed.verdict(dispatch.attempt, running),
+            Verdict::Ended(_)
+        ) {
+            continue;
+        }
+        if residual.locator.is_none() || residual.status == ProviderStatus::Dispatched {
+            found.kept.push(GcKept {
+                kind: Kind::ProviderResource.name().to_owned(),
+                path: None,
+                operation: Some(residual.creating),
+                label: Some(named),
+                reason: Keep::Unlocated.name().to_owned(),
+            });
+            continue;
+        }
+        providers.push(Provider {
+            residual: residual.clone(),
+            label: named,
+            profile: dispatch.profile.clone(),
+        });
+    }
+    providers
+}
+
+/// The harness states a capture writes beside the job's: `.next`, cut
+/// short whatever the tenure, and `.old` once a newer state is in place.
+/// Returns both paths, which no staging directory is.
+fn gc_states(
+    dir: &paths::JobDir,
+    id: JobId,
+    tenure_epoch: Option<Epoch>,
+    remove: bool,
+    found: &mut Found,
+) -> (PathBuf, PathBuf) {
+    // A capture writes `.next` and renames it into place under this
+    // lock; found here, it was cut short, whatever the tenure.
+    let next = dir.harness_state_next();
+    if exists(&next) {
+        if is_dir(&next) {
+            let entry = found.residual(Kind::HarnessStateNext, tenure(id, tenure_epoch));
+            entry.path = Some(next.clone());
+            if remove {
+                settle(entry, remove_tree(&next));
+            }
+        } else {
+            found.keep(
+                Kind::HarnessStateNext,
+                Some(next.clone()),
+                Some(label(id)),
+                Keep::Unlabeled,
+            );
+        }
+    }
+    let old = dir.harness_state_old();
+    if exists(&old) {
+        if !is_dir(&old) {
+            found.keep(
+                Kind::HarnessStateOld,
+                Some(old.clone()),
+                Some(label(id)),
+                Keep::Unlabeled,
+            );
+        } else if exists(&dir.harness_state()) {
+            let entry = found.residual(Kind::HarnessStateOld, tenure(id, tenure_epoch));
+            entry.path = Some(old.clone());
+            if remove {
+                settle(entry, remove_tree(&old));
+            }
+        } else {
+            found.keep(
+                Kind::HarnessStateOld,
+                Some(old.clone()),
+                Some(tenure(id, tenure_epoch)),
+                Keep::OnlyCopy,
+            );
+        }
+    }
+    (next, old)
 }
 
 /// The launch path's directory under the state directory, and its parts.

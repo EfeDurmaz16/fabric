@@ -271,19 +271,7 @@ fn git_state_survives_capture_and_restore() {
 
     let snapshot = store.publish(&manifest).unwrap();
     let target = dir.path().join("restored");
-    let restored = restore(
-        &store,
-        &RestoreRequest {
-            snapshot,
-            target: &target,
-            harness_state: None,
-            verify: Verify::All,
-            durability: Durability::PowerLoss,
-            carry: &|_| true,
-            label: None,
-        },
-    )
-    .unwrap();
+    let restored = restore_flushed(&store, snapshot, &target).unwrap();
     assert_eq!(restored.ignored.files, 3);
     // Three ignored files, two directories of theirs, one of W and the nine entries of W.
     assert_eq!(restored.verified, 15);

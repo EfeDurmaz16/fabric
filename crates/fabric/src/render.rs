@@ -271,20 +271,16 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
 /// Whose an item of a `gc` report is, in words: the job, then the tenure
 /// or the attempt and the node its label names.
 fn gc_whose(label: &GcLabel) -> String {
-    let mut words = format!("job {}", label.job);
-    if let Some(epoch) = label.epoch {
-        words.push_str(&format!(" epoch {epoch}"));
-    }
-    if let Some(attempt) = label.attempt {
-        words.push_str(&format!(" attempt {attempt}"));
-    }
-    if let Some(generation) = label.generation {
-        words.push_str(&format!(" generation {generation}"));
-    }
-    if let Some(node) = label.node {
-        words.push_str(&format!(" node {node}"));
-    }
-    words
+    let mut words = vec![format!("job {}", label.job)];
+    words.extend(label.epoch.map(|epoch| format!("epoch {epoch}")));
+    words.extend(label.attempt.map(|attempt| format!("attempt {attempt}")));
+    words.extend(
+        label
+            .generation
+            .map(|generation| format!("generation {generation}")),
+    );
+    words.extend(label.node.map(|node| format!("node {node}")));
+    words.join(" ")
 }
 
 /// Where an item of a `gc` report is: its path, its process group, or
@@ -314,7 +310,7 @@ pub(crate) fn gc_lines(report: &GcReport) -> (Vec<String>, Vec<String>) {
         .residuals
         .iter()
         .map(|residual| {
-            let mut line = format!(
+            let line = format!(
                 "{} {} {} {}",
                 residual.kind,
                 residual.state,
@@ -326,10 +322,10 @@ pub(crate) fn gc_lines(report: &GcReport) -> (Vec<String>, Vec<String>) {
                 ),
                 gc_whose(&residual.label)
             );
-            if let Some(detail) = &residual.detail {
-                line.push_str(&format!(": {detail}"));
+            match &residual.detail {
+                Some(detail) => format!("{line}: {detail}"),
+                None => line,
             }
-            line
         })
         .collect();
     let mut notes: Vec<String> = report
@@ -987,7 +983,8 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         Reply::JobExport(_) => json!({ "snapshot": with_job(fields), "outcome": "exported" }),
         Reply::JobExportPsf(_) => json!({ "container": with_job(fields), "outcome": "exported" }),
         // The report's own fields are keyed by their nouns (`live`,
-        // `residuals`, `kept`); a dry run is a read and has no outcome.
+        // `residuals`, `kept`); a dry run is a read and has no outcome,
+        // with the lists below.
         Reply::Gc(report) if report.removing => {
             let mut fields = fields;
             if let Some(object) = fields.as_object_mut() {
@@ -995,7 +992,6 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
             }
             fields
         }
-        Reply::Gc(_) => fields,
         Reply::ManagedCreate(operation)
         | Reply::ManagedCancel(operation)
         | Reply::ManagedSubmit(operation)
@@ -1028,6 +1024,7 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         | Reply::JobList(_)
         | Reply::JobLog(_)
         | Reply::ManagedList(_)
+        | Reply::Gc(_)
         | Reply::Doctor { .. }
         // A launch's own replies, which no `--json` command answers with.
         | Reply::JobRun(_)

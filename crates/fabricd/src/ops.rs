@@ -263,7 +263,7 @@ impl Node {
                 remove,
                 approvals,
                 worker,
-            } => Reply::Gc(self.gc(remove, approvals, worker).await?),
+            } => Reply::Gc(Box::pin(self.gc(remove, approvals, worker)).await?),
         })
     }
 
@@ -2630,20 +2630,9 @@ impl Node {
         let state_dir = job.dir().harness_state();
         if let Some(facts) = facts {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            let label = crate::gc::StagingLabel {
-                job: id,
-                node: self.id,
-                epoch,
-            };
-            self.write_snapshot(
-                snapshot,
-                &manifest,
-                (&root, harness_dir),
-                &label,
-                &facts,
-                out,
-            )
-            .await?;
+            let into = (root.as_path(), harness_dir, id, epoch);
+            self.write_snapshot(snapshot, &manifest, into, &facts, out)
+                .await?;
         }
         // A cache written with holes that setup steps fill keeps no
         // sentinel: it would call the tree whole, and materialize would
@@ -2788,12 +2777,18 @@ impl Node {
         &self,
         snapshot: SnapshotId,
         manifest: &fabric_core::snapshot::SnapshotManifest,
-        (root, harness_dir): (&Path, Option<PathBuf>),
-        label: &crate::gc::StagingLabel,
+        (root, harness_dir, job, epoch): (&Path, Option<PathBuf>, JobId, Epoch),
         facts: &NodeFacts,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let label = label.encode();
+        // Who the restore is for, in each staging directory it writes, so
+        // one a kill leaves says whose it is (ADR 0030).
+        let label = crate::gc::StagingLabel {
+            job,
+            node: self.id,
+            epoch,
+        }
+        .encode();
         let decisions = carry::decide_all(manifest, facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
