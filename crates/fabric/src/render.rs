@@ -984,8 +984,9 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         Reply::JobExportPsf(_) => json!({ "container": with_job(fields), "outcome": "exported" }),
         // The report's own fields are keyed by their nouns (`live`,
         // `residuals`, `kept`); a dry run is a read and has no outcome,
-        // with the lists below.
-        Reply::Gc(report) if report.removing => {
+        // with the lists below, and so is a removal that left a residual
+        // it listed, whose failure carries the report as its data.
+        Reply::Gc(report) if report.removing && report.residuals.iter().all(|r| r.state == "removed") => {
             let mut fields = fields;
             if let Some(object) = fields.as_object_mut() {
                 object.insert("outcome".to_owned(), Value::from("removed"));
@@ -1163,6 +1164,14 @@ mod contract_tests {
         assert!(doc.get("outcome").is_none(), "{doc}");
         assert_eq!(doc["residuals"][0]["kind"], "harness_state_next");
         assert_eq!(document(&report(true), None)["outcome"], "removed");
+        // A removal that left a residual is no change done: the failure
+        // carries this document as its data, with no outcome.
+        let mut incomplete = report(true);
+        if let Reply::Gc(report) = &mut incomplete {
+            "approval_required".clone_into(&mut report.residuals[0].state);
+        }
+        let doc = document(&incomplete, None);
+        assert!(doc.get("outcome").is_none(), "{doc}");
     }
 
     #[test]
