@@ -16,18 +16,27 @@ use super::model::{AttemptStatus, ManagedState, ResourceRef};
 use crate::id::NodeId;
 
 /// The covered write set. Exactly these four; a test lists them and fails
-/// when a variant is added without a path.
+/// when a variant is added without a path. What has a writer on the
+/// merged tree (docs/managed-jobs.md, "M6 as built"): `JournalOperation`,
+/// every report a runner sends (`Authority::report`), the cut among them,
+/// and `LedgerAppend`, the node link's managed append, fenced before its
+/// body is read. No node holds a managed ledger yet, so a live append is
+/// refused after the fence; `BundlePublish` is covered only as the report
+/// that makes a bundle the job's checkpoint, and `FacadeOutcome` has no
+/// runner writer: the facade's outcomes are the authority's own commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CoveredPath {
-    /// An `Append` to a managed job's ledger (fabric-net, per-job request).
+    /// An `Append` to a managed job's ledger (fabric-net, per-job request);
+    /// fenced, and refused after the fence while no node holds a managed
+    /// ledger.
     LedgerAppend,
-    /// A bundle publish the authority accepts as the job's checkpoint
-    /// (the `Captured` report and the verifier's fetch).
+    /// A bundle the authority accepts as the job's checkpoint: on the
+    /// merged tree, the fenced report of the cut (a journal operation).
     BundlePublish,
     /// A journal operation an executor reports: every observation,
     /// acknowledgement and operation mark.
     JournalOperation,
-    /// The outcome of a facade command (ADR 0027).
+    /// The outcome of a facade command (ADR 0027); no runner writes one.
     FacadeOutcome,
 }
 
