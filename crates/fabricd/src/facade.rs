@@ -340,6 +340,7 @@ impl Node {
                 let bearer = *token.as_bytes();
                 self.facade_watch(
                     bearer,
+                    record.expires_ms,
                     job,
                     after,
                     wait_ms.unwrap_or(DEFAULT_WAIT_MS),
@@ -456,6 +457,7 @@ impl Node {
     async fn facade_watch(
         &self,
         bearer: [u8; BEARER_BYTES],
+        expires_ms: u64,
         job: JobId,
         after: Option<EventSeq>,
         wait_ms: u32,
@@ -463,6 +465,9 @@ impl Node {
     ) -> Result<FacadeAnswer, Refusal> {
         let started = tokio::time::Instant::now();
         let deadline = started + Duration::from_millis(u64::from(wait_ms));
+        // The watch wakes on a commit (a revocation is one) or at the
+        // token's expiry, whichever is first; a read moves no counter.
+        let expiry = started + Duration::from_millis(expires_ms.saturating_sub(now_ms));
         let mut commits = self
             .authority
             .commits()
@@ -530,7 +535,7 @@ impl Node {
                         return Err(Refusal::new(RefusalCode::Unavailable, "authority"));
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => {}
+                () = tokio::time::sleep_until(deadline.min(expiry)) => {}
             }
             let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let live = self.token_record(&bearer).await?;
@@ -621,7 +626,7 @@ impl Node {
         };
         let id = record.id;
         self.authority
-            .with_journal(true, move |journal| {
+            .write_journal(true, move |journal| {
                 journal.token_mint(&record).map_err(AuthorityError::from)
             })
             .await?;
@@ -642,7 +647,7 @@ impl Node {
         let now = now_ms();
         let revoked = match self
             .authority
-            .with_journal(false, move |journal| {
+            .write_journal(false, move |journal| {
                 journal.token_revoke(id, now).map_err(AuthorityError::from)
             })
             .await
@@ -1231,7 +1236,7 @@ mod tests {
             ..record
         };
         node.authority
-            .with_journal(true, move |j| {
+            .write_journal(true, move |j| {
                 j.token_mint(&record).map_err(AuthorityError::from)
             })
             .await
@@ -1499,6 +1504,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, all);
+    }
+
+    /// A watch with nothing to deliver waits on commits, not on its own
+    /// reads: the authority's commit counter barely moves while one idle
+    /// watcher holds its wait open, so readers never crowd out a writer.
+    #[tokio::test]
+    async fn an_idle_watch_does_not_spin_the_authority() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 1_000)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k1", "g").await);
+        let FacadeAnswer::Events { next, .. } = watch(&node, &hex_of(1), job, None, 0).await else {
+            panic!("not events");
+        };
+        let commits = node.authority.commits().unwrap();
+        let before = *commits.borrow();
+        let answer = watch(&node, &hex_of(1), job, next.map(EventSeq::get), 500).await;
+        let after = *commits.borrow();
+        assert!(
+            matches!(&answer, FacadeAnswer::Events { events, .. } if events.is_empty()),
+            "{answer:?}"
+        );
+        assert!(
+            after.wrapping_sub(before) <= 2,
+            "the counter moved {} times for one idle watch",
+            after.wrapping_sub(before)
+        );
+    }
+
+    /// A token that expires while its watch waits closes the watch at the
+    /// expiry, not at the end of the wait, though nothing was committed.
+    #[tokio::test]
+    async fn a_token_expiring_during_a_watch_closes_it_at_the_expiry() {
+        let (_dir, node) = node();
+        seed_token(&node, bearer(1), any_token(1, "efe", NOW + 300)).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "k1", "g").await);
+        let FacadeAnswer::Events { next, .. } = watch(&node, &hex_of(1), job, None, 0).await else {
+            panic!("not events");
+        };
+        let started = tokio::time::Instant::now();
+        let answer = watch(&node, &hex_of(1), job, next.map(EventSeq::get), 20_000).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "closed at the expiry"
+        );
+        let FacadeAnswer::Events { closed, .. } = answer else {
+            panic!("not events: {answer:?}");
+        };
+        assert_eq!(closed.as_deref(), Some("revoked"));
     }
 
     #[tokio::test]

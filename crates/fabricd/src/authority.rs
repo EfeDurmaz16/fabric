@@ -103,9 +103,12 @@ enum Call {
     /// Work on the open journal by the facade and the inspect read (owner
     /// B, M5): the closure answers its own caller. `create` makes the
     /// journal when there is none yet, as a first `CreateJob` does, for a
-    /// token minted before any job.
+    /// token minted before any job. `writes` says whether the work may
+    /// change the journal; only then is the commit counter moved, so a
+    /// read wakes no watcher (one tick per call that changed the journal).
     With {
         create: bool,
+        writes: bool,
         work: JournalWork,
     },
 }
@@ -259,8 +262,29 @@ impl Authority {
         create: bool,
         work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
     ) -> Result<T, AuthorityError> {
+        self.journal_call(create, false, work).await
+    }
+
+    /// As [`Authority::with_journal`], for work that writes (a token
+    /// minted or revoked): the commit counter moves after it, so a watch
+    /// sees the write.
+    pub(crate) async fn write_journal<T: Send + 'static>(
+        &self,
+        create: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        self.journal_call(create, true, work).await
+    }
+
+    async fn journal_call<T: Send + 'static>(
+        &self,
+        create: bool,
+        writes: bool,
+        work: impl FnOnce(&mut Journal) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
         self.call(|reply: Reply<T>| Call::With {
             create,
+            writes,
             work: Box::new(move |journal| {
                 let _ = reply.send(journal.and_then(work));
             }),
@@ -475,7 +499,11 @@ fn serve(
     let tick = || committed.send_modify(|n| *n = n.wrapping_add(1));
     while let Some(call) = queue.blocking_recv() {
         match call {
-            Call::With { create, work } => {
+            Call::With {
+                create,
+                writes,
+                work,
+            } => {
                 if create && matches!(holder, Holder::Absent) {
                     match self::create(place) {
                         Ok(journal) => holder = Holder::Open(journal),
@@ -492,7 +520,9 @@ fn serve(
                     }
                     Holder::Stopped(reason) => Err(AuthorityError::Unavailable(reason.clone())),
                 });
-                tick();
+                if writes {
+                    tick();
+                }
             }
             Call::Submit(envelope, reply) => {
                 let answer = submit(place, &mut holder, &envelope);
