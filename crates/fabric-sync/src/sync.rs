@@ -493,7 +493,7 @@ pub fn pull(home: &Home, req: &PullRequest) -> Result<SyncReport, SyncError> {
         tree::remove_tree(&beside.previous)?;
         beside.incoming.clone()
     };
-    restore(
+    let restored = restore(
         &store,
         &RestoreRequest {
             snapshot: head.snapshot,
@@ -503,7 +503,17 @@ pub fn pull(home: &Home, req: &PullRequest) -> Result<SyncReport, SyncError> {
             durability: Durability::ProcessCrash,
             carry: &|_| true,
         },
-    )?;
+    );
+    if let Err(e) = restored {
+        // Restore renames its staging tree onto the path last, so a
+        // restore that failed wrote nothing there; a pending record left
+        // behind would let the next sync take whatever lands there later
+        // for this snapshot.
+        if empty {
+            home.clear_pending(&tree)?;
+        }
+        return Err(e.into());
+    }
     if !empty {
         home.set_pending(&tree, head)?;
         tree::swap_in(&tree, &beside)?;

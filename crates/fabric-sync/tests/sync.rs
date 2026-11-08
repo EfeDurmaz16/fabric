@@ -542,6 +542,28 @@ fn the_secret_patterns_and_caches_a_tree_declares_hold_on_a_push() {
 }
 
 #[test]
+fn a_first_pull_whose_restore_fails_records_nothing() {
+    let world = World::new();
+    let a = world.path("a/app");
+    dirty_tree(&a);
+    let target = world.path("target");
+    let (t, ta) = (target.to_str().unwrap(), a.to_str().unwrap());
+    world.ok("home-a", &["push", t, "--tree", ta]);
+    let b = world.path("b/app");
+    let tb = b.to_str().unwrap();
+    // A directory of the restore's staging name that no restore made: the restore refuses it.
+    let foreign = world.path("b/app.fabric-restoring");
+    write(&foreign.join("mine"), "mine\n");
+    let output = world.run("home-b", &["pull", t, "--tree", tb, "--json"], None);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    fs::remove_dir_all(&foreign).unwrap();
+    write(&b.join("other.txt"), "unrelated\n");
+    let output = world.run("home-b", &["pull", t, "--tree", tb, "--json"], None);
+    let doc: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(doc["reason"], "target_not_empty", "{doc}");
+}
+
+#[test]
 fn a_busy_store_over_ssh_is_store_busy_and_retryable() {
     let world = World::new();
     let a = world.path("a/app");
