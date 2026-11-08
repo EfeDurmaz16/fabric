@@ -11,7 +11,7 @@
 use std::fmt::Write as _;
 
 use fabric_client::api::{
-    AttemptRecord, AuditPage, AuditRecord, EvidenceRecord, GenerationRecord, INSPECT_SCHEMA,
+    AttemptRecord, AuditPage, AuditRecord, EvidenceRecord, GenerationRecord, INSPECT_ROWS, INSPECT_SCHEMA,
     InspectReport, OperationRecord, Reason, ReportRecord,
 };
 use fabric_core::id::JobId;
@@ -224,8 +224,9 @@ fn inspect_report(
             ended_ms: row.ended_ms,
         });
     }
-    let operations = journal
-        .operation_rows(job)?
+    let (operation_rows, operation_total) = journal.operation_rows(job, INSPECT_ROWS)?;
+    let operations_omitted = operation_total.saturating_sub(operation_rows.len() as u64);
+    let operations = operation_rows
         .into_iter()
         .map(|r| OperationRecord {
             operation: r.operation,
@@ -241,12 +242,9 @@ fn inspect_report(
             updated_ms: r.updated_ms,
         })
         .collect();
-    let evidence = journal
-        .evidence_rows(job)?
-        .into_iter()
-        .filter(|r| wanted(r.attempt))
-        .map(evidence_record)
-        .collect();
+    let (evidence_rows, evidence_total) = journal.evidence_rows(job, attempt, INSPECT_ROWS)?;
+    let evidence_omitted = evidence_total.saturating_sub(evidence_rows.len() as u64);
+    let evidence = evidence_rows.into_iter().map(evidence_record).collect();
     let last_report = journal
         .last_report(job, attempt)?
         .map(|(row, named)| ReportRecord {
@@ -262,7 +260,9 @@ fn inspect_report(
         attempts,
         generations,
         operations,
+        operations_omitted,
         evidence,
+        evidence_omitted,
         last_report,
     })
 }

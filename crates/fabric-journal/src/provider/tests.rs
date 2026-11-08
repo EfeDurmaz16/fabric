@@ -1117,3 +1117,96 @@ fn the_audit_pages_every_table_in_one_order_at_any_page_size() {
             .is_empty()
     );
 }
+
+/// `inspect` reads a job's newest operations and evidence, a bounded
+/// number of each, with how many older rows it left out; the whole history
+/// is the audit export's.
+#[test]
+fn inspect_reads_the_newest_rows_and_counts_the_rest() {
+    let mut f = granted();
+    created(&mut f, 1);
+    created(&mut f, 2);
+    let snapshot = fabric_core::id::SnapshotId::of(b"cut");
+    f.journal
+        .observe(
+            JOB,
+            &Observation::Checkpointed {
+                attempt: ATTEMPT,
+                generation: Generation::FIRST,
+                snapshot,
+                cut: fabric_core::managed::CheckpointCut {
+                    snapshot,
+                    receipts: vec![fabric_core::managed::TaskReceipt {
+                        task: TASK,
+                        class: fabric_core::managed::TaskClass::Harness,
+                        status: fabric_core::managed::ReceiptStatus::Checkpointed { snapshot },
+                        exit: None,
+                        interrupted: false,
+                        workspace: None,
+                    }],
+                    facts: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+            1_500,
+        )
+        .unwrap();
+    // More evidence rows, one per earlier event of the job, so the cut
+    // has an order to keep.
+    let seqs: Vec<i64> = {
+        let mut stmt = f
+            .journal
+            .conn
+            .prepare("SELECT seq FROM events WHERE job_id = ?1 AND seq NOT IN (SELECT seq FROM evidence) ORDER BY seq LIMIT 2")
+            .unwrap();
+        stmt.query_map([JOB.to_bytes()], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(seqs.len(), 2);
+    for seq in seqs {
+        f.journal
+            .conn
+            .execute(
+                "INSERT INTO evidence (evidence_id, job_id, attempt_id, revision, kind, ref, digest, seq)
+                 VALUES (?1, ?2, ?3, 1, 'exit', 'succeeded', NULL, ?4)",
+                rusqlite::params![[seq as u8; 16], JOB.to_bytes(), ATTEMPT.to_bytes(), seq],
+            )
+            .unwrap();
+    }
+    let (operations, total) = f.journal.operation_rows(JOB, u32::MAX).unwrap();
+    assert!(operations.len() >= 2, "{operations:?}");
+    assert_eq!(total, operations.len() as u64);
+    let (evidence, total) = f.journal.evidence_rows(JOB, None, u32::MAX).unwrap();
+    assert!(evidence.len() >= 3, "{evidence:?}");
+    assert_eq!(total, evidence.len() as u64);
+    // Oldest first, each read on its own order, so a cut is the tail.
+    assert!(
+        operations
+            .windows(2)
+            .all(|w| (w[0].accepted_ms, w[0].operation.to_bytes()) < (w[1].accepted_ms, w[1].operation.to_bytes())),
+        "{operations:?}"
+    );
+    assert!(evidence.windows(2).all(|w| w[0].seq < w[1].seq), "{evidence:?}");
+    for limit in 1..=6u32 {
+        let keep = (limit as usize).min(operations.len());
+        let (rows, total) = f.journal.operation_rows(JOB, limit).unwrap();
+        assert_eq!(rows, operations[operations.len() - keep..], "limit {limit}");
+        assert_eq!(total, operations.len() as u64);
+        let keep = (limit as usize).min(evidence.len());
+        let (rows, total) = f.journal.evidence_rows(JOB, None, limit).unwrap();
+        assert_eq!(rows, evidence[evidence.len() - keep..], "limit {limit}");
+        assert_eq!(total, evidence.len() as u64);
+    }
+    let (rows, total) = f
+        .journal
+        .evidence_rows(JOB, Some(AttemptId::from_bytes([0x77; 16])), u32::MAX)
+        .unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(total, 0);
+    assert_eq!(
+        f.journal.evidence_rows(JOB, Some(ATTEMPT), 1).unwrap().1,
+        evidence.len() as u64
+    );
+}

@@ -77,11 +77,13 @@ fabric inspect <JOB> --attempt <ATTEMPT> --json
 | `job`, `parked`, `placements`, `continuations`, `notes`, `provider_operations`, `blockers`, `residuals` | As `fabric managed inspect` shows them: the job with its tasks, their classes and last receipts, every placement decision with its candidates, every continuation with the fidelity achieved. |
 | `attempts[]` | `attempt`, `task`, `generation`, `status`, `node`, `granted_by` (the operation), `initial_checkpoint` and `last_checkpoint` (64 hex), `granted_ms`, `ended_ms`. |
 | `generations[]` | `generation`, `attempt`, `granted_by`, `granted_by_kind` (`create_job`, `start_attempt` or `continue`), `supersedes`. |
-| `operations[]` | `operation`, `operation_key`, `kind`, `status`, `revision` (absent for a rejected one), `refusal` (its code), `accepted_ms`, `updated_ms`. |
-| `evidence[]` | `seq`, `kind` (`checkpoint` or `exit`), `attempt`, `revision`, `ref`, `digest`, `at_ms`. |
+| `operations[]` | The newest 1000 operations: `operation`, `operation_key`, `kind`, `status`, `revision` (absent for a rejected one), `refusal` (its code), `accepted_ms`, `updated_ms`. |
+| `operations_omitted` | How many older operations the reply leaves out; absent when none. |
+| `evidence[]` | The newest 1000 evidence rows: `seq`, `kind` (`checkpoint` or `exit`), `attempt`, `revision`, `ref`, `digest`, `at_ms`. |
+| `evidence_omitted` | How many older evidence rows the reply leaves out; absent when none. |
 | `last_report` | The newest event a report recorded: `seq`, `kind`, `attempt`, `at_ms`. |
 
-`inspect` is local to the node's owner, so it shows operation keys and evidence refs as the journal holds them. A job the authority does not hold is refused as `unknown_job`; an attempt not in the job is `bad_request`.
+A job that checkpoints for weeks holds tens of thousands of rows, more than one reply frame holds, so `inspect` carries the newest of each and counts the rest; `fabric audit export` pages every row. `inspect` is local to the node's owner, so it shows operation keys and evidence refs as the journal holds them. A job the authority does not hold is refused as `unknown_job`; an attempt not in the job is `bad_request`.
 
 ## Audit export
 

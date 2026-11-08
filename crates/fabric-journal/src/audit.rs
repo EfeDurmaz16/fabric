@@ -338,26 +338,55 @@ impl Journal {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// `job`'s operations, accepted and rejected, oldest first.
-    pub fn operation_rows(&self, job: JobId) -> Result<Vec<OperationRow>, CommitError> {
+    /// `job`'s newest `limit` operations, accepted and rejected, oldest
+    /// first, and how many the job holds in all.
+    pub fn operation_rows(
+        &self,
+        job: JobId,
+        limit: u32,
+    ) -> Result<(Vec<OperationRow>, u64), CommitError> {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {OPERATION_COLUMNS} FROM operations WHERE job_id = ?1
-             ORDER BY accepted_ms, operation_id"
+             ORDER BY accepted_ms DESC, operation_id DESC LIMIT ?2"
         ))?;
-        let rows = stmt
-            .query_map([job.to_bytes()], operation_row)?
+        let mut rows = stmt
+            .query_map(params![job.to_bytes(), limit], operation_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().map(with_refusal).collect()
+        rows.reverse();
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM operations WHERE job_id = ?1",
+            [job.to_bytes()],
+            |r| r.get(0),
+        )?;
+        let rows = rows.into_iter().map(with_refusal).collect::<Result<_, _>>()?;
+        Ok((rows, total.unsigned_abs()))
     }
 
-    /// `job`'s evidence, in event order.
-    pub fn evidence_rows(&self, job: JobId) -> Result<Vec<EvidenceRow>, CommitError> {
+    /// `job`'s newest `limit` evidence rows (of `attempt` only, when
+    /// given), in event order, and how many there are in all.
+    pub fn evidence_rows(
+        &self,
+        job: JobId,
+        attempt: Option<AttemptId>,
+        limit: u32,
+    ) -> Result<(Vec<EvidenceRow>, u64), CommitError> {
+        let attempt = attempt.map(|a| a.to_bytes());
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {EVIDENCE_COLUMNS} FROM evidence v JOIN events e ON e.seq = v.seq
-             WHERE v.job_id = ?1 ORDER BY v.seq"
+             WHERE v.job_id = ?1 AND (?2 IS NULL OR v.attempt_id = ?2)
+             ORDER BY v.seq DESC LIMIT ?3"
         ))?;
-        let rows = stmt.query_map([job.to_bytes()], evidence_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut rows = stmt
+            .query_map(params![job.to_bytes(), attempt, limit], evidence_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.reverse();
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM evidence
+             WHERE job_id = ?1 AND (?2 IS NULL OR attempt_id = ?2)",
+            params![job.to_bytes(), attempt],
+            |r| r.get(0),
+        )?;
+        Ok((rows, total.unsigned_abs()))
     }
 
     /// The newest event a report recorded for `job` (for `attempt` only,

@@ -2189,6 +2189,11 @@ pub struct Inspection {
 /// The version of the `inspect` schema; a field is only ever added.
 pub const INSPECT_SCHEMA: u32 = 1;
 
+/// The most operations, and the most evidence rows, one `inspect` reply
+/// carries: the newest ones, so the reply stays well under the frame limit
+/// however long the job has run.
+pub const INSPECT_ROWS: u32 = 1_000;
+
 /// The whole managed state of a job, or of one attempt (ADR 0031): the
 /// body of `inspect`. Every list is oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2211,10 +2216,18 @@ pub struct InspectReport {
     pub attempts: Vec<AttemptRecord>,
     /// One row per generation: the grant that made it and what it superseded.
     pub generations: Vec<GenerationRecord>,
-    /// Every operation the journal holds for the job, accepted or rejected.
+    /// The job's newest operations, accepted or rejected, oldest first: at
+    /// most [`INSPECT_ROWS`]; `fabric audit export` holds every one.
     pub operations: Vec<OperationRecord>,
-    /// Every evidence row: checkpoints and exits.
+    /// How many older operations `operations` leaves out.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub operations_omitted: u64,
+    /// The newest evidence rows (checkpoints and exits), oldest first: at
+    /// most [`INSPECT_ROWS`].
     pub evidence: Vec<EvidenceRecord>,
+    /// How many older evidence rows `evidence` leaves out.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub evidence_omitted: u64,
     /// The newest event a report recorded, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_report: Option<ReportRecord>,

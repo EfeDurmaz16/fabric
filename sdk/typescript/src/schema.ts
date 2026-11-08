@@ -1094,6 +1094,8 @@ const inspectReport = {
       updated_ms: count,
     }),
   ),
+  /** Older operations the reply leaves out; `fabric audit export` holds them. */
+  operations_omitted: optional(count),
   evidence: z.array(
     z.object({
       seq: count,
@@ -1105,6 +1107,8 @@ const inspectReport = {
       at_ms: count,
     }),
   ),
+  /** Older evidence rows the reply leaves out. */
+  evidence_omitted: optional(count),
   last_report: optional(z.object({ seq: count, kind: UnicodeText, attempt: optional(AttemptId), at_ms: count })),
 };
 

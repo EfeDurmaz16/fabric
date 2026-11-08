@@ -500,6 +500,12 @@ fn inspect_lines(report: &fabric_client::api::InspectReport) -> Vec<String> {
             attempt.attempt, attempt.node, attempt.status
         ));
     }
+    if report.operations_omitted > 0 {
+        lines.push(format!(
+            "{} older operations not shown: fabric audit export has them",
+            report.operations_omitted
+        ));
+    }
     for operation in &report.operations {
         lines.push(match &operation.refusal {
             Some(refusal) => format!(
@@ -511,6 +517,12 @@ fn inspect_lines(report: &fabric_client::api::InspectReport) -> Vec<String> {
                 operation.operation, operation.kind, operation.operation_key, operation.status
             ),
         });
+    }
+    if report.evidence_omitted > 0 {
+        lines.push(format!(
+            "{} older evidence rows not shown: fabric audit export has them",
+            report.evidence_omitted
+        ));
     }
     for evidence in &report.evidence {
         lines.push(format!(
