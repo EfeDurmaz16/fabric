@@ -918,6 +918,24 @@ fn check_v3(journal: &mut Journal) {
         fourth.operations
     );
     assert_eq!(fourth.requests.len(), 2);
+    // The newest cut of the first attempt is the handoff's, not the in-place one.
+    let (cut_snapshot, _) = journal
+        .last_cut(FOURTH, fourth.attempts[0].id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cut_snapshot, SnapshotId::of(b"fixture handoff cut"));
+    assert_eq!(
+        journal.last_cut(FOURTH, fourth.attempts[1].id).unwrap(),
+        None
+    );
+    let newest = journal.events(FOURTH, None, 1_000).unwrap();
+    assert!(journal.head(FOURTH).unwrap().is_some());
+    assert_eq!(
+        journal.head(FOURTH).unwrap(),
+        newest
+            .last()
+            .map(|e| fabric_core::managed::EventFrame::digest(&e.frame.encode().unwrap()))
+    );
     let recovery = journal
         .recover(1_760_000_004_000, |_| fabric_journal::Liveness::CannotTell)
         .unwrap();
