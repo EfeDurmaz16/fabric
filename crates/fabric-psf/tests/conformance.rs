@@ -166,6 +166,11 @@ fn mutations() -> Vec<String> {
         out.push(seed.replacen('{', "{\"zz_new\":\"kept\",", 1));
         out.push(seed.replacen('{', "{\"Bad\":\"x\",", 1));
         out.push(seed.replacen("\"requires\":[]", "\"requires\":[\"signature\"]", 1));
+        // Numbers past the range of a binary64, which serde_json refuses
+        // to parse, and one that rounds to zero, which it reads.
+        for number in ["1e400", "-1e400", &"9".repeat(400), "1e-400"] {
+            out.push(seed.replacen("\"requires\":[]", &format!("\"requires\":[{number}]"), 1));
+        }
     }
     for depth in 126..=130 {
         out.push(format!(

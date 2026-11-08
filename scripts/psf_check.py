@@ -27,6 +27,7 @@ Python 3.9, standard library only: json, hashlib, re, os, unicodedata.
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -136,6 +137,24 @@ def _reject_constant(name):
     raise _NotJson(name)
 
 
+# serde_json, the Rust reader's parser, refuses a number past the range of
+# a binary64; one that rounds to zero it reads.
+def _float(text):
+    value = float(text)
+    if math.isinf(value):
+        raise _NotJson(text)
+    return value
+
+
+def _int(text):
+    value = int(text)
+    try:
+        float(value)
+    except OverflowError:
+        raise _NotJson(text)
+    return value
+
+
 def _has_surrogate(text):
     return any(0xD800 <= ord(c) <= 0xDFFF for c in text)
 
@@ -161,7 +180,8 @@ def _depth(value):
 def _parse(data):
     try:
         text = data.decode("utf-8")
-        value = json.loads(text, parse_constant=_reject_constant)
+        value = json.loads(text, parse_constant=_reject_constant, parse_float=_float,
+                           parse_int=_int)
     except (UnicodeDecodeError, ValueError, _NotJson, RecursionError):
         return None
     # serde_json, the Rust reader's parser, refuses a 128th level of nesting.

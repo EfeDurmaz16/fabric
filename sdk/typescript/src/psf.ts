@@ -243,13 +243,19 @@ function canonical(value: Json, path = ""): string {
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
-/** False when a string or key holds a lone surrogate, or nesting reaches 128 levels, which serde_json refuses. */
+/**
+ * False when a string or key holds a lone surrogate, nesting reaches 128
+ * levels, or a number is past the range of a binary64 (JSON.parse reads
+ * it as an infinity): serde_json refuses all three.
+ */
 function wellFormed(root: Json): boolean {
   const stack: Array<[Json, number]> = [[root, 1]];
   while (stack.length > 0) {
     const [value, depth] = stack.pop() as [Json, number];
     if (typeof value === "string") {
       if (LONE_SURROGATE.test(value)) return false;
+    } else if (typeof value === "number") {
+      if (!Number.isFinite(value)) return false;
     } else if (Array.isArray(value)) {
       if (depth > 127) return false;
       for (const item of value) stack.push([item, depth + 1]);

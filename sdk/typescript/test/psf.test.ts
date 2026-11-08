@@ -174,6 +174,7 @@ function generated(): string[] {
     out.push(seed.replace('"psf":"1"', '"psf":"1","psf":"1"'));
     out.push(seed.replace("{", '{"zz_new":"kept",'), seed.replace("{", '{"Bad":"x",'));
     out.push(seed.replace('"requires":[]', '"requires":["signature"]'));
+    for (const n of ["1e400", "-1e400", "9".repeat(400), "1e-400"]) out.push(seed.replace('"requires":[]', `"requires":[${n}]`));
     out.push(seed.replace("{", '{"__proto__":"x",'), seed.replace("{", '{"constructor":"x",'));
   }
   for (let depth = 126; depth <= 130; depth++) out.push(`{"a":${"[".repeat(depth - 1)}${"]".repeat(depth - 1)}}`);
