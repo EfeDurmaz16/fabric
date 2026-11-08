@@ -204,25 +204,19 @@ impl Pi {
     /// Refuses a launch environment that moves pi's agent or session
     /// directory away from `<home>/.pi/agent`, where the adapter reads.
     pub fn check_env(&self, env: &[(EnvVarName, String)]) -> Result<(), HarnessError> {
-        let moved = env
-            .iter()
-            .find(|(name, value)| MOVING_VARS.contains(&name.as_str()) && !value.is_empty());
+        let default_agent_dir = self.home_dir().join(".pi/agent");
+        let moved = env.iter().find_map(|(name, value)| {
+            let var = MOVING_VARS.iter().find(|var| **var == name.as_str())?;
+            let is_default = *var == MOVING_VARS[0] && Path::new(value) == default_agent_dir;
+            (!value.is_empty() && !is_default).then_some(*var)
+        });
         match moved {
-            Some((name, value))
-                if !(name.as_str() == MOVING_VARS[0]
-                    && Path::new(value) == self.home_dir().join(".pi/agent")) =>
-            {
-                Err(HarnessError::ConfigMoved {
-                    program: PROGRAM.to_owned(),
-                    var: if name.as_str() == MOVING_VARS[0] {
-                        MOVING_VARS[0]
-                    } else {
-                        MOVING_VARS[1]
-                    },
-                    moves: "the session files",
-                })
-            }
-            _ => Ok(()),
+            Some(var) => Err(HarnessError::ConfigMoved {
+                program: PROGRAM.to_owned(),
+                var,
+                moves: "the session files",
+            }),
+            None => Ok(()),
         }
     }
 
@@ -774,5 +768,27 @@ mod tests {
                 "{name}={value}"
             );
         }
+    }
+
+    #[test]
+    fn a_default_agent_dir_does_not_hide_a_moved_session_dir() {
+        let adapter = Pi::new(AbsPath::parse("/h").unwrap(), OsString::new());
+        let env = vec![
+            (
+                EnvVarName::parse("PI_CODING_AGENT_DIR").unwrap(),
+                "/h/.pi/agent".to_owned(),
+            ),
+            (
+                EnvVarName::parse("PI_CODING_AGENT_SESSION_DIR").unwrap(),
+                "/elsewhere".to_owned(),
+            ),
+        ];
+        assert!(matches!(
+            adapter.check_env(&env),
+            Err(HarnessError::ConfigMoved {
+                var: "PI_CODING_AGENT_SESSION_DIR",
+                ..
+            })
+        ));
     }
 }
