@@ -207,6 +207,7 @@ impl Verifier {
                 let (found, cut) = (found.clone(), held.cut);
                 let verifying = Arc::clone(&node);
                 tokio::spawn(async move {
+                    crate::faults::hit(crate::faults::Point::BeforeAcknowledge).await;
                     let outcome = verify(&verifying, &found, snapshot, cut).await;
                     match outcome {
                         Ok(ack) => match verifying.authority.acknowledge(job, ack).await {

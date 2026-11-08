@@ -1,21 +1,36 @@
-//! The M6 partition proof (ADR 0028): two `fabricd` processes on this host
-//! with separate state roots, a real QUIC link between them through the
-//! userspace relay of `relay.rs`, and the relay paused and resumed. This
-//! is a two-process partition on one host, not two hosts; no firewall and
-//! no system setting is touched (docs/evidence/m6).
+//! The M6 scenarios (ADR 0028), run for real: two `fabricd` processes on
+//! this host with separate state roots, a real QUIC link between them
+//! through the userspace relay of `relay.rs`, and a managed job the
+//! authority places on the runner node and launches there through the M5
+//! launch path. The runner's harness is the fake Codex held with
+//! `FAKE_CODEX_HOLD` (one process, no child: `FAKE_CODEX_WAIT`'s escaped
+//! child would block every cut, ADR 0023), its heartbeats flow, and a
+//! checkpoint is cut on the runner, fetched and acknowledged by the
+//! authority before the loss. This is a two-process partition on one
+//! host, not two hosts; no firewall and no system setting is touched
+//! (docs/evidence/m6).
 //!
-//! What runs here on the M5 base: the two daemons pair and talk through
-//! the relay, the relay drops their datagrams while paused and forwards
-//! again after, the authority keeps taking managed commands while its
-//! runner is unreachable, and scenario (4): a job the authority placed on
-//! the runner node waits under `block` with its state visible. The three
-//! scenarios that need an attempt that runs on the runner node and
-//! heartbeats to the authority are written against the harness and
-//! marked ignored: M5 places and grants, and no node launches a grant
-//! (docs/evidence/m5, "Blocked"; docs/evidence/m6).
+//! The job needs the secret `M6_SITE`. Only the runner holds it at the
+//! first placement, so the M5 placement chooses the runner; the test then
+//! provisions it on the authority, so a failover, which never chooses the
+//! lost node, has the authority to go to.
 
 use std::time::{Duration, Instant};
 
+use std::ffi::OsString;
+use std::sync::Arc;
+
+use fabric_client::Client;
+use fabric_client::api::Inspection;
+use fabric_core::id::{JobId, NodeId};
+use fabric_core::managed::launch::{Report, ReportAnswer};
+use fabric_core::managed::{AttemptId, ExitOutcome, Generation, GrantToken, Observation};
+use fabric_net::identity::NodeIdentity;
+use fabric_net::quic::QuicTransport;
+use fabric_net::rpc::Session;
+use fabric_net::tls::Trust;
+use fabric_net::transport::Transport;
+use fabric_net::wire::{Fenced, RecordBytes, RecordPage, VersionText};
 use serde_json::Value;
 
 use crate::placement::{answer, bearer};
@@ -36,18 +51,33 @@ impl Partition {
     /// path waits for the M5 executor, so here every datagram between the
     /// two crosses the relay.
     pub fn start(env: &std::sync::Arc<Env>) -> Fallible<Partition> {
+        Partition::start_with(env, None)
+    }
+
+    /// `start` with the authority's daemon armed with `fault`. Both
+    /// daemons hold their harness with `FAKE_CODEX_HOLD`, and only the
+    /// runner holds the job's secret.
+    pub fn start_with(env: &std::sync::Arc<Env>, fault: Option<&str>) -> Fallible<Partition> {
         let mut authority = Node::new(env, "authority", Wire::Quic)?;
         let mut runner = Node::new(env, "runner", Wire::Quic)?;
         authority.fake_node("v22.23.2", "127")?;
         runner.fake_node("v22.23.2", "127")?;
-        authority.start(None)?;
+        for node in [&mut authority, &mut runner] {
+            node.daemon_env("FAKE_CODEX_HOLD", OsString::from("1"));
+        }
+        authority.start(fault)?;
         let relay = Relay::start(env, "authority", authority.addr().parse()?)?;
         runner.start(None)?;
+        // After its first start, which narrows the state root.
+        provision(&runner)?;
         // The runner dials first, through the relay, so its one session
         // with the authority is the relayed one; the authority learns the
         // runner's address from that session, as `pair` does.
         runner.ok(&["node", "add", &authority.id, &relay.addr.to_string()])?;
         authority.ok(&["node", "add", &runner.id])?;
+        // The runner's session through the relay is the one the authority
+        // probes, launches and fetches over; a ping opens it.
+        runner.ok(&["node", "ping", &authority.id])?;
         Ok(Partition {
             authority,
             runner,
@@ -148,21 +178,6 @@ fn two_daemons_talk_through_the_relay_and_lose_each_other_while_it_is_paused() -
     Ok(())
 }
 
-/// The facade inspection of `job`, read from `from` through `authority`.
-fn inspect(from: &Node, authority: &str, token: &str, job: &str) -> Fallible<Value> {
-    let inspection = answer(&from.ok(&[
-        "facade",
-        "inspect",
-        "--authority",
-        authority,
-        "--token",
-        token,
-        job,
-    ])?)?;
-    assert_eq!(inspection["type"], "inspection", "{inspection}");
-    Ok(inspection)
-}
-
 /// The kinds of every event of `job`, read from `from` through `authority`.
 fn event_kinds(from: &Node, authority: &str, token: &str, job: &str) -> Fallible<Vec<Value>> {
     let events = answer(&from.ok(&[
@@ -185,200 +200,618 @@ fn event_kinds(from: &Node, authority: &str, token: &str, job: &str) -> Fallible
         .collect())
 }
 
-/// Polls `check` on the authority's own inspection until it holds.
-fn until_inspection(
-    p: &Partition,
-    token: &str,
-    job: &str,
-    within: Duration,
-    what: &str,
-    check: impl Fn(&Value) -> bool,
-) -> Fallible<Value> {
-    let started = Instant::now();
-    loop {
-        let inspection = inspect(&p.authority, &p.authority.id, token, job)?;
-        if check(&inspection) {
-            return Ok(inspection);
-        }
-        if started.elapsed() > within {
-            return Err(format!(
-                "{what} not seen within {within:?}: {inspection}\n{}",
-                p.authority.log()
-            )
-            .into());
-        }
-        std::thread::sleep(Duration::from_millis(200));
+/// The secret the scenarios' job needs, by name.
+const SITE: &str = "M6_SITE";
+
+/// Writes the job's secret into `node`'s secret directory, as a user does
+/// by hand: read live by the node's resolver, mode 0600.
+fn provision(node: &Node) -> Fallible {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = node.state().join("secrets");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(SITE);
+    std::fs::write(&path, b"site\n")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// How long a scenario waits for one step the authority takes by itself:
+/// `UNAVAILABLE_AFTER_MS` of silence, as long again of dwell, a tick, a
+/// failover probe bound and a launch, with room.
+const WITHIN: Duration = Duration::from_mins(1);
+
+/// A job the authority placed on the runner node, running there.
+struct Placed {
+    client: Client,
+    token: String,
+    job: JobId,
+    first: AttemptId,
+}
+
+impl Placed {
+    fn job_text(&self) -> String {
+        self.job.to_string()
     }
 }
 
-/// Scenario (4), the `block` policy, on two real daemons through the
-/// relay: a job submitted from the runner node and pinned to it is placed
-/// there by the authority (M5) and its attempt granted at generation 1.
-/// The relay is paused. Past `UNAVAILABLE_AFTER_MS` without a heartbeat
-/// the authority records `attempt_unavailable` and the attempt is
-/// `unknown`; under `block` it then waits: no supersede, no second grant,
-/// no automatic recovery, however long the silence. After the resume the
-/// same state is read from the runner node through the facade. The
-/// runner node runs nothing for the grant (no node launches a grant on
-/// this base, docs/evidence/m6), so its silence is that of a node that
-/// holds a grant and does not answer for it.
-///
-/// What this does not prove: no heartbeat is ever sent for the grant, so
-/// the attempt becomes `unknown` with or without the pause, and every
-/// assertion here holds with `relay.pause()` removed; the pause changes
-/// only the relay's counters. Nothing in this file reaches the fence or
-/// the acknowledgement either. Both are proved one layer down until a
-/// node launches its grants (the question in docs/evidence/m6).
-#[test]
-#[expect(clippy::too_many_lines, reason = "one scenario, its steps in order")]
-fn block_policy_waits_with_the_state_visible() -> Fallible {
-    let env = Env::new()?;
-    env.install_fake_codex()?;
-    let mut p = Partition::start(&env)?;
-    let authority = p.authority.id.clone();
-    let runner = p.runner.id.clone();
+/// Creates the job on the authority (`recovery`: `block` or
+/// `restart_from_acknowledged`) and waits until its first attempt runs on
+/// the runner node.
+async fn place_on_runner(p: &Partition, key: &str, recovery: &str) -> Fallible<Placed> {
+    let client = Client::new(p.authority.state().join("fabric.sock"));
     let token = bearer(
         &p.authority
             .ok(&["facade", "mint", "--actor", "e2e", "--ttl-ms", "600000"])?,
     )?;
-    let accepted = answer(&p.runner.ok(&[
-        "facade",
-        "submit",
-        "--authority",
-        &authority,
-        "--token",
-        &token,
+    let made = p.authority.ok(&[
+        "managed",
+        "create",
         "--empty",
         "--goal",
-        "wait for an operator",
+        "survive the partition",
         "--harness",
         "codex",
+        "--secret",
+        SITE,
+        "--recovery",
+        recovery,
+        "--drain-budget",
+        "1000",
         "--operation-key",
-        "m6-block",
-        "--pin",
-        &runner,
-    ])?)?;
-    assert_eq!(accepted["type"], "accepted", "{accepted}");
-    let job = accepted["job"].as_str().ok_or("no job")?.to_owned();
-    let placed = until_inspection(
-        &p,
-        &token,
-        &job,
-        Duration::from_secs(20),
-        "a grant on the runner node",
-        |i| i["job"]["attempts"][0]["status"] == "granted",
-    )?;
+        key,
+    ])?;
+    let job: JobId = made.lines().next().ok_or("nothing printed")?.parse()?;
+    let running = until(
+        p,
+        &client,
+        job,
+        "the first attempt running on the runner",
+        |i| i.job.attempts.len() == 1 && i.job.attempts[0].status == "running",
+    )
+    .await?;
+    let chosen = running.placements.first().and_then(|d| d.chosen);
     assert_eq!(
-        placed["placements"][0]["chosen"],
-        runner.as_str(),
-        "{placed}"
+        chosen.map(|n| n.to_string()),
+        Some(p.runner.id.clone()),
+        "placed on the runner: {running:?}"
     );
-    let attempt = placed["job"]["attempts"][0]["attempt"]
-        .as_str()
-        .ok_or("no attempt")?
-        .to_owned();
+    Ok(Placed {
+        client,
+        token,
+        job,
+        first: running.job.attempts[0].attempt,
+    })
+}
 
-    p.relay.pause()?;
-    let paused_at = Instant::now();
-    let unknown = until_inspection(
-        &p,
-        &token,
-        &job,
-        Duration::from_secs(40),
-        "the attempt unknown",
-        |i| i["job"]["attempts"][0]["status"] == "unknown",
-    )?;
-    eprintln!(
-        "unknown {:?} after the pause; the silence counts from the grant, since nothing on the runner node heartbeats",
-        paused_at.elapsed()
-    );
-    // Past the time a restart policy would have acted (the attempt
-    // unknown for UNAVAILABLE_AFTER_MS, then a tick), under block nothing
-    // more is written.
-    std::thread::sleep(Duration::from_secs(14));
-    let waited = inspect(&p.authority, &authority, &token, &job)?;
-    for state in [&unknown, &waited] {
-        let attempts = state["job"]["attempts"].as_array().ok_or("no attempts")?;
-        assert_eq!(attempts.len(), 1, "a second grant under block: {state}");
-        assert_eq!(attempts[0]["attempt"], attempt.as_str());
-        assert_eq!(attempts[0]["status"], "unknown", "{state}");
-        assert_eq!(attempts[0]["generation"], "1", "{state}");
-        assert_eq!(state["job"]["state"], "active", "{state}");
+/// Cuts the running attempt and waits until the authority fetched,
+/// verified and acknowledged the cut.
+async fn acknowledged(p: &Partition, placed: &Placed) -> Fallible<Vec<Value>> {
+    p.authority.ok(&[
+        "managed",
+        "checkpoint",
+        &placed.job_text(),
+        "--operation-key",
+        "m6-cut",
+    ])?;
+    until_event(p, placed, "checkpoint_acknowledged").await
+}
+
+/// Polls the authority's inspection of `job` until `check` holds.
+async fn until(
+    p: &Partition,
+    client: &Client,
+    job: JobId,
+    what: &str,
+    check: impl Fn(&Inspection) -> bool,
+) -> Fallible<Inspection> {
+    let started = Instant::now();
+    loop {
+        let inspection = client.managed_inspect(job, |_| {}).await?;
+        if check(&inspection) {
+            return Ok(inspection);
+        }
+        if started.elapsed() > WITHIN {
+            return Err(format!(
+                "{what} not seen within {WITHIN:?}: {inspection:?}\nauthority:\n{}\nrunner:\n{}",
+                p.authority.log(),
+                p.runner.log()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let kinds = event_kinds(&p.authority, &authority, &token, &job)?;
-    let unavailable: Vec<_> = kinds
+}
+
+/// Polls the job's events on the authority until one of `kind` is there;
+/// every event then.
+async fn until_event(p: &Partition, placed: &Placed, kind: &str) -> Fallible<Vec<Value>> {
+    let started = Instant::now();
+    loop {
+        let kinds = event_kinds(
+            &p.authority,
+            &p.authority.id,
+            &placed.token,
+            &placed.job_text(),
+        )?;
+        if kinds.iter().any(|e| e["kind"] == kind) {
+            return Ok(kinds);
+        }
+        if started.elapsed() > WITHIN {
+            return Err(format!(
+                "no {kind} within {WITHIN:?}: {kinds:?}\nauthority:\n{}\nrunner:\n{}",
+                p.authority.log(),
+                p.runner.log()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Waits until the authority superseded the first attempt and its
+/// failover runs on the authority's own node.
+async fn recovered_onto_the_authority(p: &Partition, placed: &Placed) -> Fallible<Inspection> {
+    let after = until(p, &placed.client, placed.job, "the failover running", |i| {
+        i.job.attempts.len() == 2
+            && i.job.attempts[0].status == "superseded"
+            && i.job.attempts[1].status == "running"
+    })
+    .await?;
+    let failover = after
+        .placements
         .iter()
-        .filter(|e| e["kind"] == "attempt_unavailable")
-        .collect();
-    assert_eq!(unavailable.len(), 1, "{kinds:?}");
-    assert_eq!(unavailable[0]["attempt"], attempt.as_str());
-    assert!(unavailable[0]["since_ms"].is_string(), "{kinds:?}");
-    for never in ["grant_superseded", "recovery_blocked", "attempt_reachable"] {
-        assert!(
-            !kinds.iter().any(|e| e["kind"] == never),
-            "{never} under block: {kinds:?}"
-        );
-    }
+        .find(|d| d.kind == "failover")
+        .ok_or_else(|| format!("no failover placement: {after:?}"))?;
     assert_eq!(
-        kinds
-            .iter()
-            .filter(|e| e["kind"] == "attempt_granted")
-            .count(),
-        1,
-        "{kinds:?}"
+        failover.chosen.map(|n| n.to_string()),
+        Some(p.authority.id.clone()),
+        "{after:?}"
     );
-    let counters = p.relay.counters()?;
+    let lost = failover
+        .candidates
+        .iter()
+        .find(|c| c.node.to_string() == p.runner.id)
+        .ok_or_else(|| format!("the runner was not a candidate: {after:?}"))?;
+    let verdict = serde_json::to_value(&lost.verdict)?;
+    assert!(
+        verdict.to_string().contains("excluded"),
+        "the lost node was not excluded: {verdict}"
+    );
+    assert_eq!(
+        after.job.generation,
+        Generation::new(2).ok_or("generation")?
+    );
+    Ok(after)
+}
 
-    // Resumed: the runner node reads the same waiting state through the
-    // facade; nothing it says moves the job, since nothing on it heartbeats.
+/// The number of the job's attempts that may still run.
+fn live(i: &Inspection) -> usize {
+    i.job
+        .attempts
+        .iter()
+        .filter(|a| matches!(a.status.as_str(), "granted" | "running" | "unknown"))
+        .count()
+}
+
+/// Waits until the runner's log says it stopped the attempt on a verdict
+/// that ended its grant.
+fn runner_obeyed(p: &Partition) -> Fallible {
+    let started = Instant::now();
+    while !p
+        .runner
+        .log()
+        .contains("the grant ended; stopping the attempt")
+    {
+        if started.elapsed() > WITHIN {
+            return Err(format!("the runner never obeyed:\n{}", p.runner.log()).into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// Trusts the authority alone.
+#[derive(Debug)]
+struct Only(NodeId);
+
+impl Trust for Only {
+    fn is_paired(&self, node: NodeId) -> bool {
+        node == self.0
+    }
+}
+
+/// The covered writes the old runner holds, sent under its own node key
+/// over QUIC through the relay with the old grant: its attempt's exit (a
+/// journal operation) and a ledger append. The runner itself sends
+/// neither once its heartbeat is answered with the verdict that ended its
+/// grant; these are the writes a runner that has not heard yet would send,
+/// on the same link and under the same identity.
+async fn old_runner_writes(
+    p: &Partition,
+    job: JobId,
+    attempt: AttemptId,
+) -> Fallible<(ReportAnswer, Fenced<fabric_net::wire::Appended>)> {
+    let identity = NodeIdentity::load(&p.runner.state().join("node.key"))?;
+    let authority: NodeId = p.authority.id.parse()?;
+    let transport = QuicTransport::bind(
+        &identity,
+        Arc::new(Only(authority)),
+        ([127, 0, 0, 1], 0).into(),
+    )?;
+    let connection = transport.connect(authority, p.relay.addr).await?;
+    let deadline = Duration::from_secs(10);
+    let session = Session::connect(
+        Arc::from(connection),
+        identity.node_id(),
+        VersionText::new("e2e")?,
+        deadline,
+    )
+    .await?;
+    let token = GrantToken {
+        job,
+        attempt,
+        generation: Generation::FIRST,
+    };
+    let report = session
+        .report(
+            Report {
+                token,
+                observation: Observation::Exited {
+                    attempt,
+                    generation: Generation::FIRST,
+                    outcome: ExitOutcome::Succeeded,
+                },
+            },
+            deadline,
+        )
+        .await?;
+    let append = session
+        .managed_append(
+            token,
+            RecordPage::new(RecordBytes::new(vec![7; 8])?),
+            deadline,
+        )
+        .await?;
+    Ok((report, append))
+}
+
+/// The refusals the old runner's writes got, and their records.
+async fn assert_refused_and_recorded(p: &Partition, placed: &Placed) -> Fallible {
+    let (report, append) = old_runner_writes(p, placed.job, placed.first).await?;
+    assert!(
+        matches!(
+            report,
+            ReportAnswer::Refused {
+                reason: fabric_core::managed::launch::ReportRefusal::Superseded { .. }
+            }
+        ),
+        "the old runner's exit was taken: {report:?}"
+    );
+    assert!(
+        matches!(append, Fenced::GrantRefused { .. }),
+        "the old runner's append was taken: {append:?}"
+    );
+    let kinds = until_event(p, placed, "covered_write_refused").await?;
+    let refused: Vec<_> = kinds
+        .iter()
+        .filter(|e| e["kind"] == "covered_write_refused")
+        .collect();
+    assert!(
+        refused
+            .iter()
+            .all(|e| e["attempt"] == placed.first.to_string().as_str()),
+        "{refused:?}"
+    );
+    assert!(!refused.is_empty());
+    Ok(())
+}
+
+/// The process group of the runner's harness for `attempt`, from the
+/// executor's launch record on the runner's node.
+fn harness_group(runner: &Node, attempt: AttemptId) -> Fallible<i32> {
+    let dir = runner
+        .state()
+        .join("runs")
+        .join("records")
+        .join(attempt.to_string());
+    for entry in std::fs::read_dir(&dir)? {
+        let record: Value = serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+        if let Some(pid) = record["pid"].as_u64() {
+            return Ok(i32::try_from(pid)?);
+        }
+    }
+    Err(format!("no launched task under {}", dir.display()).into())
+}
+
+/// Sends `signal` to process group `group` and to `pid`.
+fn signal(pid: u32, group: i32, signal: rustix::process::Signal) -> Fallible {
+    let daemon = rustix::process::Pid::from_raw(i32::try_from(pid)?).ok_or("no pid")?;
+    let group = rustix::process::Pid::from_raw(group).ok_or("no group")?;
+    rustix::process::kill_process_group(group, signal)?;
+    rustix::process::kill_process(daemon, signal)?;
+    Ok(())
+}
+
+/// Whether a process group still has a member.
+fn group_alive(group: i32) -> bool {
+    rustix::process::Pid::from_raw(group)
+        .is_some_and(|g| rustix::process::test_kill_process_group(g).is_ok())
+}
+
+/// Scenario (1), the relay paused with the runner alive: the authority
+/// marks the attempt unavailable and, under `restart_from_acknowledged`,
+/// supersedes it and places the failover on its own node, never on the
+/// runner. Resumed, the old runner is told its grant ended and stops; its
+/// covered writes under the old grant are refused and recorded. Exactly
+/// one attempt may run.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_paused_runner_alive() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let mut p = Partition::start(&env)?;
+    let placed = place_on_runner(&p, "m6-relay", "restart_from_acknowledged").await?;
+    acknowledged(&p, &placed).await?;
+    provision(&p.authority)?;
+    let group = harness_group(&p.runner, placed.first)?;
+    p.relay.pause()?;
+    let paused = Instant::now();
+    let after = recovered_onto_the_authority(&p, &placed).await?;
+    eprintln!("recovered {:?} after the pause", paused.elapsed());
+    let kinds = event_kinds(
+        &p.authority,
+        &p.authority.id,
+        &placed.token,
+        &placed.job_text(),
+    )?;
+    for kind in [
+        "attempt_unavailable",
+        "grant_superseded",
+        "checkpoint_acknowledged",
+    ] {
+        assert!(kinds.iter().any(|e| e["kind"] == kind), "{kind}: {kinds:?}");
+    }
+    assert!(group_alive(group), "the old harness died with the pause");
+    let counters = p.relay.counters()?;
     p.relay.resume()?;
-    let from_runner = inspect(&p.runner, &authority, &token, &job)?;
-    assert_eq!(
-        from_runner["job"]["attempts"][0]["status"], "unknown",
-        "{from_runner}"
+    runner_obeyed(&p)?;
+    let started = Instant::now();
+    while group_alive(group) {
+        assert!(started.elapsed() < WITHIN, "the old harness still runs");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_refused_and_recorded(&p, &placed).await?;
+    let end = placed.client.managed_inspect(placed.job, |_| {}).await?;
+    assert_eq!(live(&end), 1, "{end:?}");
+    assert_eq!(end.job.attempts[1].attempt, after.job.attempts[1].attempt);
+    eprintln!("relay while paused: {counters:?}");
+    p.runner.kill()?;
+    p.authority.kill()?;
+    Ok(())
+}
+
+/// Scenario (2), the old runner frozen: `SIGSTOP` to the runner's daemon
+/// and its attempt's group; the authority supersedes and regrants on its
+/// own node; `SIGCONT`: the woken runner's heartbeat is answered with the
+/// verdict that ended its grant, it stops the group, and its writes under
+/// the old grant are refused. Exactly one attempt may run.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_runner_sigstop_then_sigcont() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let mut p = Partition::start(&env)?;
+    let placed = place_on_runner(&p, "m6-stop", "restart_from_acknowledged").await?;
+    acknowledged(&p, &placed).await?;
+    provision(&p.authority)?;
+    let group = harness_group(&p.runner, placed.first)?;
+    let daemon = p.runner.daemon_pid().ok_or("the runner does not run")?;
+    signal(daemon, group, rustix::process::Signal::STOP)?;
+    recovered_onto_the_authority(&p, &placed).await?;
+    signal(daemon, group, rustix::process::Signal::CONT)?;
+    runner_obeyed(&p)?;
+    let started = Instant::now();
+    while group_alive(group) {
+        assert!(started.elapsed() < WITHIN, "the woken harness still runs");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_refused_and_recorded(&p, &placed).await?;
+    let end = placed.client.managed_inspect(placed.job, |_| {}).await?;
+    assert_eq!(live(&end), 1, "{end:?}");
+    p.runner.kill()?;
+    p.authority.kill()?;
+    Ok(())
+}
+
+/// The runner's local marker of the grant it took for `attempt`.
+fn marker(runner: &Node, attempt: AttemptId) -> Fallible<Value> {
+    let path = runner
+        .state()
+        .join("runs")
+        .join("taken")
+        .join(format!("{attempt}.json"));
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+/// Scenario (3), the runner killed: `SIGKILL` to the runner's daemon; the
+/// authority supersedes and regrants on its own node; the runner's daemon
+/// starts again in the same state root, stops what its previous run left,
+/// presents the grant it had taken and is answered superseded. It resumes
+/// nothing, and its marker and the authority's journal agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_runner_sigkill_then_restart() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let mut p = Partition::start(&env)?;
+    let placed = place_on_runner(&p, "m6-kill", "restart_from_acknowledged").await?;
+    acknowledged(&p, &placed).await?;
+    provision(&p.authority)?;
+    let group = harness_group(&p.runner, placed.first)?;
+    p.runner.kill()?;
+    assert!(
+        group_alive(group),
+        "the orphan harness died with its daemon"
     );
+    recovered_onto_the_authority(&p, &placed).await?;
+    p.runner.start(None)?;
+    let started = Instant::now();
+    let ended = loop {
+        let m = marker(&p.runner, placed.first)?;
+        if !m["ended"].is_null() {
+            break m;
+        }
+        assert!(
+            started.elapsed() < WITHIN,
+            "the grant was never presented:\n{}",
+            p.runner.log()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     assert_eq!(
-        from_runner["job"]["attempts"].as_array().map(Vec::len),
-        Some(1),
-        "{from_runner}"
+        ended["ended"]["GrantEnded"]["verdict"], "superseded",
+        "{ended}"
     );
-    let seen = event_kinds(&p.runner, &authority, &token, &job)?;
-    assert!(seen.iter().any(|e| e["kind"] == "attempt_unavailable"));
-    eprintln!(
-        "block: job {job}, attempt {attempt} unknown, {} events, relay while paused {counters:?}",
-        seen.len()
+    assert!(!group_alive(group), "the orphan harness still runs");
+    let end = placed.client.managed_inspect(placed.job, |_| {}).await?;
+    assert_eq!(end.job.attempts[0].attempt, placed.first);
+    assert_eq!(end.job.attempts[0].status, "superseded", "{end:?}");
+    assert_eq!(live(&end), 1, "{end:?}");
+    let resumed = p
+        .runner
+        .state()
+        .join("runs")
+        .join("records")
+        .join(placed.first.to_string());
+    assert!(
+        !resumed.exists(),
+        "the runner resumed the superseded attempt"
     );
     p.runner.kill()?;
     p.authority.kill()?;
     Ok(())
 }
 
-const BLOCKED: &str = "needs an attempt that runs on the runner node and heartbeats to the authority: M5 places and grants, and no node launches a grant (docs/evidence/m5 and m6, Blocked)";
-
-/// Acknowledged checkpoint; relay paused; past `UNAVAILABLE_AFTER_MS` the
-/// authority recovers; relay resumed: the old runner's later writes are
-/// refused and recorded, the authority's checkpoint head is unchanged,
-/// the new attempt starts from the acknowledged snapshot.
-#[test]
-#[ignore = "no node launches a granted attempt on the M5 base; see docs/evidence/m6"]
-fn relay_paused_runner_alive() -> Fallible {
-    Err(BLOCKED.into())
+/// Scenario (4), the `block` policy with a held harness: the relay is
+/// paused, the attempt becomes `unknown`, and through the window in which
+/// `restart_from_acknowledged` would have acted nothing moves; the state
+/// is visible. An operator recover then supersedes it and places the
+/// failover on the authority's node; resumed, the old runner stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_policy_waits_until_an_operator_recovers() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let mut p = Partition::start(&env)?;
+    let placed = place_on_runner(&p, "m6-block", "block").await?;
+    acknowledged(&p, &placed).await?;
+    provision(&p.authority)?;
+    p.relay.pause()?;
+    let unknown = until(&p, &placed.client, placed.job, "the attempt unknown", |i| {
+        i.job.attempts[0].status == "unknown"
+    })
+    .await?;
+    // A negative: past UNAVAILABLE_AFTER_MS of dwell and a tick, the
+    // window in which a restart policy acts, under block nothing moved.
+    tokio::time::sleep(Duration::from_secs(14)).await;
+    let waited = placed.client.managed_inspect(placed.job, |_| {}).await?;
+    for state in [&unknown, &waited] {
+        assert_eq!(state.job.attempts.len(), 1, "a second grant: {state:?}");
+        assert_eq!(state.job.attempts[0].status, "unknown", "{state:?}");
+    }
+    let kinds = event_kinds(
+        &p.authority,
+        &p.authority.id,
+        &placed.token,
+        &placed.job_text(),
+    )?;
+    for never in ["grant_superseded", "recovery_blocked"] {
+        assert!(
+            !kinds.iter().any(|e| e["kind"] == never),
+            "{never}: {kinds:?}"
+        );
+    }
+    p.authority.ok(&[
+        "managed",
+        "recover",
+        &placed.job_text(),
+        "--reason",
+        "the operator moved it",
+        "--operation-key",
+        "m6-operator",
+    ])?;
+    recovered_onto_the_authority(&p, &placed).await?;
+    p.relay.resume()?;
+    runner_obeyed(&p)?;
+    let end = placed.client.managed_inspect(placed.job, |_| {}).await?;
+    assert_eq!(live(&end), 1, "{end:?}");
+    p.runner.kill()?;
+    p.authority.kill()?;
+    Ok(())
 }
 
-/// Acknowledged checkpoint; `SIGSTOP` to the runner's daemon and the
-/// attempt's group; the authority recovers; `SIGCONT`: the woken runner's
-/// first heartbeat is answered superseded and its group stopped.
-#[test]
-#[ignore = "no node launches a granted attempt on the M5 base; see docs/evidence/m6"]
-fn old_runner_sigstop_then_sigcont() -> Fallible {
-    Err(BLOCKED.into())
-}
-
-/// Acknowledged checkpoint; `SIGKILL` to the runner's daemon; the authority
-/// recovers; the runner's daemon starts again in the same state root,
-/// reads its marker, is told superseded and stops the orphan group.
-#[test]
-#[ignore = "no node launches a granted attempt on the M5 base; see docs/evidence/m6"]
-fn old_runner_sigkill_then_restart() -> Fallible {
-    Err(BLOCKED.into())
+/// Scenario (5), captured but not acknowledged: the authority's verifier
+/// is held before its fetch (`before_acknowledge:hold`), so the cut is
+/// captured and never acknowledged. The relay is paused: under
+/// `restart_from_acknowledged` the restart is refused with its reason,
+/// recorded, and the job shows it. An operator recover is refused the
+/// same way; an operator supersede takes the grant and grants nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_but_not_acknowledged_is_never_restarted_and_says_why() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let mut p = Partition::start_with(&env, Some("before_acknowledge:hold"))?;
+    let placed = place_on_runner(&p, "m6-captured", "restart_from_acknowledged").await?;
+    p.authority.ok(&[
+        "managed",
+        "checkpoint",
+        &placed.job_text(),
+        "--operation-key",
+        "m6-cut",
+    ])?;
+    until_event(&p, &placed, "checkpoint_captured").await?;
+    let started = Instant::now();
+    while !p.authority.signal().exists() {
+        assert!(
+            started.elapsed() < WITHIN,
+            "the verifier never reached its hold"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    provision(&p.authority)?;
+    p.relay.pause()?;
+    let kinds = until_event(&p, &placed, "recovery_blocked").await?;
+    let blocked = kinds
+        .iter()
+        .find(|e| e["kind"] == "recovery_blocked")
+        .ok_or("no recovery_blocked")?;
+    assert_eq!(blocked["reason"], "no_acknowledged_checkpoint", "{blocked}");
+    assert!(!kinds.iter().any(|e| e["kind"] == "checkpoint_acknowledged"));
+    let shown = placed.client.managed_inspect(placed.job, |_| {}).await?;
+    assert_eq!(shown.job.attempts.len(), 1, "{shown:?}");
+    assert_eq!(shown.job.attempts[0].status, "unknown", "{shown:?}");
+    let refused = p.authority.fails(&[
+        "managed",
+        "recover",
+        &placed.job_text(),
+        "--operation-key",
+        "m6-recover",
+    ])?;
+    assert!(refused.contains("no acknowledged checkpoint"), "{refused}");
+    p.authority.ok(&[
+        "managed",
+        "supersede",
+        &placed.job_text(),
+        "--reason",
+        "nothing to restart from",
+        "--operation-key",
+        "m6-supersede",
+    ])?;
+    let end = until(&p, &placed.client, placed.job, "the grant taken", |i| {
+        i.job.attempts[0].status == "superseded"
+    })
+    .await?;
+    assert_eq!(live(&end), 0, "{end:?}");
+    assert_eq!(end.job.attempts.len(), 1, "nothing granted: {end:?}");
+    p.relay.resume()?;
+    runner_obeyed(&p)?;
+    p.runner.kill()?;
+    p.authority.kill()?;
+    Ok(())
 }
