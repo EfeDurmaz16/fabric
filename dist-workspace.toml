@@ -19,14 +19,14 @@ dist = false
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 unix-archive = ".tar.gz"
 checksum = "sha256"
-# The product name lives here and in dist/homebrew-tap (the formula name and
+# The product name lives here and in packaging/homebrew-tap (the formula name and
 # the tap). A rename changes these two places and the crate name.
 installers = ["homebrew"]
 tap = "EfeDurmaz16/homebrew-tap"
 formula = "fabric"
 # No publish job pushes to the tap: that needs a token with write access to
 # another repository, and this workflow uses GITHUB_TOKEN only. The tap pulls
-# the formula from the release instead (dist/homebrew-tap).
+# the formula from the release instead (packaging/homebrew-tap).
 publish-jobs = []
 # A CycloneDX SBOM per release, made by cargo-cyclonedx from Cargo.lock.
 cargo-cyclonedx = true

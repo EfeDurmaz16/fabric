@@ -1,0 +1,113 @@
+name: update-formula
+
+# Pulls the formula of the newest release of SOURCE_REPO into Formula/,
+# after checking every archive it names. Uses only this repository's
+# GITHUB_TOKEN. The template lives in packaging/homebrew-tap of SOURCE_REPO.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: A release tag such as v0.1.0; empty for the newest release.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+
+env:
+  # The product name and where it is released; a rename changes these and
+  # `formula` in the source repository's dist-workspace.toml.
+  SOURCE_REPO: EfeDurmaz16/fabric
+  FORMULA: fabric
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: update
+        name: Fetch, check and commit the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          if [ -z "$TAG" ]; then
+            # The newest release that is not a draft or a prerelease.
+            if ! TAG=$(gh release view -R "$SOURCE_REPO" --json tagName --jq .tagName 2>/dev/null); then
+              echo "no release of $SOURCE_REPO yet"
+              echo "changed=false" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          version=${TAG#v}
+          work=$(mktemp -d)
+          gh release download "$TAG" -R "$SOURCE_REPO" -D "$work" \
+            -p "$FORMULA.rb" -p "$FORMULA-*.tar.gz" -p sha256.sum
+          formula=$work/$FORMULA.rb
+
+          grep -q "^  version \"$version\"$" "$formula" || { echo "the formula is not for $version"; exit 1; }
+          urls=$(grep -c "url \"https://github.com/$SOURCE_REPO/releases/download/$TAG/" "$formula")
+          shas=$(grep -c 'sha256 "' "$formula")
+          archives=$(find "$work" -name "$FORMULA-*.tar.gz" | wc -l)
+          if [ "$urls" -ne "$archives" ] || [ "$shas" -ne "$archives" ]; then
+            echo "the formula has $urls urls and $shas sha256 lines for $archives archives"
+            exit 1
+          fi
+          (cd "$work" && sha256sum --check --ignore-missing sha256.sum)
+          for archive in "$work/$FORMULA"-*.tar.gz; do
+            sha=$(sha256sum "$archive" | cut -d ' ' -f 1)
+            grep -q "sha256 \"$sha\"" "$formula" || { echo "the formula does not pin $archive"; exit 1; }
+            # Built by the source repository's release workflow, from a tag.
+            gh attestation verify "$archive" -R "$SOURCE_REPO" \
+              --signer-workflow "$SOURCE_REPO/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$TAG"
+          done
+
+          mkdir -p Formula
+          cp "$formula" "Formula/$FORMULA.rb"
+          if [ -z "$(git status --porcelain -- Formula)" ]; then
+            echo "Formula/$FORMULA.rb is already $TAG"
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "Formula/$FORMULA.rb"
+          git commit -m "$FORMULA $TAG"
+          git push
+          echo "changed=true" >>"$GITHUB_OUTPUT"
+
+  # What a user runs, on a clean Mac: tap, install, run. Homebrew fetches
+  # the archive with curl, so the binary carries no quarantine attribute and
+  # Gatekeeper never stops it; this job fails if that ever changes.
+  install:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: brew install
+        run: |
+          set -eu
+          brew tap "${GITHUB_REPOSITORY%%/*}/${GITHUB_REPOSITORY#*/homebrew-}"
+          brew install "${GITHUB_REPOSITORY%%/*}/${GITHUB_REPOSITORY#*/homebrew-}/$FORMULA"
+          bin=$(brew --prefix)/bin/$FORMULA
+          "$bin" --version
+          real=$(realpath "$bin")
+          if xattr -p com.apple.quarantine "$real" >/dev/null 2>&1; then
+            echo "brew install left $real quarantined"
+            exit 1
+          fi
