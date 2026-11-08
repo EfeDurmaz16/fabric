@@ -91,6 +91,8 @@ A refusal crosses the control socket with its kind next to its text, so the CLI 
 
 A harness that exits with a code from 80 to 85 cannot be told from a refusal by the code alone; none of the supported harnesses does.
 
+What prints on which stream, `--json`, the shape of a failure and the help layout are in [docs/cli-contract.md](../cli-contract.md), which keeps these codes.
+
 ### Job roots and departed copies
 
 `fabric job new --repo <path>` clones the repository into `~/fabric/jobs/<job-id>/work` (ADR 0011, rule 2). The node makes `~/fabric/jobs/<job-id>` mode 0700, there and when a restore makes it, since the workspace holds what the agent writes, ignored secrets included; a directory that already exists keeps its mode (Codex review, 2026-10-21). `fabric job init`, which adopts a checkout in place, is not built; ADR 0001's statement that `init` is the only way a job starts is superseded by `new` for this phase.
