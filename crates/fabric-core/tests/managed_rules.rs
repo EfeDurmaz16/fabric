@@ -1549,3 +1549,46 @@ fn an_open_cancel_refuses_a_recover_and_a_supersede_completes_it() {
     );
     kept.replays();
 }
+
+#[test]
+fn an_acknowledgement_that_lands_after_a_regrant_is_stale() {
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    // A second capture whose fetch is still running when the attempt goes silent.
+    capture(&mut kept, 2).unwrap();
+    let late = ack_of(&kept, 2);
+    let a = gone_silent(&mut kept);
+    kept.submit(
+        "r-1",
+        Command::Recover {
+            attempt: a.id,
+            resource: ResourceRef::Node { node: OTHER_NODE },
+            from: snapshot(1),
+            reason: "silent".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        kept.acknowledge(&late),
+        Err(DomainError::StaleGeneration {
+            given: a.generation,
+            current: kept.state().job.generation,
+        })
+    );
+    let acked: Vec<SnapshotId> = kept
+        .state()
+        .acknowledged()
+        .iter()
+        .map(|c| c.snapshot)
+        .collect();
+    assert_eq!(acked, vec![snapshot(1)]);
+    // The acknowledgement it already holds is still the same answer.
+    assert!(
+        kept.acknowledge(&ack_of(&kept, 1))
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    kept.replays();
+}

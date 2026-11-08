@@ -1067,10 +1067,15 @@ fn reachable(
 /// The authority's acceptance of a checkpoint it fetched and verified
 /// (ADR 0028): the fourth rule function. It refuses a snapshot the attempt
 /// never reported, a cut that differs from the reported one and a
-/// generation that is not the attempt's, and accepts an acknowledgement
-/// for an attempt in any status: the bytes of a checkpoint an attempt made
-/// before it became `unknown`, `superseded` or `lost` are still its
-/// checkpoint. The same acknowledgement twice changes nothing.
+/// generation that is not the attempt's. It accepts an acknowledgement
+/// for an attempt in any status while its grant is the job's current
+/// generation: the bytes of a checkpoint an attempt made before it became
+/// `unknown`, `superseded` with nothing granted, or `lost` are still its
+/// checkpoint. Once a later generation is granted the acknowledgement is
+/// `StaleGeneration`, as the fence answers the old grant's covered
+/// writes: a verifier that finished after a regrant never makes the
+/// superseded attempt's bundle a restart point beside the new lineage.
+/// The same acknowledgement twice changes nothing.
 pub fn acknowledge(job: &ManagedState, ack: &CheckpointAck) -> Result<Transition, DomainError> {
     let attempt = job
         .attempt(ack.attempt)
@@ -1099,6 +1104,12 @@ pub fn acknowledge(job: &ManagedState, ack: &CheckpointAck) -> Result<Transition
     }
     if known.ack.is_some() {
         return Ok(unchanged(job));
+    }
+    if ack.generation != job.job.generation {
+        return Err(DomainError::StaleGeneration {
+            given: ack.generation,
+            current: job.job.generation,
+        });
     }
     one(
         job,
