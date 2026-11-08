@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AttemptId, Generation, TaskId, WorkRevision};
 use super::lifecycle::TaskClass;
 use super::model::{Intent, JobPolicy, Observation, SourceBinding};
-use super::package::{AllowedFidelity, WorkPackage};
+use super::package::{AllowedFidelity, PACKAGE_MAX_BYTES, WorkPackage};
 use super::secret_ref::SecretName;
 use crate::env::EnvVarName;
 use crate::harness::HarnessKind;
@@ -201,6 +201,62 @@ pub struct LaunchRequest {
     /// The work package of a planned handoff, built by the authority from
     /// the journal; `Some` exactly when `continuation` is.
     pub package: Option<WorkPackage>,
+}
+
+impl LaunchRequest {
+    /// Refuses a launch the node must not take as sent: more than
+    /// `MAX_TASK_LAUNCHES` tasks, a task's program failing its check, a
+    /// checkpoint without the node that holds it, a package without a
+    /// continuation or the reverse, a package past `PACKAGE_MAX_BYTES`,
+    /// or one for another job. Pure; the receiving side runs it before
+    /// it serves anything, since it trusts no bound it did not check.
+    pub fn check(&self) -> Result<(), LaunchRefusal> {
+        if self.tasks.len() > MAX_TASK_LAUNCHES {
+            return Err(LaunchRefusal::Inconsistent {
+                reason: format!(
+                    "{} tasks, above the {MAX_TASK_LAUNCHES} bound",
+                    self.tasks.len()
+                ),
+            });
+        }
+        for launch in &self.tasks {
+            launch
+                .program
+                .check()
+                .map_err(|error| LaunchRefusal::BadProgram {
+                    task: launch.task,
+                    error,
+                })?;
+        }
+        if self.initial_checkpoint.is_some() && self.snapshot_at.is_none() {
+            return Err(LaunchRefusal::Inconsistent {
+                reason: "an initial checkpoint names no node that holds it".to_owned(),
+            });
+        }
+        match (&self.continuation, &self.package) {
+            (Some(_), None) => Err(LaunchRefusal::Inconsistent {
+                reason: "a continuation carries no package".to_owned(),
+            }),
+            (None, Some(_)) => Err(LaunchRefusal::Inconsistent {
+                reason: "a package without a continuation".to_owned(),
+            }),
+            (Some(_), Some(package)) => {
+                if package.job != self.token.job {
+                    return Err(LaunchRefusal::Inconsistent {
+                        reason: "the package is another job's".to_owned(),
+                    });
+                }
+                let bytes = package.canonical_json().len();
+                if bytes > PACKAGE_MAX_BYTES {
+                    return Err(LaunchRefusal::Inconsistent {
+                        reason: format!("the package is {bytes} bytes, above {PACKAGE_MAX_BYTES}"),
+                    });
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 /// The node's answer to a launch, at once: whether it took the grant.
