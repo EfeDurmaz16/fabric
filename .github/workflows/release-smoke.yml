@@ -50,4 +50,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           DIST_DIR: ${{ runner.temp }}/dist
-        run: scripts/release-smoke.sh "$DIST_DIR" "$TARGET"
+          # The shipped crate's name, from the plan, so a rename needs no
+          # change here.
+          APP: ${{ fromJson(inputs.plan).releases[0].app_name }}
+        run: scripts/release-smoke.sh "$DIST_DIR" "$TARGET" "$APP"

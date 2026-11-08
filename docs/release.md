@@ -45,6 +45,6 @@ The attestation proves where an archive was built, not that the code is safe; th
 
 ## Changing the pipeline
 
-`dist-workspace.toml` is the configuration; `release.yml` is generated from it by [cargo-dist](https://axodotdev.github.io/cargo-dist/) 0.34.0. Edit the configuration and run `dist generate`; never edit `release.yml` by hand, because its `plan` job fails when the file and the configuration disagree. `dist plan` shows what a tag would publish, and `dist build --artifacts=local --target=<host target>` followed by `scripts/release-smoke.sh target/distrib <host target>` runs the build and the smoke on your machine.
+`dist-workspace.toml` is the configuration; `release.yml` is generated from it by [cargo-dist](https://axodotdev.github.io/cargo-dist/) 0.34.0. Edit the configuration and run `dist generate`; never edit `release.yml` by hand, because its `plan` job fails when the file and the configuration disagree. `dist plan` shows what a tag would publish, and `dist build --artifacts=local --target=<host target>` followed by `scripts/release-smoke.sh target/distrib <host target> fabric` runs the build and the smoke on your machine.
 
 The tap's files are in `packaging/homebrew-tap`; its README says how the formula gets there and why the tap pulls instead of the release pushing. The product name is in two places, `formula` in `dist-workspace.toml` and `FORMULA` in the tap's workflow, so a rename is one commit with the crate name.
