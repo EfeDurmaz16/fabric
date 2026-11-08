@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{JobId, NodeId};
+use fabric_core::id::NodeId;
 use fabric_core::managed::launch::{
     AfterCut, GrantVerdict, HEARTBEAT_MS, Heartbeat, HeartbeatAnswer, InstructAnswer,
     InstructRefusal, Instruction, LaunchAnswer, LaunchRefusal, LaunchRequest, Report, ReportAnswer,
@@ -58,8 +58,6 @@ pub(crate) struct Prepared {
 /// What the harness task is started with (the launch path, step 4).
 #[derive(Debug, Clone)]
 pub(crate) struct HarnessPlan {
-    /// The job.
-    pub job: JobId,
     /// The attempt.
     pub attempt: AttemptId,
     /// The harness.
@@ -120,6 +118,13 @@ pub(crate) trait Host: Send + Sync {
 
 /// What the runner counted since it started.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "read by the tests; the Perf step reads the same atomics"
+    )
+)]
 pub(crate) struct Counters {
     /// Launches taken.
     pub launches: u64,
@@ -149,6 +154,8 @@ enum Work {
 /// One attempt this node runs.
 struct Ctl {
     token: GrantToken,
+    /// The authority that launched it; only it instructs it.
+    from: Option<NodeId>,
     work: mpsc::UnboundedSender<Work>,
     /// Set while an instruction's work runs; a second one is `Busy`.
     busy: AtomicBool,
@@ -227,6 +234,7 @@ impl Runner {
     }
 
     /// The executor that runs the attempts' tasks.
+    #[cfg(test)]
     pub(crate) fn executor(&self) -> &Arc<Executor> {
         &self.executor
     }
@@ -238,6 +246,7 @@ impl Runner {
     }
 
     /// What the runner counted.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the tests"))]
     pub(crate) fn counters(&self) -> Counters {
         Counters {
             launches: self.launches.load(Ordering::Relaxed),
@@ -325,6 +334,7 @@ impl Runner {
         let (work, rx) = mpsc::unbounded_channel();
         let ctl = Arc::new(Ctl {
             token,
+            from,
             work,
             busy: AtomicBool::new(false),
             root: OnceLock::new(),
@@ -339,15 +349,22 @@ impl Runner {
         LaunchAnswer::Accepted
     }
 
-    /// Takes an instruction for an attempt this node runs; answers at once.
+    /// Takes an instruction for an attempt this node runs from the
+    /// authority `from` that launched it; answers at once.
     pub(crate) async fn instruct(
         &self,
+        from: Option<NodeId>,
         token: GrantToken,
         instruction: Instruction,
     ) -> InstructAnswer {
         let Some(ctl) = self.attempts.lock().await.get(&token.attempt).cloned() else {
             return instruct_refused(InstructRefusal::NotRunning);
         };
+        if ctl.from != from {
+            // Another authority than the one that granted it names nothing
+            // this node runs for it.
+            return instruct_refused(InstructRefusal::NotRunning);
+        }
         if let Some(current) = self.executor.current(token.job).await
             && current > token.generation
         {
@@ -538,10 +555,13 @@ impl Runner {
                         .await?;
                     return Ok(());
                 }
-                prompt.push_str(&format!(
-                    "\n\nThe work so far is described in the work package at {}.",
-                    path.display()
-                ));
+                let _ = std::fmt::Write::write_fmt(
+                    &mut prompt,
+                    format_args!(
+                        "\n\nThe work so far is described in the work package at {}.",
+                        path.display()
+                    ),
+                );
             }
             let env = match self.executor.secret_env(attempt).await {
                 Ok(env) => env,
@@ -551,7 +571,6 @@ impl Runner {
                 }
             };
             let plan = HarnessPlan {
-                job: token.job,
                 attempt,
                 harness: request.intent.harness.clone(),
                 root: prepared.root.clone(),
@@ -737,20 +756,14 @@ impl Runner {
                 cut,
             })
             .await?;
-        match (answer, then) {
-            (ReportAnswer::Recorded { .. }, AfterCut::Resume) => {
-                let _ = self.executor.resume(attempt).await;
-                Ok(false)
-            }
-            (ReportAnswer::Recorded { .. }, AfterCut::End) => {
-                let _ = self.executor.stop(attempt, budget).await;
-                Ok(true)
-            }
-            (ReportAnswer::Refused { .. }, _) => {
-                let _ = self.executor.resume(attempt).await;
-                Ok(false)
-            }
+        if let (ReportAnswer::Recorded { .. }, AfterCut::End) = (answer, then) {
+            let _ = self.executor.stop(attempt, budget).await;
+            return Ok(true);
         }
+        // Resumed, or refused for another reason than a stale grant: the
+        // attempt goes on.
+        let _ = self.executor.resume(attempt).await;
+        Ok(false)
     }
 }
 
@@ -792,15 +805,15 @@ async fn heartbeat_loop(
             .verdicts
             .iter()
             .find(|(attempt, _)| *attempt == token.attempt)
-            .map(|(_, verdict)| verdict.clone());
+            .map(|(_, verdict)| *verdict);
         match verdict {
-            Some(GrantVerdict::Live) => retry.notify_one(),
-            Some(_) => {
+            Some(GrantVerdict::Stale { .. } | GrantVerdict::Unknown) => {
                 let _ = stale.send(true);
                 return;
             }
-            // An answer that names nothing of this grant says nothing of it.
-            None => retry.notify_one(),
+            // Live, or an answer that names nothing of this grant, which
+            // says nothing of it: a waiting report goes again.
+            _ => retry.notify_one(),
         }
     }
 }
@@ -873,13 +886,404 @@ impl Reporter<'_> {
     }
 }
 
+/// How long a report or a heartbeat waits for the authority's answer.
+const LINK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The node a runner runs on: its sources, store, adapters and links.
+pub(crate) struct NodeHost {
+    node: std::sync::Weak<crate::node::Node>,
+    capturer: Arc<crate::capturer::NodeCapturer>,
+}
+
+impl NodeHost {
+    pub(crate) fn new(
+        node: std::sync::Weak<crate::node::Node>,
+        capturer: Arc<crate::capturer::NodeCapturer>,
+    ) -> Self {
+        NodeHost { node, capturer }
+    }
+
+    fn node(&self) -> Result<Arc<crate::node::Node>, String> {
+        self.node
+            .upgrade()
+            .ok_or_else(|| "the node is stopping".to_owned())
+    }
+}
+
+/// A harness its adapter started, which this node reaps.
+struct AdapterHarness(fabric_harness::Running);
+
+impl HarnessProcess for AdapterHarness {
+    fn pid(&self) -> u32 {
+        self.0.pid().get()
+    }
+    fn release(&mut self) -> Result<(), String> {
+        self.0.release().map_err(|e| e.to_string())
+    }
+    fn wait(self: Box<Self>) -> BoxFuture<'static, Option<i32>> {
+        let mut running = self.0;
+        Box::pin(async move {
+            running
+                .child_mut()
+                .wait()
+                .await
+                .ok()
+                .and_then(|status| status.code())
+        })
+    }
+}
+
+/// Moves a root a previous attempt left aside, so the new attempt's
+/// preparation starts from an empty directory and nothing is lost.
+fn set_aside(root: &std::path::Path, attempt: AttemptId) -> Result<(), String> {
+    let Ok(mut entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    if entries.next().is_none() {
+        return Ok(());
+    }
+    let name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("{} has no name", root.display()))?;
+    let aside = root.with_file_name(format!("{name}.before-{attempt}"));
+    std::fs::rename(root, &aside).map_err(|e| format!("{}: {e}", root.display()))
+}
+
+impl Host for NodeHost {
+    fn has_harness(&self, harness: &HarnessKind) -> BoxFuture<'_, bool> {
+        let harness = harness.clone();
+        Box::pin(async move {
+            let Ok(node) = self.node() else {
+                return false;
+            };
+            let env = node.node_env();
+            if let HarnessKind::Acp { program, .. } = &harness {
+                return crate::facts::find_on_path(program.as_str(), env.path_var()).is_some();
+            }
+            let Ok(harness_env) = node.harness_env(&env) else {
+                return false;
+            };
+            match crate::harnesses::adapter(&harness, &harness_env, None) {
+                Ok(adapter) => matches!(adapter.detect().await, Ok(Some(_))),
+                Err(_) => false,
+            }
+        })
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        request: &'a LaunchRequest,
+    ) -> BoxFuture<'a, Result<Prepared, String>> {
+        Box::pin(async move {
+            let node = self.node()?;
+            let job = request.token.job;
+            let root = crate::sources::root_for(&node, job);
+            set_aside(&root, request.token.attempt)?;
+            let source = match request.initial_checkpoint {
+                Some(snapshot) => {
+                    let complete = crate::transfer::is_complete(&node.store, snapshot)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !complete
+                        && let Some(peer) = request.snapshot_at
+                        && peer != node.id
+                    {
+                        let session = node.session(peer).await.map_err(|e| e.to_string())?;
+                        crate::transfer::fetch_snapshot(&node.store, &session, snapshot)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    fabric_core::managed::SourceBinding::Snapshot { snapshot }
+                }
+                None => request.source.clone(),
+            };
+            let prepared = crate::sources::prepare(&node, job, &source)
+                .await
+                .map_err(|e| e.to_string())?;
+            let root = match prepared {
+                crate::sources::Prepared::Cloned { root, .. }
+                | crate::sources::Prepared::Restored { root, .. }
+                | crate::sources::Prepared::Empty { root } => root,
+            };
+            let offered = if request.continuation.is_some() {
+                let ask = fabric_net::rpc::Advertise {
+                    job,
+                    harness: request.intent.harness.clone(),
+                    root: root.clone(),
+                    snapshot: request.initial_checkpoint,
+                    secrets: Vec::new(),
+                };
+                let advert = crate::placement::advert_from_wire(&node.own_advert(&ask).await);
+                // A restore of the harness's own state is not part of this
+                // launch, so the layout is never called the same and no
+                // native session is offered (docs/managed-jobs.md, "Launch
+                // path", as built).
+                fabric_core::managed::offered_fidelity(
+                    &request.intent.harness,
+                    None,
+                    &advert,
+                    false,
+                )
+            } else {
+                Vec::new()
+            };
+            Ok(Prepared {
+                root,
+                offered,
+                session: None,
+            })
+        })
+    }
+
+    fn launch_harness(
+        &self,
+        plan: HarnessPlan,
+    ) -> BoxFuture<'_, Result<Box<dyn HarnessProcess>, String>> {
+        Box::pin(async move {
+            let node = self.node()?;
+            let tool_env = node.node_env();
+            let harness_env = node.harness_env(&tool_env).map_err(|e| e.to_string())?;
+            let adapter = crate::harnesses::adapter(&plan.harness, &harness_env, None)
+                .map_err(|e| e.to_string())?;
+            // The daemon's environment, as a CLI run passes the user's,
+            // without the node's secrets; the job's own under their names.
+            let mut env: Vec<(fabric_core::env::EnvVarName, String)> = std::env::vars_os()
+                .filter_map(|(name, value)| {
+                    let name = name.to_str()?;
+                    if name.starts_with(fabric_core::managed::SECRET_ENV_PREFIX) {
+                        return None;
+                    }
+                    let name = fabric_core::env::EnvVarName::parse(name).ok()?;
+                    Some((name, value.into_string().ok()?))
+                })
+                .collect();
+            for (name, value) in plan.env {
+                if let Ok(name) = fabric_core::env::EnvVarName::parse(&name) {
+                    env.retain(|(have, _)| *have != name);
+                    env.push((name, value));
+                }
+            }
+            let launch = fabric_harness::Launch::Headless {
+                resume: plan.resume,
+                prompt: plan.prompt,
+            };
+            let mut running = adapter
+                .launch(std::path::Path::new(plan.root.as_str()), launch, &env)
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(env);
+            // A headless harness prints its turn; it is read for the
+            // session and dropped, so a full pipe never stops the harness.
+            let read_line: Option<fn(&mut fabric_harness::TurnReport, &str) -> bool> =
+                match plan.harness {
+                    HarnessKind::ClaudeCode => {
+                        Some(fabric_harness::claude::ClaudeCode::read_headless_line)
+                    }
+                    HarnessKind::Codex => Some(fabric_harness::codex::Codex::read_headless_line),
+                    HarnessKind::Acp { .. } => None,
+                };
+            let capturer = Arc::clone(&self.capturer);
+            let attempt = plan.attempt;
+            if let Some(stdout) = running.child_mut().stdout.take() {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut lines = tokio::io::BufReader::new(stdout).lines();
+                    let mut report = fabric_harness::TurnReport::default();
+                    let mut named = false;
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if let Some(read) = read_line {
+                            read(&mut report, &line);
+                            if !named && let Some(session) = report.session.clone() {
+                                capturer.set_session(attempt, session);
+                                named = true;
+                            }
+                        }
+                    }
+                });
+            }
+            if let Some(stderr) = running.child_mut().stderr.take() {
+                tokio::spawn(async move {
+                    let mut stderr = stderr;
+                    let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                });
+            }
+            if let Some(mut turn) = running.take_turn() {
+                let capturer = Arc::clone(&self.capturer);
+                tokio::spawn(async move {
+                    while let Some(event) = turn.next().await {
+                        if let fabric_harness::TurnEvent::Session(session) = event {
+                            capturer.set_session(attempt, session);
+                        }
+                    }
+                });
+            }
+            Ok(Box::new(AdapterHarness(running)) as Box<dyn HarnessProcess>)
+        })
+    }
+
+    fn task_command(&self, root: &AbsPath, program: &Program) -> std::process::Command {
+        let mut command = std::process::Command::new(&program.argv[0]);
+        command.args(&program.argv[1..]);
+        let dir = match &program.cwd {
+            Some(cwd) => std::path::Path::new(root.as_str()).join(cwd.as_str()),
+            None => PathBuf::from(root.as_str()),
+        };
+        command.current_dir(dir);
+        // Of the node's environment only `PATH`, `HOME` and what the
+        // program names; the executor adds the job's secrets.
+        command.env_clear();
+        if let Some(node) = self.node.upgrade() {
+            command.env("PATH", node.node_env().path_var());
+            command.env("HOME", &node.cfg.home);
+        }
+        for name in &program.env_allowlist {
+            if !name
+                .as_str()
+                .starts_with(fabric_core::managed::SECRET_ENV_PREFIX)
+                && let Some(value) = std::env::var_os(name.as_str())
+            {
+                command.env(name.as_str(), value);
+            }
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    fn report(
+        &self,
+        to: Option<NodeId>,
+        report: Report,
+    ) -> BoxFuture<'_, Result<ReportAnswer, String>> {
+        Box::pin(async move {
+            let node = self.node()?;
+            match to {
+                None => Ok(node.accept_report(None, report).await),
+                Some(peer) => {
+                    let session = node.session(peer).await.map_err(|e| e.to_string())?;
+                    session
+                        .report(report, LINK_DEADLINE)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        })
+    }
+
+    fn heartbeat(
+        &self,
+        to: Option<NodeId>,
+        beat: Heartbeat,
+    ) -> BoxFuture<'_, Result<HeartbeatAnswer, String>> {
+        Box::pin(async move {
+            let node = self.node()?;
+            match to {
+                None => Ok(node.accept_heartbeat(None, &beat).await),
+                Some(peer) => {
+                    let session = node.session(peer).await.map_err(|e| e.to_string())?;
+                    session
+                        .heartbeat(beat, LINK_DEADLINE)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        })
+    }
+
+    fn attempt_root(&self, attempt: AttemptId, root: Option<(&LaunchRequest, &AbsPath)>) {
+        self.capturer.set(
+            attempt,
+            root.map(|(request, root)| crate::capturer::Attempt {
+                job: request.token.job,
+                root: root.clone(),
+                harness: request.intent.harness.clone(),
+                export: request.policy.export_allowlist.clone(),
+                session: None,
+            }),
+        );
+    }
+}
+
+/// The adapters' suspend path, for the capturer.
+pub(crate) struct AdapterSuspend {
+    node: std::sync::Weak<crate::node::Node>,
+}
+
+impl AdapterSuspend {
+    pub(crate) fn new(node: std::sync::Weak<crate::node::Node>) -> Self {
+        AdapterSuspend { node }
+    }
+}
+
+impl crate::capturer::Suspend for AdapterSuspend {
+    fn suspend<'a>(
+        &'a self,
+        attempt: &'a crate::capturer::Attempt,
+        session: &'a SessionId,
+        out: &'a std::path::Path,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let node = self
+                .node
+                .upgrade()
+                .ok_or_else(|| "the node is stopping".to_owned())?;
+            let env = node
+                .harness_env(&node.node_env())
+                .map_err(|e| e.to_string())?;
+            let adapter = crate::harnesses::adapter(&attempt.harness, &env, None)
+                .map_err(|e| e.to_string())?;
+            adapter
+                .capture(std::path::Path::new(attempt.root.as_str()), session, out)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// The node's facts a cut records, measured when it is taken.
+pub(crate) struct NodeFactsNow {
+    node: std::sync::Weak<crate::node::Node>,
+}
+
+impl NodeFactsNow {
+    pub(crate) fn new(node: std::sync::Weak<crate::node::Node>) -> Self {
+        NodeFactsNow { node }
+    }
+}
+
+impl crate::capturer::Facts for NodeFactsNow {
+    fn measure(&self) -> BoxFuture<'_, Vec<(String, String)>> {
+        Box::pin(async move {
+            let Some(node) = self.node.upgrade() else {
+                return Vec::new();
+            };
+            let facts = crate::facts::NodeFacts::measure(
+                &node.cfg.home,
+                &node.node_env(),
+                crate::facts::Probes::NONE,
+            )
+            .await;
+            let mut facts: Vec<(String, String)> = facts
+                .iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect();
+            facts.sort();
+            facts
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
     use std::os::unix::process::CommandExt;
     use std::sync::Mutex as StdMutex;
 
-    use fabric_core::id::SnapshotId;
+    use fabric_core::id::{JobId, SnapshotId};
     use fabric_core::managed::launch::ContinuationAsk;
     use fabric_core::managed::{
         AllowedFidelity, EventDigest, Generation, Intent, JobPolicy, RestartPolicy, SourceBinding,
@@ -1043,14 +1447,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .verdict
-                    .clone()
                     .unwrap_or(GrantVerdict::Live);
                 Ok(HeartbeatAnswer {
-                    verdicts: beat
-                        .attempts
-                        .iter()
-                        .map(|t| (t.attempt, verdict.clone()))
-                        .collect(),
+                    verdicts: beat.attempts.iter().map(|t| (t.attempt, verdict)).collect(),
                 })
             })
         }
@@ -1058,7 +1457,7 @@ mod tests {
     }
 
     struct Bench {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         runner: Arc<Runner>,
         host: Arc<FakeHost>,
     }
@@ -1081,11 +1480,7 @@ mod tests {
             ..FakeHost::default()
         });
         runner.bind(host.clone());
-        Bench {
-            _dir: dir,
-            runner,
-            host,
-        }
+        Bench { dir, runner, host }
     }
 
     const JOB: JobId = JobId::from_bytes([1; 16]);
@@ -1231,7 +1626,7 @@ mod tests {
         // still knows the attempt was taken.
         let again = Arc::new(Runner::new(
             Arc::clone(b.runner.executor()),
-            b._dir.path().join("taken"),
+            b.dir.path().join("taken"),
         ));
         again.bind(b.host.clone());
         assert_eq!(
@@ -1246,6 +1641,7 @@ mod tests {
         );
         b.runner
             .instruct(
+                None,
                 token(1),
                 Instruction::Stop {
                     reason: "done".into(),
@@ -1309,6 +1705,7 @@ mod tests {
         assert_eq!(
             b.runner
                 .instruct(
+                    None,
                     token(1),
                     Instruction::Checkpoint {
                         then: AfterCut::Resume
@@ -1343,13 +1740,14 @@ mod tests {
         .await;
         assert_eq!(
             b.runner
-                .instruct(token(1), Instruction::Spawn(test_task(3, &["true"])))
+                .instruct(None, token(1), Instruction::Spawn(test_task(3, &["true"])))
                 .await,
             InstructAnswer::Accepted
         );
         assert_eq!(
             b.runner
                 .instruct(
+                    None,
                     token(1),
                     Instruction::Checkpoint {
                         then: AfterCut::End
@@ -1387,6 +1785,7 @@ mod tests {
         assert_eq!(
             b.runner
                 .instruct(
+                    None,
                     token(1),
                     Instruction::Stop {
                         reason: "cancelled".into()
@@ -1413,6 +1812,7 @@ mod tests {
         assert_eq!(
             b.runner
                 .instruct(
+                    None,
                     token(1),
                     Instruction::Stop {
                         reason: "again".into()

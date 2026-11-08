@@ -67,8 +67,8 @@ pub(crate) struct NodeCapturer {
     node: NodeId,
     /// Where a harness state is captured before it goes into the store.
     states: PathBuf,
-    suspend: Arc<dyn Suspend>,
-    facts: Arc<dyn Facts>,
+    suspend: Mutex<Arc<dyn Suspend>>,
+    facts: Mutex<Arc<dyn Facts>>,
     attempts: Mutex<BTreeMap<AttemptId, Attempt>>,
     /// The facts the last capture measured, which the cut then records.
     measured: Mutex<Vec<(String, String)>>,
@@ -93,11 +93,17 @@ impl NodeCapturer {
             store,
             node,
             states,
-            suspend,
-            facts,
+            suspend: Mutex::new(suspend),
+            facts: Mutex::new(facts),
             attempts: Mutex::new(BTreeMap::new()),
             measured: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Binds the suspend path and the facts once the node exists.
+    pub(crate) fn bind(&self, suspend: Arc<dyn Suspend>, facts: Arc<dyn Facts>) {
+        *lock(&self.suspend) = suspend;
+        *lock(&self.facts) = facts;
     }
 
     /// Names the attempt's root and policy, before anything runs in it;
@@ -131,7 +137,8 @@ impl NodeCapturer {
     /// Captures the attempt's root, and `state` as its harness state when
     /// given, into a published snapshot under the job's export allowlist.
     async fn snapshot(&self, what: &Attempt, state: Option<PathBuf>) -> Result<SnapshotId, String> {
-        *lock(&self.measured) = self.facts.measure().await;
+        let facts = Arc::clone(&lock(&self.facts));
+        *lock(&self.measured) = facts.measure().await;
         let root = PathBuf::from(what.root.as_str());
         let job = what.job;
         let node = self.node;
@@ -181,7 +188,8 @@ impl Capturer for NodeCapturer {
             };
             let out = self.states.join(attempt.to_string());
             std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-            self.suspend.suspend(&what, &session, &out).await?;
+            let suspend = Arc::clone(&lock(&self.suspend));
+            suspend.suspend(&what, &session, &out).await?;
             self.snapshot(&what, Some(out)).await
         })
     }
