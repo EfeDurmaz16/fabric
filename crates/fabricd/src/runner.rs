@@ -626,7 +626,10 @@ impl Runner {
                     })
                     .await?;
             }
-            // Step 6: the build and test tasks the launch names.
+            // Step 6: the build and test tasks the launch names; one that
+            // does not start is reported `Blocked` with why, as a spawn
+            // instruction that fails is refused with why.
+            let mut unstarted = Vec::new();
             for launch in &request.tasks {
                 let command = host.task_command(&prepared.root, &launch.program);
                 if let Err(e) = self
@@ -635,7 +638,20 @@ impl Runner {
                     .await
                 {
                     tracing::warn!(%attempt, task = %launch.task, error = %e, "a task of the launch did not start");
+                    unstarted.push(TaskReceipt {
+                        class: launch.class,
+                        ..blocked(launch.task, e.to_string())
+                    });
                 }
+            }
+            if !unstarted.is_empty() {
+                reporter
+                    .send(Observation::Receipts {
+                        attempt,
+                        generation: token.generation,
+                        receipts: unstarted,
+                    })
+                    .await?;
             }
             // Steps 7 to 10.
             let mut stale = reporter.stale.clone();
@@ -1804,6 +1820,40 @@ mod tests {
             vec![true, false],
             "an end's cut is reported only once the harness is stopped"
         );
+    }
+
+    /// A task of the launch whose program does not start is reported
+    /// `Blocked` with why, so it is never left open with no record.
+    #[tokio::test]
+    async fn a_launch_task_that_does_not_start_is_reported_blocked() {
+        let b = bench(Script {
+            harness_secs: 30,
+            ..Script::default()
+        });
+        let mut req = request(1);
+        req.tasks
+            .push(test_task(2, &["/nonexistent/fabric-no-such-program"]));
+        assert_eq!(b.runner.launch(None, req).await, LaunchAnswer::Accepted);
+        until("the receipt", || names(&b.host).contains(&"receipts")).await;
+        let receipts = b.host.reports.lock().unwrap().iter().find_map(|o| match o {
+            Observation::Receipts { receipts, .. } => Some(receipts.clone()),
+            _ => None,
+        });
+        let receipts = receipts.unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].task, TaskId::from_bytes([2; 16]));
+        assert_eq!(receipts[0].class, TaskClass::Test);
+        assert!(matches!(receipts[0].status, ReceiptStatus::Blocked { .. }));
+        b.runner
+            .instruct(
+                None,
+                token(1),
+                Instruction::Stop {
+                    reason: "done".into(),
+                },
+            )
+            .await;
+        ended(&b, 1).await;
     }
 
     #[tokio::test]
