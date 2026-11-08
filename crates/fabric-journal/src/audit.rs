@@ -358,7 +358,10 @@ impl Journal {
             [job.to_bytes()],
             |r| r.get(0),
         )?;
-        let rows = rows.into_iter().map(with_refusal).collect::<Result<_, _>>()?;
+        let rows = rows
+            .into_iter()
+            .map(with_refusal)
+            .collect::<Result<_, _>>()?;
         Ok((rows, total.unsigned_abs()))
     }
 
@@ -370,7 +373,7 @@ impl Journal {
         attempt: Option<AttemptId>,
         limit: u32,
     ) -> Result<(Vec<EvidenceRow>, u64), CommitError> {
-        let attempt = attempt.map(|a| a.to_bytes());
+        let attempt = attempt.map(AttemptId::to_bytes);
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {EVIDENCE_COLUMNS} FROM evidence v JOIN events e ON e.seq = v.seq
              WHERE v.job_id = ?1 AND (?2 IS NULL OR v.attempt_id = ?2)

@@ -11,8 +11,8 @@
 use std::fmt::Write as _;
 
 use fabric_client::api::{
-    AttemptRecord, AuditPage, AuditRecord, EvidenceRecord, GenerationRecord, INSPECT_ROWS, INSPECT_SCHEMA,
-    InspectReport, OperationRecord, Reason, ReportRecord,
+    AttemptRecord, AuditPage, AuditRecord, EvidenceRecord, GenerationRecord, INSPECT_ROWS,
+    INSPECT_SCHEMA, InspectReport, OperationRecord, Reason, ReportRecord,
 };
 use fabric_core::id::JobId;
 use fabric_core::managed::{AttemptId, ResourceRef};

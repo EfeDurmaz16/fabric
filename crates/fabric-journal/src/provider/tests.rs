@@ -1165,13 +1165,13 @@ fn inspect_reads_the_newest_rows_and_counts_the_rest() {
             .unwrap()
     };
     assert_eq!(seqs.len(), 2);
-    for seq in seqs {
+    for (n, seq) in (0x40u8..).zip(seqs) {
         f.journal
             .conn
             .execute(
                 "INSERT INTO evidence (evidence_id, job_id, attempt_id, revision, kind, ref, digest, seq)
                  VALUES (?1, ?2, ?3, 1, 'exit', 'succeeded', NULL, ?4)",
-                rusqlite::params![[seq as u8; 16], JOB.to_bytes(), ATTEMPT.to_bytes(), seq],
+                rusqlite::params![[n; 16], JOB.to_bytes(), ATTEMPT.to_bytes(), seq],
             )
             .unwrap();
     }
@@ -1185,10 +1185,14 @@ fn inspect_reads_the_newest_rows_and_counts_the_rest() {
     assert!(
         operations
             .windows(2)
-            .all(|w| (w[0].accepted_ms, w[0].operation.to_bytes()) < (w[1].accepted_ms, w[1].operation.to_bytes())),
+            .all(|w| (w[0].accepted_ms, w[0].operation.to_bytes())
+                < (w[1].accepted_ms, w[1].operation.to_bytes())),
         "{operations:?}"
     );
-    assert!(evidence.windows(2).all(|w| w[0].seq < w[1].seq), "{evidence:?}");
+    assert!(
+        evidence.windows(2).all(|w| w[0].seq < w[1].seq),
+        "{evidence:?}"
+    );
     for limit in 1..=6u32 {
         let keep = (limit as usize).min(operations.len());
         let (rows, total) = f.journal.operation_rows(JOB, limit).unwrap();
