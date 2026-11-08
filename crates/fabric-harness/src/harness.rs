@@ -183,7 +183,7 @@ pub struct PassedSetting {
 }
 
 /// The most characters of a recorded value a report shows.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
 const SHOWN_VALUE_LEN: usize = 64;
 
 /// A setting the session records, or the adapter was configured with
@@ -205,7 +205,7 @@ pub struct NotCarried {
 /// after a cut, and every control character replaced by `?`. Text that
 /// comes from a file that travelled goes through this before an error or
 /// a note prints it.
-#[cfg(any(feature = "claude", feature = "codex"))]
+#[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
 pub(crate) fn shown(text: &str) -> String {
     let mut shown: String = text
         .chars()
@@ -220,7 +220,7 @@ pub(crate) fn shown(text: &str) -> String {
 
 impl NotCarried {
     /// A setting left out, with its recorded value made safe to print.
-    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
     pub(crate) fn new(name: SettingName, value: &str, reason: impl Into<String>) -> Self {
         NotCarried {
             name,
@@ -352,7 +352,12 @@ impl Drop for Running {
 impl Running {
     /// Wraps a child that `process::spawn` started held in a new process
     /// group.
-    #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+    #[cfg(any(
+        feature = "acp",
+        feature = "claude",
+        feature = "codex",
+        feature = "gemini"
+    ))]
     pub(crate) fn new(session: Option<SessionId>, spawned: crate::process::Spawned) -> Self {
         Running {
             pid: spawned.pid,
@@ -395,7 +400,7 @@ impl Running {
     }
 
     /// Records the version the launch asked of the binary it started.
-    #[cfg(feature = "codex")]
+    #[cfg(any(feature = "codex", feature = "gemini"))]
     pub(crate) fn with_version(mut self, version: Option<crate::version::HarnessVersion>) -> Self {
         self.version = version;
         self
@@ -413,7 +418,7 @@ impl Running {
     }
 
     /// Records what the launch passed and left out.
-    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
     pub(crate) fn with_settings(mut self, settings: LaunchSettings) -> Self {
         self.settings = settings;
         self
@@ -521,7 +526,7 @@ impl TurnReport {
     /// Takes `text` as the session the turn ran in. Returns true when it
     /// names a valid session other than the one already held; an id that
     /// does not parse is logged and left out.
-    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[cfg(any(feature = "claude", feature = "codex", feature = "gemini"))]
     pub(crate) fn note_session(&mut self, text: Option<&str>) -> bool {
         let Some(text) = text else {
             return false;
