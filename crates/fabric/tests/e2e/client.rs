@@ -249,7 +249,7 @@ async fn e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status() {
         assert!(stdout.starts_with(&format!("job {id}\n")), "{stdout}");
         let path = dir.join(record);
         assert!(
-            stderr.starts_with("error: ") && stderr.contains(path.to_str().unwrap()),
+            stderr.starts_with("Error: ") && stderr.contains(path.to_str().unwrap()),
             "{stderr}"
         );
     };

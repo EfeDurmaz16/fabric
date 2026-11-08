@@ -1,0 +1,9 @@
+{
+  "container": "native_session",
+  "summary": "A manifest and the one blob it names, present and matching.",
+  "expect": {
+    "outcome": "accept",
+    "digest": "2ce91e0bbae3bd72301be195315bbd25baebfd7b623a66674736851e62b337c5",
+    "detached": []
+  }
+}

@@ -168,6 +168,43 @@ fn url_has_password(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The Portable Session Format promises that its three readers refuse
+    /// exactly this list (section 8), so its table is this list: one row
+    /// per shape, in this order, with the body length and alphabet, and
+    /// the rule that a prefix only counts where a word starts.
+    #[test]
+    fn the_psf_spec_lists_every_shape_with_its_body_and_the_word_rule() {
+        let spec = include_str!("../../../docs/portable-session-format.md");
+        let section = spec
+            .split("## 8. Secrets")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .unwrap();
+        let rows: Vec<String> = section
+            .lines()
+            .filter(|l| l.starts_with("| `"))
+            .map(str::to_owned)
+            .collect();
+        let want: Vec<String> = TOKEN_SHAPES
+            .iter()
+            .map(|shape| {
+                let of = if (shape.allowed)(b'-') {
+                    "`[A-Za-z0-9_-]`"
+                } else if (shape.allowed)(b'a') {
+                    "`[A-Za-z0-9]`"
+                } else {
+                    "`[A-Z0-9]`"
+                };
+                format!("| `{}` | {} | {of} |", shape.prefix, shape.min_len)
+            })
+            .collect();
+        assert_eq!(rows, want);
+        assert!(
+            section.contains("not preceded by a character of `[A-Za-z0-9_-]`"),
+            "section 8 does not state the word rule"
+        );
+    }
+
     #[test]
     fn credential_shapes_are_recognized() {
         let github = format!("ghp_{}", "a1".repeat(18));

@@ -1,0 +1,12 @@
+{
+  "case": "valid_workspace_only",
+  "summary": "A job whose harness keeps its thread on a server: no attachment travels, the workspace revision alone does.",
+  "input": "{\"attachments\":[],\"caches\":[],\"evidence\":[],\"fidelity\":{\"level\":\"workspace_only\",\"reason\":null},\"harness\":{\"args\":[],\"kind\":\"amp\",\"program\":null,\"version\":null},\"job\":{\"created_by\":\"fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq\",\"goal\":\"fix the flaky test\",\"id\":\"01JABCDEFGHJKMNPQRSTVWXYZ0\"},\"package\":null,\"produced\":{\"at_ms\":\"1762600000000\",\"by\":\"fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq\",\"writer\":\"fabric/0.1.0\"},\"psf\":\"1\",\"requires\":[],\"secrets\":{\"allowlist\":[],\"left_behind\":[],\"policy\":\"never_inside\"},\"source\":{\"kind\":\"empty\"},\"workspace\":{\"bundle_head\":\"abababababababababababababababababababababababababababababababab\",\"epoch\":\"2\",\"ledger_head\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"platform\":{\"arch\":\"arm64\",\"os\":\"macos\"},\"root\":\"/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work\"}}",
+  "expect": {
+    "outcome": "accept",
+    "psf": "1",
+    "digest": "2740b5c27ef26d19b682b19c62ed54baca05a22474b6e2281da7c8a49fcf373d",
+    "fidelity": "workspace_only",
+    "package": false
+  }
+}

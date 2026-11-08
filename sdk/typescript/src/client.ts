@@ -55,6 +55,7 @@ import {
   type ManagedStatus,
   type Repaired,
   type Exported,
+  type PsfExported,
   type Counter,
   type NodeId,
   OperationKey,
@@ -373,6 +374,14 @@ export class FabricClient {
     options: CallOptions & { readonly path?: SystemPath; readonly env?: ClientEnv } = {},
   ): Promise<Exported> {
     return this.call({ op: "job_export", job, path: options.path, env: options.env }, options);
+  }
+
+  /**
+   * Writes the job's latest snapshot as a Portable Session Format container
+   * at `dir`, which must not exist (ADR 0029); read it with `readContainer`.
+   */
+  jobExportPsf(job: JobId, dir: SystemPath, options?: CallOptions): Promise<PsfExported> {
+    return this.call({ op: "job_export_psf", job, dir }, options);
   }
 
   /**

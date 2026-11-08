@@ -25,6 +25,7 @@ $ cargo test --workspace
 $ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 $ cargo deny check
 $ scripts/check-hygiene.sh origin/main
+$ scripts/check-docs.sh
 ```
 
 ## Dependencies added

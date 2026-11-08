@@ -458,6 +458,11 @@ pub enum NodeError {
     /// A blocking task panicked or was cancelled.
     #[error("a blocking task ended early: {0}")]
     Task(String),
+    /// A Portable Session Format export could not be written as asked:
+    /// the directory exists, or the job's state would not make a valid
+    /// document (a token shape in its goal, a path the format refuses).
+    #[error("portable session export: {0}")]
+    Psf(String),
 }
 
 impl From<LedgerStoreError<LedgerFileError>> for NodeError {
@@ -603,7 +608,9 @@ impl NodeError {
                 left_at: *epoch,
             },
             NodeError::NoWorkspace(job) => Reason::NoWorkspace { job: *job },
-            NodeError::NotFrozen { .. } | NodeError::NotAnOrphan { .. } => Reason::BadRequest,
+            NodeError::NotFrozen { .. } | NodeError::NotAnOrphan { .. } | NodeError::Psf(_) => {
+                Reason::BadRequest
+            }
             NodeError::Unfinished { job, step } => Reason::Unfinished {
                 job: *job,
                 step: *step,

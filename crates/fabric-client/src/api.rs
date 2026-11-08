@@ -141,11 +141,13 @@ pub enum Op {
     JobRepair,
     /// [`Request::JobExport`].
     JobExport,
+    /// [`Request::JobExportPsf`].
+    JobExportPsf,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 25] = [
+    pub const ALL: [Op; 26] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -171,6 +173,7 @@ impl Op {
         Op::ManagedList,
         Op::JobRepair,
         Op::JobExport,
+        Op::JobExportPsf,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -202,6 +205,7 @@ impl Op {
             Op::ManagedList => "managed_list",
             Op::JobRepair => "job_repair",
             Op::JobExport => "job_export",
+            Op::JobExportPsf => "job_export_psf",
         }
     }
 }
@@ -667,6 +671,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<ClientEnv>,
     },
+    /// Writes the job's latest snapshot as a Portable Session Format v1
+    /// container (ADR 0029): the manifest naming the revision, the cache
+    /// rows and what was left behind, and the captured harness state as
+    /// one attachment. No workspace byte and no secret goes into it, and
+    /// nothing in the job changes.
+    JobExportPsf {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The container directory to create; it must not exist.
+        dir: SystemPath,
+    },
 }
 
 /// Every capability a node of this api version lists in its welcome, in
@@ -743,7 +759,8 @@ impl Request {
             | Request::ManagedCancel { .. }
             | Request::ManagedStatus { .. }
             | Request::ManagedList
-            | Request::JobRepair { .. } => None,
+            | Request::JobRepair { .. }
+            | Request::JobExportPsf { .. } => None,
         }
     }
 
@@ -776,6 +793,7 @@ impl Request {
             Request::ManagedList => Op::ManagedList,
             Request::JobRepair { .. } => Op::JobRepair,
             Request::JobExport { .. } => Op::JobExport,
+            Request::JobExportPsf { .. } => Op::JobExportPsf,
         }
     }
 }
@@ -1145,6 +1163,8 @@ pub enum Reply {
     JobRepair(Repaired),
     /// For [`Request::JobExport`].
     JobExport(Exported),
+    /// For [`Request::JobExportPsf`].
+    JobExportPsf(PsfExported),
 }
 
 impl Reply {
@@ -1177,6 +1197,7 @@ impl Reply {
             Reply::ManagedList(_) => Op::ManagedList,
             Reply::JobRepair(_) => Op::JobRepair,
             Reply::JobExport(_) => Op::JobExport,
+            Reply::JobExportPsf(_) => Op::JobExportPsf,
         }
     }
 }
@@ -1227,6 +1248,24 @@ pub struct Exported {
     /// It and each bundle base it needs, all pinned.
     #[serde(with = "text::list")]
     pub chain: Vec<SnapshotId>,
+}
+
+/// What a Portable Session Format export wrote (ADR 0029).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PsfExported {
+    /// The container directory.
+    pub dir: PathBuf,
+    /// The document digest: sha256 of `manifest.json`, lowercase hex.
+    pub digest: String,
+    /// The fidelity the document offers, as the format spells it.
+    pub fidelity: String,
+    /// The snapshot the document names as its bundle head.
+    #[serde(with = "text")]
+    pub snapshot: SnapshotId,
+    /// The attachments written, by name.
+    pub attachments: Vec<String>,
+    /// The workspace paths left behind on this node, which the reader must recreate.
+    pub left_behind: Vec<String>,
 }
 
 /// A managed job as the client API shows it (ADR 0019).

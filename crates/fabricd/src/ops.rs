@@ -244,6 +244,10 @@ impl Node {
                 let path = path.map(|path| PathBuf::from(path.as_str()));
                 Reply::JobExport(self.job_export(job, path, &env, out).await?)
             }
+            Request::JobExportPsf { job, dir } => Reply::JobExportPsf(
+                self.job_export_psf(job, PathBuf::from(dir.as_str()))
+                    .await?,
+            ),
         })
     }
 

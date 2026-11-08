@@ -47,6 +47,7 @@ export const OPS = [
   "managed_list",
   "job_repair",
   "job_export",
+  "job_export_psf",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -965,6 +966,7 @@ export const Request = z.discriminatedUnion("op", [
   z.object({ op: z.literal("managed_list") }),
   z.object({ op: z.literal("job_repair"), job: JobId }),
   z.object({ op: z.literal("job_export"), job: JobId, path: optional(SystemPath), env }),
+  z.object({ op: z.literal("job_export_psf"), job: JobId, dir: SystemPath }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -1117,6 +1119,16 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("managed_list"), jobs: z.array(ManagedJob), left_out: optional(count) }),
   z.object({ kind: z.literal("job_repair"), peer: NodeId, outcome: RepairOutcome }),
   z.object({ kind: z.literal("job_export"), snapshot: SnapshotId, root: Path, chain: z.array(SnapshotId) }),
+  /** A Portable Session Format container the node wrote (ADR 0029). */
+  z.object({
+    kind: z.literal("job_export_psf"),
+    dir: Path,
+    digest: UnicodeText,
+    fidelity: UnicodeText,
+    snapshot: SnapshotId,
+    attachments: z.array(UnicodeText),
+    left_behind: z.array(UnicodeText),
+  }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -1139,6 +1151,7 @@ export type ManagedStatus = ReplyTo<"managed_status">;
 export type ManagedJobs = ReplyTo<"managed_list">;
 export type Repaired = ReplyTo<"job_repair">;
 export type Exported = ReplyTo<"job_export">;
+export type PsfExported = ReplyTo<"job_export_psf">;
 
 // The exchange.
 
