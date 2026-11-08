@@ -150,6 +150,8 @@ function generated(): string[] {
     "unsupported",
     "codex",
     "Café",
+    "2.1.294-rc.1",
+    "0.163.1-alpha.2+b",
   ];
   const out: string[] = [];
   for (const seed of seeds) {
@@ -233,6 +235,16 @@ describe("psf fixtures", () => {
     expect(result.achieved).toBe("workspace_only");
     expect(result.why.join(" ")).toContain("bound to another root or home");
   });
+});
+
+test("a pre-release target compares by semver precedence", () => {
+  const c = JSON.parse(readFileSync(join(fixtures, "cases/valid_native_session.json"), "utf8")) as { input: string };
+  const m = readManifest(Buffer.from(c.input, "utf8"));
+  const on = (version: string) => achievable(m, { ...TARGET, harnesses: [["claude_code", version]] }).achieved;
+  expect(on("2.1.294-rc.1")).toBe("workspace_only");
+  expect(on("2.1.295-alpha.10.2")).toBe("native_session");
+  expect(on("2.1.294+build.7")).toBe("native_session");
+  expect(on("2.1.294-")).toBe("workspace_only");
 });
 
 describe("psf conformance", () => {

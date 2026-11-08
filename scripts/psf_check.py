@@ -631,16 +631,39 @@ def read_container(path):
     return manifest, present, detached
 
 
-def _not_older(have, want):
+def _version(text):
+    """(core, pre) of `core[-pre][+build]`, or None; achieve.rs Version."""
+    text = text.split("+", 1)[0]
+    core, sep, pre = text.partition("-")
+    def number(p):
+        if not re.match(r"[0-9]+\Z", p) or int(p) > U64_MAX:
+            raise ValueError(p)
+        return int(p)
     try:
-        h = [int(p) if re.match(r"[0-9]+\Z", p) else None for p in have.split(".")]
-        w = [int(p) if re.match(r"[0-9]+\Z", p) else None for p in want.split(".")]
+        c = [number(p) for p in core.split(".")]
+        idents = []
+        for p in (pre.split(".") if sep else []):
+            if not re.match(r"[0-9A-Za-z-]+\Z", p):
+                return None
+            # Digits before letters, as semver orders them.
+            idents.append((0, number(p), b"") if re.match(r"[0-9]+\Z", p) else (1, 0, p.encode()))
     except ValueError:
         return None
-    if None in h or None in w or any(x > U64_MAX for x in h + w):
+    return c, idents
+
+
+def _not_older(have, want):
+    h, w = _version(have), _version(want)
+    if h is None or w is None:
         return None
-    n = max(len(h), len(w))
-    return h + [0] * (n - len(h)) >= w + [0] * (n - len(w))
+    n = max(len(h[0]), len(w[0]))
+    hc, wc = h[0] + [0] * (n - len(h[0])), w[0] + [0] * (n - len(w[0]))
+    if hc != wc:
+        return hc > wc
+    if not h[1] or not w[1]:
+        # A release is newer than any of its pre-releases.
+        return not h[1]
+    return h[1] >= w[1]
 
 
 def achievable(manifest, target, detached=()):

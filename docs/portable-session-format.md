@@ -165,6 +165,8 @@ The ladder is ADR 0024's, with its stored names:
 | `workspace_only` | always, once the revision is restorable | it can restore the revision; no session is started |
 | `unsupported` | the writer could not capture, with the reason in `fidelity.reason` | never; a reader reports the reason |
 
+"Not older" compares versions of the form `core[-pre][+build]` by semver precedence: `core` is dot-separated decimal integers of at most 2^64-1, compared as numbers with a missing part as 0; `build` is ignored; a version with a `pre` is older than the same core without one; `pre` identifiers (`[0-9A-Za-z-]+`, split at dots) compare as numbers when both are digits, digits before letters, otherwise by bytes, and a shorter list that is a prefix of the other is older. So `0.163.0-alpha.10.2` is older than `0.163.0` and newer than `0.162.9`. Any other text, an empty identifier included, is not comparable, and the level falls.
+
 `fidelity` is `{"level": <name>, "reason": null}` for the first three and `{"level": "unsupported", "reason": <text>}` for the last. A document at `unsupported` has no attachments. The reader's result names both the offered level and the achieved one, and why it fell, so a user sees "offered native_session, achieved workspace_only: the attachment is bound to /Users/me and this node's home is /home/me".
 
 ## 7. Limits

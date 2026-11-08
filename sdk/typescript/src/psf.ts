@@ -802,26 +802,62 @@ export async function readContainer(dir: string): Promise<Container> {
   };
 }
 
-function notOlder(have: string, want: string): boolean | undefined {
-  const parts = (text: string): bigint[] | undefined => {
-    const out: bigint[] = [];
-    for (const p of text.split(".")) {
-      if (!/^[0-9]+$/.test(p)) return undefined;
-      const n = BigInt(p);
-      if (n > U64_MAX) return undefined;
-      out.push(n);
-    }
-    return out;
+type Ident = { n: bigint } | { w: string };
+
+/** `core[-pre][+build]` as section 6 orders it, or undefined; achieve.rs `Version`. */
+function version(text: string): { core: bigint[]; pre: Ident[] } | undefined {
+  const plus = text.indexOf("+");
+  const bare = plus < 0 ? text : text.slice(0, plus);
+  const dash = bare.indexOf("-");
+  const number = (p: string): bigint | undefined => {
+    if (!/^[0-9]+$/.test(p)) return undefined;
+    const n = BigInt(p);
+    return n > U64_MAX ? undefined : n;
   };
-  const h = parts(have);
-  const w = parts(want);
+  const core: bigint[] = [];
+  for (const p of (dash < 0 ? bare : bare.slice(0, dash)).split(".")) {
+    const n = number(p);
+    if (n === undefined) return undefined;
+    core.push(n);
+  }
+  const pre: Ident[] = [];
+  if (dash >= 0) {
+    for (const p of bare.slice(dash + 1).split(".")) {
+      if (!/^[0-9A-Za-z-]+$/.test(p)) return undefined;
+      if (/^[0-9]+$/.test(p)) {
+        const n = number(p);
+        if (n === undefined) return undefined;
+        pre.push({ n });
+      } else pre.push({ w: p });
+    }
+  }
+  return { core, pre };
+}
+
+/** Digits before letters, numbers by value, words by bytes (semver). */
+function compareIdent(a: Ident, b: Ident): number {
+  if ("n" in a && "n" in b) return a.n === b.n ? 0 : a.n < b.n ? -1 : 1;
+  if ("n" in a) return -1;
+  if ("n" in b) return 1;
+  return compareBytes(a.w, b.w);
+}
+
+function notOlder(have: string, want: string): boolean | undefined {
+  const h = version(have);
+  const w = version(want);
   if (h === undefined || w === undefined) return undefined;
-  for (let i = 0; i < Math.max(h.length, w.length); i++) {
-    const a = h[i] ?? 0n;
-    const b = w[i] ?? 0n;
+  for (let i = 0; i < Math.max(h.core.length, w.core.length); i++) {
+    const a = h.core[i] ?? 0n;
+    const b = w.core[i] ?? 0n;
     if (a !== b) return a > b;
   }
-  return true;
+  // A release is newer than any of its pre-releases.
+  if (h.pre.length === 0 || w.pre.length === 0) return h.pre.length === 0;
+  for (let i = 0; i < Math.min(h.pre.length, w.pre.length); i++) {
+    const c = compareIdent(h.pre[i] as Ident, w.pre[i] as Ident);
+    if (c !== 0) return c > 0;
+  }
+  return h.pre.length >= w.pre.length;
 }
 
 /** What `target` achieves with `manifest` when the attachments in `detached` are absent (section 6). */

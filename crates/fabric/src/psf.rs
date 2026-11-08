@@ -11,6 +11,7 @@ use clap::Subcommand;
 use fabric_client::api::{DoctorReport, Reply, Request};
 use fabric_client::{Client, ClientError};
 use fabric_core::id::JobId;
+use fabric_core::version::HarnessVersion;
 use fabric_psf::{Achieved, Container, Target, achievable, hex, read_container, read_manifest};
 
 use crate::{Notes, write_lines};
@@ -161,7 +162,7 @@ pub(crate) async fn import(client: &Client, home: &Path, dir: &Path) -> Result<E
 }
 
 /// The harnesses this node's doctor reports, by the format's kind names,
-/// with the first dotted number of each version line.
+/// with the version each version line names.
 async fn installed(client: &Client) -> Vec<(String, Option<String>)> {
     let request = Request::Doctor {
         peer: None,
@@ -174,14 +175,6 @@ async fn installed(client: &Client) -> Vec<(String, Option<String>)> {
     else {
         return Vec::new();
     };
-    let version = |text: &str| {
-        text.split_whitespace()
-            .find(|word| {
-                word.split('.')
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-            })
-            .map(str::to_owned)
-    };
     facts
         .iter()
         .filter_map(|fact| {
@@ -193,4 +186,31 @@ async fn installed(client: &Client) -> Vec<(String, Option<String>)> {
             Some((kind.to_owned(), version(&fact.value)))
         })
         .collect()
+}
+
+/// The version a `--version` line names, as the doctor and the resume
+/// guard read it, pre-release and build included: `codex-cli
+/// 0.163.0-alpha.10.2` names `0.163.0-alpha.10.2`.
+fn version(text: &str) -> Option<String> {
+    HarnessVersion::from_output(text)
+        .ok()
+        .map(|v| v.as_str().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version;
+
+    #[test]
+    fn a_pre_release_version_line_names_its_version() {
+        assert_eq!(
+            version("codex-cli 0.163.0-alpha.10.2").as_deref(),
+            Some("0.163.0-alpha.10.2")
+        );
+        assert_eq!(
+            version("2.1.294 (Claude Code)").as_deref(),
+            Some("2.1.294")
+        );
+        assert_eq!(version("codex-cli").as_deref(), None);
+    }
 }

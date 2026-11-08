@@ -117,6 +117,8 @@ fn replacements() -> Vec<Value> {
         "unsupported",
         "codex",
         "Cafe\u{301}",
+        "2.1.294-rc.1",
+        "0.163.1-alpha.2+b",
     ]
     .into_iter()
     .map(Value::from)

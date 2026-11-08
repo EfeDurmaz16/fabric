@@ -161,3 +161,40 @@ fn a_later_version_is_refused_as_such_before_its_form_is_checked() {
         );
     }
 }
+
+/// A pre-release is older than its release and newer than the release
+/// before (semver precedence), and build metadata does not count, so a
+/// target on `codex-cli 0.163.0-alpha.10.2` is compared, not dropped.
+#[test]
+fn a_pre_release_compares_by_semver_precedence() {
+    let m = Manifest::new(&parts(b"state")).unwrap();
+    for (have, achieved) in [
+        ("2.1.294-rc.1", Fidelity::WorkspaceOnly),
+        ("2.1.295-alpha.10.2", Fidelity::NativeSession),
+        ("2.1.294+build.7", Fidelity::NativeSession),
+        ("2.1.294-", Fidelity::WorkspaceOnly),
+    ] {
+        assert_eq!(
+            m.achievable(&target("/Users/me", have)).achieved,
+            achieved,
+            "{have}"
+        );
+    }
+    let mut p = parts(b"state");
+    p.harness.version = Some("2.1.294-rc.2".into());
+    let m = Manifest::new(&p).unwrap();
+    for (have, achieved) in [
+        ("2.1.294", Fidelity::NativeSession),
+        ("2.1.294-rc.10", Fidelity::NativeSession),
+        ("2.1.294-rc.1", Fidelity::WorkspaceOnly),
+        ("2.1.294-rc", Fidelity::WorkspaceOnly),
+        ("2.1.294-rc.2.a", Fidelity::NativeSession),
+        ("2.1.294-beta", Fidelity::WorkspaceOnly),
+    ] {
+        assert_eq!(
+            m.achievable(&target("/Users/me", have)).achieved,
+            achieved,
+            "{have}"
+        );
+    }
+}

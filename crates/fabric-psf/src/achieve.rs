@@ -27,24 +27,81 @@ pub struct Achieved {
     pub why: Vec<String>,
 }
 
-/// Compares dotted versions part by part as integers; `None` when either
-/// has a part that is not a number.
-fn not_older(have: &str, want: &str) -> Option<bool> {
-    let parts = |text: &str| -> Option<Vec<u64>> {
-        text.split('.')
-            .map(|p| {
-                p.bytes()
-                    .all(|b| b.is_ascii_digit())
-                    .then(|| p.parse().ok())
-                    .flatten()
+/// One version as section 6 orders it: `core[-pre][+build]`.
+#[derive(PartialEq, Eq)]
+struct Version {
+    core: Vec<u64>,
+    pre: Vec<Ident>,
+}
+
+/// A pre-release identifier: digits before letters, as semver orders them.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Ident {
+    Number(u64),
+    Word(String),
+}
+
+impl Version {
+    /// `None` when `text` is not of the form section 6 compares.
+    fn parse(text: &str) -> Option<Version> {
+        let text = text.split_once('+').map_or(text, |(version, _)| version);
+        let (core, pre) = match text.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (text, None),
+        };
+        let number = |p: &str| {
+            (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| p.parse::<u64>().ok())
+                .flatten()
+        };
+        let core = core.split('.').map(number).collect::<Option<Vec<u64>>>()?;
+        let pre = match pre {
+            None => Vec::new(),
+            Some(pre) => pre
+                .split('.')
+                .map(|p| {
+                    if p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                        None
+                    } else if p.bytes().all(|b| b.is_ascii_digit()) {
+                        number(p).map(Ident::Number)
+                    } else {
+                        Some(Ident::Word(p.to_owned()))
+                    }
+                })
+                .collect::<Option<Vec<Ident>>>()?,
+        };
+        Some(Version { core, pre })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let len = self.core.len().max(other.core.len());
+        let at = |v: &Version, i: usize| v.core.get(i).copied().unwrap_or(0);
+        (0..len)
+            .map(|i| at(self, i).cmp(&at(other, i)))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => self.pre.cmp(&other.pre),
             })
-            .collect()
-    };
-    let (mut have, mut want) = (parts(have)?, parts(want)?);
-    let len = have.len().max(want.len());
-    have.resize(len, 0);
-    want.resize(len, 0);
-    Some(have >= want)
+    }
+}
+
+/// Whether `have` is not older than `want` (section 6); `None` when either
+/// is not a version section 6 compares.
+fn not_older(have: &str, want: &str) -> Option<bool> {
+    Some(Version::parse(have)? >= Version::parse(want)?)
 }
 
 impl Manifest {
