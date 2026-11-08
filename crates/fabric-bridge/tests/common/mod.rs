@@ -101,13 +101,12 @@ pub fn journal_for(dir: &Path, scope: Scope) -> Journal {
             intent: Intent {
                 goal: "bridge scenario".into(),
                 harness: HarnessKind::Codex,
+                acceptance: Vec::new(),
             },
             source: SourceBinding::Repository {
                 path: AbsPath::parse("/src/repo").unwrap(),
             },
-            policy: JobPolicy {
-                restart: RestartPolicy::ExplicitOnly,
-            },
+            policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
         },
     };
     journal.submit(&create, ids(1)).unwrap();

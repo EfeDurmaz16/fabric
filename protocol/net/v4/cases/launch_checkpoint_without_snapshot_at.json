@@ -1,0 +1,53 @@
+{
+  "case": "launch_checkpoint_without_snapshot_at",
+  "direction": "authority_to_node",
+  "message": {
+    "type": "launch",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A2",
+      "generation": "2"
+    },
+    "task": "01K8W3A00000000000000000T1",
+    "intent": {
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "acceptance": [
+        "cargo test passes"
+      ]
+    },
+    "source": {
+      "kind": "empty"
+    },
+    "policy": {
+      "drain_budget_ms": 30000,
+      "allowed_fidelity": [
+        "native_session",
+        "new_native_session_with_package"
+      ],
+      "secrets": [
+        {
+          "name": "API_TOKEN",
+          "attempt": "any",
+          "resource_kinds": [
+            "node"
+          ]
+        }
+      ],
+      "export_allowlist": [],
+      "disk_bytes": 2147483648,
+      "pin": null
+    },
+    "initial_checkpoint": "2222222222222222222222222222222222222222222222222222222222222222",
+    "snapshot_at": null,
+    "tasks": [],
+    "continuation": null,
+    "package": null
+  },
+  "expect": {
+    "outcome": "reject",
+    "reason": "inconsistent"
+  }
+}

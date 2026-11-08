@@ -5,8 +5,8 @@
 //! node measures in the environment of the CLI that asked, not its own.
 
 use fabric_client::api::{
-    Answer, Decision, Event, HelloAnswer, LedgerEvent, Marker, Process, Reason, RefusalKind, Reply,
-    Request, Standing, SystemPath, View, WorkspaceState,
+    API_VERSION, Answer, Decision, Event, HelloAnswer, LedgerEvent, Marker, Process, Reason,
+    RefusalKind, Reply, Request, Standing, SystemPath, View, WorkspaceState,
 };
 use fabric_client::{Client, ClientError, frame};
 use fabric_core::harness::HarnessKind;
@@ -137,13 +137,19 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
         .unwrap();
     let answer: HelloAnswer = frame::read(&mut stream).await.unwrap().unwrap();
     assert!(
-        matches!(answer, HelloAnswer::Incompatible { api: 1, .. }),
+        matches!(
+            answer,
+            HelloAnswer::Incompatible {
+                api: API_VERSION,
+                ..
+            }
+        ),
         "{answer:?}"
     );
     assert!(frame::read_bytes(&mut stream).await.unwrap().is_none());
 
     let mut stream = UnixStream::connect(&socket).await.unwrap();
-    frame::write(&mut stream, &json!({"api": 1, "client": "test"}))
+    frame::write(&mut stream, &json!({"api": API_VERSION, "client": "test"}))
         .await
         .unwrap();
     let _welcome: HelloAnswer = frame::read(&mut stream).await.unwrap().unwrap();
@@ -164,11 +170,17 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
         .unwrap();
     let answer: HelloAnswer = frame::read(&mut stream).await.unwrap().unwrap();
     assert!(
-        matches!(answer, HelloAnswer::Incompatible { api: 1, .. }),
+        matches!(
+            answer,
+            HelloAnswer::Incompatible {
+                api: API_VERSION,
+                ..
+            }
+        ),
         "{answer:?}"
     );
     let mut stream = UnixStream::connect(&socket).await.unwrap();
-    frame::write(&mut stream, &json!({"api": 1, "client": "test"}))
+    frame::write(&mut stream, &json!({"api": API_VERSION, "client": "test"}))
         .await
         .unwrap();
     let _welcome: HelloAnswer = frame::read(&mut stream).await.unwrap().unwrap();
@@ -186,7 +198,7 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
 
     // The same request as a typed client sends it is served.
     let mut stream = UnixStream::connect(&socket).await.unwrap();
-    frame::write(&mut stream, &json!({"api": 1, "client": "test"}))
+    frame::write(&mut stream, &json!({"api": API_VERSION, "client": "test"}))
         .await
         .unwrap();
     let _welcome: HelloAnswer = frame::read(&mut stream).await.unwrap().unwrap();

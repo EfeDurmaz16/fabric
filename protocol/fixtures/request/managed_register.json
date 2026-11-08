@@ -1,0 +1,20 @@
+{
+  "op": "managed_register",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "expected_revision": "3",
+  "parent": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+  "label": "cargo test",
+  "class": "test",
+  "program": {
+    "argv": [
+      "cargo",
+      "test",
+      "--workspace"
+    ],
+    "cwd": "crates/app",
+    "env_allowlist": [
+      "CARGO_HOME"
+    ]
+  }
+}

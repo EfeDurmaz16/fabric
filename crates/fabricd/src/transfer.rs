@@ -32,8 +32,9 @@ pub const MANIFEST_DEADLINE: Duration = Duration::from_secs(30);
 /// How many times a batch is asked for again after a failure.
 const RETRIES: usize = 3;
 
-/// The longest bundle chain followed: ADR 0014's sixteen links and the full bundle under them.
-const MAX_CHAIN: usize = 17;
+/// The longest bundle chain followed: ADR 0014's links, as many as capture
+/// makes, and the full bundle under them.
+const MAX_CHAIN: usize = fabric_store::capture::MAX_BUNDLE_CHAIN as usize + 1;
 
 /// Runs `work` on the store off the async runtime, on a handle of its own.
 ///

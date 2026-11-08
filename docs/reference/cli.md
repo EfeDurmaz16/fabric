@@ -22,7 +22,8 @@ Work on jobs:
   psf      Read Portable Session Format containers
 
 Managed jobs:
-  managed  Make, cancel and read managed jobs (experimental)
+  managed  Make, cancel and read managed jobs, and the M5 operations on them (experimental)
+  facade   Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
 
 Global Options:
   -d, --debug            Print diagnostic detail on stderr
@@ -213,7 +214,7 @@ Make a job from a repository, rooted at ~/fabric/jobs/<id>/work
 
 Options:
       --goal <TEXT>        The goal in your words
-      --harness <HARNESS>  The harness: claude, codex or acp:<program> [default: claude]
+      --harness <HARNESS>  The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program> [default: claude]
       --repo <PATH>        The repository to clone into the job's root
 
 Global Options: See `fabric --help`
@@ -283,7 +284,7 @@ Arguments:
 
 Options:
       --force              Waive the preflight refusals that can be waived when pulling
-      --harness <HARNESS>  Continue under another harness: claude, codex or acp:<program>
+      --harness <HARNESS>  Continue under another harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>
       --headless           Run one turn without a terminal, print the answer and the session, and exit
       --on <NODE>          The node that holds the job, when this node has never seen it
       --prompt <TEXT>      The first message to send
@@ -546,13 +547,19 @@ Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.m
 
 ```text
 Usage: fabric managed <COMMAND>
-Make, cancel and read managed jobs (experimental)
+Make, cancel and read managed jobs, and the M5 operations on them (experimental)
 
 Commands:
-  create  Make a managed job from a repository
-  cancel  Cancel a managed job none of whose attempts may still run
-  status  One managed job: its revision, state, tasks and attempts
-  ls      Every managed job this node's authority holds [alias: list]
+  create      Make a managed job from a repository, a git revision, a snapshot, an imported directory or nothing
+  cancel      Cancel a managed job, or one task of it; a live attempt is stopped first
+  note        Record a decision with its reason, a question, or an answer on a job's history
+  register    Register a build or test task with the program it runs under a task of a job
+  checkpoint  Take a checkpoint cut of the job's live attempt; the attempt goes on
+  continue    Continue the job on a newly placed attempt: a quiescence, a cut, a placement
+  inspect     Everything the journal holds about a job: placements, continuations, notes, provider operations
+  import      Capture a directory on this node into a snapshot a job can start from, untouched
+  status      One managed job: its revision, state, tasks and attempts
+  ls          Every managed job this node's authority holds [alias: list]
 
 Global Options: See `fabric --help`
 
@@ -562,14 +569,42 @@ Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.m
 #### `fabric managed create`
 
 ```text
-Usage: fabric managed create [OPTIONS] --repo <PATH> --goal <TEXT>
-Make a managed job from a repository
+Usage: fabric managed create [OPTIONS] --goal <TEXT> <--repo <PATH>|--git <URI>|--commit <COMMIT>|--snapshot <SNAPSHOT>|--empty|--import <PATH>>
+Make a managed job from a repository, a git revision, a snapshot, an imported directory or nothing
 
 Options:
-      --goal <TEXT>          The goal in your words
-      --harness <HARNESS>    The harness: claude, codex or acp:<program> [default: claude]
-      --operation-key <KEY>  The command's key; the same key and arguments again give the same job
-      --repo <PATH>          The repository to clone into the job's workspace
+      --acceptance <ACCEPTANCE>
+          What the work must satisfy, in your words; repeatable
+      --allow-fidelity <ALLOW_FIDELITY>
+          A continuation fidelity to allow, by its name on the fidelity ladder; repeatable
+      --commit <COMMIT>
+          The exact commit, 40 or 64 lowercase hex characters
+      --disk-bytes <DISK_BYTES>
+          The free disk a node needs to run the job, in bytes
+      --drain-budget <DRAIN_BUDGET>
+          How long a quiescence may take, in milliseconds (1000 to 600000)
+      --empty
+          Start from nothing
+      --export <EXPORT>
+          A workspace path that may leave the node although it looks like a secret; repeatable
+      --git <URI>
+          A git URI (https, ssh, git+ssh or file) to clone; needs --commit
+      --goal <TEXT>
+          The goal in your words
+      --harness <HARNESS>
+          The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program> [default: claude]
+      --import <PATH>
+          A directory on this node the node imports into a snapshot first, untouched
+      --operation-key <KEY>
+          The command's key; the same key and arguments again give the same job
+      --pin <PIN>
+          The one node the job may run on
+      --repo <PATH>
+          A repository on this node to clone into the job's workspace
+      --secret <SECRETS>
+          A secret the tasks need by name ([A-Z0-9_]); repeatable
+      --snapshot <SNAPSHOT>
+          A published snapshot to start from
 
 Global Options: See `fabric --help`
 
@@ -584,7 +619,7 @@ Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.m
 
 ```text
 Usage: fabric managed cancel [OPTIONS] <JOB>
-Cancel a managed job none of whose attempts may still run
+Cancel a managed job, or one task of it; a live attempt is stopped first
 
 Arguments:
   <JOB>  The job
@@ -593,6 +628,7 @@ Options:
       --expected-revision <REVISION>  Refuse unless the job is at this revision
       --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
       --reason <TEXT>                 Why, for the journal [default: ""]
+      --task <TASK>                   The task to cancel; the whole job without it
 
 Global Options: See `fabric --help`
 
@@ -601,6 +637,153 @@ Examples:
     fabric managed cancel <JOB> --expected-revision <REVISION>
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-cancel
+```
+
+#### `fabric managed note`
+
+```text
+Usage: fabric managed note [OPTIONS] <--question <QUESTION>|--decision <DECISION>|--answer <REVISION>> <JOB>
+Record a decision with its reason, a question, or an answer on a job's history
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --answer <REVISION>             The revision of the question this answers; needs --text
+      --decision <DECISION>           What was decided; needs --reason
+      --expected-revision <REVISION>  Refuse unless the job is at this revision
+      --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
+      --question <QUESTION>           A question left open
+      --reason <REASON>               Why it was decided
+      --text <TEXT>                   The answer's text
+
+Global Options: See `fabric --help`
+
+Examples:
+  Record a decision and why
+    fabric managed note <JOB> --decision <TEXT> --reason <TEXT>
+
+  Leave a question open
+    fabric managed note <JOB> --question <TEXT>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-note
+```
+
+#### `fabric managed register`
+
+```text
+Usage: fabric managed register [OPTIONS] --parent <PARENT> --label <LABEL> --class <CLASS> <JOB> -- <ARGV>...
+Register a build or test task with the program it runs under a task of a job
+
+Arguments:
+  <JOB>      The job
+  <ARGV>...  The command and its arguments, after `--`
+
+Options:
+      --class <CLASS>                 build or test
+      --cwd <CWD>                     Where it runs, relative to the attempt's root; the root without it
+      --env <ENV>                     A variable of the node's environment it may see, by name; repeatable
+      --expected-revision <REVISION>  Refuse unless the job is at this revision
+      --label <LABEL>                 Your label for it
+      --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
+      --parent <PARENT>               The task it is registered under
+
+Global Options: See `fabric --help`
+
+Examples:
+  Register a test task under a task of the job
+    fabric managed register <JOB> --parent <TASK> --label <TEXT> --class test -- cargo test
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-register
+```
+
+#### `fabric managed checkpoint`
+
+```text
+Usage: fabric managed checkpoint [OPTIONS] <JOB>
+Take a checkpoint cut of the job's live attempt; the attempt goes on
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --expected-revision <REVISION>  Refuse unless the job is at this revision
+      --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
+
+Global Options: See `fabric --help`
+
+Examples:
+  Cut the live attempt and let it go on
+    fabric managed checkpoint <JOB>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-checkpoint
+```
+
+#### `fabric managed continue`
+
+```text
+Usage: fabric managed continue [OPTIONS] <JOB>
+Continue the job on a newly placed attempt: a quiescence, a cut, a placement
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --allow-fidelity <ALLOW_FIDELITY>
+          A fidelity this continuation may achieve; repeatable; the job's allowance without it
+      --expected-revision <REVISION>
+          Refuse unless the job is at this revision
+      --operation-key <KEY>
+          The command's key; the same key and arguments again give the same answer
+      --pin <PIN>
+          The one node the new attempt may run on
+
+Global Options: See `fabric --help`
+
+Examples:
+  Continue the job on a named node
+    fabric managed continue <JOB> --pin <NODE>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-continue
+```
+
+#### `fabric managed inspect`
+
+```text
+Usage: fabric managed inspect <JOB>
+Everything the journal holds about a job: placements, continuations, notes, provider operations
+
+Arguments:
+  <JOB>  The job
+
+Global Options: See `fabric --help`
+
+Examples:
+  Read the job's placements and continuations
+    fabric managed inspect <JOB>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-inspect
+```
+
+#### `fabric managed import`
+
+```text
+Usage: fabric managed import [OPTIONS] <DIR>
+Capture a directory on this node into a snapshot a job can start from, untouched
+
+Arguments:
+  <DIR>  The directory
+
+Options:
+      --export <EXPORT>  A path that may leave although it looks like a secret; repeatable
+
+Global Options: See `fabric --help`
+
+Examples:
+  Capture a directory into a snapshot
+    fabric managed import <PATH>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-import
 ```
 
 #### `fabric managed status`
@@ -636,6 +819,244 @@ Examples:
     fabric managed ls
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-managed-ls
+```
+
+### `fabric facade`
+
+```text
+Usage: fabric facade <COMMAND>
+Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
+
+Commands:
+  mint        Mint a token on this node's authority; the bearer is printed once
+  revoke      Revoke a token by its id
+  submit      Submit a job to an authority
+  inspect     Inspect a job at its authority
+  watch       A page of a job's events after a cursor
+  cancel      Cancel a job or one task at its authority
+  checkpoint  Checkpoint a job at its authority
+  continue    Continue a job at its authority
+
+Global Options: See `fabric --help`
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade
+```
+
+#### `fabric facade mint`
+
+```text
+Usage: fabric facade mint [OPTIONS] --actor <ACTOR> <--ttl-ms <TTL_MS>|--expires-ms <EXPIRES_MS>>
+Mint a token on this node's authority; the bearer is printed once
+
+Options:
+      --actor <ACTOR>            Who acts under the token: 1 to 64 characters of [A-Za-z0-9._-]
+      --expires-ms <EXPIRES_MS>  When the token stops working, in Unix milliseconds
+      --job <JOBS>               A job the token may act on; repeatable; every owned job without it
+      --node <NODES>             A node the token may pin or place on; repeatable; any node without it
+      --ttl-ms <TTL_MS>          How long the token works from now, in milliseconds
+
+Global Options: See `fabric --help`
+
+Examples:
+  Mint a token that works for an hour
+    fabric facade mint --actor <ACTOR> --ttl-ms 3600000
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-mint
+```
+
+#### `fabric facade revoke`
+
+```text
+Usage: fabric facade revoke <TOKEN_ID>
+Revoke a token by its id
+
+Arguments:
+  <TOKEN_ID>  The token
+
+Global Options: See `fabric --help`
+
+Examples:
+  Revoke a token
+    fabric facade revoke <TOKEN_ID>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-revoke
+```
+
+#### `fabric facade submit`
+
+```text
+Usage: fabric facade submit [OPTIONS] --authority <AUTHORITY> --token <TOKEN> --goal <TEXT> <--empty|--snapshot <SNAPSHOT>|--git <URI>|--commit <COMMIT>>
+Submit a job to an authority
+
+Options:
+      --acceptance <ACCEPTANCE>
+          What the work must satisfy, in your words; repeatable
+      --allow-fidelity <ALLOW_FIDELITY>
+          A continuation fidelity to allow, by its name on the fidelity ladder; repeatable
+      --authority <AUTHORITY>
+          The authority node; this node's own id is allowed
+      --commit <COMMIT>
+          The exact commit, 40 or 64 lowercase hex characters
+      --disk-bytes <DISK_BYTES>
+          The free disk a node needs to run the job, in bytes
+      --drain-budget <DRAIN_BUDGET>
+          How long a quiescence may take, in milliseconds (1000 to 600000)
+      --empty
+          Start from nothing
+      --export <EXPORT>
+          A workspace path that may leave the node although it looks like a secret; repeatable
+      --git <URI>
+          A git URI (https, ssh, git+ssh or file) to clone; needs --commit
+      --goal <TEXT>
+          The goal in your words
+      --harness <HARNESS>
+          The harness: claude, codex or acp:<program> [default: claude]
+      --operation-key <KEY>
+          The command's key; the same key and arguments again give the same answer
+      --pin <PIN>
+          The one node the job may run on
+      --secret <SECRETS>
+          A secret the tasks need by name ([A-Z0-9_]); repeatable
+      --snapshot <SNAPSHOT>
+          A published snapshot to start from
+      --token <TOKEN>
+          The bearer, 64 lowercase hex characters, as `fabric facade mint` printed it
+
+Global Options: See `fabric --help`
+
+Examples:
+  Submit a job from nothing to an authority
+    fabric facade submit --authority <NODE> --token <BEARER> --empty --goal <TEXT>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-submit
+```
+
+#### `fabric facade inspect`
+
+```text
+Usage: fabric facade inspect --authority <AUTHORITY> --token <TOKEN> <JOB>
+Inspect a job at its authority
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --authority <AUTHORITY>  The authority node; this node's own id is allowed
+      --token <TOKEN>          The bearer, 64 lowercase hex characters, as `fabric facade mint` printed it
+
+Global Options: See `fabric --help`
+
+Examples:
+  Inspect a job at its authority
+    fabric facade inspect --authority <NODE> --token <BEARER> <JOB>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-inspect
+```
+
+#### `fabric facade watch`
+
+```text
+Usage: fabric facade watch [OPTIONS] --authority <AUTHORITY> --token <TOKEN> <JOB>
+A page of a job's events after a cursor
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --after <AFTER>          The last event sequence you have; the first event without it
+      --authority <AUTHORITY>  The authority node; this node's own id is allowed
+      --token <TOKEN>          The bearer, 64 lowercase hex characters, as `fabric facade mint` printed it
+      --wait-ms <WAIT_MS>      How long the authority waits for a first event, in milliseconds (0 to 25000)
+
+Global Options: See `fabric --help`
+
+Examples:
+  Wait up to 20 seconds for the job's next events
+    fabric facade watch --authority <NODE> --token <BEARER> <JOB> --wait-ms 20000
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-watch
+```
+
+#### `fabric facade cancel`
+
+```text
+Usage: fabric facade cancel [OPTIONS] --authority <AUTHORITY> --token <TOKEN> <JOB>
+Cancel a job or one task at its authority
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --authority <AUTHORITY>         The authority node; this node's own id is allowed
+      --expected-revision <REVISION>  Refuse unless the job is at this revision
+      --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
+      --reason <TEXT>                 Why [default: ""]
+      --task <TASK>                   The task; the whole job without it
+      --token <TOKEN>                 The bearer, 64 lowercase hex characters, as `fabric facade mint` printed it
+
+Global Options: See `fabric --help`
+
+Examples:
+  Cancel a job at its authority
+    fabric facade cancel --authority <NODE> --token <BEARER> <JOB>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-cancel
+```
+
+#### `fabric facade checkpoint`
+
+```text
+Usage: fabric facade checkpoint [OPTIONS] --authority <AUTHORITY> --token <TOKEN> <JOB>
+Checkpoint a job at its authority
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --authority <AUTHORITY>         The authority node; this node's own id is allowed
+      --expected-revision <REVISION>  Refuse unless the job is at this revision
+      --operation-key <KEY>           The command's key; the same key and arguments again give the same answer
+      --token <TOKEN>                 The bearer, 64 lowercase hex characters, as `fabric facade mint` printed it
+
+Global Options: See `fabric --help`
+
+Examples:
+  Checkpoint a job at its authority
+    fabric facade checkpoint --authority <NODE> --token <BEARER> <JOB>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-checkpoint
+```
+
+#### `fabric facade continue`
+
+```text
+Usage: fabric facade continue [OPTIONS] --authority <AUTHORITY> --token <TOKEN> <JOB>
+Continue a job at its authority
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --allow-fidelity <ALLOW_FIDELITY>
+          A fidelity this continuation may achieve; repeatable
+      --authority <AUTHORITY>
+          The authority node; this node's own id is allowed
+      --expected-revision <REVISION>
+          Refuse unless the job is at this revision
+      --operation-key <KEY>
+          The command's key; the same key and arguments again give the same answer
+      --pin <PIN>
+          The one node the new attempt may run on
+      --token <TOKEN>
+          The bearer, 64 lowercase hex characters, as `fabric facade mint` printed it
+
+Global Options: See `fabric --help`
+
+Examples:
+  Continue a job on a named node
+    fabric facade continue --authority <NODE> --token <BEARER> <JOB> --pin <NODE>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-continue
 ```
 
 ### `fabric help`

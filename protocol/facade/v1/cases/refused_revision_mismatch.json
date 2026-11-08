@@ -1,0 +1,15 @@
+{
+  "case": "refused_revision_mismatch",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "refused",
+    "facade": 1,
+    "code": "revision_mismatch",
+    "reason": "revision",
+    "message": "revision_mismatch: revision",
+    "current_revision": "5"
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

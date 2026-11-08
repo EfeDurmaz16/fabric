@@ -1,0 +1,7 @@
+{
+  "op": "managed_import",
+  "path": "/Users/me/work/copy",
+  "export_allowlist": [
+    ".env.example"
+  ]
+}

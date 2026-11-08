@@ -1,6 +1,6 @@
 [package]
 name = "fabric-store"
-version = "0.1.0"
+version.workspace = true
 description = "Content-addressed object store, SQLite catalog, workspace capture and restore for Fabric"
 edition.workspace = true
 license.workspace = true

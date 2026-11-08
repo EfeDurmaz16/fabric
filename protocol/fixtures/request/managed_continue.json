@@ -1,0 +1,12 @@
+{
+  "op": "managed_continue",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "expected_revision": "6",
+  "fidelity": [
+    "native_session",
+    "new_native_session_with_package",
+    "workspace_only"
+  ],
+  "pin": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+}

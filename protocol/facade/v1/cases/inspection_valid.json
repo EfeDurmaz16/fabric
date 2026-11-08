@@ -1,0 +1,66 @@
+{
+  "case": "inspection_valid",
+  "direction": "authority_to_client",
+  "message": {
+    "type": "inspection",
+    "facade": 1,
+    "job": {
+      "job": "01K8W3A00000000000000000J1",
+      "revision": "3",
+      "generation": "1",
+      "state": "active",
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "primary_task": "01K8W3A00000000000000000T1",
+      "tasks": [
+        {
+          "task": "01K8W3A00000000000000000T1",
+          "state": "open",
+          "class": "harness"
+        }
+      ],
+      "attempts": [
+        {
+          "attempt": "01K8W3A00000000000000000A1",
+          "task": "01K8W3A00000000000000000T1",
+          "generation": "1",
+          "status": "running"
+        }
+      ]
+    },
+    "parked": false,
+    "placements": [
+      {
+        "seq": "3",
+        "kind": "initial",
+        "chosen": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+        "candidates": [
+          {
+            "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+            "verdict": {
+              "eligible": {
+                "rank": [
+                  "bundle_chain",
+                  {
+                    "load": 120
+                  },
+                  "identity"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "continuations": [],
+    "notes": [],
+    "provider_operations": [],
+    "blockers": [],
+    "residuals": []
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

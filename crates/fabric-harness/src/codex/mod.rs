@@ -111,7 +111,7 @@ use fabric_core::session::SessionId;
 use tracing::{info, warn};
 
 use crate::error::{HarnessError, Input, IoOp};
-use crate::harness::{Harness, Installed, Launch, Restored, Running, TurnReport};
+use crate::harness::{Fidelity, Harness, Installed, Launch, Restored, Running, TurnReport};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::place::{self, Relation};
@@ -1050,6 +1050,10 @@ impl Codex {
 impl Harness for Codex {
     fn kind(&self) -> HarnessKind {
         HarnessKind::Codex
+    }
+
+    fn fidelity(&self) -> Fidelity {
+        Fidelity::NativeSession
     }
 
     fn detect(&self) -> BoxFuture<'_, Result<Option<Installed>, HarnessError>> {

@@ -31,5 +31,7 @@ pub mod restore;
 pub mod store;
 pub mod writer;
 
+pub use crate::durable::write_atomic;
+
 #[cfg(test)]
 mod crash_tests;

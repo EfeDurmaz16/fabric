@@ -1,0 +1,21 @@
+{
+  "case": "report_token_mismatch",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "report",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "observation": {
+      "kind": "started",
+      "attempt": "01K8W3A00000000000000000A2",
+      "generation": "1"
+    }
+  },
+  "expect": {
+    "outcome": "reject",
+    "reason": "token_mismatch"
+  }
+}

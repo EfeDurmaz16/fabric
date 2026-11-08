@@ -76,6 +76,29 @@ impl Drop for TempFile {
     }
 }
 
+/// Replaces `path` with `bytes`, durable at return: a new temp file in the
+/// same directory, flushed, renamed onto the name, then the directory flushed.
+///
+/// The temp name holds the process id and a counter (`temp_path`) and is
+/// created with `O_EXCL`, so a link planted at a guessable name is never
+/// written through, and two processes writing one name never share a temp file.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let tmp = TempFile::in_dir(dir);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp.path())?;
+    file.write_all(bytes)?;
+    full_fsync(&file)?;
+    drop(file);
+    fs::rename(tmp.path(), path)?;
+    fsync_dir(dir)
+}
+
 /// What `publish_noclobber` found at the final name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Published {

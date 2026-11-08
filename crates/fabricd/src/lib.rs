@@ -12,25 +12,37 @@
 //! command finishes or refuses with the command that resolves it.
 
 mod authority;
+mod capturer;
 mod carry;
 mod catchup;
 pub mod clock;
 mod control;
+mod dispatch;
 mod doctor;
 pub mod durable;
 pub mod error;
+pub mod executor;
+mod facade;
 mod facts;
 mod faults;
 pub mod harnesses;
 mod job;
+mod launch;
 mod ledger_file;
 mod local;
 mod managed;
+mod managed_ops;
 pub mod node;
 mod ops;
+mod package;
 pub mod paths;
+mod placement;
 mod psf;
+mod report;
+mod runner;
+pub mod secrets;
 mod service;
+pub mod sources;
 mod stamp;
 pub mod tool_env;
 mod transfer;

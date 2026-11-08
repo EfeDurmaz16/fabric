@@ -79,13 +79,12 @@ pub(crate) fn create() -> Command {
         intent: Intent {
             goal: "make the greeting louder".into(),
             harness: HarnessKind::Codex,
+            acceptance: Vec::new(),
         },
         source: SourceBinding::Repository {
             path: AbsPath::parse("/src/repo").unwrap(),
         },
-        policy: JobPolicy {
-            restart: RestartPolicy::ExplicitOnly,
-        },
+        policy: JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly),
     }
 }
 
@@ -254,7 +253,8 @@ fn a_restart_keeps_identity_and_progress_and_makes_a_dispatch_unknown() {
         refused.result,
         StoredResult::Rejected(DomainError::AttemptStillLive { .. })
     ));
-    // A second recovery changes nothing more.
+    // A second recovery changes nothing more; the explicit grant stood in
+    // for the create's initial placement, so no effect waits.
     let again = f.journal.recover(4_000, |_| Liveness::CannotTell).unwrap();
     assert_eq!(again, Recovery::default());
     // The executor's late report settles it.
@@ -408,11 +408,25 @@ fn events_and_evidence_are_append_only_and_tampering_is_found() {
                 attempt: attempt.id,
                 generation: attempt.generation,
                 snapshot,
+                cut: fabric_core::managed::CheckpointCut {
+                    snapshot,
+                    receipts: vec![fabric_core::managed::TaskReceipt {
+                        task: attempt.task,
+                        class: fabric_core::managed::TaskClass::Harness,
+                        status: fabric_core::managed::ReceiptStatus::Checkpointed { snapshot },
+                        exit: None,
+                        interrupted: true,
+                        workspace: None,
+                    }],
+                    facts: Vec::new(),
+                    evidence: Vec::new(),
+                },
             },
             2_000,
         )
         .unwrap();
-    assert_eq!(count(&f.path(), "evidence"), 1);
+    // The snapshot's evidence row and the cut's.
+    assert_eq!(count(&f.path(), "evidence"), 2);
 
     let conn = Connection::open(f.path()).unwrap();
     assert!(conn.execute("UPDATE events SET at_ms = 0", []).is_err());
@@ -548,4 +562,30 @@ fn events_page_in_order() {
     assert_eq!(page, all[2..4].to_vec());
     assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
     assert_eq!(all[0].frame.prev, None);
+}
+
+/// The receipts read of one job never scans the events table: it searches
+/// `events_by_job` for that job alone, whatever other jobs hold.
+#[test]
+fn the_receipts_read_searches_one_jobs_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::create(&dir.path().join(FILE_NAME), NODE, 1).unwrap();
+    let plan: Vec<String> = journal
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {RECEIPTS_SQL}"))
+        .unwrap()
+        .query_map([JobId::from_bytes([1; 16]).to_bytes()], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter().any(|step| step.contains("events_by_job")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.starts_with("SCAN events")),
+        "{plan:?}"
+    );
 }

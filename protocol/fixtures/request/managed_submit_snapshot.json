@@ -1,0 +1,16 @@
+{
+  "op": "managed_submit",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "goal": "Continue the import",
+  "harness": {
+    "kind": "acp",
+    "program": "my-agent",
+    "args": [
+      "--headless"
+    ]
+  },
+  "source": {
+    "kind": "snapshot",
+    "snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "fabric-psf"
-version = "0.1.0"
+version.workspace = true
 description = "The Portable Session Format v1: read, check, write and project a coding-agent job as a container any program can read"
 edition.workspace = true
 license.workspace = true

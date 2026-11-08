@@ -1,11 +1,27 @@
 [package]
 name = "fabric"
-version = "0.1.0"
+version.workspace = true
 description = "The fabric command: run the node, pair nodes, and make, run, suspend, move and resume jobs"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# A crate cargo-dist ships (dist-workspace.toml), with the one binary users
+# install; the fixtures stay out of the archive. The formula is fabric-node,
+# not fabric: homebrew-core has a fabric (the Python SSH tool, binary fab),
+# and two formulae with one name share Cellar/fabric, so a user with it
+# installed could not install this one. The binary is still fabric.
+[package.metadata.dist]
+dist = true
+formula = "fabric-node"
+
+[package.metadata.dist.binaries]
+aarch64-apple-darwin = ["fabric"]
+x86_64-apple-darwin = ["fabric"]
+x86_64-unknown-linux-gnu = ["fabric"]
 
 [features]
 # Named fault points in the node, for the end-to-end test only.
@@ -35,6 +51,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
+# The sync scenario of the bench (tests/e2e/sync_bench.rs) drives the library.
+fabric-sync = { path = "../fabric-sync" }
 # The end-to-end test runs this package's binaries with the fault points,
 # the fake agent and the counted system tools built in; this turns them on
 # for test builds only.
@@ -43,6 +61,9 @@ fabric = { path = ".", features = ["counted-tools", "faults", "fixtures"] }
 # controlling terminal; rustix is already a dependency of this package.
 rustix = { version = "1.1", features = ["fs", "process", "pty", "termios"] }
 tempfile = "3.27"
+# The provider read-surface test seeds a stopped daemon's managed journal
+# with provider operations, which only the bridge path writes.
+fabric-journal = { path = "../fabric-journal" }
 # The time budget reads its limits from budget.toml; fabricd and fabric-env
 # already build this crate.
 toml = { version = "1.1", default-features = false, features = ["std", "parse"] }

@@ -6,7 +6,9 @@
 # `bench::m2_paths` (job creation, first headless launch, ledger appends,
 # CLI cold start and a CLI round trip to the node). Both use the e2e
 # fixture: two nodes over QUIC on loopback, test profile, fake probed
-# programs that answer after 50 ms.
+# programs that answer after 50 ms. Last, `sync_bench::counters` records
+# what fabric-sync sends for a dirty tree with a node_modules: counters,
+# which do not depend on the machine's load.
 #
 # Every run's whole output is kept in the output directory, with the
 # commit, the machine and its load before and after, so a later run on a
@@ -70,6 +72,11 @@ echo "bench, $reps runs" >&2
 FABRIC_BENCH_REPS=$reps cargo test -p fabric --test e2e --locked -- \
   --ignored --exact bench::m2_paths --nocapture >"$out/bench.log" 2>&1
 machine
+
+# Counters, not times: what fabric-sync sends for the bench tree.
+cargo test -p fabric --test e2e --locked -- \
+  --ignored --exact sync_bench::counters --nocapture >"$out/sync.log" 2>&1
+grep '^COUNTER' "$out/sync.log" | cut -f2- >"$out/sync-counters.tsv"
 
 # The raw samples of the bench, op, run and microseconds, tab separated.
 grep '^RAW' "$out/bench.log" | cut -f2- >"$out/bench-raw.tsv"

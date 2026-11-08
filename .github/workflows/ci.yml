@@ -128,9 +128,13 @@ jobs:
       # must build clean, not only the default set.
       - name: Clippy per feature
         run: |
-          for features in "" acp claude codex; do
+          for features in "" acp claude codex cursor gemini opencode pi; do
             cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features "$features" -- -D warnings
           done
+          # The fabric-sync users build: its tests turn on the fault points
+          # through a dev-dependency on itself, so --all-targets never lints
+          # the build without them.
+          cargo clippy -p fabric-sync --lib --bins --locked -- -D warnings
 
       # The end-to-end test runs in the next step, so its time and its
       # failures show on their own line.

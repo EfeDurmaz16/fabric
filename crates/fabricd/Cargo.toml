@@ -1,6 +1,6 @@
 [package]
 name = "fabricd"
-version = "0.1.0"
+version.workspace = true
 description = "The Fabric node: state directory, job ledgers, the store, the network service and the control socket"
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-# Named fault points the end-to-end test drives through FABRIC_FAULT; off
+# Named fault points the end-to-end test drives through FABRIC_FAULT, and
+# the link capture it reads through FABRIC_NET_TAP; off
 # in every build that is not a test.
-faults = []
+faults = ["fabric-net/tap"]
 
 [dependencies]
 blake3 = "1.8"

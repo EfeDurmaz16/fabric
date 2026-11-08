@@ -13,17 +13,19 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId};
-use fabric_core::managed::{OperationKey, WorkRevision};
+use fabric_core::managed::{OperationKey, TaskId, WorkRevision};
 use fabric_core::session::SessionId;
 use fabric_core::version::HarnessVersion;
 use tokio::net::UnixStream;
 
 use crate::api::{
-    API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Exported, Hello, HelloAnswer,
-    JobCreated, JobList, JobLog, JobStatus, Lease, ManagedJob, ManagedJobs, ManagedOperation,
-    NodeIdentity, Op, Paired, PeerList, Pong, PsfExported, Refusal, Registered, Repaired, Reply,
-    Request, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
+    API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Exported, FidelityName, Hello,
+    HelloAnswer, Imported, Inspection, JobCreated, JobList, JobLog, JobScopeWire, JobStatus, Lease,
+    ManagedJob, ManagedJobs, ManagedOperation, Minted, NodeIdentity, NoteWire, Op, Paired,
+    PeerList, Pong, ProgramWire, PsfExported, Refusal, RegisterClass, Registered, Repaired, Reply,
+    Request, ResourceScopeWire, Revoked, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
 };
+use crate::facade::{ClientMessage, FacadeAnswer, ProtocolViolation, Submit};
 use crate::frame::{self, FrameError};
 
 /// Why a call did not get its reply.
@@ -105,6 +107,9 @@ pub enum ClientError {
     /// The node refused or failed the command.
     #[error("{0}")]
     Refused(Refusal),
+    /// The authority's facade answer was not one this client reads.
+    #[error(transparent)]
+    Facade(#[from] ProtocolViolation),
 }
 
 /// A client of the node whose control socket is at a path.
@@ -527,6 +532,8 @@ impl Client {
             repo,
             goal,
             harness,
+            acceptance: Vec::new(),
+            policy: None,
         };
         match self.call(&request, on_event).await? {
             Reply::ManagedCreate(reply) => Ok(*reply),
@@ -549,6 +556,7 @@ impl Client {
             job,
             expected_revision,
             reason,
+            task: None,
         };
         match self.call(&request, on_event).await? {
             Reply::ManagedCancel(reply) => Ok(*reply),
@@ -576,6 +584,210 @@ impl Client {
         match self.call(&Request::ManagedList, on_event).await? {
             Reply::ManagedList(reply) => Ok(reply),
             other => Err(unexpected(Op::ManagedList, &other)),
+        }
+    }
+
+    /// Makes a managed job from a source that is not a repository on the
+    /// node (M5); `key` as for [`Client::managed_create`].
+    pub async fn managed_submit(
+        &self,
+        key: OperationKey,
+        submit: Submit,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedSubmit {
+            operation_key: key,
+            goal: submit.goal,
+            harness: submit.harness,
+            acceptance: submit.acceptance,
+            source: submit.source,
+            policy: submit.policy,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedSubmit(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedSubmit, &other)),
+        }
+    }
+
+    /// Records a note on a managed job (M5); `key` as for [`Client::managed_create`].
+    pub async fn managed_note(
+        &self,
+        key: OperationKey,
+        job: JobId,
+        expected_revision: Option<WorkRevision>,
+        note: NoteWire,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedNote {
+            operation_key: key,
+            job,
+            expected_revision,
+            note,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedNote(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedNote, &other)),
+        }
+    }
+
+    /// Registers a build or test task with its program under `parent` (M5,
+    /// the launch path); `key` as for [`Client::managed_create`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per field of the request, as the wire names them"
+    )]
+    pub async fn managed_register(
+        &self,
+        key: OperationKey,
+        job: JobId,
+        expected_revision: Option<WorkRevision>,
+        parent: TaskId,
+        label: String,
+        class: RegisterClass,
+        program: ProgramWire,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedRegister {
+            operation_key: key,
+            job,
+            expected_revision,
+            parent,
+            label,
+            class,
+            program,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedRegister(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedRegister, &other)),
+        }
+    }
+
+    /// Takes a checkpoint cut of a managed job's live attempt (M5).
+    pub async fn managed_checkpoint(
+        &self,
+        key: OperationKey,
+        job: JobId,
+        expected_revision: Option<WorkRevision>,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedCheckpoint {
+            operation_key: key,
+            job,
+            expected_revision,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedCheckpoint(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedCheckpoint, &other)),
+        }
+    }
+
+    /// Continues a managed job on a newly placed attempt (M5).
+    pub async fn managed_continue(
+        &self,
+        key: OperationKey,
+        job: JobId,
+        expected_revision: Option<WorkRevision>,
+        fidelity: Option<Vec<FidelityName>>,
+        pin: Option<NodeId>,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedContinue {
+            operation_key: key,
+            job,
+            expected_revision,
+            fidelity,
+            pin,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedContinue(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedContinue, &other)),
+        }
+    }
+
+    /// Everything the journal holds about one managed job (M5).
+    pub async fn managed_inspect(
+        &self,
+        job: JobId,
+        on_event: impl FnMut(Event),
+    ) -> Result<Inspection, ClientError> {
+        match self
+            .call(&Request::ManagedInspect { job }, on_event)
+            .await?
+        {
+            Reply::ManagedInspect(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedInspect, &other)),
+        }
+    }
+
+    /// Captures a directory on the node into a snapshot (M5).
+    pub async fn managed_import(
+        &self,
+        path: SystemPath,
+        export_allowlist: Vec<String>,
+        on_event: impl FnMut(Event),
+    ) -> Result<Imported, ClientError> {
+        let request = Request::ManagedImport {
+            path,
+            export_allowlist,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedImport(reply) => Ok(reply),
+            other => Err(unexpected(Op::ManagedImport, &other)),
+        }
+    }
+
+    /// Mints a facade token on the node's authority (ADR 0027).
+    pub async fn facade_mint(
+        &self,
+        actor: String,
+        jobs: JobScopeWire,
+        resources: ResourceScopeWire,
+        expires_ms: u64,
+        on_event: impl FnMut(Event),
+    ) -> Result<Minted, ClientError> {
+        let request = Request::FacadeMint {
+            actor,
+            jobs,
+            resources,
+            expires_ms,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::FacadeMint(reply) => Ok(reply),
+            other => Err(unexpected(Op::FacadeMint, &other)),
+        }
+    }
+
+    /// Revokes a facade token.
+    pub async fn facade_revoke(
+        &self,
+        token_id: String,
+        on_event: impl FnMut(Event),
+    ) -> Result<Revoked, ClientError> {
+        match self
+            .call(&Request::FacadeRevoke { token_id }, on_event)
+            .await?
+        {
+            Reply::FacadeRevoke(reply) => Ok(reply),
+            other => Err(unexpected(Op::FacadeRevoke, &other)),
+        }
+    }
+
+    /// Sends one facade message to `authority` through the node and
+    /// returns the authority's answer, parsed as the facade protocol reads
+    /// an answer.
+    pub async fn facade_call(
+        &self,
+        authority: NodeId,
+        message: &ClientMessage,
+        on_event: impl FnMut(Event),
+    ) -> Result<FacadeAnswer, ClientError> {
+        let request = Request::FacadeCall {
+            authority,
+            message: message.to_json(),
+        };
+        match self.call(&request, on_event).await? {
+            Reply::FacadeCall(reply) => Ok(FacadeAnswer::from_json(&reply.message)?),
+            other => Err(unexpected(Op::FacadeCall, &other)),
         }
     }
 

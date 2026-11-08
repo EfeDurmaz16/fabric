@@ -1,0 +1,8 @@
+{
+  "op": "managed_cancel",
+  "operation_key": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "expected_revision": "3",
+  "reason": "stop the test",
+  "task": "01JABCDEFGHJKMNPQRSTVWXYZ3"
+}

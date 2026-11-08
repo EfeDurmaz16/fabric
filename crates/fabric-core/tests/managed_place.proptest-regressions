@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc eed2f0039476f87734de69a3e7293708bab30277ee01b941c5949b6750db3665 # shrinks to probes = [Probe { node: NodeId(fab1aucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucq), advert: None, secrets_unresolved: [], probe_ms: 1 }, Probe { node: NodeId(fab1aucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucq), advert: Some(NodeAdvert { node: NodeId(fab1aucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucqkbifaucq), platform: Platform { os: "macos", arch: "arm64" }, harnesses: [HarnessInventory { kind: Codex, version: HarnessVersion { core: [0, 50, 0], pre: [], text: "0.50.0" } }], layout: PathLayout { home: AbsPath("/Users/me"), root: AbsPath("/Users/me/fabric/j") }, capacity: Capacity { load_1m_milli: 0, free_disk_bytes: 0 }, warmth: Warmth { bundle_chain: false, workspace: false }, measured_at_ms: 1762128000000 }), secrets_unresolved: [], probe_ms: 1 }], shuffle = Index(9223372036854775808)

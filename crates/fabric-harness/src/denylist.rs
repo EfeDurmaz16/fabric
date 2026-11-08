@@ -61,6 +61,9 @@ const SECRET_NAMES: &[&str] = &[
     ".credentials.json",
     "credentials.json",
     "auth.json",
+    // Gemini CLI's OAuth tokens and signed-in accounts (`~/.gemini`).
+    "oauth_creds.json",
+    "google_accounts.json",
     ".claude.json",
     ".netrc",
     ".npmrc",
@@ -226,6 +229,8 @@ mod tests {
             "home/.claude/history.jsonl",
             "home/.claude/plugins/x/bin",
             "home/.codex/auth.json",
+            "home/.gemini/oauth_creds.json",
+            "home/.gemini/google_accounts.json",
             "home/.codex/state_5.sqlite",
             "home/.codex/thread_history_1.sqlite-wal",
             "home/.codex/thread-writer-locks/t.lock",

@@ -1,0 +1,122 @@
+{
+  "case": "launch_package_without_continuation",
+  "direction": "authority_to_node",
+  "message": {
+    "type": "launch",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A2",
+      "generation": "2"
+    },
+    "task": "01K8W3A00000000000000000T1",
+    "intent": {
+      "goal": "Make the tests pass",
+      "harness": {
+        "kind": "claude_code"
+      },
+      "acceptance": [
+        "cargo test passes"
+      ]
+    },
+    "source": {
+      "kind": "empty"
+    },
+    "policy": {
+      "drain_budget_ms": 30000,
+      "allowed_fidelity": [
+        "native_session",
+        "new_native_session_with_package"
+      ],
+      "secrets": [
+        {
+          "name": "API_TOKEN",
+          "attempt": "any",
+          "resource_kinds": [
+            "node"
+          ]
+        }
+      ],
+      "export_allowlist": [],
+      "disk_bytes": 2147483648,
+      "pin": null
+    },
+    "initial_checkpoint": "2222222222222222222222222222222222222222222222222222222222222222",
+    "snapshot_at": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "tasks": [],
+    "continuation": null,
+    "package": {
+      "version": 1,
+      "job": "01K8W3A00000000000000000J1",
+      "revision": "8",
+      "intent": {
+        "goal": "Make the tests pass",
+        "harness": {
+          "kind": "claude_code"
+        },
+        "acceptance": [
+          "cargo test passes"
+        ]
+      },
+      "decisions": [
+        {
+          "what": "Use the fake agent",
+          "reason": "the real one needs a login",
+          "revision": "2"
+        }
+      ],
+      "tasks": [
+        {
+          "task": "01K8W3A00000000000000000T1",
+          "class": "harness",
+          "state": "open",
+          "receipt": null
+        },
+        {
+          "task": "01K8W3A00000000000000000T2",
+          "class": "test",
+          "state": "open",
+          "receipt": {
+            "task": "01K8W3A00000000000000000T2",
+            "class": "test",
+            "status": "interrupted",
+            "exit": null,
+            "interrupted": true,
+            "workspace": null
+          }
+        }
+      ],
+      "workspace": {
+        "bundle_head": "2222222222222222222222222222222222222222222222222222222222222222",
+        "ledger_head": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "evidence": [
+        {
+          "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+          "attempt": "01K8W3A00000000000000000A1",
+          "kind": "checkpoint"
+        }
+      ],
+      "questions": [],
+      "artifacts": [],
+      "next_actions": [
+        "continue",
+        "checkpoint",
+        "cancel",
+        {
+          "finish_task": {
+            "task": "01K8W3A00000000000000000T2"
+          }
+        },
+        {
+          "register_task": {
+            "parent": "01K8W3A00000000000000000T1"
+          }
+        }
+      ]
+    }
+  },
+  "expect": {
+    "outcome": "reject",
+    "reason": "inconsistent"
+  }
+}

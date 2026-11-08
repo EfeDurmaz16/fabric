@@ -383,6 +383,10 @@ impl Seen {
                 HarnessKind::ClaudeCode,
                 HarnessKind::Codex,
                 HarnessKind::Acp { .. },
+                HarnessKind::OpenCode,
+                HarnessKind::Pi,
+                HarnessKind::GeminiCli,
+                HarnessKind::CursorAgent,
             ]
         );
         self.tagged("Harness", harness_tag(harness), index);
@@ -987,11 +991,27 @@ fn launched(message: &Value, pointer: &str) -> bool {
     in_plan || message.pointer(pointer).is_some_and(is_harness)
 }
 
+/// Whether the object at `pointer` is carried through unchanged rather
+/// than read: a facade message inside `facade_call`, which the node
+/// forwards byte for byte (docs/facade-protocol.md), and a placement
+/// verdict's rank and exclusion reasons, which a client keeps as they
+/// came so a reason it does not know still shows (ADR 0026).
+fn carried(message: &Value, pointer: &str) -> bool {
+    let facade_call = message
+        .get("op")
+        .or_else(|| message.get("kind"))
+        .and_then(Value::as_str)
+        == Some("facade_call");
+    (facade_call && pointer.starts_with("/message"))
+        || pointer.contains("/rank/")
+        || pointer.contains("/reasons/")
+}
+
 /// Whether `value` is a harness, by its kind.
 fn is_harness(value: &Value) -> bool {
     matches!(
         value.get("kind").and_then(Value::as_str),
-        Some("claude_code" | "codex" | "acp")
+        Some("claude_code" | "codex" | "acp" | "opencode" | "pi" | "gemini_cli" | "cursor_agent")
     )
 }
 
@@ -1028,7 +1048,15 @@ fn every_object_skips_a_field_it_does_not_know_outside_what_a_client_launches() 
                     .unwrap()
                     .insert("added_by_a_newer_node".to_owned(), unknown.clone());
                 let parsed = parse_as(dir, &grown);
-                if launched(&json, &pointer) {
+                if carried(&json, &pointer) {
+                    match parsed {
+                        Ok(read) => assert_eq!(
+                            read, grown,
+                            "{dir}/{name}: a field at {pointer:?} is carried as it came"
+                        ),
+                        Err(e) => panic!("{dir}/{name}: a field at {pointer:?} was refused: {e}"),
+                    }
+                } else if launched(&json, &pointer) {
                     assert!(
                         parsed.is_err(),
                         "{dir}/{name}: a field at {pointer:?} was skipped in what a client launches"
