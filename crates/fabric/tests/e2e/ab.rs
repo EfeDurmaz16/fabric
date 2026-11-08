@@ -23,8 +23,10 @@
 //!   page of counters, and each op records what all of them did while it
 //!   ran: the processes they started, by program; file flushes, by kind and
 //!   by class of file; opens, renames and unlinks; allocations; the bytes
-//!   and calls of every read and write, by class of file. Also the peak
-//!   resident size and CPU time of the CLI processes the op started, and
+//!   and calls of every read and write, by class of file; the instructions
+//!   all of them retired, where the machine counts them. Also the peak
+//!   resident size, peak physical footprint and CPU time of the CLI
+//!   processes the op started, and
 //!   each daemon's resident size and physical footprint after it. None of
 //!   this depends on how loaded the machine is. One warm-up run, then `FABRIC_AB_COUNTED` runs,
 //!   3 when unset.
@@ -89,7 +91,7 @@ const RESAMPLES: usize = 10_000;
 
 /// The scalar words of a counter page, by name, in the order of `enum
 /// word` in `scripts/perf-ab/counters.c`, which writes them.
-const WORDS: [&str; 17] = [
+const WORDS: [&str; 20] = [
     "magic",
     "pid",
     "exited",
@@ -107,6 +109,9 @@ const WORDS: [&str; 17] = [
     "malloc_bytes",
     "frees",
     "lock",
+    "instructions",
+    "cycles",
+    "phys_footprint",
 ];
 
 /// The classes of file a read, write or flush touches, in the order of
@@ -554,14 +559,17 @@ fn command(line: &str) -> String {
 
 /// The counters that add up across processes and over time.
 fn additive(name: &str) -> bool {
-    !matches!(name, "magic" | "pid" | "exited" | "maxrss" | "lock")
+    !matches!(
+        name,
+        "magic" | "pid" | "exited" | "maxrss" | "lock" | "phys_footprint"
+    )
 }
 
 /// What every process did between `before` and `after`: the change of each
 /// additive counter summed over the pages, each program's starts as
 /// `spawn:<program>`, and of the processes that started meanwhile but the
-/// daemons, how many there were, their CPU time and their largest peak
-/// resident size.
+/// daemons, how many there were, their CPU time, their largest peak
+/// resident size and their largest peak physical footprint.
 fn delta(before: &BTreeMap<String, Page>, after: &BTreeMap<String, Page>) -> BTreeMap<String, u64> {
     let mut out: BTreeMap<String, u64> = BTreeMap::new();
     let empty = BTreeMap::new();
@@ -588,6 +596,8 @@ fn delta(before: &BTreeMap<String, Page>, after: &BTreeMap<String, Page>) -> BTr
             *out.entry("cli_cpu_us".to_owned()).or_default() += page.counts["cpu_us"];
             let peak = out.entry("cli_maxrss_kib".to_owned()).or_default();
             *peak = (*peak).max(page.counts["maxrss"] / 1024);
+            let peak = out.entry("cli_footprint_kib".to_owned()).or_default();
+            *peak = (*peak).max(page.counts["phys_footprint"] / 1024);
         }
     }
     out
@@ -1067,7 +1077,7 @@ fn counted_report(samples: &[Sample], out: &mut String) {
     if ops.is_empty() {
         return;
     }
-    let columns: [(&str, &[&str]); 8] = [
+    let columns: [(&str, &[&str]); 10] = [
         ("spawns", &["spawns"]),
         ("full flushes", &["fullfsync"]),
         ("fsyncs", &["fsync"]),
@@ -1087,7 +1097,9 @@ fn counted_report(samples: &[Sample], out: &mut String) {
         ),
         ("allocations", &["mallocs"]),
         ("CLI peak RSS KiB", &["cli_maxrss_kib"]),
+        ("CLI peak footprint KiB", &["cli_footprint_kib"]),
         ("CLI CPU ms", &["cli_cpu_us"]),
+        ("instructions M", &["instructions"]),
     ];
     out.push_str(
         "\n### Counted ops\n\n\
@@ -1111,6 +1123,8 @@ fn counted_report(samples: &[Sample], out: &mut String) {
             }
             if *title == "CLI CPU ms" {
                 let _ = write!(out, " {:.1} -> {:.1} |", sum[0] / 1000.0, sum[1] / 1000.0);
+            } else if *title == "instructions M" {
+                let _ = write!(out, " {:.1} -> {:.1} |", sum[0] / 1e6, sum[1] / 1e6);
             } else {
                 let _ = write!(out, " {:.0} -> {:.0} |", sum[0], sum[1]);
             }
@@ -1128,7 +1142,10 @@ fn counted_report(samples: &[Sample], out: &mut String) {
             .iter()
             .filter(|sample| sample.phase == "counted" && sample.op == *op)
             .map(|sample| sample.metric.as_str())
-            .filter(|metric| !metric.starts_with("daemon_") && *metric != "cpu_us")
+            .filter(|metric| {
+                !metric.starts_with("daemon_")
+                    && !matches!(*metric, "cpu_us" | "instructions" | "cycles")
+            })
             .collect();
         let mut differs = Vec::new();
         for metric in metrics {
@@ -1318,6 +1335,7 @@ fn a_counter_page_reads_back() -> Fallible {
     };
     set(&mut bytes, 3, 8 << 20);
     set(&mut bytes, 8, 2);
+    set(&mut bytes, 19, 6 << 20);
     // write_bytes.ledger: the second class of the first group.
     set(&mut bytes, WORDS.len() + 1, 300);
     bytes[ROLE.0..ROLE.0 + 11].copy_from_slice(b"job approve");
@@ -1335,6 +1353,7 @@ fn a_counter_page_reads_back() -> Fallible {
     assert_eq!(changed["spawn:git"], 3);
     assert_eq!(changed["cli_processes"], 1);
     assert_eq!(changed["cli_maxrss_kib"], 8192);
+    assert_eq!(changed["cli_footprint_kib"], 6144);
     assert_eq!(Page::parse(&[0_u8; 4096])?, None);
     Ok(())
 }

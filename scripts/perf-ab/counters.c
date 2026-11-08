@@ -6,7 +6,11 @@
  * loaded the machine is: processes started, file flushes by kind, opens,
  * renames and unlinks, allocations, and the bytes and calls of every read
  * and write, by the class of file they touch. It also keeps the process's
- * peak resident size and CPU time.
+ * peak resident size, CPU time, retired instructions and cycles, and peak
+ * physical footprint, from getrusage(2) and proc_pid_rusage(3). A process
+ * notes those as it flushes, starts a program and exits; a daemon
+ * (`fabric serve`) also notes them every 10 ms from a thread of this
+ * library, so a reader between two of its calls sees them nearly current.
  *
  * Each `fabric` process maps a page of its own,
  * FABRIC_AB_COUNTS/<pid>.<ns>.page, shared with the file, so the e2e test
@@ -17,7 +21,12 @@
  * nothing and counts nothing; the calls pass straight through.
  *
  * macOS only: dyld's __interpose section replaces each function for every
- * image but this one, so the calls below reach the real functions.
+ * image but this one, so the calls below reach the real functions, and the
+ * instruction and footprint counts come from proc_pid_rusage, which Linux
+ * does not have. docs/evidence/perf-ab/README.md says why there is no
+ * LD_PRELOAD port: the durability path this counts (F_FULLFSYNC and
+ * F_BARRIERFSYNC) and the footprint are macOS's, and CI measures on
+ * macos-15.
  * Built by scripts/bench-ab.sh with `cc -dynamiclib -O2`.
  *
  * The layout is read by crates/fabric/tests/e2e/ab.rs; change both or
@@ -31,6 +40,8 @@
 
 #include <crt_externs.h>
 #include <fcntl.h>
+#include <libproc.h>
+#include <pthread.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -83,6 +94,9 @@ enum word {
     W_MALLOC_BYTES,
     W_FREES,
     W_LOCK,
+    W_INSTRUCTIONS,
+    W_CYCLES,
+    W_PHYS_FOOTPRINT,
     W_WRITE_BYTES,
     W_WRITE_CALLS = W_WRITE_BYTES + CLASSES,
     W_READ_BYTES = W_WRITE_CALLS + CLASSES,
@@ -104,11 +118,23 @@ static void add(int word, uint64_t n) {
     }
 }
 
-/* Notes the process's CPU time and peak resident size so far. */
+/*
+ * Notes the process's CPU time, peak resident size, instructions, cycles
+ * and peak physical footprint so far. Instructions and cycles stay 0 where
+ * the machine does not count them for the process, as in some virtual
+ * machines.
+ */
 static void note_usage(void) {
     struct rusage usage;
     if (page == NULL || getrusage(RUSAGE_SELF, &usage) != 0) {
         return;
+    }
+    struct rusage_info_v4 info;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&info) == 0) {
+        __atomic_store_n(&page[W_INSTRUCTIONS], info.ri_instructions, __ATOMIC_RELAXED);
+        __atomic_store_n(&page[W_CYCLES], info.ri_cycles, __ATOMIC_RELAXED);
+        __atomic_store_n(&page[W_PHYS_FOOTPRINT], info.ri_lifetime_max_phys_footprint,
+                         __ATOMIC_RELAXED);
     }
     uint64_t cpu = (uint64_t)usage.ru_utime.tv_sec * 1000000 + (uint64_t)usage.ru_utime.tv_usec
                    + (uint64_t)usage.ru_stime.tv_sec * 1000000 + (uint64_t)usage.ru_stime.tv_usec;
@@ -224,6 +250,17 @@ static void count_program(const char *path, char *const argv[]) {
     unlock();
 }
 
+/* A daemon's thread that notes its usage every 10 ms. */
+static void *refresh(void *unused) {
+    (void)unused;
+    struct timespec period = {0, 10 * 1000 * 1000};
+    for (;;) {
+        nanosleep(&period, NULL);
+        note_usage();
+    }
+    return NULL;
+}
+
 __attribute__((constructor)) static void start(void) {
     const char *dir = getenv("FABRIC_AB_COUNTS");
     if (dir == NULL || strcmp(getprogname(), "fabric") != 0) {
@@ -270,6 +307,12 @@ __attribute__((constructor)) static void start(void) {
     memcpy((void *)words, "FABAB\x01\0\0", 8);
     page = words;
     note_usage();
+    if (argc > 1 && strcmp(argv[1], "serve") == 0) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, refresh, NULL) == 0) {
+            pthread_detach(thread);
+        }
+    }
 }
 
 __attribute__((destructor)) static void stop(void) {
