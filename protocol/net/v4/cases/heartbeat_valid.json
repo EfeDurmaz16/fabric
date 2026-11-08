@@ -1,0 +1,22 @@
+{
+  "case": "heartbeat_valid",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "heartbeat",
+    "attempts": [
+      {
+        "job": "01K8W3A00000000000000000J1",
+        "attempt": "01K8W3A00000000000000000A1",
+        "generation": "1"
+      },
+      {
+        "job": "01K8W3A00000000000000000J1",
+        "attempt": "01K8W3A00000000000000000A2",
+        "generation": "2"
+      }
+    ]
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "case": "instruct_spawn",
+  "direction": "authority_to_node",
+  "message": {
+    "type": "instruct",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "instruction": {
+      "spawn": {
+        "task": "01K8W3A00000000000000000T2",
+        "class": "build",
+        "program": {
+          "argv": [
+            "cargo",
+            "build"
+          ],
+          "cwd": null,
+          "env_allowlist": []
+        }
+      }
+    }
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}

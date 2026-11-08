@@ -1,0 +1,19 @@
+{
+  "case": "heartbeat_too_many",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "heartbeat",
+    "attempts": {
+      "repeat": {
+        "job": "01K8W3A00000000000000000J1",
+        "attempt": "01K8W3A00000000000000000A1",
+        "generation": "1"
+      },
+      "count": 65
+    }
+  },
+  "expect": {
+    "outcome": "reject",
+    "reason": "too_many_attempts"
+  }
+}

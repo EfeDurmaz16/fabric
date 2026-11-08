@@ -17,7 +17,7 @@ import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The sha256 of protocol/facade/v1/manifest.sha256; change it with the Rust pin. */
-const MANIFEST_SHA256 = "88fcd0c54e37431acecd6c376f26fc9277d06cfdfe40c817466a1975dde9068c";
+const MANIFEST_SHA256 = "9023ae20621d336e809abe88b6af9eb9de4a5f38ec5fcf0d2800a9d87cde7f7a";
 
 const ROOT = fileURLToPath(new URL("../../../protocol/facade/v1/", import.meta.url));
 

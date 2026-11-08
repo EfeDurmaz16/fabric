@@ -1,0 +1,66 @@
+{
+  "case": "report_checkpointed",
+  "direction": "node_to_authority",
+  "message": {
+    "type": "report",
+    "token": {
+      "job": "01K8W3A00000000000000000J1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "observation": {
+      "kind": "checkpointed",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1",
+      "snapshot": "2222222222222222222222222222222222222222222222222222222222222222",
+      "cut": {
+        "snapshot": "2222222222222222222222222222222222222222222222222222222222222222",
+        "receipts": [
+          {
+            "task": "01K8W3A00000000000000000T1",
+            "class": "harness",
+            "status": {
+              "checkpointed": {
+                "snapshot": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            },
+            "exit": null,
+            "interrupted": false,
+            "workspace": {
+              "bundle_head": "2222222222222222222222222222222222222222222222222222222222222222",
+              "ledger_head": "3333333333333333333333333333333333333333333333333333333333333333"
+            }
+          },
+          {
+            "task": "01K8W3A00000000000000000T2",
+            "class": "test",
+            "status": "interrupted",
+            "exit": null,
+            "interrupted": true,
+            "workspace": null
+          }
+        ],
+        "facts": [
+          [
+            "os",
+            "macos"
+          ],
+          [
+            "arch",
+            "arm64"
+          ]
+        ],
+        "evidence": [
+          {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "attempt": "01K8W3A00000000000000000A1",
+            "kind": "checkpoint"
+          }
+        ]
+      }
+    }
+  },
+  "expect": {
+    "outcome": "accept"
+  }
+}
