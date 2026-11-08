@@ -222,12 +222,16 @@ pub(crate) enum Keep {
     UnknownAttempt,
     /// A provider create with no locator: attach it first.
     Unlocated,
+    /// A record of the job gc could not read: what it would judge by that record is kept until it reads.
+    Unreadable,
+    /// A recorded pid whose start time could not be read, so gc cannot tell whether it is still the harness.
+    Unidentified,
 }
 
 impl Keep {
     /// Every reason, in the order the inventory lists them.
     #[cfg(test)]
-    pub(crate) const ALL: [Keep; 9] = [
+    pub(crate) const ALL: [Keep; 11] = [
         Keep::Preserved,
         Keep::Busy,
         Keep::Moving,
@@ -237,6 +241,8 @@ impl Keep {
         Keep::UnknownJob,
         Keep::UnknownAttempt,
         Keep::Unlocated,
+        Keep::Unreadable,
+        Keep::Unidentified,
     ];
 
     pub(crate) fn name(self) -> &'static str {
@@ -250,6 +256,8 @@ impl Keep {
             Keep::UnknownJob => "unknown_job",
             Keep::UnknownAttempt => "unknown_attempt",
             Keep::Unlocated => "unlocated",
+            Keep::Unreadable => "unreadable",
+            Keep::Unidentified => "unidentified",
         }
     }
 }
@@ -591,7 +599,7 @@ impl Node {
                 "a provider resource is removed through a worker; name one".into(),
             ));
         }
-        self.gc_jobs(remove, &mut found).await?;
+        self.gc_jobs(remove, &mut found).await;
         self.gc_home(&mut found);
         self.gc_runs(remove, &managed, &running, &mut found).await;
         let first = found.residuals.len();
@@ -658,7 +666,7 @@ impl Node {
     }
 
     /// Judges, and with `remove` removes, what each standalone job left.
-    async fn gc_jobs(&self, remove: bool, found: &mut Found) -> Result<(), NodeError> {
+    async fn gc_jobs(&self, remove: bool, found: &mut Found) {
         let jobs: Vec<(JobId, Arc<tokio::sync::Mutex<Job>>)> = self
             .jobs
             .lock()
@@ -669,15 +677,11 @@ impl Node {
         let known: BTreeSet<JobId> = jobs.iter().map(|(id, _)| *id).collect();
         for (id, job) in jobs {
             if let Ok(job) = job.try_lock() {
-                self.gc_job(&job, remove, found).await?;
+                self.gc_job(&job, remove, found).await;
                 continue;
             }
             found.live("busy", label(id));
-            for path in self.candidates(id, None) {
-                if exists(&path) {
-                    found.keep(Kind::Unknown, Some(path), Some(label(id)), Keep::Busy);
-                }
-            }
+            self.keep_job(id, None, Keep::Busy, found);
         }
         // A job directory the node did not load holds nothing gc can judge.
         if let Ok(entries) = std::fs::read_dir(self.cfg.state.jobs()) {
@@ -698,13 +702,23 @@ impl Node {
                 }
             }
         }
-        Ok(())
+    }
+
+    /// Keeps, for `why`, every staging directory and harness state a
+    /// capture or a restore of `id` may leave that is there.
+    fn keep_job(&self, id: JobId, marker: Option<&Path>, why: Keep, found: &mut Found) {
+        for (kind, path) in self.candidates(id, marker) {
+            if exists(&path) {
+                found.keep(kind, Some(path), Some(label(id)), why);
+            }
+        }
     }
 
     /// Every staging directory a restore for `id` may leave: beside the
     /// job's root under the home, beside its fallback root, beside its
-    /// harness state, and beside the root `marker` names.
-    fn candidates(&self, id: JobId, marker: Option<&Path>) -> Vec<PathBuf> {
+    /// harness state, and beside the root `marker` names, each with its
+    /// kind, with the harness states a capture writes.
+    fn candidates(&self, id: JobId, marker: Option<&Path>) -> Vec<(Kind, PathBuf)> {
         let dir = self.cfg.state.job(id);
         let mut targets = vec![
             paths::job_root(&self.cfg.home, id),
@@ -712,22 +726,45 @@ impl Node {
             dir.harness_state(),
         ];
         targets.extend(marker.map(Path::to_owned));
-        let mut out: Vec<PathBuf> = targets.iter().filter_map(|t| staging_dir(t)).collect();
-        out.push(dir.harness_state_next());
-        out.push(dir.harness_state_old());
+        let mut out: Vec<(Kind, PathBuf)> = targets
+            .iter()
+            .filter_map(|t| staging_dir(t))
+            .map(|path| (Kind::RestoreStaging, path))
+            .collect();
+        out.push((Kind::HarnessStateNext, dir.harness_state_next()));
+        out.push((Kind::HarnessStateOld, dir.harness_state_old()));
         out.sort();
         out.dedup();
         out
     }
 
-    async fn gc_job(&self, job: &Job, remove: bool, found: &mut Found) -> Result<(), NodeError> {
+    /// Judges, and with `remove` removes, what one standalone job left. A
+    /// record of the job that does not read keeps what it would judge,
+    /// and the run goes on to the next job.
+    async fn gc_job(&self, job: &Job, remove: bool, found: &mut Found) {
         let id = job.id();
         let view = job.view(self.id);
+        let frozen = match view {
+            LeaseView::Owner(_) => job.is_frozen(),
+            _ => Ok(false),
+        };
+        let (Ok(frozen), Ok(marker)) = (frozen, job.marker()) else {
+            self.keep_job(id, None, Keep::Unreadable, found);
+            if exists(&job.dir().harness()) {
+                found.keep(
+                    Kind::HarnessRecord,
+                    Some(job.dir().harness()),
+                    Some(label(id)),
+                    Keep::Unreadable,
+                );
+            }
+            self.gc_copies(id, found);
+            return;
+        };
         let owned = match view {
-            LeaseView::Owner(token) if !job.is_frozen()? => Some(token.epoch),
+            LeaseView::Owner(token) if !frozen => Some(token.epoch),
             _ => None,
         };
-        let marker = job.marker()?;
         let tenure_epoch = marker.as_ref().map(|m| m.epoch);
         if let Some(epoch) = owned {
             found.live("tenure", tenure(id, Some(epoch)));
@@ -735,17 +772,19 @@ impl Node {
         let dir = job.dir().clone();
         if matches!(view, LeaseView::Departing { .. }) {
             found.live("moving", tenure(id, tenure_epoch));
-            for path in self.candidates(id, marker.as_ref().map(|m| m.root.as_path())) {
-                if exists(&path) {
-                    found.keep(Kind::Unknown, Some(path), Some(label(id)), Keep::Moving);
-                }
-            }
-            return Ok(());
+            self.keep_job(
+                id,
+                marker.as_ref().map(|m| m.root.as_path()),
+                Keep::Moving,
+                found,
+            );
+            return;
         }
         let (next, old) = gc_states(&dir, id, tenure_epoch, remove, found);
         let stagings: Vec<PathBuf> = self
             .candidates(id, marker.as_ref().map(|m| m.root.as_path()))
             .into_iter()
+            .filter_map(|(kind, path)| (kind == Kind::RestoreStaging).then_some(path))
             .filter(|path| *path != next && *path != old && exists(path))
             .collect();
         for staging in stagings {
@@ -791,22 +830,27 @@ impl Node {
                 settle(entry, remove_tree(&staging));
             }
         }
-        self.gc_harness(job, owned, remove, found).await?;
+        self.gc_harness(job, owned, remove, found).await;
         self.gc_copies(id, found);
-        Ok(())
     }
 
     /// The harness record of a tenure this node no longer owns: its group
     /// while it runs, the record once it is gone.
-    async fn gc_harness(
-        &self,
-        job: &Job,
-        owned: Option<Epoch>,
-        remove: bool,
-        found: &mut Found,
-    ) -> Result<(), NodeError> {
+    async fn gc_harness(&self, job: &Job, owned: Option<Epoch>, remove: bool, found: &mut Found) {
         let (id, dir) = (job.id(), job.dir());
-        if let Some(record) = job.harness_record()?
+        let record = match job.harness_record() {
+            Ok(record) => record,
+            Err(_) => {
+                found.keep(
+                    Kind::HarnessRecord,
+                    Some(dir.harness()),
+                    Some(label(id)),
+                    Keep::Unreadable,
+                );
+                return;
+            }
+        };
+        if let Some(record) = record
             && owned != Some(record.epoch)
         {
             let named = tenure(id, Some(record.epoch));
@@ -816,7 +860,7 @@ impl Node {
                         Kind::HarnessGroup,
                         Some(dir.harness()),
                         Some(named),
-                        Keep::Unlabeled,
+                        Keep::Unidentified,
                     );
                 }
                 Liveness::Gone => {
@@ -839,7 +883,6 @@ impl Node {
                 }
             }
         }
-        Ok(())
     }
 
     /// The departed and orphan copies beside the job's roots: kept by design.

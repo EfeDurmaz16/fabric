@@ -49,4 +49,6 @@ Why gc keeps what it keeps, the `reason` of each kept item:
 - `unknown_job`: A job this node does not hold.
 - `unknown_attempt`: An attempt the journal on this node does not hold, as one run for another authority: gc cannot tell whether it may still run.
 - `unlocated`: A provider create with no locator: attach it first.
+- `unreadable`: A record of the job gc could not read: what it would judge by that record is kept until it reads.
+- `unidentified`: A recorded pid whose start time could not be read, so gc cannot tell whether it is still the harness.
 <!-- residuals:end -->

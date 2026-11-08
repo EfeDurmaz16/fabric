@@ -1734,8 +1734,10 @@ pub struct GcKept {
     /// holds the job), `only_copy` (the only harness state the job has),
     /// `unlabeled` (no label gc can read), `other_node` (a label naming
     /// another node), `unknown_job` (a job this node does not hold),
-    /// `unknown_attempt` (an attempt the journal here does not hold) or
-    /// `unlocated` (a provider create with no locator).
+    /// `unknown_attempt` (an attempt the journal here does not hold),
+    /// `unlocated` (a provider create with no locator), `unreadable` (a
+    /// record of the job gc could not read) or `unidentified` (a recorded
+    /// pid whose start time could not be read).
     pub reason: String,
 }
 

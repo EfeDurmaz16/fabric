@@ -434,3 +434,47 @@ fn every_kind_and_reason_has_its_own_name() {
     let reasons: std::collections::BTreeSet<&str> = Keep::ALL.iter().map(|k| k.name()).collect();
     assert_eq!(reasons.len(), Keep::ALL.len());
 }
+
+/// A job record that does not read keeps that job's rows with the reason
+/// `unreadable` and the run goes on: the report comes back, with what was
+/// removed before it. Before, the read error ended the whole gc after
+/// earlier residuals were already removed, and no report said which. A
+/// job whose lock is taken keeps its harness state typed by its kind,
+/// not `unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_job_record_keeps_that_job_and_the_run_goes_on() {
+    let (dir, node) = recovered_node().await;
+    let id = crate::ops::tests::job(dir.path(), &node).await;
+    let state = node.cfg.state.job(id);
+    let next = state.harness_state_next();
+    std::fs::create_dir_all(&next).unwrap();
+
+    let job = Arc::clone(node.jobs.lock().await.get(&id).unwrap());
+    {
+        let _busy = job.lock().await;
+        let found = node.gc_with(false, Vec::new(), None).await.unwrap();
+        let kept: Vec<(&str, &str)> = found
+            .kept
+            .iter()
+            .map(|k| (k.kind.as_str(), k.reason.as_str()))
+            .collect();
+        assert_eq!(kept, [("harness_state_next", "busy")], "{found:?}");
+    }
+
+    std::fs::write(state.harness(), b"not a record").unwrap();
+    let removed = node.gc_with(true, Vec::new(), None).await.unwrap();
+    let listed: Vec<(&str, &str)> = removed
+        .residuals
+        .iter()
+        .map(|r| (r.kind.as_str(), r.state.as_str()))
+        .collect();
+    assert_eq!(listed, [("harness_state_next", "removed")], "{removed:?}");
+    assert!(!next.exists());
+    let kept: Vec<(&str, &str)> = removed
+        .kept
+        .iter()
+        .map(|k| (k.kind.as_str(), k.reason.as_str()))
+        .collect();
+    assert_eq!(kept, [("harness_record", "unreadable")], "{removed:?}");
+    assert!(state.harness().exists(), "an unreadable record is kept");
+}
