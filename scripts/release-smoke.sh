@@ -103,7 +103,9 @@ expect_exit() {
   [ "$code" -eq "$1" ] || { cat "$work/err" >&2; fail "$2: exit $code, want $1"; }
 }
 
-export FABRIC_HOME="$work/home"
+# Each binary keeps its state under <APP>_HOME, such as FABRIC_HOME.
+home_var=$(printf '%s' "$app" | tr 'a-z-' 'A-Z_')_HOME
+export "$home_var=$work/home"
 export CI=1
 
 step "--version is $version"
@@ -125,37 +127,77 @@ expect_exit 2 "an unknown option"
 [ ! -s "$work/out" ] || fail "a failure under --json wrote to stdout"
 tail -n 1 "$work/err" | grep -q '"reason":"unknown_option"' || fail "no unknown_option reason on stderr"
 
-step "no node: exit 80, reason no_daemon"
-run node id --json
-expect_exit 80 "node id without a node"
-tail -n 1 "$work/err" | grep -q '"reason":"no_daemon"' || fail "no no_daemon reason on stderr"
+# What the binary is for. The archive's app name says which binary it is.
+case $app in
+fabric-sync)
+  # A tree with a commit, a change, an untracked file and a secret, pushed
+  # to a directory and pulled into a new one: the work travels, the secret
+  # stays behind.
+  step "push a tree to a directory, then pull it into a new one"
+  tree=$work/tree
+  mkdir -p "$tree"
+  git -C "$tree" init -q
+  printf 'one\n' >"$tree/tracked.txt"
+  git -C "$tree" add tracked.txt
+  git -C "$tree" -c user.name=smoke -c user.email=smoke@example.invalid commit -q -m one
+  printf 'two\n' >"$tree/tracked.txt"
+  printf 'new\n' >"$tree/untracked.txt"
+  printf 'TOKEN=secret\n' >"$tree/.env"
 
-step "serve, then the commands that talk to it"
-mkdir -p "$FABRIC_HOME"
-"$bin" serve --listen 127.0.0.1:0 >"$work/serve.out" 2>"$work/serve.err" &
-node_pid=$!
-tries=0
-# The control socket is the one socket the node makes in its home.
-until [ -n "$(find "$FABRIC_HOME" -maxdepth 1 -type s)" ]; do
-  tries=$((tries + 1))
-  if [ "$tries" -gt 300 ] || ! kill -0 "$node_pid" 2>/dev/null; then
-    cat "$work/serve.err" >&2
-    fail "serve did not open its control socket"
-  fi
-  sleep 0.1
-done
+  run push "$work/target" --tree "$tree" --name app --json
+  expect_exit 0 "push"
+  grep -q '"outcome":"pushed"' "$work/out" || fail "push printed $(cat "$work/out")"
+  grep -q '"left_behind":\[".env"\]' "$work/out" || fail "push did not leave .env behind"
 
-run node id
-expect_exit 0 "node id"
-[ "$(wc -l <"$work/out" | tr -d ' ')" = 1 ] || fail "node id printed more than one line"
+  run pull "$work/target" --name app --tree "$work/copy" --json
+  expect_exit 0 "pull"
+  [ "$(cat "$work/copy/tracked.txt")" = two ] || fail "the pull lost the unstaged change"
+  [ "$(cat "$work/copy/untracked.txt")" = new ] || fail "the pull lost the untracked file"
+  [ ! -e "$work/copy/.env" ] || fail "the secret travelled"
+  [ "$(git -C "$work/copy" log -1 --format=%s)" = one ] || fail "the pull lost the commit"
 
-run job ls
-expect_exit 0 "job ls on a new node"
-[ ! -s "$work/out" ] || fail "an empty job list wrote to stdout"
+  step "a pull onto another tree with content is refused, exit 84"
+  mkdir "$work/other"
+  printf 'mine\n' >"$work/other/file.txt"
+  run pull "$work/target" --name app --tree "$work/other" --json
+  expect_exit 84 "a pull over a tree with content"
+  tail -n 1 "$work/err" | grep -q '"reason":"target_not_empty"' || fail "no target_not_empty reason on stderr"
+  [ "$(cat "$work/other/file.txt")" = mine ] || fail "the refused pull changed the tree"
+  ;;
+*)
+  step "no node: exit 80, reason no_daemon"
+  run node id --json
+  expect_exit 80 "node id without a node"
+  tail -n 1 "$work/err" | grep -q '"reason":"no_daemon"' || fail "no no_daemon reason on stderr"
 
-run doctor --json
-expect_exit 0 "doctor --json"
-[ ! -s "$work/err" ] || fail "doctor --json wrote to stderr on success"
-grep -q '^{' "$work/out" || fail "doctor --json did not print a JSON document"
+  step "serve, then the commands that talk to it"
+  mkdir -p "$work/home"
+  "$bin" serve --listen 127.0.0.1:0 >"$work/serve.out" 2>"$work/serve.err" &
+  node_pid=$!
+  tries=0
+  # The control socket is the one socket the node makes in its home.
+  until [ -n "$(find "$work/home" -maxdepth 1 -type s)" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 300 ] || ! kill -0 "$node_pid" 2>/dev/null; then
+      cat "$work/serve.err" >&2
+      fail "serve did not open its control socket"
+    fi
+    sleep 0.1
+  done
+
+  run node id
+  expect_exit 0 "node id"
+  [ "$(wc -l <"$work/out" | tr -d ' ')" = 1 ] || fail "node id printed more than one line"
+
+  run job ls
+  expect_exit 0 "job ls on a new node"
+  [ ! -s "$work/out" ] || fail "an empty job list wrote to stdout"
+
+  run doctor --json
+  expect_exit 0 "doctor --json"
+  [ ! -s "$work/err" ] || fail "doctor --json wrote to stderr on success"
+  grep -q '^{' "$work/out" || fail "doctor --json did not print a JSON document"
+  ;;
+esac
 
 echo "smoke: $app $version for $target passed" >&2

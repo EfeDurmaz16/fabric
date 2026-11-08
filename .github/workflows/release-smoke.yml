@@ -4,8 +4,9 @@ name: release-smoke
 # the archives are built and before anything is hosted, on every tag and on
 # every pull request. Each archive is downloaded to a clean runner that did
 # not build it and has no Rust toolchain step, and scripts/release-smoke.sh
-# runs it: the checksum, the version, the CLI contract against a node it
-# starts, and on macOS the quarantine behaviour the README describes. A
+# runs it for every app the plan ships: the checksum, the version, the CLI
+# contract, what the binary is for, and on macOS the quarantine behaviour the
+# README describes. A
 # failure here stops the release before the GitHub Release exists.
 on:
   workflow_call:
@@ -40,7 +41,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download the built archive
+      - name: Download the built archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: artifacts-build-local-${{ matrix.target }}
@@ -50,7 +51,13 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           DIST_DIR: ${{ runner.temp }}/dist
-          # The shipped crate's name, from the plan, so a rename needs no
-          # change here.
-          APP: ${{ fromJson(inputs.plan).releases[0].app_name }}
-        run: scripts/release-smoke.sh "$DIST_DIR" "$TARGET" "$APP"
+          # Every shipped crate's name, from the plan, so a rename or a new
+          # app needs no change here.
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -eu
+          apps=$(printf '%s' "$PLAN" | jq -r '.releases[].app_name')
+          [ -n "$apps" ] || { echo "the plan names no app"; exit 1; }
+          for app in $apps; do
+            scripts/release-smoke.sh "$DIST_DIR" "$TARGET" "$app"
+          done
