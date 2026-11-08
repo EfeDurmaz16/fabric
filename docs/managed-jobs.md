@@ -1663,6 +1663,19 @@ impl Node {
 }
 ```
 
+#### As built (owner A)
+
+Where the code differs from the shapes above, or adds to them:
+
+- `LaunchRequest::check` (fabric-core) is the receiving side's check of a launch: at most `MAX_TASK_LAUNCHES` tasks, every program through `Program::check` (`BadProgram`), `snapshot_at` with an initial checkpoint, a package exactly with a continuation, for the token's job and at most `PACKAGE_MAX_BYTES` (`Inconsistent`). The authority runs it on every plan; the runner runs it again before it records a launch.
+- fabric-net: `RequestBody::check_bounds` refuses a launch past `MAX_TASK_LAUNCHES` tasks and a heartbeat past `MAX_HEARTBEAT_ATTEMPTS` grants when a request is parsed (`Request::from_control_payload`) and before `Session::launch` or `Session::heartbeat` sends one. The four messages are served under the per-peer job work cap like a facade message: the work runs to its end, only the answer races the budget.
+- `launch::send` and `launch::instruct` are the `Link` trait, which the dispatch takes so its tests can record what is sent; `NodeLink` is the node's. A grant on this node is sent through the node's own `Service::launch` with its own id as the peer, not by calling `Node::runner_launch(None, ..)`: owner B's service maps its own id to `None`, so the runner takes a launch from its own authority by the same path as from a peer, and this branch builds without the runner. `plan` answers `PlanError::{Authority, Blocked}`: a journal that cannot be read is tried again, a grant that cannot be launched as recorded (no package, a failing check) is failed like a refused launch.
+- `package::build_for_continue` answers `BuildError::{Journal, NoCut, Package}`. It reads two journal reads added for it: `Journal::head` (the job's newest event digest, the ledger head) and `Journal::last_cut` (the newest cut's snapshot and digest, the evidence; the cut's own evidence list is not journaled).
+- `report::accept` and `report::heartbeat` take the `Authority` and the node's id, so their tests need no daemon; `Node::accept_report` and `Node::accept_heartbeat` call them. A report the domain answers with `StaleObservationRefused` is answered `StaleGeneration { current }`; one that names a generation newer than the job's is the domain's `StaleGeneration` refusal and answered the same.
+- The dispatch launches only grants a `CreateJob` or a `Continue` made; a `StartAttempt` grant stays the CLI's to start, as in M2. One pass launches the grants first, then dispatches the pending effects, then places every dispatched continue whose attempt ended at its cut, then launches what that granted. A launch that does not reach its node is tried again after the next commit or `RETRY` (2 s); an instruction that does not reach its node marks its command `Unknown`, since the node may have taken it; a refused instruction marks it `Failed`; an effect whose attempt ended before it was dispatched is marked `Dispatched` then `Failed`.
+- `crash_tests::a_launch_killed_after_the_node_accepted_is_not_launched_twice` is `dispatch::crash_tests`, a restart simulated by a dispatch that remembers nothing over the same journal; the kill at `after_launch_accepted` with two daemons needs owner B's runner and belongs with the e2e acceptance.
+- The v3 fixture's test child is registered while the first job's grant may still run, so it asks for a spawn, marked dispatched then succeeded. `tests/fixtures/v3-draft.sqlite` is the v3 fixture before the `program` column, for the `DraftSchema { version: 3 }` test.
+
 #### fabricd, the node side (owner B)
 
 ```rust
