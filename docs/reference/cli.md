@@ -1,0 +1,438 @@
+<!-- This page is written by scripts/docs/cli-reference.sh from `fabric --help`. Do not edit it; run the script. -->
+
+# CLI reference
+
+Every command of `fabric` on `main`, as its own `--help` prints it. CI regenerates this page and fails when it differs, so it says what the binary does today.
+
+Exit codes (ADR 0016, Exit codes): 0 for success, the harness's own code when it exits, 128 plus the signal when a signal stopped it, 80 when no node answers on the control socket, 81 not the owner, 82 frozen, 83 a peer unreachable, 84 refused without `--force` or `--yes`, 85 the job's state stops the command, 2 a usage error, and 1 any other failure. See [ADR 0016](../adr/0016-node-and-cli-as-built.md) for each one.
+
+## `fabric`
+
+```text
+Move a development job between your machines and harnesses
+
+Usage: fabric <COMMAND>
+
+Commands:
+  serve    Run the node daemon in the foreground
+  node     This node's identity and its paired nodes
+  job      Make, run, suspend, move and resume jobs
+  managed  Make, cancel and read managed jobs (ADR 0019)
+  doctor   Print this node's facts, or compare them with a paired node's before a move
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+### `fabric serve`
+
+```text
+Run the node daemon in the foreground
+
+Usage: fabric serve [OPTIONS]
+
+Options:
+      --listen <LISTEN>
+          Where both transports listen
+
+          [default: 0.0.0.0:7777]
+
+      --wire <WIRE>
+          Which wires this node dials: QUIC then TCP+TLS, or only one of them
+
+          Possible values:
+          - auto:    QUIC first, TCP with TLS when QUIC does not connect
+          - quic:    QUIC only
+          - tcp-tls: TCP with TLS only
+
+          [default: auto]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `fabric node`
+
+```text
+This node's identity and its paired nodes
+
+Usage: fabric node <COMMAND>
+
+Commands:
+  id    Print this node's id and address
+  add   Pair a node; give its address when this node can dial it
+  ls    List the paired nodes
+  ping  Ping a paired node over its session, dialing it when none is open
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric node id`
+
+```text
+Print this node's id and address
+
+Usage: fabric node id
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric node add`
+
+```text
+Pair a node; give its address when this node can dial it
+
+Usage: fabric node add <NODE> [ADDR]
+
+Arguments:
+  <NODE>  The node's id, as `fabric node id` prints it there
+  [ADDR]  Where it listens, `host:port`; leave it out for a node behind a NAT that dials in
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric node ls`
+
+```text
+List the paired nodes
+
+Usage: fabric node ls
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric node ping`
+
+```text
+Ping a paired node over its session, dialing it when none is open
+
+Usage: fabric node ping <NODE>
+
+Arguments:
+  <NODE>  The node
+
+Options:
+  -h, --help  Print help
+```
+
+### `fabric job`
+
+```text
+Make, run, suspend, move and resume jobs
+
+Usage: fabric job <COMMAND>
+
+Commands:
+  new      Make a job from a repository, rooted at ~/fabric/jobs/<id>/work
+  run      Run the job's harness here, attached to this terminal
+  suspend  Stop the harness, snapshot the workspace and record the suspend
+  resume   Pull the job here if another node owns it, restore it, and run it
+  move     Move the job to a paired node by the cooperative move protocol
+  steal    Take the job without its owner's consent; prints what it would do without --force
+  status   The job's state on this node
+  ls       Every job this node knows
+  log      The job's ledger
+  approve  Record an approval in the ledger
+  reject   Record a rejection in the ledger
+  repair   Settle a job frozen after a fork by the fork rule: take the peer's chain when it wins, keeping this node's ledger and its snapshots
+  export   Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric job new`
+
+```text
+Make a job from a repository, rooted at ~/fabric/jobs/<id>/work
+
+Usage: fabric job new [OPTIONS] --repo <REPO> --goal <GOAL>
+
+Options:
+      --repo <REPO>        The repository to clone into the job's root
+      --goal <GOAL>        The goal in your words
+      --harness <HARNESS>  The harness: claude, codex or acp:<program> [default: claude]
+  -h, --help               Print help
+```
+
+#### `fabric job run`
+
+```text
+Run the job's harness here, attached to this terminal
+
+Usage: fabric job run [OPTIONS] <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --prompt <PROMPT>  The first message to send; the goal for a new session
+      --headless         Run one turn without a terminal, print the answer and the session, and exit
+      --yes              Run setup steps this node has not approved for the job, as the workspace now is, without asking
+  -h, --help             Print help
+```
+
+#### `fabric job suspend`
+
+```text
+Stop the harness, snapshot the workspace and record the suspend
+
+Usage: fabric job suspend <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric job resume`
+
+```text
+Pull the job here if another node owns it, restore it, and run it
+
+Usage: fabric job resume [OPTIONS] <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --on <ON>            The node that holds the job, when this node has never seen it
+      --harness <HARNESS>  Continue under another harness: claude, codex or acp:<program>
+      --prompt <PROMPT>    The first message to send
+      --headless           Run one turn without a terminal, print the answer and the session, and exit
+      --force              Waive the preflight refusals that can be waived when pulling
+      --yes                Run setup steps this node has not approved for the job, as the workspace now is, without asking
+  -h, --help               Print help
+```
+
+#### `fabric job move`
+
+```text
+Move the job to a paired node by the cooperative move protocol
+
+Usage: fabric job move [OPTIONS] --to <TO> <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --to <TO>  The node to move it to
+      --force    Waive the preflight refusals that can be waived
+  -h, --help     Print help
+```
+
+#### `fabric job steal`
+
+```text
+Take the job without its owner's consent; prints what it would do without --force
+
+Usage: fabric job steal [OPTIONS] <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --force            Do it
+      --reason <REASON>  Why, for the ledger [default: ""]
+  -h, --help             Print help
+```
+
+#### `fabric job status`
+
+```text
+The job's state on this node
+
+Usage: fabric job status <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric job ls`
+
+```text
+Every job this node knows
+
+Usage: fabric job ls
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric job log`
+
+```text
+The job's ledger
+
+Usage: fabric job log <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric job approve`
+
+```text
+Record an approval in the ledger
+
+Usage: fabric job approve [OPTIONS] <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --note <NOTE>  Your words [default: ""]
+  -h, --help         Print help
+```
+
+#### `fabric job reject`
+
+```text
+Record a rejection in the ledger
+
+Usage: fabric job reject [OPTIONS] <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --note <NOTE>  Your words [default: ""]
+  -h, --help         Print help
+```
+
+#### `fabric job repair`
+
+```text
+Settle a job frozen after a fork by the fork rule: take the peer's chain when it wins, keeping this node's ledger and its snapshots
+
+Usage: fabric job repair <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric job export`
+
+```text
+Snapshot an orphan workspace of the job without making it the job's head, and keep the snapshot
+
+Usage: fabric job export [OPTIONS] <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --path <PATH>  A workspace a restore set aside under orphan/ beside the job's root; the workspace at the root when left out
+  -h, --help         Print help
+```
+
+### `fabric managed`
+
+```text
+Make, cancel and read managed jobs (ADR 0019)
+
+Usage: fabric managed <COMMAND>
+
+Commands:
+  create  Make a managed job from a repository
+  cancel  Cancel a managed job none of whose attempts may still run
+  status  One managed job: its revision, state, tasks and attempts
+  ls      Every managed job this node's authority holds [alias: list]
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric managed create`
+
+```text
+Make a managed job from a repository
+
+Usage: fabric managed create [OPTIONS] --repo <REPO> --goal <GOAL>
+
+Options:
+      --repo <REPO>                    The repository to clone into the job's workspace
+      --goal <GOAL>                    The goal in your words
+      --harness <HARNESS>              The harness: claude, codex or acp:<program> [default: claude]
+      --operation-key <OPERATION_KEY>  The command's key; the same key and arguments again give the same job
+  -h, --help                           Print help
+```
+
+#### `fabric managed cancel`
+
+```text
+Cancel a managed job none of whose attempts may still run
+
+Usage: fabric managed cancel [OPTIONS] <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+      --expected-revision <EXPECTED_REVISION>
+          Refuse unless the job is at this revision
+      --reason <REASON>
+          Why, for the journal [default: ""]
+      --operation-key <OPERATION_KEY>
+          The command's key; the same key and arguments again give the same answer
+  -h, --help
+          Print help
+```
+
+#### `fabric managed status`
+
+```text
+One managed job: its revision, state, tasks and attempts
+
+Usage: fabric managed status <JOB>
+
+Arguments:
+  <JOB>  The job
+
+Options:
+  -h, --help  Print help
+```
+
+#### `fabric managed ls`
+
+```text
+Every managed job this node's authority holds
+
+Usage: fabric managed ls
+
+Options:
+  -h, --help  Print help
+```
+
+### `fabric doctor`
+
+```text
+Print this node's facts, or compare them with a paired node's before a move
+
+Usage: fabric doctor [OPTIONS]
+
+Options:
+      --peer <PEER>  The node to compare with
+      --job <JOB>    The job a move would carry; only with --peer
+  -h, --help         Print help
+```
+

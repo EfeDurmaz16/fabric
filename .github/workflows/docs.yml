@@ -1,0 +1,105 @@
+name: docs
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a PR cancels its older run. Pushes to main each keep their own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The one docs tool. Bump the version and the digest together; the digest
+  # is the one GitHub lists for the release asset.
+  MDBOOK_VERSION: 0.5.4
+  MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
+
+jobs:
+  check:
+    name: docs check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install mdBook
+        run: |
+          asset="mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$asset" "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/$asset"
+          echo "${MDBOOK_SHA256}  $RUNNER_TEMP/$asset" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/mdbook"
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/mdbook"
+          echo "MDBOOK=$RUNNER_TEMP/mdbook/mdbook" >> "$GITHUB_ENV"
+
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      # Only main saves the cache, so parallel PR branches do not evict it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The CLI reference is generated from this binary's --help.
+      - name: Build the CLI
+        run: |
+          . scripts/docs/names.env
+          cargo build -p "$CLI_PACKAGE" --locked
+
+      - name: Prove the docs checks fire
+        run: scripts/test-check-docs.sh
+
+      - name: Generated pages, links, and the site
+        run: scripts/check-docs.sh
+
+      - name: Keep the site for the deploy
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/docs-site
+
+  # Publishes the site built from main. Needs Pages set to deploy from
+  # GitHub Actions in the repository's settings. Deploys run one at a time,
+  # and one whose commit is no longer the head of main stands down, so a
+  # slow older run cannot put an older site live after a newer one.
+  deploy:
+    name: docs deploy
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-pages
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Stand down unless this commit is still the head of main
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main is at $head now; the run for it deploys instead of $GITHUB_SHA"
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy to GitHub Pages
+        if: steps.head.outputs.newest == 'true'
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

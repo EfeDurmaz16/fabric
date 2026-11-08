@@ -1,0 +1,14 @@
+# The docs site, built by scripts/docs/build.sh with mdBook. The title, the
+# repository link and the site URL come from scripts/docs/names.env through
+# the environment, so a rename touches one file.
+[book]
+src = "docs"
+language = "en"
+
+[preprocessor.repo-links]
+command = "python3 scripts/docs/repo-links.py"
+before = ["links"]
+
+[output.html]
+# Keep -- and quotes as typed: smart punctuation would render an em dash.
+smart-punctuation = false
