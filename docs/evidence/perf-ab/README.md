@@ -1,5 +1,10 @@
 # A/B of main and the M2 branch
 
+Since 2026-11-08 the A/B runs in CI, in the `perf` job of
+`.github/workflows/perf.yml`, and a pull request keeps no local run here;
+the last section, CI, says how and holds the runs that set the job's
+design. The sections before it are the local record.
+
 The performance rule of 27 Oct 2026 (CONTRIBUTING.md, Performance rule):
 no hot path may be slower, or use more memory, than the anchor, `main` at
 `176622e`, and the aim is to beat it. This directory holds the first runs
@@ -639,3 +644,41 @@ Two lockstep changes the review fixes needed in Fabric's tests, both on the benc
 `m4-gates/run-gates.sh` ran the whole list once on `386f3b6` with this README's M4 section uncommitted beside it, at a load average of 5.2 to 7.2, nothing timed (`m4-gates/summary.txt`, each gate's log beside it): `cargo fmt --all --check`; clippy with `-D warnings` for the workspace and for `fabric-harness` with no features and each of `acp`, `claude`, `codex`; `cargo test --workspace --locked -- --skip e2e_`; `cargo test -p fabric --test e2e --locked`; `cargo doc` with `-D warnings`; `cargo deny check`; the hygiene, budget and fixture scripts and their self-tests against `origin/m3/capsule-bridge`; actionlint on both workflows; `cargo build -p fabric`; the TypeScript SDK install, typecheck, build and `bun test` against the node built here; and `FABRIC_BUDGET=count` `budget::hot_paths`. All 15 passed on the first run. The interop binary, `cargo test -p fabric-bridge --test capsule_worker`, ran with `--ignored` in `m4-interop/`.
 
 A note on the host: at about 00:00 on 2026-11-03, between the second and the third timed run, something outside this session deleted the untracked and most of the tracked files of every worktree under `/tmp/fabric-wt` and `/tmp/capsule-wt` (both `m4` trees among them, with their `.git` link files, `Cargo.toml` and `package.json`); the branch refs and the commits were untouched in the base repositories, the evidence under `docs/` and `benchmarks/` survived, and both trees were restored from their index (`git checkout -- .`) and, for Capsule, reinstalled and rebuilt from the pnpm store before the remaining runs. Nothing here was measured on a tree in that state: the runs that hit it failed at once and were run again.
+
+# CI: the perf job
+
+Recorded on 2026-11-08 on `pr15/perf-in-ci`. The rule stays (CONTRIBUTING.md, Performance rule: no op slower, no daemon or CLI larger than `176622e`, release build); the measurement moves to GitHub Actions, where everyone sees it, and a local run is optional. The job runs on every pull request and push to `main`: it builds the anchor (cached by commit, profile and toolchain) and the candidate in release on one `macos-15` runner, runs `scripts/bench-ab.sh --release --pairs 15 --counted 5`, then `scripts/bench-ab.sh --gate`, and writes the verdict, the machine and the report to the job summary, every file of the run to the artifact `perf-ab-<sha>-<attempt>`, and the verdict to one comment on a same-repository pull request, from a job of its own that never runs the pull request's code (a fork's pull request gets a read-only token and only the summary). A run takes about 20 minutes with the anchor cached, 30 to 35 with a confirmation.
+
+## The runner
+
+`macos-15` is an Apple M1 virtual machine with 3 cores and 7 GB (`machine.txt`: `Apple M1 (Virtual) 3 cores`), SIP off. Three things follow.
+
+- The counters needed an arm64e slice. With SIP off, `DYLD_INSERT_LIBRARIES` reaches the system's `git` and `sh`, which are arm64e, and dyld ended every one of them: the first trial (run 42501356405) failed at the first `job new` on all five jobs. `scripts/bench-ab.sh` now builds `counters.c` for arm64 and arm64e; those programs map nothing and count nothing, as before.
+- The virtual machine does not count instructions: `proc_pid_rusage`'s `ri_instructions` and `ri_cycles` read 0 for every process (the `instructions M` column reads `0.0 -> 0.0` in every CI report), while the same library reads 162 million instructions for a loop of 10 million additions on an M5 Pro, to 0.1 percent between two runs. So there is no instruction gate. Valgrind, which iai-callgrind and CodSpeed's instrumented mode count with, does not run on macOS arm64, and a Linux runner would measure another durability path (below).
+- Times are noisy. The 1-minute load is up to 21 when a bench starts (the builds before it; 2.1 for a confirmation, which builds nothing) and 1.6 to 3.9 when it ends.
+
+## Why macOS only
+
+The counter library stays macOS only. Its interposing is dyld's `__interpose` section, and an `LD_PRELOAD` port is possible, but what the gate holds would differ on Linux: a durable write there is a plain `fsync`, where on macOS it is `F_FULLFSYNC` or `F_BARRIERFSYNC` and a plain `fsync` does not reach the disk, and the physical footprint is macOS's. Fabric's nodes are Macs first, so CI measures on the platform the rule is for, with one runner type and one set of counters.
+
+## Trials
+
+Three trials ran on the real runner, each a matrix of five jobs in parallel: A/B runs of the branch head against the anchor (`head`), and A/A runs of the anchor against itself (`aa`, `--candidate 176622e`, the same cached binary on both sides). `ci-trials/<run>/<job>/` keeps each job's `verdict.md`, `machine.txt` and `report.md` (and `confirm/` for a confirmation); every sample is in the run's artifact while GitHub keeps it (90 days).
+
+| Run | Jobs | Gate as it ran | Single-run verdicts |
+|---|---|---|---|
+| 42502371634 | 3 head, 2 aa | one run, counted daemon sizes gated | head 3 of 3 pass; aa 1 of 2 fail (`acp new`, family interval 1.001 to 1.708, and the four counted daemon sizes, 1.004 to 1.075) |
+| 42504596042 | 1 head, 4 aa | confirmation on failure, same fixture order | head pass; aa 3 of 4 pass; `1-aa` failed daemon b's resident size (1.008, family 1.002 to 1.023) and footprint (1.020) and its confirmation failed the same two (1.013 and 1.035), so the job failed |
+| 42507362258 | 1 head, 4 aa | every run confirmed, confirmation with the candidate's fixture first | head pass and pass; aa first runs 3 of 4 pass (`2-aa`: `acp pull`), confirmations 2 of 4 pass (`2-aa`: daemon b's footprint; `4-aa`: `ledger append`); no check failed twice, so all five jobs pass |
+
+What these set:
+
+- Times use a family interval: Bonferroni over the 26 timed ops, each op's interval at 1 - 0.05/26. Across 15 single runs of two equal builds, 6 failed a check (3 on times: `acp new`, `acp pull`, `ledger append`; 3 on daemon b's size), more than the one in 20 a family interval promises, since the samples of a shared runner are neither independent nor alike. A failing run is therefore confirmed by a second run of both builds, and a check fails only when it fails in both. Of the four A/A jobs under the final design (run 42507362258) none failed; a real regression fails again, noise did not.
+- Daemon sizes after the counted ops left the gate. Each side has one daemon per node, read after every op, so those pairs are one process against another, and two equal builds read 0.971 to 1.075 there. They stay in the report.
+- The confirmation starts the candidate's fixture first. Daemon b, which lives through the whole timed phase, is also one process per build; in run 42504596042 the side started second had the larger daemon b in the run and in its confirmation. With the order swapped, run 42507362258's one daemon b failure (`2-aa`, confirmation) did not repeat in its first run. Daemon a restarts every run (`restart`), so its pairs are fresh processes and its A/A ratios stay within 0.98 to 1.005.
+- Ops too noisy for times alone: `new`, `launch` of Claude and Codex, `cold start` and the approvals, whose family intervals span about 0.6 to 1.9 in A/A and A/B runs alike (for example `codex launch` 0.742 to 1.919 in `42502371634/1-head`). There the counter gate carries the rule: per op, the candidate's median process starts and full or barrier flushes over the counted runs must not exceed the anchor's. They do not depend on load, and they are what those ops spend: in M4 `new` is 1 start and 3 full flushes against the anchor's 3 and 8, `launch` 2 starts and 5 to 8 full flushes against 4 and 15 to 17. Plain `fsync`, bytes and allocations are tracked, not gated: M4's `resume` makes 22 full or barrier flushes and 55 plain ones against the anchor's 24 and 51 at under half its time.
+- The suspend, move, resume and pull ops, `ledger append` and `restart` have family intervals within 0.69 to 1.48 in the A/A runs, two thirds of them within 0.85 to 1.2: on this runner times alone catch a regression of a fifth to a half on these ops, not a few percent. The gap is what the counters are for, and why a local run on a quiet Mac stays useful before a change to a hot path.
+
+## Main against the anchor on the runner
+
+All six A/B runs (five jobs and one confirmation) pass. 19 to 22 of the 26 ops are faster with intervals below 1, and no op is slower. In `42507362258/1-head`: `new` 0.24 to 0.29 of the anchor, `resume` 0.40 to 0.46, `pull` 0.54 to 0.60, `move` 0.64 to 0.75, `suspend` 0.67 to 0.94, `restart` 0.49, `cold start` 0.61; `claude launch` (1.184, 0.769 to 1.475) and `codex launch` (1.036, 0.711 to 1.403) hold 1, as they do in every run, with medians between 0.90 and 1.18. Daemon a's resident size is 0.852 to 0.857 of the anchor's in every run and its footprint 0.890 to 0.915; daemon b's resident size 0.869 to 0.901 and its footprint 0.924 to 1.020, the 1.020 (family interval 0.985 to 1.044) in the one run whose confirmation read 0.960; the CLI's peak resident size 0.913 to 0.919 and its footprint 0.956 to 0.964. Every process start and full flush count is at or below the anchor's on every op.
