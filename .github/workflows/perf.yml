@@ -100,8 +100,22 @@ jobs:
           path: ~/.cache/fabric-ab
           key: ${{ steps.anchor-cache.outputs.cache-primary-key }}
 
-      - name: Gate
-        run: scripts/bench-ab.sh --release --gate "$RUNNER_TEMP/perf"
+      # A run that fails is confirmed by a second run of both builds, and
+      # a check fails only when it fails in both: a shared runner's times
+      # are noisy enough that one run of two equal builds can fail an op
+      # (docs/evidence/perf-ab/README.md, CI section).
+      - name: Gate, and confirm a failure
+        env:
+          CANDIDATE: ${{ matrix.candidate || inputs.candidate }}
+        run: |
+          out=$RUNNER_TEMP/perf
+          status=0
+          scripts/bench-ab.sh --release --gate "$out" || status=$?
+          [ "$status" -eq 1 ] || exit "$status"
+          echo "::notice::the first run fails the gate; both builds run again to confirm"
+          scripts/bench-ab.sh --release --pairs 15 --counted 5 \
+            ${CANDIDATE:+--candidate "$CANDIDATE"} "$out/confirm"
+          scripts/bench-ab.sh --release --gate --confirm "$out/confirm" "$out"
 
       - name: Job summary
         if: always()
