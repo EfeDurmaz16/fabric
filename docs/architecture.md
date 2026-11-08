@@ -28,7 +28,7 @@ crates/
   fabric-core      job, ledger, manifest, lease and move state machine, the secret policy, trait definitions
   fabric-store     objects, blob store, SQLite catalog, snapshot publish and restore, ignored-file classes
   fabric-net       node identity, Endpoint and the per-wire Transport trait, QUIC and TCP+TLS, blob transfer, pairing
-  fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
+  fabric-harness   Harness trait, ACP, Claude Code and Codex adapters; OpenCode, pi, Gemini CLI and Cursor Agent CLI (PR 5, docs/harness-adapters.md)
   fabric-env       EnvSpec detection, the .fabric/env.toml override file, materialization
   fabric-client    the client API: typed requests, replies, events and refusals as JSON on the control socket, and a Rust client
   fabric-journal   the managed authority's journal: jobs, operations, events, and the provider operations of the bridge
@@ -144,7 +144,7 @@ If B dies between steps 7 and 9, B owns epoch 2 and the job is not lost: the sna
 - An always-on witness that may write `Stolen` without `--force` after a time-based lease, which is the only place expiry comes back (ADR 0003).
 - Sleep and lid-close triggers (ADR 0008 names the watcher as later).
 - Different home paths between nodes: the P2 rewrites per tool (ADR 0011).
-- Cross-harness resume through a neutral brief (ADR 0006 calls this an experiment, not a promise); OpenCode and Pi as the next adapters.
+- Cross-harness resume through a neutral brief (ADR 0006 calls this an experiment, not a promise). OpenCode, pi, Gemini CLI and Cursor Agent CLI are the next adapters, scaffolded in PR 5 with their contract in [docs/harness-adapters.md](harness-adapters.md).
 - Three or more nodes with quorum-based leases.
 - Phone and cloud nodes. GPU nodes as a placement target.
 - `devcontainer.json` import into `EnvSpec`.

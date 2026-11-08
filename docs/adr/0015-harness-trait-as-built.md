@@ -14,6 +14,8 @@ Amended 2026-10-27 (issue #17, defect R2 of the M2 register): every `Running` st
 
 Amended 2026-10-27 (defect M2-01 of the M2 register): the feed of the ACP trait launch ends with the turn's answer and its failure, under "Launch".
 
+Amended 2026-11-08 (PR 5, harness adapters): the trait gains `fidelity`, the ceiling an adapter declares in the four words of the managed continuation (`native_session`, `new_native_session_with_package`, `workspace_only`, `unsupported`), and `Restored` gains `session`, the session the harness continues on this node, and `fidelity`, what the restore reached, so a harness that mints a new id when it imports a session (OpenCode) reports it instead of claiming the captured id; the node records `Restored::session` as the job's session. The contract page is `docs/harness-adapters.md`; the method list below reads with `fidelity` added after `kind`.
+
 Supersedes the section "The `Harness` trait" of ADR 0006. The rest of ADR 0006 stands: which harnesses get adapters, the credential rules, opaque state, no path rewrite, and cross-harness resume as an experiment.
 
 Written after the first implementation (`crates/fabric-harness`, branch `feat/harness`, PR #6) and two review rounds. ADR 0009 says an ADR is superseded, not edited, when a decision changes. Moving the trait out of the core and changing its signatures are decisions, so they are recorded here.
