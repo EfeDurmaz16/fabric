@@ -11,7 +11,7 @@ name: perf
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, pr15/perf-in-ci]
   workflow_dispatch:
     inputs:
       candidate:
@@ -39,6 +39,16 @@ jobs:
     # says why there is no Linux port.
     runs-on: macos-15
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
+        candidate: [""]
+        include:
+          - rep: 1
+            candidate: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
+          - rep: 2
+            candidate: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,7 +82,7 @@ jobs:
       # 15 pairs, the fewest the rule accepts, and 5 counted runs.
       - name: A/B against the anchor
         env:
-          CANDIDATE: ${{ inputs.candidate }}
+          CANDIDATE: ${{ matrix.candidate || inputs.candidate }}
         run: |
           scripts/bench-ab.sh --release --pairs 15 --counted 5 \
             ${CANDIDATE:+--candidate "$CANDIDATE"} "$RUNNER_TEMP/perf"
@@ -110,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: perf-ab-${{ github.sha }}-${{ github.run_attempt }}
+          name: perf-ab-${{ github.sha }}-${{ github.run_attempt }}-${{ matrix.rep }}-${{ matrix.candidate || 'head' }}
           path: ${{ runner.temp }}/perf
           if-no-files-found: warn
           retention-days: 90
