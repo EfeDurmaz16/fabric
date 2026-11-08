@@ -747,7 +747,9 @@ impl Modes {
             interactive: !globals.json
                 && !globals.non_interactive
                 && !ci
-                && std::io::stdin().is_terminal()
+                // Not `std::io::stdin()`: its first use allocates the
+                // buffer of a reader this run may never read with.
+                && rustix::termios::isatty(rustix::stdio::stdin())
                 && stderr_tty,
             rich: stderr_tty && !dumb,
             color: color(globals.no_color, env, stderr_tty && !dumb),
