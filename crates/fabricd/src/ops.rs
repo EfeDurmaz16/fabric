@@ -3303,7 +3303,12 @@ pub(crate) fn for_harness(probes: Probes, harness: &HarnessKind) -> Probes {
     let others: &[Tool] = match harness {
         HarnessKind::ClaudeCode => &[Tool::Codex, Tool::CodexLogin],
         HarnessKind::Codex => &[Tool::Claude, Tool::ClaudeLogin],
-        HarnessKind::Acp { .. } => &[
+        // The PR 5 harnesses have no doctor rows yet (docs/harness-adapters.md).
+        HarnessKind::Acp { .. }
+        | HarnessKind::OpenCode
+        | HarnessKind::Pi
+        | HarnessKind::GeminiCli
+        | HarnessKind::CursorAgent => &[
             Tool::Claude,
             Tool::ClaudeLogin,
             Tool::Codex,
@@ -3349,7 +3354,11 @@ pub(crate) fn preflight_probes(
     let (version, login) = match harness {
         HarnessKind::ClaudeCode => (Some(Tool::Claude), Some(Tool::ClaudeLogin)),
         HarnessKind::Codex => (Some(Tool::Codex), Some(Tool::CodexLogin)),
-        HarnessKind::Acp { .. } => (None, None),
+        HarnessKind::Acp { .. }
+        | HarnessKind::OpenCode
+        | HarnessKind::Pi
+        | HarnessKind::GeminiCli
+        | HarnessKind::CursorAgent => (None, None),
     };
     let mut both = Probes::of(&[Tool::User, Tool::Git]).union(carry);
     if let Some(version) = version {

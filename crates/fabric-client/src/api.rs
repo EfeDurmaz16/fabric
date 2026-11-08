@@ -29,8 +29,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::text;
 
-/// The version of the client API this crate speaks; a node answers only the same number.
-pub const API_VERSION: u32 = 1;
+/// The version of the client API this crate speaks; a node answers only
+/// the same number. 2 since PR 5 (2026-11-08): the closed set of harness
+/// kinds grew by `opencode`, `pi`, `gemini_cli` and `cursor_agent`.
+pub const API_VERSION: u32 = 2;
 
 /// The client's first frame on a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +213,9 @@ impl fmt::Display for Op {
 }
 
 /// The harness kinds as the client API writes them: `{ "kind": "claude_code" }`,
-/// `{ "kind": "codex" }` or `{ "kind": "acp", "program": ..., "args": [...] }`.
+/// `{ "kind": "codex" }`, `{ "kind": "acp", "program": ..., "args": [...] }`,
+/// and since api 2 `{ "kind": "opencode" }`, `{ "kind": "pi" }`,
+/// `{ "kind": "gemini_cli" }` and `{ "kind": "cursor_agent" }`.
 ///
 /// A field this client does not know is refused, not skipped: a harness
 /// says what a client launches, and a client that dropped a field would
@@ -233,6 +237,11 @@ enum HarnessDef {
         program: fabric_core::harness::ProgramName,
         args: Vec<String>,
     },
+    #[serde(rename = "opencode")]
+    OpenCode {},
+    Pi {},
+    GeminiCli {},
+    CursorAgent {},
 }
 
 /// Reads a field that has a default, taking `null` as absent: ADR 0018

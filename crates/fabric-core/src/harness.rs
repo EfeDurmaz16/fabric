@@ -1,7 +1,8 @@
 //! The kinds of harness.
 //!
 //! Invariant: the core knows which kind of adapter drives a job and how to
-//! start it, nothing more; the state an adapter carries is a tree of paths
+//! start it, nothing more; a new kind is appended after the last, so the
+//! postcard index of every kind a ledger already holds stays what it was; the state an adapter carries is a tree of paths
 //! and hashes in `crate::snapshot::HarnessState` that the core never reads.
 //! A program the core names is a bare name for a `PATH` lookup, so what a
 //! peer sends can never be a path or an option.
@@ -111,6 +112,14 @@ pub enum HarnessKind {
         /// Its arguments, passed as they are.
         args: Vec<String>,
     },
+    /// OpenCode through `opencode run`.
+    OpenCode,
+    /// pi, Earendil's coding agent, through `pi`.
+    Pi,
+    /// Gemini CLI through `gemini`.
+    GeminiCli,
+    /// Cursor Agent CLI through `cursor-agent`.
+    CursorAgent,
 }
 
 impl fmt::Display for HarnessKind {
@@ -125,6 +134,10 @@ impl fmt::Display for HarnessKind {
                 }
                 Ok(())
             }
+            HarnessKind::OpenCode => f.write_str("opencode"),
+            HarnessKind::Pi => f.write_str("pi"),
+            HarnessKind::GeminiCli => f.write_str("gemini-cli"),
+            HarnessKind::CursorAgent => f.write_str("cursor-agent"),
         }
     }
 }
@@ -145,6 +158,10 @@ mod tests {
             .to_string(),
             "acp:opencode acp"
         );
+        assert_eq!(HarnessKind::OpenCode.to_string(), "opencode");
+        assert_eq!(HarnessKind::Pi.to_string(), "pi");
+        assert_eq!(HarnessKind::GeminiCli.to_string(), "gemini-cli");
+        assert_eq!(HarnessKind::CursorAgent.to_string(), "cursor-agent");
     }
 
     #[test]

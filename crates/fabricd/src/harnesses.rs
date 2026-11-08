@@ -19,13 +19,19 @@ use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::claude::{ClaudeCode, VersionAhead};
 use fabric_harness::codex::Codex;
+use fabric_harness::cursor::CursorAgent;
+use fabric_harness::gemini::GeminiCli;
+use fabric_harness::opencode::OpenCode;
+use fabric_harness::pi::Pi;
 use serde::{Deserialize, Serialize};
 
 /// Why a harness could not be named or configured.
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessConfigError {
-    /// The text is not `claude`, `codex` or `acp:<program> [args]`.
-    #[error("unknown harness {0:?}; use claude, codex or acp:<program>")]
+    /// The text is none of the harness names `parse_harness` takes.
+    #[error(
+        "unknown harness {0:?}; use claude, codex, opencode, pi, gemini, cursor or acp:<program>"
+    )]
     Unknown(String),
     /// The ACP program name is not a bare program name.
     #[error("acp program: {0}")]
@@ -90,11 +96,17 @@ fn abs_path(path: &Path) -> Result<AbsPath, HarnessConfigError> {
     })
 }
 
-/// Parses the harness names the CLI takes: `claude`, `codex`, or `acp:<program> [args...]`.
+/// Parses the harness names the CLI takes: `claude`, `codex`, `opencode`,
+/// `pi`, `gemini`, `cursor`, each also under the name its kind displays
+/// with, or `acp:<program> [args...]`.
 pub fn parse_harness(text: &str) -> Result<HarnessKind, HarnessConfigError> {
     match text {
         "claude" | "claude-code" => Ok(HarnessKind::ClaudeCode),
         "codex" => Ok(HarnessKind::Codex),
+        "opencode" => Ok(HarnessKind::OpenCode),
+        "pi" => Ok(HarnessKind::Pi),
+        "gemini" | "gemini-cli" => Ok(HarnessKind::GeminiCli),
+        "cursor" | "cursor-agent" => Ok(HarnessKind::CursorAgent),
         _ => {
             let spec = text
                 .strip_prefix("acp:")
@@ -198,7 +210,12 @@ impl HarnessConfig {
                 .map(|config| (program.as_str().to_owned(), config.clone()))
                 .into_iter()
                 .collect(),
-            HarnessKind::ClaudeCode | HarnessKind::Codex => BTreeMap::new(),
+            HarnessKind::ClaudeCode
+            | HarnessKind::Codex
+            | HarnessKind::OpenCode
+            | HarnessKind::Pi
+            | HarnessKind::GeminiCli
+            | HarnessKind::CursorAgent => BTreeMap::new(),
         };
         HarnessConfig { acp }
     }
@@ -267,7 +284,9 @@ impl HarnessEnv {
 /// newest harness version known to have written the session the adapter
 /// will capture (`SessionRecord::known_writer`); only the Codex adapter
 /// takes it, because a Claude transcript records the version of every
-/// Claude that wrote a line and an ACP agent's state is opaque.
+/// Claude that wrote a line and an ACP agent's state is opaque. The PR 5
+/// adapters (docs/harness-adapters.md) take the home and the `PATH` alone
+/// until their owners give them a known writer of their own.
 pub fn adapter(
     kind: &HarnessKind,
     env: &HarnessEnv,
@@ -281,13 +300,20 @@ pub fn adapter(
             Codex::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
         ),
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
+        HarnessKind::OpenCode => Box::new(OpenCode::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::Pi => Box::new(Pi::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::GeminiCli => Box::new(GeminiCli::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::CursorAgent => {
+            Box::new(CursorAgent::new(env.home.clone(), env.path_var.clone()))
+        }
     })
 }
 
 /// Starts asking the installed harness of `kind` its version, as a
 /// restore of its state asks it, so the probe runs beside the restore of
 /// the workspace (item 14 of docs/evidence/perf-ab/README.md); `None` for
-/// an ACP agent, whose restore asks nothing.
+/// an ACP agent, whose restore asks nothing, and for a PR 5 adapter until
+/// its owner gives its restore a version to ask.
 #[must_use]
 pub fn ask_installed_ahead(kind: &HarnessKind, env: &HarnessEnv) -> Option<VersionAhead> {
     match kind {
@@ -297,7 +323,11 @@ pub fn ask_installed_ahead(kind: &HarnessKind, env: &HarnessEnv) -> Option<Versi
         HarnessKind::Codex => {
             Some(Codex::new(env.home.clone(), env.path_var.clone()).ask_installed_ahead())
         }
-        HarnessKind::Acp { .. } => None,
+        HarnessKind::Acp { .. }
+        | HarnessKind::OpenCode
+        | HarnessKind::Pi
+        | HarnessKind::GeminiCli
+        | HarnessKind::CursorAgent => None,
     }
 }
 
@@ -322,6 +352,12 @@ pub fn adapter_with_installed(
                 .with_installed_ahead(ahead),
         ),
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
+        HarnessKind::OpenCode => Box::new(OpenCode::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::Pi => Box::new(Pi::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::GeminiCli => Box::new(GeminiCli::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::CursorAgent => {
+            Box::new(CursorAgent::new(env.home.clone(), env.path_var.clone()))
+        }
     })
 }
 
@@ -362,7 +398,16 @@ mod tests {
             }
         );
         assert!(parse_harness("acp:/bin/sh").is_err());
-        assert!(parse_harness("gemini").is_err());
+        assert_eq!(parse_harness("opencode").unwrap(), HarnessKind::OpenCode);
+        assert_eq!(parse_harness("pi").unwrap(), HarnessKind::Pi);
+        assert_eq!(parse_harness("gemini").unwrap(), HarnessKind::GeminiCli);
+        assert_eq!(parse_harness("gemini-cli").unwrap(), HarnessKind::GeminiCli);
+        assert_eq!(parse_harness("cursor").unwrap(), HarnessKind::CursorAgent);
+        assert_eq!(
+            parse_harness("cursor-agent").unwrap(),
+            HarnessKind::CursorAgent
+        );
+        assert!(parse_harness("copilot").is_err());
     }
 
     #[test]

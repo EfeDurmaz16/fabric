@@ -43,6 +43,10 @@ use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome, VersionAhead};
 use fabric_harness::codex::Codex;
+use fabric_harness::cursor::CursorAgent;
+use fabric_harness::gemini::GeminiCli;
+use fabric_harness::opencode::OpenCode;
+use fabric_harness::pi::Pi;
 use fabric_harness::{
     Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnEvent, TurnFeed,
     TurnReport,
@@ -142,7 +146,7 @@ enum JobCommand {
         /// The goal in your words.
         #[arg(long)]
         goal: String,
-        /// The harness: claude, codex or acp:<program>.
+        /// The harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
         #[arg(long, default_value = "claude", value_parser = harness_arg)]
         harness: HarnessKind,
     },
@@ -172,7 +176,7 @@ enum JobCommand {
         /// The node that holds the job, when this node has never seen it.
         #[arg(long)]
         on: Option<NodeId>,
-        /// Continue under another harness: claude, codex or acp:<program>.
+        /// Continue under another harness: claude, codex, opencode, pi, gemini, cursor or acp:<program>.
         #[arg(long, value_parser = harness_arg)]
         harness: Option<HarnessKind>,
         /// The first message to send.
@@ -616,7 +620,12 @@ impl GuardAhead {
             HarnessKind::Codex => {
                 Codex::new(env.home, env.path_var).ask_guard_ahead(root, &launch_env)
             }
-            HarnessKind::Acp { .. } => return,
+            // No resume guard asks ahead for these yet (docs/harness-adapters.md).
+            HarnessKind::Acp { .. }
+            | HarnessKind::OpenCode
+            | HarnessKind::Pi
+            | HarnessKind::GeminiCli
+            | HarnessKind::CursorAgent => return,
         };
         // A probe that cannot start, as without the binary, is left to
         // the guard, which reports it in its own words.
@@ -988,6 +997,34 @@ async fn adapter_for(
             };
             (Box::new(agent), launch)
         }
+        HarnessKind::OpenCode => (
+            Box::new(OpenCode::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
+        HarnessKind::Pi => (
+            Box::new(Pi::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
+        HarnessKind::GeminiCli => (
+            Box::new(GeminiCli::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
+        HarnessKind::CursorAgent => (
+            Box::new(CursorAgent::new(
+                harness_env.home.clone(),
+                harness_env.path_var.clone(),
+            )),
+            launch,
+        ),
     })
 }
 
