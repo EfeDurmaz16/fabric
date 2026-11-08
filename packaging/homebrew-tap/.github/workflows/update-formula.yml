@@ -52,6 +52,13 @@ jobs:
               exit 0
             fi
           fi
+          # The source repository refuses to release a tag that is not on
+          # main; check again here, so the tap never takes one.
+          status=$(gh api "repos/$SOURCE_REPO/compare/main...$TAG" --jq .status)
+          case $status in
+          identical | behind) ;;
+          *) echo "$TAG is $status of main in $SOURCE_REPO"; exit 1 ;;
+          esac
           version=${TAG#v}
           work=$(mktemp -d)
           gh release download "$TAG" -R "$SOURCE_REPO" -D "$work" \

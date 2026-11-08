@@ -68,6 +68,19 @@ jobs:
         run: scripts/install-release-tool.sh dist
       - name: Check release.yml against dist-workspace.toml
         run: scripts/release-workflow.sh --check
+      # A release is a tag on main (docs/release.md). A version-shaped tag
+      # on any other commit stops here, before anything is built or hosted.
+      - name: Refuse a tag that is not on main
+        if: ${{ !github.event.pull_request }}
+        run: |
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+          case $status in
+          identical | behind) echo "$GITHUB_REF_NAME is on main" ;;
+          *)
+            echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is $status of main; tag a commit on main"
+            exit 1
+            ;;
+          esac
       - name: Cache dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

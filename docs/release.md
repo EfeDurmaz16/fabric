@@ -1,6 +1,6 @@
 # Releases
 
-A release is a git tag `v<version>` on `main`. The tag starts `.github/workflows/release.yml`, which builds, checks and publishes everything below. Nothing is published by hand, and nothing in the workflow uses a secret other than the repository's own `GITHUB_TOKEN`.
+A release is a git tag `v<version>` on a commit on `main`; the `plan` job refuses a tag anywhere else, and the tap checks again before it takes a formula. The tag starts `.github/workflows/release.yml`, which builds, checks and publishes everything below. Nothing is published by hand, and nothing in the workflow uses a secret other than the repository's own `GITHUB_TOKEN`.
 
 ## What a release contains
 
