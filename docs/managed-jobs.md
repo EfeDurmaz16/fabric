@@ -1406,6 +1406,24 @@ Each test is written first and fails on the M4 code. Names are what the implemen
 | The read surface for provider operations (carried from M4) | as the row under "Carried to M5": the node test over a seeded journal, the TypeScript test of `managedInspect`, the CLI test of `fabric managed inspect` |
 | Counters, not time | the facade: one journal read per `inspect` and `watch`, one commit per command; a placement: one probe round per decision; the executor: no fsync beyond the capture's own; `tests/off_runtime.rs` unchanged. Time is the Perf step's alone |
 
+### As built (M5): the initial placement's dispatch and what the acceptance runs prove
+
+Added in the acceptance step, after both owners merged. The selections stand as selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe.
+
+- `fabricd::dispatch` places every accepted `CreateJob` whose source is `snapshot`, `git` or `empty` (an imported directory is a snapshot by then): `Node::place_job` with `PlacementKind::Initial`, then the `Placed` observation, which records the decision and grants the primary task's first attempt on the chosen node in one batch, or parks the job. The list is `Authority::pending()`, read anew after every commit the authority counts, so a create accepted before a crash is placed after the restart, once. A create with a `repository` source is the M2 form and is still settled by its explicit `StartAttempt`; the loop leaves it alone, so the M2 tests and journals see no new event. The loop waits on `Authority::started()` and never starts the authority's thread itself, so a node with no managed job still starts none. A placement whose observation is refused is logged and not tried again in that process. Fault point `before_placement` (after the create's commit, before any decision) is the crash test's.
+- A harness version is advertised as the version in the harness's `--version` output (`codex-cli 0.155.1` is `0.155.1`); before this, every real Codex and Claude Code was advertised in a form the asking node could not parse and every node was excluded `harness_missing`.
+- Not built: the launch of a granted attempt, on this node or another. fabric-net protocol 4 carries `Advertise` and the facade, and no message that asks the chosen node to run a grant or carries its observations (`Started`, `Exited`, `Receipts`, `Checkpointed`, `HandoffBlocked`, `Continued`) back to the authority; the node has no `Capturer` but the tests' fake; `RegisterTask` names no program for a build or test task, so the executor has nothing to spawn for one; and no work package is built or carried. So a `Continue` stays `accepted` and the M5 rows "A planned handoff with child-task outcomes and the fidelity achieved" and the e2e tests the table names for it (`continuity::*`, `secrets::e2e_a_secret_value_appears_in_no_journal_snapshot_package_receipt_or_log`, and the attempt half of `e2e_a_submit_runs_on_the_eligible_node_without_naming_it`) are not run end to end. The question this needs is in docs/evidence/m5/README.md, "Blocked".
+
+The acceptance tests that ran through real daemons (two `fabricd` on one host, separate state roots, a TCP and TLS node link):
+
+| Acceptance | Test |
+| --- | --- |
+| Submit without choosing a machine: two eligible nodes, the decision recorded, the grant on the first ranked | `placement::e2e_a_submit_names_no_machine_and_the_decision_is_recorded` |
+| A secret only one node resolves; no eligible node parks the submit; a pin | the same test |
+| A create accepted before a crash is placed once after the restart | `placement::e2e_a_create_accepted_before_a_crash_is_placed_once_after_the_restart` |
+| The same job observed after a client reconnect, from another node | `facade::e2e_the_same_job_is_observed_after_a_reconnect_from_another_node` |
+| The watch cursor across an authority restart | `facade::e2e_a_watch_cursor_holds_across_an_authority_restart` |
+
 ### As built (M5): P03 to P05
 
 Owner A's parts landed in two commits, the model (`fabric-core`, format byte 2, schema version 3) and the node modules (`fabricd` executor, secrets, sources). The code is the authority on signatures; this note lists where it differs from the contract above and why. The selections stand as selected by the implementation agent on 2026-11-02 under Efe's delegation of 2026-11-02; none was approved by Efe.

@@ -64,3 +64,5 @@ Built on 2026-11-03 by owner B. Where the code differs from the decision above, 
 
 - Budget inputs beyond disk and load (cost, data placement permissions) once a provider resource can be placed.
 - Whether a node may advertise for a job it has never seen a snapshot of, with a transfer cost estimate as a rank input.
+
+The dispatch landed in the acceptance step (`fabricd::dispatch`): an accepted create from a `snapshot`, `git` or `empty` source is placed through `Node::place_job` after its commit and after a restart, and the decision is recorded with its grant or the park; a `repository` create keeps the M2 path. A harness is advertised by the version in its `--version` output, so a real Codex or Claude Code is admitted. The launch of the grant on the chosen node is not built; docs/managed-jobs.md, "As built (M5): the initial placement's dispatch", says what is missing.
