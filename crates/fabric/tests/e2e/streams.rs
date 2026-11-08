@@ -93,7 +93,10 @@ impl Asked {
         self.note(args);
         let mut args = args.to_vec();
         // Before a `--`, after which every word is the task's program.
-        let at = args.iter().position(|arg| *arg == "--").unwrap_or(args.len());
+        let at = args
+            .iter()
+            .position(|arg| *arg == "--")
+            .unwrap_or(args.len());
         args.insert(at, "--json");
         let output = node.run(&args)?;
         let what = format!("`fabric {}`", args.join(" "));
