@@ -23,6 +23,7 @@ use crate::{Notes, Refused, contract, write_lines};
 
 /// Read a Portable Session Format container without a node.
 #[derive(Debug, Subcommand)]
+#[command(defer = true)]
 pub(crate) enum PsfCommand {
     /// Check a container or a manifest and print its digest, the fidelity
     /// it offers and the attachments it lacks.
