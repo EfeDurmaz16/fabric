@@ -11,7 +11,7 @@ publish.workspace = true
 fabric-core = { path = "../fabric-core" }
 # The workspace's existing SQLite binding, at the version and features
 # fabric-store uses (ADR 0020): no new crate enters the workspace.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 thiserror = "2.0"
 
 [dev-dependencies]
