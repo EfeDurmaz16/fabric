@@ -6665,6 +6665,11 @@ pub(crate) mod tests {
         let rustc = bin.join("rustc");
         std::fs::write(&rustc, "#!/bin/sh\necho rustc 1.0.0-shell\n").unwrap();
         std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // macOS checks a new executable the first time it runs; on a
+        // loaded machine that first run outlasted `COMMAND_TIMEOUT` inside
+        // the measure and the key came back `Unmeasured` (the M6 gate run).
+        // The check is paid here, as `CountingTools` pays it at install.
+        assert!(std::process::Command::new(&rustc).status().unwrap().success());
         a.remember_env(&ClientEnv {
             path: vec![
                 PathDir::parse(bin.to_str().unwrap()).unwrap(),
