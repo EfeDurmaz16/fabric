@@ -943,15 +943,14 @@ fn serve(
                 if let Ok(t) = &answer {
                     note(place, &mut presence, job, &t.events, mono_ms());
                 }
-                let _ = reply.send(answer);
                 bump();
+                let _ = reply.send(answer);
             }
             Call::Mark(job, operation, mark, reply) => {
-                let _ = reply.send(
-                    open(&mut holder, job)
-                        .and_then(|j| Ok(j.mark_authority(job, operation, mark, now_ms())?)),
-                );
+                let answer = open(&mut holder, job)
+                    .and_then(|j| Ok(j.mark_authority(job, operation, mark, now_ms())?));
                 bump();
+                let _ = reply.send(answer);
             }
             Call::Report(token, from, observation, reply) => {
                 let from = from.unwrap_or(place.node);
@@ -965,8 +964,8 @@ fn serve(
                 if let Ok(Ok(t)) = &answer {
                     note(place, &mut presence, token.job, &t.events, mono_ms());
                 }
-                let _ = reply.send(answer);
                 bump();
+                let _ = reply.send(answer);
             }
             Call::Fenced(token, path, from, write) => {
                 let from = from.unwrap_or(place.node);
@@ -982,33 +981,30 @@ fn serve(
                 bump();
             }
             Call::Acknowledge(job, ack, reply) => {
-                let _ = reply.send(
-                    open(&mut holder, job).and_then(|j| Ok(j.acknowledge(job, &ack, now_ms())?)),
-                );
+                let answer =
+                    open(&mut holder, job).and_then(|j| Ok(j.acknowledge(job, &ack, now_ms())?));
                 bump();
+                let _ = reply.send(answer);
             }
             // A heartbeat or a tick moves the counter only when it wrote,
-            // so an idle authority wakes no facade watch (ADR 0028).
+            // so an idle authority wakes no facade watch (ADR 0028). Each
+            // call moves it before it answers, so a caller that saw its
+            // answer sees the counter moved.
             Call::Heartbeat(from, beat, reply) => {
                 let mut wrote = false;
-                let _ = reply.send(heartbeat(
-                    place,
-                    &mut holder,
-                    &mut presence,
-                    from,
-                    &beat,
-                    &mut wrote,
-                ));
+                let answer = heartbeat(place, &mut holder, &mut presence, from, &beat, &mut wrote);
                 if wrote {
                     bump();
                 }
+                let _ = reply.send(answer);
             }
             Call::Tick(now, reply) => {
                 let mut wrote = false;
-                let _ = reply.send(tick(place, &mut holder, &mut presence, now, &mut wrote));
+                let answer = tick(place, &mut holder, &mut presence, now, &mut wrote);
                 if wrote {
                     bump();
                 }
+                let _ = reply.send(answer);
             }
             Call::Job(job, reply) => {
                 let _ = reply.send(match &holder {
