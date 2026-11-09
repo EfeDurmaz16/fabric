@@ -24,7 +24,10 @@ use fabric_client::Client;
 use fabric_client::api::Inspection;
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::launch::{Report, ReportAnswer};
-use fabric_core::managed::{AttemptId, ExitOutcome, Generation, GrantToken, Observation};
+use fabric_core::managed::{
+    AttemptId, ExitOutcome, Generation, GrantToken, HEARTBEAT_INTERVAL_MS, Observation,
+    UNAVAILABLE_AFTER_MS,
+};
 use fabric_net::identity::NodeIdentity;
 use fabric_net::quic::QuicTransport;
 use fabric_net::rpc::Session;
@@ -384,6 +387,34 @@ async fn recovered_onto_the_authority(p: &Partition, placed: &Placed) -> Fallibl
     Ok(after)
 }
 
+/// Heartbeats hold presence while the link is up: past
+/// `UNAVAILABLE_AFTER_MS` (and two heartbeats more) after the first
+/// attempt was seen running at `since`, it is still `running` and the
+/// authority recorded no unavailability. Silence is counted from the last
+/// heartbeat, never from the grant (review finding on PR #39).
+async fn heartbeats_hold_presence(p: &Partition, placed: &Placed, since: Instant) -> Fallible {
+    let past = since
+        + Duration::from_millis(UNAVAILABLE_AFTER_MS)
+        + Duration::from_millis(2 * HEARTBEAT_INTERVAL_MS);
+    if let Some(left) = past.checked_duration_since(Instant::now()) {
+        tokio::time::sleep(left).await;
+    }
+    let held = placed.client.managed_inspect(placed.job, |_| {}).await?;
+    assert_eq!(held.job.attempts.len(), 1, "{held:?}");
+    assert_eq!(held.job.attempts[0].status, "running", "{held:?}");
+    let kinds = event_kinds(
+        &p.authority,
+        &p.authority.id,
+        &placed.token,
+        &placed.job_text(),
+    )?;
+    assert!(
+        !kinds.iter().any(|e| e["kind"] == "attempt_unavailable"),
+        "unavailable while the link was up: {kinds:?}"
+    );
+    Ok(())
+}
+
 /// The number of the job's attempts that may still run.
 fn live(i: &Inspection) -> usize {
     i.job
@@ -550,13 +581,24 @@ async fn relay_paused_runner_alive() -> Fallible {
     env.install_fake_codex()?;
     let mut p = Partition::start(&env)?;
     let placed = place_on_runner(&p, "m6-relay", "restart_from_acknowledged").await?;
+    let running = Instant::now();
     acknowledged(&p, &placed).await?;
     provision(&p.authority)?;
     let group = harness_group(&p.runner, placed.first)?;
+    heartbeats_hold_presence(&p, &placed, running).await?;
     p.relay.pause()?;
     let paused = Instant::now();
     let after = recovered_onto_the_authority(&p, &placed).await?;
-    eprintln!("recovered {:?} after the pause", paused.elapsed());
+    let took = paused.elapsed();
+    eprintln!("recovered {took:?} after the pause");
+    // The silence that made it unknown, then as long again, both counted
+    // from the last heartbeat before the pause, at most one interval
+    // earlier: never counted from the grant.
+    let floor = Duration::from_millis(2 * UNAVAILABLE_AFTER_MS - HEARTBEAT_INTERVAL_MS);
+    assert!(
+        took >= floor,
+        "recovered {took:?} after the pause, under {floor:?}"
+    );
     let kinds = event_kinds(
         &p.authority,
         &p.authority.id,
@@ -700,13 +742,22 @@ async fn block_policy_waits_until_an_operator_recovers() -> Fallible {
     env.install_fake_codex()?;
     let mut p = Partition::start(&env)?;
     let placed = place_on_runner(&p, "m6-block", "block").await?;
+    let running = Instant::now();
     acknowledged(&p, &placed).await?;
     provision(&p.authority)?;
+    heartbeats_hold_presence(&p, &placed, running).await?;
     p.relay.pause()?;
+    let paused = Instant::now();
     let unknown = until(&p, &placed.client, placed.job, "the attempt unknown", |i| {
         i.job.attempts[0].status == "unknown"
     })
     .await?;
+    let floor = Duration::from_millis(UNAVAILABLE_AFTER_MS - HEARTBEAT_INTERVAL_MS);
+    let took = paused.elapsed();
+    assert!(
+        took >= floor,
+        "unknown {took:?} after the pause, under {floor:?}"
+    );
     // A negative: past UNAVAILABLE_AFTER_MS of dwell and a tick, the
     // window in which a restart policy acts, under block nothing moved.
     tokio::time::sleep(Duration::from_secs(14)).await;
