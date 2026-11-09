@@ -47,12 +47,15 @@ pub enum Point {
     /// The authority's verifier is about to fetch a capture it has not
     /// acknowledged (ADR 0028).
     BeforeAcknowledge,
+    /// A suspend captured the harness state into `harness-state.next` and
+    /// has not put it in place yet.
+    MidHarnessCapture,
 }
 
 impl Point {
     /// Every point, for parsing.
     #[cfg(feature = "faults")]
-    const ALL: [Point; 12] = [
+    const ALL: [Point; 13] = [
         Point::AfterQuiesce,
         Point::AfterSnapshotPublish,
         Point::AfterDepartingWrite,
@@ -65,6 +68,7 @@ impl Point {
         Point::AfterLaunchAccepted,
         Point::WhileStopping,
         Point::BeforeAcknowledge,
+        Point::MidHarnessCapture,
     ];
 
     fn name(self) -> &'static str {
@@ -81,6 +85,7 @@ impl Point {
             Point::AfterLaunchAccepted => "after_launch_accepted",
             Point::WhileStopping => "while_stopping",
             Point::BeforeAcknowledge => "before_acknowledge",
+            Point::MidHarnessCapture => "mid_harness_capture",
         }
     }
 }

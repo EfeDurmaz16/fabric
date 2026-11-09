@@ -11,12 +11,13 @@ publish.workspace = true
 # Named fault points the end-to-end test drives through FABRIC_FAULT, and
 # the link capture it reads through FABRIC_NET_TAP; off
 # in every build that is not a test.
-faults = ["fabric-net/tap"]
+faults = ["fabric-net/tap", "fabric-store/faults"]
 
 [dependencies]
 blake3 = "1.8"
 fabric-client = { path = "../fabric-client" }
 fabric-core = { path = "../fabric-core" }
+fabric-bridge = { path = "../fabric-bridge" }
 fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
 fabric-journal = { path = "../fabric-journal" }

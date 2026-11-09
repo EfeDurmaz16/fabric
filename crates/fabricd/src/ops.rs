@@ -261,6 +261,11 @@ impl Node {
                 self.job_export_psf(job, PathBuf::from(dir.as_str()))
                     .await?,
             ),
+            Request::Gc {
+                remove,
+                approvals,
+                worker,
+            } => Reply::Gc(Box::pin(self.gc(remove, approvals, worker)).await?),
         })
     }
 
@@ -1094,6 +1099,8 @@ impl Node {
         let captured = harness.capture(root, &session, &next).await;
         if captured.is_err() {
             remove_dir_if_any(&next)?;
+        } else {
+            crate::faults::hit(crate::faults::Point::MidHarnessCapture).await;
         }
         match captured {
             Ok(manifest) => {
@@ -2646,7 +2653,8 @@ impl Node {
         let state_dir = job.dir().harness_state();
         if let Some(facts) = facts {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            self.write_snapshot(snapshot, &manifest, &root, harness_dir, &facts, out)
+            let into = (root.as_path(), harness_dir, id, epoch);
+            self.write_snapshot(snapshot, &manifest, into, &facts, out)
                 .await?;
         }
         // A cache written with holes that setup steps fill keeps no
@@ -2792,11 +2800,18 @@ impl Node {
         &self,
         snapshot: SnapshotId,
         manifest: &fabric_core::snapshot::SnapshotManifest,
-        root: &Path,
-        harness_dir: Option<PathBuf>,
+        (root, harness_dir, job, epoch): (&Path, Option<PathBuf>, JobId, Epoch),
         facts: &NodeFacts,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        // Who the restore is for, in each staging directory it writes, so
+        // one a kill leaves says whose it is (ADR 0030).
+        let label = crate::gc::StagingLabel {
+            job,
+            node: self.id,
+            epoch,
+        }
+        .encode();
         let decisions = carry::decide_all(manifest, facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
@@ -2819,6 +2834,7 @@ impl Node {
                     verify: Verify::Sample(32),
                     durability: Durability::PowerLoss,
                     carry: &carry,
+                    label: Some(label.as_bytes()),
                 },
             )?)
         })
@@ -4374,7 +4390,7 @@ pub(crate) mod tests {
     /// A node with its state in `state` and the home `home`, which other
     /// nodes of a test may share as the gate Macs share one home path,
     /// started in `env`.
-    fn node_at(home: &Path, state: &Path, env: ToolEnv) -> Arc<Node> {
+    pub(crate) fn node_at(home: &Path, state: &Path, env: ToolEnv) -> Arc<Node> {
         std::fs::create_dir_all(home).unwrap();
         Node::start(NodeConfig {
             state: StateDir::resolve(Some(state.as_os_str()), home).unwrap(),

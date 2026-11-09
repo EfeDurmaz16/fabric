@@ -295,6 +295,22 @@ impl Runner {
         }
     }
 
+    /// The grants of the attempts this node runs now, and the attempts its
+    /// executor holds open: what `gc` holds live on the launch path (ADR
+    /// 0030). Read under the lock a launch takes before it writes
+    /// anything of the attempt, so an attempt launched after this read
+    /// left nothing a read before it saw.
+    pub(crate) async fn running(&self) -> (Vec<GrantToken>, Vec<AttemptId>) {
+        let tokens = self
+            .attempts
+            .lock()
+            .await
+            .values()
+            .map(|ctl| ctl.token)
+            .collect();
+        (tokens, self.executor.open().await)
+    }
+
     fn taken_path(&self, attempt: AttemptId) -> PathBuf {
         self.taken.join(format!("{attempt}.json"))
     }

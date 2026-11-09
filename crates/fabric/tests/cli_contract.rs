@@ -154,6 +154,8 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "argv" => "true".to_owned(),
         "ttl_ms" => "60000".to_owned(),
         "psf" | "container" | "DIR" | "CONTAINER" => sandbox.path("psf").display().to_string(),
+        "OPERATION_APPROVAL" => "01JABCDEFGHJKMNPQRSTVWXYZ3=apr-demo".to_owned(),
+        "PROFILE" => "docker".to_owned(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
 }
@@ -426,6 +428,40 @@ fn a_stray_word_is_a_usage_error_that_names_it() {
             format!("Unexpected argument stray for {name}."),
             "{name}: {doc}"
         );
+    }
+}
+
+/// The commands that remove anything: each takes `--yes`, reports only
+/// without it, and refuses the inputs of a removal without it as a usage
+/// error, so no removal runs on a default.
+const REMOVES: &[&[&str]] = &[&["gc"]];
+
+#[test]
+fn a_command_that_removes_takes_yes_and_reports_without_it() {
+    let sandbox = Sandbox::new();
+    for path in REMOVES {
+        let path: Vec<String> = path.iter().map(|word| (*word).to_owned()).collect();
+        let name = joined(&path);
+        let cmd = find(&path);
+        let yes = cmd
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("yes"))
+            .unwrap_or_else(|| panic!("{name} removes and has no --yes"));
+        assert!(!yes.is_required_set(), "{name}: --yes is required");
+        let mut args = path.clone();
+        args.extend(words(&[
+            "--approve",
+            "01JABCDEFGHJKMNPQRSTVWXYZ3=apr-demo",
+            "--worker",
+            "/bin/true",
+            "--profile",
+            "docker",
+            "--json",
+        ]));
+        let output = sandbox.run(&args);
+        let doc = error_document(&output, &format!("{name} --approve without --yes"));
+        assert_eq!(output.status.code(), Some(2), "{name}: {doc}");
+        assert_eq!(stdout(&output), "", "{name}");
     }
 }
 

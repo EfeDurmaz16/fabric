@@ -8,7 +8,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
 
 [Give each stream one job; Principles: stdout is the answer]
 
-- Standard output carries only the answer. A read prints its data: `job status`, `job log`, `job ls`, `node ls`, `doctor`, `job import --psf` and `psf inspect`. A change prints the bare identifier of what it changed or made, one line, so `id=$(fabric job new --repo . --goal "...")` holds the job id and nothing else:
+- Standard output carries only the answer. A read prints its data: `job status`, `job log`, `job ls`, `node ls`, `doctor`, `gc`, `job import --psf` and `psf inspect`. A change prints the bare identifier of what it changed or made, one line, so `id=$(fabric job new --repo . --goal "...")` holds the job id and nothing else:
 
   | Command | Standard output |
   |---|---|
@@ -18,6 +18,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
   | `job export --psf` | the document digest of the container it wrote |
   | `node add` | the node id |
   | `node id` | this node's id |
+  | `gc --yes` | one row per residual it removed, as `gc` lists them |
 
 - Everything else goes to standard error: progress (each phase of a move, a suspend, a restore, a setup step), context (`root ...`, `harness ...`, `listening on ...`), the hint of an empty list, a count of rows left out, warnings, prompts and errors.
 - An empty list is success: exit 0, nothing on standard output, a first-use hint on standard error [Tables, details & empty results].
@@ -30,7 +31,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
 [Machine results; Machine errors]
 
 - `--json` works on every command at any depth. Standard output then holds exactly one JSON document and a newline, indented when standard output is a terminal and on one line otherwise. Standard error stays empty on success: progress, notes and warnings are not printed, and log lines below `error` are off unless `--debug` is given.
-- The document mirrors the client API (ADR 0018), the same fields the TypeScript SDK reads, keyed by the noun: `{ "job": {...} }` for a read of one, the API's own list keys (`{ "jobs": [...], "closed": [...] }`, `{ "peers": [...] }`, `{ "records": [...] }`) for a list, and `{ "job": {...}, "outcome": "<verb>" }` for a change, the outcome one of `created`, `suspended`, `moved`, `stolen`, `recorded`, `repaired`, `exported`, `added`, `canceled` or `unchanged` (a managed command answered again for its operation key).
+- The document mirrors the client API (ADR 0018), the same fields the TypeScript SDK reads, keyed by the noun: `{ "job": {...} }` for a read of one, the API's own list keys (`{ "jobs": [...], "closed": [...] }`, `{ "peers": [...] }`, `{ "records": [...] }`) for a list, and `{ "job": {...}, "outcome": "<verb>" }` for a change, the outcome one of `created`, `suspended`, `moved`, `stolen`, `recorded`, `repaired`, `exported`, `added`, `canceled`, `removed` or `unchanged` (a managed command answered again for its operation key). `gc` answers with the report's own keys (`removing`, `live`, `residuals`, `kept`), with `"outcome": "removed"` under `--yes` once every residual it listed was removed, and no outcome on a dry run or on a removal that left one (`gc_incomplete`, `approval_required`), whose failure carries the report as its `data`.
 - A failure under `--json` writes nothing to standard output and exactly one single-line JSON document to standard error, the last line there:
 
   ```json
@@ -47,7 +48,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
   | `retryable` | `true` only when running the same command again is safe; `false` for a refusal and for a lost connection whose outcome is unknown |
   | `userActionRequired` | `true` when a human must approve: `--force` over a preflight, `--yes` for setup steps |
 
-  The CLI's own reasons: `unknown_option`, `unexpected_argument` (a stray word no argument takes), `unknown_command`, `missing_argument`, `invalid_arguments` (usage, exit 2), `no_daemon` (exit 80), `untrusted_state`, `incompatible_node`, `unknown_outcome`, `unreadable_record`, `invalid_container` (a Portable Session Format container, manifest or fixture set that does not read), `stale_container` (exit 85: this node's head for the job is not the revision a container names), `confirmation_required`, `workspace_busy`, `node_error`, and `failed` for any other error (exit 1).
+  The CLI's own reasons: `unknown_option`, `unexpected_argument` (a stray word no argument takes), `unknown_command`, `missing_argument`, `invalid_arguments` (usage, exit 2), `no_daemon` (exit 80), `untrusted_state`, `incompatible_node`, `unknown_outcome`, `unreadable_record`, `invalid_container` (a Portable Session Format container, manifest or fixture set that does not read), `stale_container` (exit 85: this node's head for the job is not the revision a container names), `confirmation_required`, `workspace_busy`, `node_error`, `gc_incomplete` (exit 1: a removal `fabric gc --yes` listed failed; the report is the data), `approval_required` (exit 84: a provider resource `fabric gc --yes` was given no approval for), and `failed` for any other error (exit 1).
 - `job run` and `job resume` refuse `--json` as a usage error (exit 2), because the harness owns standard output. This is a recorded exception to "every command that reads or changes a resource supports it".
 - Help is text under `--json` too: `fabric help --json`, `fabric job --help --json` and a bare group with `--json` print the help and exit 0. Help as JSON waits for the rename (below).
 - `managed create` and `managed cancel` without `--operation-key` run under a key the CLI makes. In words it is on standard error before the request; under `--json` it is the answer's `operation.operation_key`, and every failure carries it as `data.operation_key`. When the answer was lost (`unknown_outcome`) the failure's `next` is the same command with `--operation-key <key>`, which the node answers with its first answer and never runs twice; the same command without it would make a second job.
@@ -67,7 +68,7 @@ This page describes the behaviour, not the names: the command vocabulary (`job n
 | 81 | Not the owner: another node owns the job, this node does not know it, or the plan's epoch is over |
 | 82 | Frozen: a move this node started waits for its target, or the job is frozen after a fork |
 | 83 | A peer could not be reached, or gave no answer in time |
-| 84 | Refused without `--force` (the preflight, a steal's dry run) or without `--yes` (setup steps not approved) |
+| 84 | Refused without `--force` (the preflight, a steal's dry run), without `--yes` (setup steps not approved) or without an approval (a provider resource `gc --yes` may not remove) |
 | 85 | The job's state stops the command |
 | 128 + n | Stopped by signal n; Ctrl-C is 130 |
 | the harness's code | `run` and `resume` exit with the harness's code when it exits on its own |
@@ -136,7 +137,7 @@ Every command takes these at any depth, before or after the command path:
 | `--no-color` | Disable color |
 | `-d, --debug` | Diagnostic log lines on standard error (`FABRIC_LOG` still wins) |
 
-Options are parsed strictly: an unknown option or an extra positional fails before any work, and no command or option is matched by a prefix [Options & parsing]. Recurring inputs use one name everywhere: `--to` for a target node, `--harness` for a harness, `--force` waives a refusal, `--yes` answers a confirmation, and they are different options [Bind consent to consequences].
+Options are parsed strictly: an unknown option or an extra positional fails before any work, and no command or option is matched by a prefix [Options & parsing]. Recurring inputs use one name everywhere: `--to` for a target node, `--harness` for a harness, `--force` waives a refusal, `--yes` answers a confirmation, and they are different options [Bind consent to consequences]. A command that removes anything (`gc`) only reports without `--yes`, and `tests/cli_contract.rs` holds every such command to it.
 
 ## Times
 

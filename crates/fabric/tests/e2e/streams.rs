@@ -330,6 +330,18 @@ fn m5_commands_keep_their_streams(
     Ok(())
 }
 
+/// `gc`: a dry run is a read keyed by the report's own nouns, with no
+/// outcome; `--yes` is a change whose outcome is `removed`.
+fn gc_keeps_its_streams(asked: &mut Asked, a: &Node) -> Fallible {
+    asked.words(a, &["gc"])?;
+    let report = asked.read(a, &["gc"], "residuals")?;
+    assert_eq!(report["removing"], false, "{report}");
+    let removed = asked.json(a, &["gc", "--yes"])?;
+    assert_eq!(removed["outcome"], "removed", "{removed}");
+    assert!(removed["residuals"].is_array(), "{removed}");
+    Ok(())
+}
+
 #[test]
 fn e2e_every_answer_keeps_its_streams_in_words_and_as_json() -> Fallible {
     let mut asked = Asked::default();
@@ -419,6 +431,8 @@ fn e2e_every_answer_keeps_its_streams_in_words_and_as_json() -> Fallible {
     let cancel = ["managed", "cancel", &managed, "--operation-key", "x-1"];
     asked.change(a, &cancel, &managed)?;
     asked.changed(a, &cancel, "operation", "unchanged")?;
+
+    gc_keeps_its_streams(&mut asked, a)?;
 
     // Every leaf command is held here or names the test that holds it.
     let elsewhere: BTreeSet<&str> = ELSEWHERE.iter().map(|(path, _)| *path).collect();

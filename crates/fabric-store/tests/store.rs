@@ -872,6 +872,7 @@ mod shared_bench {
                 verify: Verify::Sample(32),
                 durability: Durability::PowerLoss,
                 carry: &|_| true,
+                label: None,
             },
         )?;
         Ok(())
