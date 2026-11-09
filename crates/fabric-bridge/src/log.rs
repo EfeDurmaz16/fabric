@@ -162,8 +162,13 @@ impl<L> std::fmt::Debug for Place<'_, L> {
 }
 
 /// A call handed to the thread that owns a log, given the log or why it
-/// cannot be reached.
-pub type Handed<L> = Box<dyn FnOnce(Result<&mut L, LogError>) + Send>;
+/// cannot be reached. It returns its caller's answer unsent: the owner
+/// does its own bookkeeping of the call (a commit counter, say), then
+/// calls the answer, so a caller that heard it sees that bookkeeping.
+pub type Handed<L> = Box<dyn FnOnce(Result<&mut L, LogError>) -> HandedAnswer + Send>;
+
+/// The answer of a [`Handed`] call, sent when called.
+pub type HandedAnswer = Box<dyn FnOnce() + Send>;
 
 /// Room for one call on the queue of a thread that owns a log and serves
 /// other work too: the node's managed authority, the one writer of the
@@ -173,7 +178,8 @@ pub type Handed<L> = Box<dyn FnOnce(Result<&mut L, LogError>) + Send>;
 /// thread serves its other work.
 pub trait Hand<L>: Send {
     /// Queues `call`; the owner runs it once, with the log or the reason
-    /// it has none. An owner that stopped drops it unrun.
+    /// it has none, and calls the [`HandedAnswer`] it returns last. An owner
+    /// that stopped drops it unrun.
     fn hand(self: Box<Self>, call: Handed<L>);
 }
 
@@ -220,8 +226,11 @@ impl<L: OperationLog + Send + 'static> Slot<'_, L> {
             Place::Hand(hand) => {
                 let (reply, result) = oneshot::channel();
                 hand.hand(Box::new(move |log| {
-                    // A caller that stopped waiting has nothing to hear.
-                    let _ = reply.send(log.map(call));
+                    let value = log.map(call);
+                    Box::new(move || {
+                        // A caller that stopped waiting has nothing to hear.
+                        let _ = reply.send(value);
+                    })
                 }));
                 Waiting::Hand(result)
             }

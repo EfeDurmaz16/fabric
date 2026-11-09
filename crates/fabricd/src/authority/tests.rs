@@ -1484,3 +1484,76 @@ async fn a_grant_made_by_a_derived_command_is_tracked_for_presence() {
     let s = authority.job(job).await.unwrap().unwrap();
     assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
 }
+
+/// Sends the call `make` builds around a probe answer, and returns whether
+/// the commit counter had moved when the thread delivered that answer:
+/// the probe reads the counter at the moment a caller would hear it.
+async fn moved_before_the_answer(
+    authority: &Authority,
+    make: impl FnOnce(Deliver) -> Call,
+) -> bool {
+    let mut commits = authority.commits().unwrap();
+    commits.borrow_and_update();
+    let (heard, answer) = tokio::sync::oneshot::channel();
+    let probe: Deliver = Box::new(move || {
+        let _ = heard.send(commits.has_changed().unwrap());
+    });
+    let (calls, _) = authority.running().unwrap();
+    calls.send(make(probe)).await.unwrap();
+    answer.await.unwrap()
+}
+
+// Review finding on PR #39: the arms whose closure answers its caller sent
+// the answer before the counter moved, as the tick did.
+
+#[tokio::test]
+async fn a_writing_journal_call_moves_the_counter_before_it_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let moved = moved_before_the_answer(&authority, |probe| Call::With {
+        create: false,
+        writes: true,
+        work: Box::new(move |journal| {
+            assert!(journal.is_ok());
+            probe
+        }),
+    })
+    .await;
+    assert!(moved, "the answer was delivered before the counter moved");
+}
+
+#[tokio::test]
+async fn a_derived_submit_moves_the_counter_before_it_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let moved = moved_before_the_answer(&authority, |probe| {
+        Call::Derived(Box::new(move |_, _, _| probe))
+    })
+    .await;
+    assert!(moved, "the answer was delivered before the counter moved");
+}
+
+#[tokio::test]
+async fn a_fenced_write_moves_the_counter_before_it_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (_, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    let moved = moved_before_the_answer(&authority, |probe| {
+        Call::Fenced(
+            token,
+            fabric_core::managed::CoveredPath::LedgerAppend,
+            Some(RUNNER),
+            Box::new(move |fenced| {
+                assert_eq!(fenced.unwrap(), Ok(()));
+                probe
+            }),
+        )
+    })
+    .await;
+    assert!(moved, "the answer was delivered before the counter moved");
+}

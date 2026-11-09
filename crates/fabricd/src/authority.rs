@@ -109,8 +109,21 @@ type Reply<T> = oneshot::Sender<Result<T, AuthorityError>>;
 type Fenced = Result<Result<(), FenceVerdict>, AuthorityError>;
 
 /// The write behind a fence, run on the authority's thread with what the
-/// fence said; it answers the caller itself.
-type Write = Box<dyn FnOnce(Fenced) + Send>;
+/// fence said; it returns the caller's answer unsent.
+type Write = Box<dyn FnOnce(Fenced) -> Deliver + Send>;
+
+/// A caller's answer, made and held until the thread has moved the commit
+/// counter: the thread calls it last, so a caller that saw its answer
+/// sees the counter moved.
+type Deliver = Box<dyn FnOnce() + Send>;
+
+/// The [`Deliver`] that sends `value` on `reply`.
+fn deliver<T: Send + 'static>(reply: oneshot::Sender<T>, value: T) -> Deliver {
+    Box::new(move || {
+        // A caller that stopped waiting has nothing to hear.
+        let _ = reply.send(value);
+    })
+}
 
 enum Call {
     Submit(Envelope<Command>, Reply<Answer>),
@@ -126,7 +139,8 @@ enum Call {
     /// A covered write other than a journal operation: the fence, then the
     /// write itself, on the authority's thread, so nothing commits between
     /// the two. The closure gets the fence's answer and does the write for
-    /// `Ok(Ok(()))`, and answers the caller itself.
+    /// `Ok(Ok(()))`, and returns the caller's answer, sent after the
+    /// counter moved.
     Fenced(GrantToken, CoveredPath, Option<NodeId>, Write),
     /// The authority's acceptance of a checkpoint it fetched and verified.
     Acknowledge(JobId, CheckpointAck, Reply<Transition>),
@@ -139,7 +153,8 @@ enum Call {
     List(Reply<Vec<ManagedState>>),
     Pending(Reply<Vec<PendingEffect>>),
     /// Work on the open journal by the facade and the inspect read (owner
-    /// B, M5): the closure answers its own caller. `create` makes the
+    /// B, M5): the closure returns its caller's answer, sent after the
+    /// counter moved. `create` makes the
     /// journal when there is none yet, as a first `CreateJob` does, for a
     /// token minted before any job. `writes` says whether the work may
     /// change the journal; only then is the commit counter moved, so a
@@ -174,10 +189,10 @@ pub(crate) struct PendingEffect {
 }
 
 /// Work the facade or a read runs inside the authority's thread; it
-/// answers its own caller.
-type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
+/// returns its caller's answer unsent.
+type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) -> Deliver + Send>;
 
-type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder, &mut Presence) + Send>;
+type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder, &mut Presence) -> Deliver + Send>;
 
 /// A read for [`Authority::read_journal`]: the journal, `None` when there
 /// is none, or why the authority stopped.
@@ -417,9 +432,7 @@ impl Authority {
         self.call(|reply: Reply<T>| Call::With {
             create,
             writes,
-            work: Box::new(move |journal| {
-                let _ = reply.send(journal.and_then(work));
-            }),
+            work: Box::new(move |journal| deliver(reply, journal.and_then(work))),
         })
         .await
     }
@@ -507,9 +520,8 @@ impl Authority {
         let answer = self
             .call(|reply: Reply<Result<Answer, E>>| {
                 Call::Derived(Box::new(move |place, holder, presence| {
-                    let _ = reply.send(derived(
-                        place, holder, presence, &key, &request, job, derive,
-                    ));
+                    let answer = derived(place, holder, presence, &key, &request, job, derive);
+                    deliver(reply, answer)
                 }))
             })
             .await;
@@ -623,7 +635,7 @@ impl Authority {
             from,
             Box::new(move |fenced| {
                 let out = fenced.map(|fenced| fenced.map(|()| write()));
-                let _ = reply.send(out);
+                deliver(reply, out)
             }),
         );
         calls
@@ -759,7 +771,7 @@ impl fabric_bridge::Hand<Journal> for Turn {
             create: false,
             writes: true,
             work: Box::new(move |journal| {
-                call(journal.map_err(|e| fabric_bridge::LogError::Storage(e.to_string())));
+                call(journal.map_err(|e| fabric_bridge::LogError::Storage(e.to_string())))
             }),
         });
     }
@@ -887,12 +899,12 @@ fn serve(
                     match self::create(place) {
                         Ok(journal) => holder = Holder::Open(journal),
                         Err(e) => {
-                            work(Err(e));
+                            work(Err(e))();
                             continue;
                         }
                     }
                 }
-                work(match &mut holder {
+                let answer = work(match &mut holder {
                     Holder::Open(journal) => Ok(journal),
                     Holder::Absent => {
                         Err(AuthorityError::Unavailable("no managed journal yet".into()))
@@ -902,10 +914,12 @@ fn serve(
                 if writes {
                     bump();
                 }
+                answer();
             }
             Call::Derived(work) => {
-                work(place, &mut holder, &mut presence);
+                let answer = work(place, &mut holder, &mut presence);
                 bump();
+                answer();
             }
             Call::Read(work) => work(match &holder {
                 Holder::Absent => Ok(None),
@@ -977,8 +991,9 @@ fn serve(
                     }),
                 };
                 // The write runs here, before the next call is taken.
-                write(fenced);
+                let answer = write(fenced);
                 bump();
+                answer();
             }
             Call::Acknowledge(job, ack, reply) => {
                 let answer =
