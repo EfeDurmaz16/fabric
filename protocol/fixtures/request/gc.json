@@ -1,0 +1,15 @@
+{
+  "op": "gc",
+  "remove": true,
+  "approvals": [
+    {
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+      "approval": "apr-cleanup-1"
+    }
+  ],
+  "worker": {
+    "program": "/usr/local/bin/capsule-bridge-worker",
+    "profile": "docker",
+    "config": "/Users/me/.config/capsule/worker.json"
+  }
+}

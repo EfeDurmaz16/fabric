@@ -63,6 +63,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub mod contract;
+mod gc;
 mod managed;
 mod psf;
 mod render;
@@ -77,6 +78,7 @@ pub(crate) struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(defer = true)]
 enum Command {
     /// Run the node daemon in the foreground.
     Serve(ServeArgs),
@@ -104,6 +106,8 @@ enum Command {
         #[arg(long, requires = "peer", value_name = "JOB")]
         job: Option<JobId>,
     },
+    /// Report what crashed or ended work left on this node; remove it with --yes.
+    Gc(gc::GcArgs),
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +131,7 @@ enum Wire {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(defer = true)]
 enum NodeCommand {
     /// Print this node's id and address.
     Id,
@@ -147,6 +152,7 @@ enum NodeCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(defer = true)]
 enum JobCommand {
     /// Make a job from a repository, rooted at ~/fabric/jobs/<id>/work.
     New {
@@ -501,7 +507,7 @@ fn answer(run: &contract::Run, reply: &Reply, job: Option<JobId>) -> Result<()> 
 #[must_use]
 pub fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    let (cli, run_of) = match contract::parse(&argv) {
+    let (cli, run_of) = match contract::parse(argv) {
         contract::Parsed::Run(cli, run) => (*cli, run),
         contract::Parsed::Exit(code) => return code,
     };
@@ -629,6 +635,7 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Psf(command) => psf::run(command, run),
+        Command::Gc(args) => gc::run(&client, args, run).await,
     }
 }
 

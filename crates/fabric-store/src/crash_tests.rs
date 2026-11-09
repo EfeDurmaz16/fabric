@@ -24,6 +24,8 @@ use crate::store::{CheckDepth, Store};
 const JOB: JobId = JobId::from_bytes([7; 16]);
 const NODE: NodeId = NodeId::from_bytes([1; 32]);
 const CREATED_AT: u64 = 1_760_000_000_000;
+/// The label the killed restore carries, which its staging directory keeps.
+const LABEL: &[u8] = b"job 7\n";
 
 /// A temp directory whose read-only directories are opened up so that it can be removed.
 struct Scratch(tempfile::TempDir);
@@ -142,6 +144,7 @@ fn crash_child() {
                     verify: Verify::None,
                     durability: Durability::ProcessCrash,
                     carry: &|_| true,
+                    label: Some(LABEL),
                 },
             )
             .unwrap();
@@ -292,6 +295,12 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             restore_state(&target)
         );
         assert!(!target.exists(), "{checkpoint}: target must not exist yet");
+        let staging = crate::restore::staging_dir(&target).unwrap();
+        assert_eq!(
+            fs::read(staging.join(crate::restore::STAGING_LABEL)).unwrap(),
+            LABEL,
+            "{checkpoint}: the killed staging directory says whose it is"
+        );
         let report = restore(
             &store,
             &RestoreRequest {
@@ -301,10 +310,15 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
                 verify: Verify::All,
                 durability: Durability::ProcessCrash,
                 carry: &carry,
+                label: None,
             },
         )
         .unwrap();
         assert!(report.verified > 0, "{checkpoint}");
+        assert!(
+            !staging.exists(),
+            "{checkpoint}: the rerun left its staging"
+        );
         assert_eq!(
             restore_state(&target).unwrap(),
             RestoreState::Present,
@@ -345,6 +359,7 @@ fn assert_cache_whole(store: &Store, snapshot: SnapshotId, target: &Path, checkp
             verify: Verify::All,
             durability: Durability::ProcessCrash,
             carry: &|_| true,
+            label: None,
         },
     )
     .unwrap();

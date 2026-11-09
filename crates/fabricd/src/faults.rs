@@ -44,12 +44,15 @@ pub enum Point {
     AfterLaunchAccepted,
     /// `fabric serve` was told to stop and still holds the state directory.
     WhileStopping,
+    /// A suspend captured the harness state into `harness-state.next` and
+    /// has not put it in place yet.
+    MidHarnessCapture,
 }
 
 impl Point {
     /// Every point, for parsing.
     #[cfg(feature = "faults")]
-    const ALL: [Point; 11] = [
+    const ALL: [Point; 12] = [
         Point::AfterQuiesce,
         Point::AfterSnapshotPublish,
         Point::AfterDepartingWrite,
@@ -61,6 +64,7 @@ impl Point {
         Point::BeforeLaunch,
         Point::AfterLaunchAccepted,
         Point::WhileStopping,
+        Point::MidHarnessCapture,
     ];
 
     fn name(self) -> &'static str {
@@ -76,6 +80,7 @@ impl Point {
             Point::BeforeLaunch => "before_launch",
             Point::AfterLaunchAccepted => "after_launch_accepted",
             Point::WhileStopping => "while_stopping",
+            Point::MidHarnessCapture => "mid_harness_capture",
         }
     }
 }

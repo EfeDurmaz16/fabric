@@ -167,6 +167,7 @@ fn restore_timed(store: &Store, id: SnapshotId, target: &Path) -> Fallible<(Dura
             verify: Verify::None,
             durability: Durability::ProcessCrash,
             carry: &|_| true,
+            label: None,
         },
     )?;
     Ok((
@@ -245,6 +246,7 @@ fn restore_as_node(store: &Store, id: SnapshotId, target: &Path) -> Fallible<(Du
             verify: Verify::Sample(32),
             durability: Durability::PowerLoss,
             carry: &|_| true,
+            label: None,
         },
     )?;
     Ok((started.elapsed(), report.bundles_unpacked))
