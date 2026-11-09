@@ -18,7 +18,7 @@ use super::model::{
 };
 use super::package::{Fidelity, TEXT_MAX_BYTES};
 use crate::credential::looks_like_credential;
-use crate::id::{JobId, SnapshotId};
+use crate::id::{JobId, NodeId, SnapshotId};
 
 /// Decides what a command under a key that may have been seen gets.
 #[must_use]
@@ -173,6 +173,58 @@ fn resume_point(state: &ManagedState, from: Option<SnapshotId>) -> Result<(), Do
         return Err(DomainError::NotAcknowledged { snapshot });
     }
     Ok(())
+}
+
+/// Where a continue of a task with no live attempt starts, and the node
+/// it must not be placed on (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinueStart {
+    /// The checkpoint the grant starts from; `None` when the task has none.
+    pub from: Option<SnapshotId>,
+    /// The node of the task's newest attempt when that attempt was
+    /// superseded: it may still run there, so the continue is placed as a
+    /// failover with this node excluded, as a recover is.
+    pub lost: Option<NodeId>,
+}
+
+/// The start of a continue of `task` placed once no attempt of it runs.
+/// The task's last cut is a restart point when the attempt that cut it
+/// ended by its own runner's word (checkpointed, exited, lost: the M5
+/// handoff, whose target fetches the cut from that runner), unless a
+/// later attempt of the task has an acknowledged checkpoint, which is
+/// newer. A cut of a superseded attempt may exist only on the lost
+/// runner, so it restarts nothing unacknowledged: the newest acknowledged
+/// checkpoint of the task is the start instead, and with none the
+/// continue is refused `NotAcknowledged` naming the cut (ADR 0028).
+pub fn continue_start(state: &ManagedState, task: TaskId) -> Result<ContinueStart, DomainError> {
+    let lost = state
+        .attempts
+        .iter()
+        .rev()
+        .find(|a| a.task == task)
+        .and_then(|a| match (&a.status, &a.resource) {
+            (AttemptStatus::Superseded { .. }, ResourceRef::Node { node }) => Some(*node),
+            _ => None,
+        });
+    let position = |attempt: AttemptId| state.attempts.iter().position(|a| a.id == attempt);
+    let newest_ack = state
+        .acknowledged()
+        .into_iter()
+        .find(|a| state.attempt(a.attempt).is_some_and(|x| x.task == task));
+    let start = |from: Option<SnapshotId>| Ok(ContinueStart { from, lost });
+    match last_checkpoint(state, task) {
+        Some((by, cut)) if !matches!(by.status, AttemptStatus::Superseded { .. }) => {
+            match newest_ack {
+                Some(ack) if position(ack.attempt) > position(by.id) => start(Some(ack.snapshot)),
+                _ => start(Some(cut)),
+            }
+        }
+        Some((_, cut)) => match newest_ack {
+            Some(ack) => start(Some(ack.snapshot)),
+            None => Err(DomainError::NotAcknowledged { snapshot: cut }),
+        },
+        None => start(newest_ack.map(|a| a.snapshot)),
+    }
 }
 
 /// The live attempt of `task`, if one may still run.
@@ -621,6 +673,11 @@ fn command_events(
                 return Err(DomainError::AttemptStillLive { attempt: live.id });
             }
             no_effect_in_flight(state)?;
+            if live_of(state, *task).is_none() {
+                // Placed at once from the task's restart point: refused
+                // here when it has none (`continue_start`).
+                continue_start(state, *task)?;
+            }
             (
                 true,
                 vec![ManagedEvent::EffectRequested {
@@ -1068,7 +1125,14 @@ fn place(
         }
         _ => None,
     };
-    if let (Some((_, lost)), Some(chosen)) = (recover, decision.chosen)
+    let resumed = match op.kind {
+        CommandKind::Continue => Some(continue_start(job, task)?),
+        _ => None,
+    };
+    let lost = recover
+        .map(|(_, lost)| lost)
+        .or(resumed.and_then(|r| r.lost));
+    if let (Some(lost), Some(chosen)) = (lost, decision.chosen)
         && chosen == lost
     {
         // A failover never goes back to the node whose attempt it
@@ -1089,7 +1153,7 @@ fn place(
         Some(node) => {
             let initial_checkpoint = match (op.kind, recover) {
                 (CommandKind::Recover, Some((from, _))) => Some(from),
-                (CommandKind::Continue, _) => last_checkpoint(job, task),
+                (CommandKind::Continue, _) => resumed.and_then(|r| r.from),
                 _ => match job.job.source {
                     SourceBinding::Snapshot { snapshot } => Some(snapshot),
                     _ => None,
@@ -1404,7 +1468,7 @@ fn derived_attempt(operation: OperationId, generation: Generation) -> AttemptId 
 /// task's newest attempt that has one, a checkpoint command's cut
 /// included, else that attempt's own checkpointed end (an M2 suspend
 /// records no cut).
-fn last_checkpoint(job: &ManagedState, task: TaskId) -> Option<crate::id::SnapshotId> {
+fn last_checkpoint(job: &ManagedState, task: TaskId) -> Option<(&Attempt, SnapshotId)> {
     job.attempts
         .iter()
         .rev()
@@ -1419,6 +1483,7 @@ fn last_checkpoint(job: &ManagedState, task: TaskId) -> Option<crate::id::Snapsh
                     AttemptStatus::Checkpointed { snapshot } => Some(snapshot),
                     _ => None,
                 })
+                .map(|snapshot| (a, snapshot))
         })
 }
 

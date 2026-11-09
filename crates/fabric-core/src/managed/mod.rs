@@ -129,6 +129,6 @@ pub use placement::{NodeAdvert, PlacementDecision, PlacementKind};
 pub use secret_ref::{SECRET_ENV_PREFIX, SecretName, SecretRef, SecretScope, SecretValue};
 pub use source::{CommitId, GitUri, SourceError};
 pub use transition::{
-    accept_command, acknowledge, admit_recovery, apply_batch, apply_observation, dedupe,
-    mark_operation, record_recovery_block, recovery_decision, replay,
+    ContinueStart, accept_command, acknowledge, admit_recovery, apply_batch, apply_observation,
+    continue_start, dedupe, mark_operation, record_recovery_block, recovery_decision, replay,
 };

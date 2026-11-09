@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fabric_core::id::{JobId, SnapshotId};
+use fabric_core::id::JobId;
 use fabric_core::managed::launch::{
     AfterCut, InstructAnswer, InstructRefusal, Instruction, LaunchAnswer, LaunchRefusal, TaskLaunch,
 };
@@ -35,7 +35,7 @@ use fabric_core::managed::placement::{CurrentPlacement, PlacementKind};
 use fabric_core::managed::{
     Attempt, AttemptId, AttemptStatus, CommandKind, EffectRequest, ExitOutcome, ManagedState,
     Observation, OperationId, OperationMark, OperationStatus, ReceiptStatus, ResourceRef,
-    SourceBinding, TaskClass, TaskId, TaskReceipt,
+    SourceBinding, TaskClass, TaskId, TaskReceipt, continue_start,
 };
 
 use crate::authority::{Authority, AuthorityError, PendingEffect};
@@ -229,18 +229,11 @@ fn live_of(state: &ManagedState, task: TaskId) -> Option<&Attempt> {
         .find(|a| a.task == task && a.status.may_run())
 }
 
-/// The snapshot a continue of `task` starts from, for the probe's warmth.
-fn last_cut(state: &ManagedState, task: TaskId) -> Option<SnapshotId> {
-    state
-        .cuts
-        .iter()
-        .rev()
-        .find(|(attempt, _)| state.attempt(*attempt).is_some_and(|a| a.task == task))
-        .map(|(_, snapshot)| *snapshot)
-}
-
-/// Places a continue of `task` as a planned handoff from its last cut;
-/// the domain grants from that cut.
+/// Places a continue of `task` from the task's restart point
+/// (`continue_start`): a planned handoff from its last cut, or, when the
+/// task's newest attempt was superseded, a failover with that attempt's
+/// node excluded, as a recover is. The domain grants from the same point.
+/// A continue with no restart point is failed here, as the domain refused it.
 async fn place_handoff(
     authority: &Authority,
     link: &dyn Link,
@@ -248,12 +241,32 @@ async fn place_handoff(
     operation: OperationId,
     task: TaskId,
 ) -> Result<(), AuthorityError> {
+    let start = match continue_start(state, task) {
+        Ok(start) => start,
+        Err(e) => {
+            tracing::warn!(job = %state.job.id, %operation, error = %e, "a continue has no restart point; it fails");
+            authority
+                .mark_authority(state.job.id, operation, OperationMark::Dispatched)
+                .await?;
+            authority
+                .mark_authority(state.job.id, operation, OperationMark::Failed)
+                .await?;
+            return Ok(());
+        }
+    };
     let ask = PlacementAsk {
         task,
-        kind: PlacementKind::PlannedHandoff,
+        kind: if start.lost.is_some() {
+            PlacementKind::Failover
+        } else {
+            PlacementKind::PlannedHandoff
+        },
         required_layout: None,
-        current: None,
-        snapshot: last_cut(state, task),
+        current: start.lost.map(|node| CurrentPlacement {
+            node,
+            healthy: false,
+        }),
+        snapshot: start.from,
     };
     // A continue's pin names the node the work moves to, in place of the
     // job's own pin; without one the job's policy places it.
@@ -1304,6 +1317,117 @@ mod tests {
         let (node, request) = launched.expect("the recover's grant was launched");
         assert_eq!(node, OTHER);
         assert_eq!(request.initial_checkpoint, Some(snapshot));
+        assert_eq!(
+            request.snapshot_at,
+            Some(OWN),
+            "the authority holds the bytes"
+        );
+    }
+
+    /// Review finding on PR #39: a continue after a supersede was placed
+    /// as a planned handoff from the task's last cut, captured only and
+    /// held by the lost node alone. It is placed as a failover with that
+    /// node excluded, from the acknowledged checkpoint this authority
+    /// holds.
+    #[tokio::test]
+    async fn a_continue_after_a_supersede_is_placed_as_a_failover_from_the_acknowledged_checkpoint()
+    {
+        let world = World::new();
+        let link = FakeLink::new();
+        let job = world.created("create").await;
+        let first = world.granted(job, REMOTE).await;
+        world.started(job, first).await;
+        let generation = world.state(job).await.attempt(first).unwrap().generation;
+        let snapshot = fabric_core::id::SnapshotId::of(b"acknowledged");
+        let cut = fabric_core::managed::CutDigest::from_bytes([4; 32]);
+        world
+            .authority
+            .observe_authority(
+                job,
+                Observation::Captured {
+                    attempt: first,
+                    generation,
+                    snapshot,
+                    cut,
+                },
+            )
+            .await
+            .unwrap();
+        world
+            .authority
+            .acknowledge(
+                job,
+                fabric_core::managed::CheckpointAck {
+                    attempt: first,
+                    generation,
+                    snapshot,
+                    cut,
+                    manifests: 1,
+                    chunks: 1,
+                    bytes: 1,
+                    fetched_from: REMOTE,
+                },
+            )
+            .await
+            .unwrap();
+        world
+            .authority
+            .observe_authority(
+                job,
+                Observation::ResourceUnavailable {
+                    attempt: first,
+                    generation,
+                    last_heartbeat_ms: None,
+                    at_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+        world
+            .submit(
+                job,
+                "supersede",
+                Command::Supersede {
+                    attempt: first,
+                    reason: "silent".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let primary = world.state(job).await.job.primary;
+        let cont = world
+            .submit(
+                job,
+                "continue",
+                Command::Continue {
+                    task: primary,
+                    fidelity: fabric_core::managed::AllowedFidelity::DEFAULT,
+                    pin: None,
+                },
+            )
+            .await
+            .unwrap();
+        *link.place_on.lock().unwrap() = Some(OTHER);
+        let mut seen = Seen::default();
+        pass(&world.authority, &link, &mut seen).await;
+        let asked = link.asked.lock().unwrap().clone();
+        assert!(
+            asked.contains(&Asked::Place(PlacementKind::Failover)),
+            "{asked:?}"
+        );
+        let state = world.state(job).await;
+        let next = state.attempts.last().unwrap();
+        assert_eq!(next.granted_by, cont);
+        assert_eq!(next.resource, ResourceRef::Node { node: OTHER });
+        assert_eq!(next.initial_checkpoint, Some(snapshot));
+        let launched = asked.iter().find_map(|a| match a {
+            Asked::Launch(node, request) if request.token.attempt == next.id => {
+                Some((*node, request.clone()))
+            }
+            _ => None,
+        });
+        let (node, request) = launched.expect("the continue's grant was launched");
+        assert_eq!(node, OTHER);
         assert_eq!(
             request.snapshot_at,
             Some(OWN),

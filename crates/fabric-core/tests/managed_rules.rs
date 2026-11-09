@@ -1877,3 +1877,107 @@ fn a_supersede_fails_a_spawn_under_the_old_attempt() {
         ManagedEvent::OperationMarked { operation, status: OperationMark::Failed } if *operation == spawn
     )));
 }
+
+/// Review finding on PR #39: a continue after a supersede was placed
+/// from the task's last cut even when that cut was only captured, so
+/// the next generation started from bytes the authority never held,
+/// fetched from the lost node, and the placement could choose that node.
+/// A continue now starts only from the cut its attempt ended at or from
+/// an acknowledged checkpoint, and never goes back to the node of a
+/// superseded attempt.
+#[test]
+fn a_continue_after_a_supersede_starts_from_an_acknowledged_checkpoint_never_on_the_lost_node() {
+    let continue_ = |task| Command::Continue {
+        task,
+        fidelity: AllowedFidelity::DEFAULT,
+        pin: None,
+    };
+    let cut_by_command = |kept: &mut Kept, key: &str, n: u8| {
+        let a = kept.state().live_attempt().unwrap().clone();
+        let asked = kept
+            .submit(key, Command::Checkpoint { attempt: a.id })
+            .unwrap();
+        let ManagedEvent::CommandAccepted { operation, .. } = asked.events[0] else {
+            panic!("not accepted");
+        };
+        kept.mark(operation, OperationMark::Dispatched).unwrap();
+        let the_cut = cut(kept.state(), snapshot(n));
+        kept.observe(&Observation::Checkpointed {
+            attempt: a.id,
+            generation: a.generation,
+            snapshot: snapshot(n),
+            cut: the_cut,
+        })
+        .unwrap();
+    };
+    // Captured only: the continue has no restart point and is refused.
+    let mut kept = running();
+    let primary = kept.state().job.primary;
+    cut_by_command(&mut kept, "cp-1", 1);
+    assert!(kept.state().acknowledged().is_empty());
+    let a = gone_silent(&mut kept);
+    kept.submit(
+        "s-1",
+        Command::Supersede {
+            attempt: a.id,
+            reason: "silent".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        kept.submit("c-1", continue_(primary)),
+        Err(DomainError::NotAcknowledged {
+            snapshot: snapshot(1)
+        })
+    );
+    assert_eq!(kept.state().attempts.len(), 1, "nothing was granted");
+    kept.replays();
+
+    // An older acknowledged checkpoint is the start, placed off the lost node.
+    let mut kept = running();
+    capture(&mut kept, 1).unwrap();
+    kept.acknowledge(&ack_of(&kept, 1)).unwrap();
+    cut_by_command(&mut kept, "cp-2", 2);
+    let a = gone_silent(&mut kept);
+    kept.submit(
+        "s-2",
+        Command::Supersede {
+            attempt: a.id,
+            reason: "silent".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        continue_start(kept.state(), primary),
+        Ok(ContinueStart {
+            from: Some(snapshot(1)),
+            lost: Some(NODE),
+        })
+    );
+    let t = kept.submit("c-2", continue_(primary)).unwrap();
+    let ManagedEvent::CommandAccepted { operation, .. } = t.events[0] else {
+        panic!("not accepted");
+    };
+    let placed = |kept: &mut Kept, node| {
+        kept.observe(&Observation::Placed {
+            operation,
+            task: primary,
+            decision: PlacementDecision {
+                kind: PlacementKind::Failover,
+                decided_at_ms: 70,
+                candidates: Vec::new(),
+                chosen: Some(node),
+            },
+        })
+    };
+    assert_eq!(
+        placed(&mut kept, NODE),
+        Err(DomainError::FailoverToLostNode { node: NODE })
+    );
+    placed(&mut kept, OTHER_NODE).unwrap();
+    let next = kept.state().attempts[1].clone();
+    assert_eq!(next.generation.get(), 2);
+    assert_eq!(next.initial_checkpoint, Some(snapshot(1)));
+    assert_eq!(next.resource, ResourceRef::Node { node: OTHER_NODE });
+    kept.replays();
+}
