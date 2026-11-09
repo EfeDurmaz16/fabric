@@ -1623,7 +1623,9 @@ impl InFlight {
     /// locator it names is recorded (`Bridge::record_late`). A caller that
     /// drops a request instead leaves it the same way: `unknown`, recorded
     /// by the next call handed the log, with the locator its late answer
-    /// names. A read dropped, lost or timed out changes nothing.
+    /// names. A read dropped, lost or timed out changes nothing. A
+    /// request whose answer the log fails to record is left the same way,
+    /// and a locator the log fails to record is kept for the next call.
     ///
     /// Room on the log is taken before a frame is: a step taken from the
     /// worker is then recorded, on the log's side, even when the caller
@@ -1645,8 +1647,13 @@ impl InFlight {
             Ok(Some(Incoming::Lost(why))) => Answer::Lost(why),
             Ok(Some(Incoming::Progress(locator))) => {
                 let record = locator_record(&locator);
-                slot.run(move |log| log.locate(operation, &record))
-                    .await??;
+                let located = slot.run(move |log| log.locate(operation, &record)).await;
+                if let Err(e) | Ok(Err(e)) = located {
+                    // Taken from the worker and not recorded: kept for
+                    // the next call handed the log, as a late answer's.
+                    keep_found(&mut self.shared.lock(), operation, locator);
+                    return Err(e.into());
+                }
                 return Ok(Event::Progress(locator));
             }
             Ok(Some(Incoming::Answer(message))) => match *message {
@@ -1662,12 +1669,34 @@ impl InFlight {
         let (kind, said) = (self.kind, Said::of(&answer));
         // A read settles nothing a request in flight here will settle.
         let request_open = kind != Kind::Request && self.shared.request_open(operation);
+        let named = match &answer {
+            Answer::Result(r) => Some(r.resource.clone()),
+            Answer::Error(e) => e.error.resource.clone(),
+            Answer::TimedOut | Answer::Lost(_) => None,
+        };
         let settled = slot.run(move |log| settle(log, operation, kind, request_open, said));
         self.done = true;
         if kind == Kind::Request {
             self.shared.lock().open.remove(&operation);
         }
-        let status = settled.await??;
+        let status = match settled.await {
+            Ok(Ok(status)) => status,
+            Ok(Err(LogError::Transition(e))) => return Err(LogError::Transition(e).into()),
+            Err(e) | Ok(Err(e)) => {
+                // The answer was taken and not recorded, and nothing else
+                // will settle a request: it is due `unknown`, with the
+                // locator its answer named, by the next call handed the
+                // log, as one whose caller dropped it.
+                if kind == Kind::Request {
+                    let mut state = self.shared.lock();
+                    state.dropped.push(operation);
+                    if let Some(resource) = named {
+                        keep_found(&mut state, operation, resource);
+                    }
+                }
+                return Err(e.into());
+            }
+        };
         Ok(Event::Done(Outcome { status, answer }))
     }
 
