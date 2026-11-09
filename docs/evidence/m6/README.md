@@ -1,6 +1,6 @@
 # M6 evidence: loss recovery on the merged tree
 
-Recorded on 2026-11-09 on `m6/loss-recovery` at `281635c`, after M6 merged `main` with the M5 launch path (`ad744de`, merge `db7f63f`). The host is an Apple Silicon Mac, macOS arm64 (Darwin 25.6.0), with other work running (load before the run: 7.30 7.74 7.57, in `meta.txt`). Nothing here was timed for performance; perf runs in CI. Every selection behind M5 and M6 was selected by the implementation agent under Efe's delegation of 2026-11-02; none was approved by Efe.
+First recorded on 2026-11-09 on `m6/loss-recovery` at `281635c` and recorded again at `7b4be69` after the review round of the same day, after M6 merged `main` with the M5 launch path (`ad744de`, merge `db7f63f`). The host is an Apple Silicon Mac, macOS arm64 (Darwin 25.6.0), with other work running (load before the run: 7.30 7.74 7.57, in `meta.txt`). Nothing here was timed for performance; perf runs in CI. Every selection behind M5 and M6 was selected by the implementation agent under Efe's delegation of 2026-11-02; none was approved by Efe.
 
 What this is, plainly: two `fabricd` processes on one host, each with its own state root (`FABRIC_HOME`), paired over a real QUIC link that runs through a small userspace relay the test owns (`fabric-relay`, `crates/fabric/fixtures/relay.rs`, std only). Pausing the relay drops every datagram between the two in both directions and holds every TCP byte while the sockets stay open; resuming forwards again. This is a two-process partition on one host, not two hosts. No firewall rule and no system setting was touched. No `fabricd` or `fabric-relay` process was left after the run (`pgrep -x`, in `meta.txt`).
 
@@ -13,15 +13,17 @@ sh scripts/m6-partition.sh
 
 The script runs `cargo test -p fabric --test e2e --locked -- relay:: partition:: --test-threads 1 --nocapture` and writes `meta.txt`, `run.log` (paths scrubbed) and `counters.txt` under `runs/<date>/`. The five scenarios also run in the ordinary test suite; none is ignored.
 
-## The run: `runs/20261108T231706Z/`
+## The run: `runs/20261109T001309Z/`
 
-7 passed, 0 failed, 188.9 s.
+7 passed, 0 failed, 217.1 s, at `7b4be69` (the review round of 2026-11-09), load before 8.96 9.82 9.25 from other work. Scenario (1) recovered 28.5 s after the pause. Since this round, scenarios (1) and (4) also assert that heartbeats hold presence while the link is up (the attempt still `running`, no `attempt_unavailable`, past `UNAVAILABLE_AFTER_MS` and two heartbeats after it was seen running) and that the loss is counted from the pause, not the grant: (4) is `unknown` no sooner than `UNAVAILABLE_AFTER_MS - HEARTBEAT_INTERVAL_MS` after the pause and (1) recovers no sooner than `2 * UNAVAILABLE_AFTER_MS - HEARTBEAT_INTERVAL_MS`. In (3) the restarted runner's presentation is a heartbeat marked not running, which the authority answers without taking it as presence. The scenario rows below are unchanged otherwise; the earlier run `runs/20261108T231706Z/` (7 passed, 188.9 s, at `281635c`) is kept.
+
+The fixes of this round and their red-first runs (each test against a mutation that turns its fix off): `runs/20261109T001309Z/red-first.txt`.
 
 The set-up every scenario shares: the authority creates a managed job (`fabric managed create --empty --harness codex --secret M6_SITE --recovery <policy>`). Only the runner holds the secret `M6_SITE` at the first placement, so the M5 placement chooses the runner and excludes the authority by `secret`; the authority's dispatch launches the attempt there over the relayed session, and the runner's loop starts the fake Codex held with `FAKE_CODEX_HOLD` and heartbeats every 2 s. `fabric managed checkpoint` cuts it on the runner; the fenced `Checkpointed` report records the cut as the job's captured checkpoint, and the authority's verifier fetches the snapshot's chain over the relay, checks it by content and commits `checkpoint_acknowledged`. Then the secret is provisioned on the authority, so a failover has somewhere to go other than the lost node.
 
 | Scenario | Test | What it shows |
 |---|---|---|
-| (1) relay paused, runner alive | `partition::relay_paused_runner_alive` | `attempt_unavailable`, then `grant_superseded` and a `failover` placement that excludes the runner and chooses the authority, the failover running at generation 2, 26.3 s after the pause. The runner's harness group still runs during the pause. Resumed: the runner's heartbeat is answered `superseded`, it logs that the grant ended and stops the group. The runner's covered writes under the old grant (its exit as a report, and a ledger append), sent under its own node key over the relay, are refused `Superseded` and `GrantRefused` and recorded `covered_write_refused`. Exactly one attempt may run. Relay while paused: `udp_forwarded [32, 28]`, `udp_dropped [21, 19]`, TCP 0. |
+| (1) relay paused, runner alive | `partition::relay_paused_runner_alive` | `attempt_unavailable`, then `grant_superseded` and a `failover` placement that excludes the runner and chooses the authority, the failover running at generation 2, 28.5 s after the pause (26.3 s in the earlier run). The runner's harness group still runs during the pause. Resumed: the runner's heartbeat is answered `superseded`, it logs that the grant ended and stops the group. The runner's covered writes under the old grant (its exit as a report, and a ledger append), sent under its own node key over the relay, are refused `Superseded` and `GrantRefused` and recorded `covered_write_refused`. Exactly one attempt may run. Relay while paused: `udp_forwarded [46, 42]`, `udp_dropped [21, 19]`, TCP 0. |
 | (2) old runner stopped and woken | `partition::old_runner_sigstop_then_sigcont` | `SIGSTOP` to the runner's daemon and its harness group; the authority supersedes and places the failover on itself; `SIGCONT`: the woken runner is told `superseded`, stops the group, and its writes are refused and recorded. One live attempt. |
 | (3) old runner killed and restarted | `partition::old_runner_sigkill_then_restart` | `SIGKILL` to the runner's daemon (its harness survives as an orphan group); the failover runs on the authority; the runner's daemon starts again in the same state root, stops the orphan group, presents the grant it had taken and is answered `superseded`. Its marker (`runs/taken/<attempt>.json`) says `GrantEnded { verdict: "superseded" }`, the journal says `superseded`, nothing of the attempt is resumed, one live attempt. |
 | (4) block with a held harness | `partition::block_policy_waits_until_an_operator_recovers` | Relay paused: `unknown`, and through the window in which `restart_from_acknowledged` acts (14 s past the unavailability) nothing moves: one attempt, no `grant_superseded`, no `recovery_blocked`, the state visible in the inspection and the events. `fabric managed recover` then supersedes it and the failover runs on the authority; resumed, the runner stops. |
@@ -33,7 +35,7 @@ Counters the code keeps: the runner's `stale_obeyed` (a verdict or refusal that 
 
 ## Red first
 
-`runs/20261108T231706Z/red-first.txt`, from one scratch copy of `281635c` built into the same target and deleted after:
+`runs/20261108T231706Z/red-first.txt`, from one scratch copy of `281635c` built into the same target and deleted after (this round's are in `runs/20261109T001309Z/red-first.txt`):
 
 - With the fence forced to `Live`, scenarios (1), (2), (3) and (4) fail: the runner is never told its grant ended, and in (3) the restarted runner's marker does not say superseded.
 - With the acknowledgement check removed (a captured checkpoint taken as a restart point), scenario (5) fails: no `recovery_blocked` is recorded, the authority restarts from the captured cut.
@@ -47,8 +49,8 @@ Counters the code keeps: the runner's `stale_obeyed` (a verdict or refusal that 
 
 ## Gates
 
-`gates.txt`: one full gate run, at the commit it names.
+`gates.txt`: one full gate run, at the commit it names, every gate green.
 
 ## Earlier runs
 
-`runs/2026-11-02T220505Z/`, `runs/20261108T134838Z/` and `runs/20261108T164203Z/` are the runs on the M4 base and on the M5 base before the launch path, when four of the five scenarios were blocked. They are kept as they were.
+`runs/20261108T231706Z/` is the first run on the merged tree, before the review round of 2026-11-09. `runs/2026-11-02T220505Z/`, `runs/20261108T134838Z/` and `runs/20261108T164203Z/` are the runs on the M4 base and on the M5 base before the launch path, when four of the five scenarios were blocked. They are kept as they were.

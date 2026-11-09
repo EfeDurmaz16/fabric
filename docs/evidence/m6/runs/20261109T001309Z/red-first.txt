@@ -1,0 +1,11 @@
+Red first for the review round of 2026-11-09 (after 281635c's run): each fix's
+test was run against a mutation that turns the fix off, in the worktree, built
+into the one shared target, and the mutation was reverted at once. One line per
+mutation: what was turned off, the test, what it reported.
+
+F1 continue_start: mutation `if true ||` (ack gate off) -> managed_rules::a_continue_after_a_supersede_... FAILED: left Ok(CommandAccepted Continue) right Err(NotAcknowledged)
+F1 place lost-node: mutation `lost = recover only` -> FAILED: left Ok(AttemptGranted on NODE gen 2) right Err(FailoverToLostNode)
+F1 dispatch: mutation kind always PlannedHandoff -> dispatch::tests::a_continue_after_a_supersede_... FAILED (no Failover placement asked)
+F2 presentation: mutation 'beat.running || true' -> authority::tests::a_restarted_runner_s_presentation_is_answered_and_never_presence FAILED
+F3 verifier due: mutation drop superseded filter -> recovery::tests::only_a_capture_... FAILED; F11 bound: mutation drop failure bound -> same test FAILED
+F5: mutation drop EffectInFlight pre-check -> authority::tests::an_open_cancel_blocks_... FAILED (left [Refused{..}] right [EffectInFlight{..}])
