@@ -290,7 +290,19 @@ impl Shared {
     /// Stops waiting on `id` because its caller did: nothing will settle
     /// the operation, so a request is also due to be recorded `unknown`,
     /// as one whose deadline passed, by the next call handed the log.
-    fn give_up(&self, id: &str) {
+    /// `request` is the operation of a request. When the worker was lost
+    /// first, the loss took the waiter and told it, and the caller never
+    /// read that, so the request is due to be recorded the same way.
+    fn give_up(&self, id: &str, request: Option<OperationId>) {
+        {
+            let mut state = self.lock();
+            if !state.waiters.contains_key(id) {
+                if let Some(operation) = request {
+                    state.dropped.push(operation);
+                }
+                return;
+            }
+        }
         self.stop_waiting(id, true);
     }
 
@@ -1541,7 +1553,8 @@ pub struct InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.done {
-            self.shared.give_up(&self.request_id);
+            let request = (self.kind == Kind::Request).then_some(self.operation);
+            self.shared.give_up(&self.request_id, request);
             if self.kind == Kind::Request {
                 self.shared.lock().open.remove(&self.operation);
             }
