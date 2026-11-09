@@ -95,7 +95,10 @@ async fn end(node: &Node, g: &Granted) {
             outcome: ExitOutcome::Failed { code: Some(1) },
         },
     ] {
-        node.authority.observe_authority(g.job, observation).await.unwrap();
+        node.authority
+            .observe_authority(g.job, observation)
+            .await
+            .unwrap();
     }
 }
 
