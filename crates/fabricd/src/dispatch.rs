@@ -1330,6 +1330,10 @@ mod tests {
     /// node excluded, from the acknowledged checkpoint this authority
     /// holds.
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the loss, the supersede and the continue read best as one scenario"
+    )]
     async fn a_continue_after_a_supersede_is_placed_as_a_failover_from_the_acknowledged_checkpoint()
     {
         let world = World::new();

@@ -43,14 +43,13 @@ pub(crate) fn build_for_continue(
     start: Option<SnapshotId>,
 ) -> Result<WorkPackage, BuildError> {
     let job = state.job.id;
-    let (snapshot, cut, cut_by) = match start.and_then(|s| state.checkpoint(s)) {
-        Some(held) => (held.snapshot, held.cut, held.attempt),
-        None => {
-            let (snapshot, cut) = journal
-                .last_cut(job, from)?
-                .ok_or(BuildError::NoCut(from))?;
-            (snapshot, cut, from)
-        }
+    let (snapshot, cut, cut_by) = if let Some(held) = start.and_then(|s| state.checkpoint(s)) {
+        (held.snapshot, held.cut, held.attempt)
+    } else {
+        let (snapshot, cut) = journal
+            .last_cut(job, from)?
+            .ok_or(BuildError::NoCut(from))?;
+        (snapshot, cut, from)
     };
     let head = journal.head(job)?.ok_or(BuildError::NoCut(from))?;
     let notes = journal.notes(job)?;

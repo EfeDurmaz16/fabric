@@ -381,7 +381,7 @@ mod tests {
             due([(&running, snapshot)], Generation::FIRST, &failures),
             vec![key]
         );
-        let stops: Vec<bool> = (0..MAX_VERIFY_FAILURES + 1)
+        let stops: Vec<bool> = (0..=MAX_VERIFY_FAILURES)
             .map(|_| count_failure(&mut failures, key, &corrupt))
             .collect();
         assert_eq!(stops.iter().filter(|s| **s).count(), 1, "{stops:?}");
