@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::world::{Env, Fallible, Node, Wire, edit, pair, write_executable};
+use crate::world::{Env, Fallible, Node, WARM_GUARD, Wire, edit, pair, write_executable};
 
 /// The budget, read when the test is built.
 const BUDGET: &str = include_str!("budget.toml");
@@ -126,10 +126,14 @@ pub(crate) fn install_fakes(env: &Env) -> Fallible {
     for harness in ["claude", "codex"] {
         let path = env.bin().join(harness);
         let script = fs::read_to_string(&path)?;
-        let (shebang, rest) = script.split_once('\n').ok_or("an empty fake")?;
+        // The delay goes after the guard, so the run at install skips it.
+        let head = format!("#!/bin/sh\n{WARM_GUARD}");
+        let rest = script
+            .strip_prefix(&head)
+            .ok_or("a fake without its guard")?;
         write_executable(
             &path,
-            format!("{shebang}\nsleep {PROBE_DELAY}\n{rest}").as_bytes(),
+            format!("{head}sleep {PROBE_DELAY}\n{rest}").as_bytes(),
         )?;
     }
     fs::create_dir_all(env.home.join(".claude/sessions"))?;
@@ -480,11 +484,13 @@ impl Counter {
         Ok(counter)
     }
 
-    /// Puts the wrappers in place, each by one rename.
+    /// Puts the wrappers in place, each by one rename. A wrapper's guard
+    /// ends its run at install before it notes a start, so that run is in
+    /// no count.
     fn on(&self) -> Fallible {
         for (name, real) in &self.real {
             let script = format!(
-                "#!/bin/sh\necho >> '{}'\nexec '{}' \"$@\"\n",
+                "#!/bin/sh\n{WARM_GUARD}echo >> '{}'\nexec '{}' \"$@\"\n",
                 self.dir.join(name).display(),
                 real.path().display()
             );

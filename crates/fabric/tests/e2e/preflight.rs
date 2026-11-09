@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::world::{Env, Fallible, Node, Wire, pair, text};
+use crate::world::{Env, Fallible, Node, Wire, link_executable, pair, text};
 
 /// The directory of programs only the node at `state` finds, as
 /// `world::node_bin` places it.
@@ -18,11 +18,10 @@ fn node_bin(state: &Path) -> PathBuf {
 /// Puts the fake ACP agent on `node`'s own `PATH` as `program` and gives
 /// it a `state_dir` in `node`'s `harness.toml`.
 fn agent_only_on(node: &Node, program: &str) -> Fallible {
-    std::os::unix::fs::symlink(
+    link_executable(
         env!("CARGO_BIN_EXE_fabric-fake-agent"),
-        node_bin(node.state()).join(program),
-    )?;
-    Ok(())
+        &node_bin(node.state()).join(program),
+    )
 }
 
 /// Gives `program` the state directory `.fake-agent` in `node`'s `harness.toml`.

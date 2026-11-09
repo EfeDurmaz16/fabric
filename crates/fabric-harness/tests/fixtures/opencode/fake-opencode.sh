@@ -1,4 +1,5 @@
 #!/bin/sh
+[ -z "$FABRIC_TOOL_WARM" ] || exit 0
 # A fake opencode 1.18.34 for the adapter's tests. It keeps OpenCode's
 # data directory, ${XDG_DATA_HOME:-$HOME/.local/share}/opencode, with an
 # opencode.db that holds a fake login token and an auth.json, which must
