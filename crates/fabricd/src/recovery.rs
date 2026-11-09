@@ -19,11 +19,13 @@
 //! digest is the job's checkpoint was selected by the implementation
 //! agent under Efe's delegation of 2026-11-02.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use fabric_core::id::{JobId, NodeId, SnapshotId};
-use fabric_core::managed::{Attempt, AttemptId, CheckpointAck, CutDigest, ResourceRef};
+use fabric_core::managed::{
+    Attempt, AttemptId, AttemptStatus, CheckpointAck, CutDigest, Generation, ResourceRef,
+};
 use fabric_store::store::Store;
 
 use crate::node::{Node, lock};
@@ -164,14 +166,64 @@ pub(crate) async fn verify(
     acknowledgement(attempt, snapshot, cut, fetched)
 }
 
+/// How many fetches of one capture may fail for a reason other than an
+/// unreachable runner before this node stops fetching it. The transfer
+/// cannot tell a corrupt chunk on the runner from a link that dropped
+/// mid-fetch (both end as a fetch error), so a capture is fetched again a
+/// bounded number of times, never on every heartbeat for as long as its
+/// job runs.
+pub(crate) const MAX_VERIFY_FAILURES: u32 = 3;
+
+/// The captures to fetch now, from `captures` (each unacknowledged
+/// capture's attempt and snapshot) of a job at `generation`: only those
+/// the domain may still acknowledge (`acknowledge`: the job's generation,
+/// an attempt not superseded), never one whose fetches failed
+/// `MAX_VERIFY_FAILURES` times. A superseded attempt's node is the lost
+/// one, and a capture under an older generation would be refused stale.
+pub(crate) fn due<'a>(
+    captures: impl IntoIterator<Item = (&'a Attempt, SnapshotId)>,
+    generation: Generation,
+    failures: &HashMap<(AttemptId, SnapshotId), u32>,
+) -> Vec<(AttemptId, SnapshotId)> {
+    captures
+        .into_iter()
+        .filter(|(attempt, _)| {
+            attempt.generation == generation
+                && !matches!(attempt.status, AttemptStatus::Superseded { .. })
+        })
+        .map(|(attempt, snapshot)| (attempt.id, snapshot))
+        .filter(|key| failures.get(key).copied().unwrap_or(0) < MAX_VERIFY_FAILURES)
+        .collect()
+}
+
+/// Counts a failed fetch of `key`. An unreachable runner is not counted:
+/// it is fetched again on its next heartbeat. Returns whether this
+/// failure is the one that stops the fetches.
+pub(crate) fn count_failure(
+    failures: &mut HashMap<(AttemptId, SnapshotId), u32>,
+    key: (AttemptId, SnapshotId),
+    error: &VerifyError,
+) -> bool {
+    if matches!(error, VerifyError::Unreachable { .. }) {
+        return false;
+    }
+    let count = failures.entry(key).or_insert(0);
+    *count = count.saturating_add(1);
+    *count == MAX_VERIFY_FAILURES
+}
+
 /// The verifier on the authority's node: one fetch at a time per captured
 /// checkpoint, started when a report recorded a capture and again on each
 /// live heartbeat from the attempt's node while the capture is not yet
-/// acknowledged, so an unreachable runner is retried without a timer.
+/// acknowledged, so an unreachable runner is retried without a timer. A
+/// capture of a superseded attempt or of an older generation is not
+/// fetched, and one whose fetches failed `MAX_VERIFY_FAILURES` times stays
+/// captured without another fetch until this node restarts.
 #[derive(Debug, Default)]
 pub(crate) struct Verifier {
     node: OnceLock<Weak<Node>>,
     in_flight: Mutex<HashSet<(AttemptId, SnapshotId)>>,
+    failures: Mutex<HashMap<(AttemptId, SnapshotId), u32>>,
 }
 
 impl Verifier {
@@ -180,8 +232,8 @@ impl Verifier {
         let _ = self.node.set(node);
     }
 
-    /// Starts a verification of every capture of `job` not acknowledged
-    /// and not being verified now. Returns at once.
+    /// Starts a verification of every capture of `job` that is `due` and
+    /// not being verified now. Returns at once.
     pub(crate) fn check(&self, job: JobId) {
         let Some(node) = self.node.get().and_then(Weak::upgrade) else {
             return;
@@ -195,7 +247,16 @@ impl Verifier {
                     return;
                 }
             };
-            for (attempt, _, snapshot) in state.captured_only() {
+            let captures = state
+                .captured_only()
+                .into_iter()
+                .filter_map(|(attempt, _, snapshot)| Some((state.attempt(attempt)?, snapshot)));
+            let due = due(
+                captures,
+                state.job.generation,
+                &lock(&node.verifier.failures),
+            );
+            for (attempt, snapshot) in due {
                 let (Some(found), Some(held)) =
                     (state.attempt(attempt), state.checkpoint(snapshot))
                 else {
@@ -222,7 +283,16 @@ impl Verifier {
                             tracing::info!(%job, %attempt, %node, "the capture's node did not answer; retried on its next heartbeat");
                         }
                         Err(e) => {
-                            tracing::warn!(%job, %attempt, %snapshot, error = %e, "a capture did not verify; it stays captured");
+                            let stopped = count_failure(
+                                &mut lock(&verifying.verifier.failures),
+                                (attempt, snapshot),
+                                &e,
+                            );
+                            if stopped {
+                                tracing::warn!(%job, %attempt, %snapshot, error = %e, failures = MAX_VERIFY_FAILURES, "a capture did not verify again; it stays captured and is not fetched again");
+                            } else {
+                                tracing::warn!(%job, %attempt, %snapshot, error = %e, "a capture did not verify; it stays captured");
+                            }
                         }
                     }
                     lock(&verifying.verifier.in_flight).remove(&(attempt, snapshot));
@@ -235,9 +305,7 @@ impl Verifier {
 #[cfg(test)]
 mod tests {
     use fabric_core::id::JobId;
-    use fabric_core::managed::{
-        AttemptId, AttemptStatus, Generation, OperationId, ResourceRef, TaskId,
-    };
+    use fabric_core::managed::{OperationId, TaskId};
 
     use super::*;
 
@@ -264,6 +332,60 @@ mod tests {
             bytes: 1_024,
             head: head.to_vec(),
         }
+    }
+
+    /// Review findings on PR #39: the verifier fetched every capture of a
+    /// job on every live heartbeat, a superseded attempt's from the lost
+    /// node and an older generation's that the domain refuses stale, and
+    /// fetched a capture that failed verification again every 2 s for as
+    /// long as the job ran.
+    #[test]
+    fn only_a_capture_the_domain_may_acknowledge_is_fetched_and_a_failing_one_stops() {
+        let snapshot = SnapshotId::of(b"capture");
+        let running = attempt();
+        let superseded = Attempt {
+            id: AttemptId::from_bytes([4; 16]),
+            status: AttemptStatus::Superseded { by: None },
+            ..attempt()
+        };
+        let older = Attempt {
+            id: AttemptId::from_bytes([5; 16]),
+            status: AttemptStatus::Checkpointed { snapshot },
+            ..attempt()
+        };
+        let mut failures = HashMap::new();
+        let next = Generation::new(2).unwrap();
+        // Under the first generation the superseded one is never due.
+        assert_eq!(
+            due(
+                [(&running, snapshot), (&superseded, snapshot)],
+                Generation::FIRST,
+                &failures,
+            ),
+            vec![(running.id, snapshot)]
+        );
+        // Once the job moved on, none of the first generation is.
+        assert!(due([(&running, snapshot), (&older, snapshot)], next, &failures).is_empty());
+        // An unreachable runner never stops the fetches; a failing fetch
+        // stops them at the bound, once.
+        let key = (running.id, snapshot);
+        let unreachable = VerifyError::Unreachable { node: RUNNER };
+        let corrupt = VerifyError::Corrupt {
+            snapshot,
+            reason: "chunk did not hash to its id".into(),
+        };
+        for _ in 0..10 {
+            assert!(!count_failure(&mut failures, key, &unreachable));
+        }
+        assert_eq!(
+            due([(&running, snapshot)], Generation::FIRST, &failures),
+            vec![key]
+        );
+        let stops: Vec<bool> = (0..MAX_VERIFY_FAILURES + 1)
+            .map(|_| count_failure(&mut failures, key, &corrupt))
+            .collect();
+        assert_eq!(stops.iter().filter(|s| **s).count(), 1, "{stops:?}");
+        assert!(due([(&running, snapshot)], Generation::FIRST, &failures).is_empty());
     }
 
     #[test]
