@@ -49,6 +49,9 @@
 //! there. The first stays in the double's process group, as an attached
 //! `docker exec` client stays in a worker's; the second leads a group of
 //! its own, as a provider effect that must outlive the worker does.
+//!
+//! `FABRIC_BRIDGE_DOUBLE_TRACEPARENT` names a file the double writes the
+//! `TRACEPARENT` it was started with to, or `unset`, before the handshake.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -666,11 +669,21 @@ fn children() -> Result<(), std::io::Error> {
     std::fs::rename(partial, path)
 }
 
+/// Writes the `TRACEPARENT` the double got to the file
+/// `FABRIC_BRIDGE_DOUBLE_TRACEPARENT` names.
+fn traceparent() -> Result<(), std::io::Error> {
+    let Some(path) = std::env::var_os("FABRIC_BRIDGE_DOUBLE_TRACEPARENT") else {
+        return Ok(());
+    };
+    let value = std::env::var("TRACEPARENT").unwrap_or_else(|_| "unset".into());
+    std::fs::write(path, value)
+}
+
 async fn run() -> u8 {
     let Some(profiles) = profiles() else {
         return 70;
     };
-    if children().is_err() {
+    if children().is_err() || traceparent().is_err() {
         return 71;
     }
     let mut stdin = tokio::io::stdin();

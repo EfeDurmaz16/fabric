@@ -25,6 +25,8 @@ Work on jobs:
 Managed jobs:
   managed  Make, cancel and read managed jobs, and the M5 operations on them (experimental)
   facade   Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
+  inspect  Read a managed job's whole state, or one attempt's, from its authority
+  audit    Export the authority's journal for an audit, as JSON lines
 
 Global Options:
   -d, --debug            Print diagnostic detail on stderr
@@ -55,8 +57,9 @@ Usage: fabric serve [OPTIONS]
 Run the node daemon in the foreground
 
 Options:
-      --listen <ADDR>  Where both transports listen [default: 0.0.0.0:7777]
-      --wire <WIRE>    Which wires this node dials: QUIC then TCP+TLS, or only one of them [default: auto] [possible values: auto, quic, tcp-tls]
+      --listen <ADDR>        Where both transports listen [default: 0.0.0.0:7777]
+      --otlp-endpoint <URL>  Export one OpenTelemetry span per operation as OTLP/HTTP JSON to this collector, `http://host:port` (spans go to /v1/traces). Without it, `OTEL_EXPORTER_OTLP_ENDPOINT` is read; without both, nothing is exported
+      --wire <WIRE>          Which wires this node dials: QUIC then TCP+TLS, or only one of them [default: auto] [possible values: auto, quic, tcp-tls]
 
 Global Options: See `fabric --help`
 
@@ -1086,6 +1089,66 @@ Examples:
     fabric facade continue --authority <NODE> --token <BEARER> <JOB> --pin <NODE>
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-continue
+```
+
+### `fabric inspect`
+
+```text
+Usage: fabric inspect [OPTIONS] <JOB>
+Read a managed job's whole state, or one attempt's, from its authority
+
+Arguments:
+  <JOB>  The managed job
+
+Options:
+      --attempt <ATTEMPT>  Narrow the attempts, generations, evidence, provider operations and last report to this attempt of the job
+
+Global Options: See `fabric --help`
+
+Examples:
+  Read a managed job's whole state as JSON
+    fabric inspect <JOB> --json
+
+  Read one attempt of the job
+    fabric inspect <JOB> --attempt <ATTEMPT> --json
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-inspect
+```
+
+### `fabric audit`
+
+```text
+Usage: fabric audit <COMMAND>
+Export the authority's journal for an audit, as JSON lines
+
+Commands:
+  export  Export the journal's operations, events, evidence and provider operations as JSON lines, oldest first; `--json` wraps them as `{"records":[...]}`
+
+Global Options: See `fabric --help`
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-audit
+```
+
+#### `fabric audit export`
+
+```text
+Usage: fabric audit export [OPTIONS]
+Export the journal's operations, events, evidence and provider operations as JSON lines, oldest first; `--json` wraps them as `{"records":[...]}`
+
+Options:
+      --since <TIME>  The window's start, inclusive: an RFC 3339 time, or a date, which is that day's midnight UTC
+      --until <TIME>  The window's end, exclusive: an RFC 3339 time, or a date, which is that day's midnight UTC, so the day itself is left out
+
+Global Options: See `fabric --help`
+
+Examples:
+  Export one week of the journal as JSON lines
+    fabric audit export --since 2026-11-01 --until 2026-11-08
+
+  Export everything as one JSON document
+    fabric audit export --json
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-audit-export
 ```
 
 ### `fabric help`

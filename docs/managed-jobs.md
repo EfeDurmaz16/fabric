@@ -2,6 +2,8 @@
 
 Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day; on `main` since 2026-11-03 (PR #31), with schema version 2 (PR #32) beside it. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`. The section "Reconciliation and cleanup (M4)" was added 2026-10-29 with ADR 0022 and implemented in Fabric the same day; it is on `main` since 2026-11-08 (PR #36), and its "As built (M4)" notes record where the code differs. The section "Placement and planned continuity (M5)" was added 2026-11-03 with ADRs 0023 to 0027 and implemented on the M5 branch; its "As built (M5)" notes record where the code differs.
 
+The spans a node exports for these operations, `fabric inspect --json` over the journal's tables and `fabric audit export` of them are in [observability.md](observability.md) (ADR 0031).
+
 ## Identity
 
 | Name | Form | Made by | Meaning |

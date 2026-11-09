@@ -1404,11 +1404,37 @@ impl Host for NodeHost {
             match to {
                 None => Ok(node.accept_report(None, report).await),
                 Some(peer) => {
-                    let session = node.session(peer).await.map_err(|e| e.to_string())?;
-                    session
-                        .report(report, LINK_DEADLINE)
-                        .await
-                        .map_err(|e| e.to_string())
+                    let span = node.trace.on().then(|| {
+                        crate::otel::hooks::launch_begin(
+                            crate::otel::SpanOp::REPORT,
+                            &report.token,
+                            Some(peer),
+                        )
+                    });
+                    let session = node.session(peer).await.map_err(|e| e.to_string());
+                    let answer = match session {
+                        Ok(session) => session
+                            .report(report, LINK_DEADLINE)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    };
+                    if let Some(mut span) = span {
+                        match &answer {
+                            Ok(ReportAnswer::Refused { reason }) => {
+                                crate::otel::hooks::answer_end(&mut span, Some(reason));
+                            }
+                            Ok(ReportAnswer::Recorded { .. }) => {
+                                crate::otel::hooks::answer_end::<()>(&mut span, None);
+                            }
+                            Err(_) => span.failed(
+                                crate::otel::SpanResult::Unknown,
+                                crate::otel::Code::fixed("Unreachable"),
+                            ),
+                        }
+                        node.trace.emit(span);
+                    }
+                    answer
                 }
             }
         })

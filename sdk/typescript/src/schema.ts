@@ -59,6 +59,8 @@ export const OPS = [
   "managed_register",
   "job_export_psf",
   "gc",
+  "inspect",
+  "audit_export",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -1050,6 +1052,120 @@ const inspection = {
 
 /** Everything the journal holds about one managed job. */
 export const Inspection = z.object(inspection);
+
+const hex32 = z.string().regex(HEX_32, "not 64 lowercase hex");
+
+/** The rows `inspect` adds to an inspection (ADR 0031, docs/observability.md). */
+const inspectReport = {
+  ...inspection,
+  schema: count,
+  attempt: optional(AttemptId),
+  attempts: z.array(
+    z.object({
+      attempt: AttemptId,
+      task: TaskId,
+      generation: count,
+      status: UnicodeText,
+      node: NodeId,
+      granted_by: OperationId,
+      initial_checkpoint: optional(hex32),
+      last_checkpoint: optional(hex32),
+      granted_ms: count,
+      ended_ms: optional(count),
+    }),
+  ),
+  generations: z.array(
+    z.object({
+      generation: count,
+      attempt: AttemptId,
+      granted_by: OperationId,
+      granted_by_kind: UnicodeText,
+      supersedes: optional(count),
+    }),
+  ),
+  operations: z.array(
+    z.object({
+      operation: OperationId,
+      operation_key: UnicodeText,
+      kind: UnicodeText,
+      status: UnicodeText,
+      revision: optional(count),
+      refusal: optional(UnicodeText),
+      accepted_ms: count,
+      updated_ms: count,
+    }),
+  ),
+  /** Older operations the reply leaves out; `fabric audit export` holds them. */
+  operations_omitted: optional(count),
+  evidence: z.array(
+    z.object({
+      seq: count,
+      kind: UnicodeText,
+      attempt: optional(AttemptId),
+      revision: count,
+      ref: UnicodeText,
+      digest: optional(hex32),
+      at_ms: count,
+    }),
+  ),
+  /** Older evidence rows the reply leaves out. */
+  evidence_omitted: optional(count),
+  last_report: optional(z.object({ seq: count, kind: UnicodeText, attempt: optional(AttemptId), at_ms: count })),
+};
+
+/** One audit row (ADR 0031): ids, codes, counters, times and SHA-256 digests only. */
+export const AuditRecord = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("operation"),
+    at_ms: count,
+    operation: OperationId,
+    job: optional(JobId),
+    kind: UnicodeText,
+    decision: z.enum(["accept", "reject"]),
+    status: UnicodeText,
+    refusal: optional(UnicodeText),
+    key_digest: hex32,
+  }),
+  z.object({
+    type: z.literal("event"),
+    at_ms: count,
+    seq: count,
+    job: JobId,
+    revision: count,
+    operation: optional(OperationId),
+    kind: UnicodeText,
+    digest: hex32,
+    prev_digest: optional(hex32),
+  }),
+  z.object({
+    type: z.literal("evidence"),
+    at_ms: count,
+    seq: count,
+    job: JobId,
+    attempt: optional(AttemptId),
+    kind: UnicodeText,
+    ref_digest: hex32,
+    digest: optional(hex32),
+  }),
+  z.object({
+    type: z.literal("provider_operation"),
+    at_ms: count,
+    operation: OperationId,
+    job: JobId,
+    task: TaskId,
+    attempt: AttemptId,
+    generation: count,
+    profile: UnicodeText,
+    action: UnicodeText,
+    effect_class: UnicodeText,
+    purpose: UnicodeText,
+    status: UnicodeText,
+    code: optional(UnicodeText),
+    effect: optional(UnicodeText),
+    locator_key: optional(hex32),
+  }),
+]);
+export type AuditRecord = z.infer<typeof AuditRecord>;
 export type Inspection = z.infer<typeof Inspection>;
 
 /** Who acts under a facade token: 1 to 64 characters of `[A-Za-z0-9._-]`. */
@@ -1253,6 +1369,8 @@ export const Request = z.discriminatedUnion("op", [
     approvals: optional(z.array(GcApproval)),
     worker: optional(GcWorker),
   }),
+  z.object({ op: z.literal("inspect"), job: JobId, attempt: optional(AttemptId) }),
+  z.object({ op: z.literal("audit_export"), since_ms: optional(count), until_ms: optional(count), after: optional(UnicodeText) }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -1454,6 +1572,10 @@ export const Reply = z.discriminatedUnion("kind", [
     residuals: z.array(GcResidual),
     kept: z.array(GcKept),
   }),
+  /** The whole managed state of a job or one attempt (ADR 0031). */
+  z.object({ kind: z.literal("inspect"), ...inspectReport }),
+  /** One page of the audit rows; `next` is the cursor of the next page, absent on the last. */
+  z.object({ kind: z.literal("audit_export"), records: z.array(AuditRecord), next: optional(UnicodeText) }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -1490,6 +1612,8 @@ export type Repaired = ReplyTo<"job_repair">;
 export type Exported = ReplyTo<"job_export">;
 export type PsfExported = ReplyTo<"job_export_psf">;
 export type GcReport = ReplyTo<"gc">;
+export type InspectReport = ReplyTo<"inspect">;
+export type AuditPage = ReplyTo<"audit_export">;
 
 // The exchange.
 

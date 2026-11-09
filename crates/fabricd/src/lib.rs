@@ -11,6 +11,7 @@
 //! anything acts on it, so a `kill -9` at any point leaves state the next
 //! command finishes or refuses with the command that resolves it.
 
+mod audit;
 mod authority;
 mod capturer;
 mod carry;
@@ -35,6 +36,7 @@ mod managed;
 mod managed_ops;
 pub mod node;
 mod ops;
+pub mod otel;
 mod package;
 pub mod paths;
 mod placement;

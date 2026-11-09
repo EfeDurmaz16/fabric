@@ -255,6 +255,14 @@ impl Node {
                 let path = path.map(|path| PathBuf::from(path.as_str()));
                 Reply::JobExport(self.job_export(job, path, &env, out).await?)
             }
+            Request::Inspect { job, attempt } => {
+                Reply::Inspect(Box::new(self.inspect_report(job, attempt).await?))
+            }
+            Request::AuditExport {
+                since_ms,
+                until_ms,
+                after,
+            } => Reply::AuditExport(self.audit_export(since_ms, until_ms, after).await?),
             Request::JobExportPsf { job, dir } => Reply::JobExportPsf(
                 self.job_export_psf(job, PathBuf::from(dir.as_str()))
                     .await?,
@@ -4365,6 +4373,7 @@ pub(crate) mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
             env,
+            otlp: None,
         })
         .unwrap()
     }
@@ -5903,6 +5912,7 @@ pub(crate) mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
             env: ToolEnv::current(),
+            otlp: None,
         })
         .unwrap();
         paired(&a, &b).await;
@@ -8523,6 +8533,7 @@ pub(crate) mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
             env: ToolEnv::current(),
+            otlp: None,
         })
         .unwrap();
         let repo = repo(&root);

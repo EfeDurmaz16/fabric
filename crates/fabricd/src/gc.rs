@@ -530,7 +530,7 @@ pub(crate) enum Worker {
     Spawn(GcWorker),
     /// Already connected: an in-process worker in a test.
     #[cfg(test)]
-    Ready(Bridge),
+    Ready(Box<Bridge>),
 }
 
 impl Node {
@@ -972,7 +972,7 @@ impl Node {
         let bridge = match worker {
             Worker::Spawn(spec) => spawn(&spec).await,
             #[cfg(test)]
-            Worker::Ready(bridge) => Ok(bridge),
+            Worker::Ready(bridge) => Ok(*bridge),
         };
         let bridge = match bridge {
             Ok(bridge) => bridge,

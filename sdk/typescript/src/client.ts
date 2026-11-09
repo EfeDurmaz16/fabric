@@ -70,6 +70,9 @@ import {
   type GcApproval,
   type GcReport,
   type GcWorker,
+  type InspectReport,
+  type AttemptId,
+  type AuditPage,
   type Counter,
   type NodeId,
   OperationKey,
@@ -511,6 +514,28 @@ export class FabricClient {
         approvals: options.approvals?.length ? [...options.approvals] : undefined,
         worker: options.worker,
       },
+      options,
+    );
+  }
+
+  /**
+   * The whole managed state of `job`, or of one of its attempts (ADR 0031);
+   * the schema is in docs/observability.md.
+   */
+  inspect(job: JobId, attempt?: AttemptId, options?: CallOptions): Promise<InspectReport> {
+    return this.call({ op: "inspect", job, attempt }, options);
+  }
+
+  /**
+   * One page of the audit rows made in `[sinceMs, untilMs)`, after the
+   * cursor `after` of the page before (ADR 0031).
+   */
+  auditExport(
+    window: { sinceMs?: number; untilMs?: number; after?: string } = {},
+    options?: CallOptions,
+  ): Promise<AuditPage> {
+    return this.call(
+      { op: "audit_export", since_ms: window.sinceMs, until_ms: window.untilMs, after: window.after },
       options,
     );
   }
