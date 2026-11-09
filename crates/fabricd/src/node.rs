@@ -109,6 +109,8 @@ pub struct Node {
     pub(crate) authority: crate::authority::Authority,
     /// The attempts this node runs for an authority (the launch path).
     pub(crate) runner: Arc<crate::runner::Runner>,
+    /// The verifier of the captures this node's authority records (ADR 0028).
+    pub(crate) verifier: crate::recovery::Verifier,
     /// The span exporter, off unless `NodeConfig::otlp` names an endpoint.
     pub(crate) trace: crate::otel::Tracer,
     _lock: File,
@@ -172,9 +174,12 @@ impl Node {
             .map_or_else(crate::otel::Tracer::off, |endpoint| {
                 crate::otel::Tracer::start(endpoint, identity.node_id())
             });
-        let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
-            .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?
-            .traced(trace.clone());
+        let authority = crate::authority::Authority::start_traced(
+            &cfg.state,
+            identity.node_id(),
+            trace.clone(),
+        )
+        .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
         // The launch path's runner: its executor's launch records, and the
         // records of the launches taken, live under the state directory.
         let runs = cfg.state.root().join("runs");
@@ -213,9 +218,11 @@ impl Node {
             client_env: Mutex::new(client_env),
             authority,
             runner,
+            verifier: crate::recovery::Verifier::default(),
             trace,
             _lock: lock_file,
         });
+        node.verifier.bind(Arc::downgrade(&node));
         capturer.bind(
             Arc::new(crate::runner::AdapterSuspend::new(Arc::downgrade(&node))),
             Arc::new(crate::runner::NodeFactsNow::new(Arc::downgrade(&node))),
@@ -271,7 +278,22 @@ impl Node {
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "the runner's launch records do not read"),
         }
+        // Every grant taken before a restart is presented to its
+        // authority and never resumed (ADR 0028).
+        let runner = Arc::clone(&self.runner);
+        tokio::spawn(async move {
+            let presented = runner.present_taken().await;
+            if !presented.is_empty() {
+                tracing::info!(
+                    presented = presented.len(),
+                    "presented the grants taken before the restart"
+                );
+            }
+        });
         tokio::spawn(Arc::clone(&self).recover());
+        // The authority's clock (ADR 0028): a tick every heartbeat
+        // interval; nothing runs while no managed job exists.
+        tokio::spawn(self.authority.clone().run_ticker());
         tokio::spawn(crate::dispatch::run(Arc::clone(&self)));
         loop {
             tokio::select! {

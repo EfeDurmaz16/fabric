@@ -1,0 +1,8 @@
+host: Darwin 25.6.0 arm64 (Apple M5 Pro, 18 cores, 48 GiB), rustc 1.97.1
+commit: 801ff1f52723b1888418acc998cfc8166481397c (m6/loss-recovery, before the evidence commits)
+started: 2026-11-02T22:05:05Z
+load before: 6.80 6.94 6.17
+load after:  6.17 6.76 6.14
+command: CARGO_TARGET_DIR=<scratch>/target cargo test -j 6 -p fabric --test e2e --locked -- relay:: partition:: --nocapture
+note: two fabricd processes on one host through a userspace relay; no firewall or system setting touched; every process the test started was gone at the end
+note: run 1 ran before the evidence directory was renamed from docs/evidence/m6-partition to docs/evidence/m6, so its ignore reasons name the old path

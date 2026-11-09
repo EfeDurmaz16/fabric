@@ -1,0 +1,6 @@
+op	rounds	median_ns	min_ns	max_ns	journal_bytes_per_call
+heartbeat live	20	16816	15301	18868	0
+fenced write	20	11848	9563	13804	0
+tick idle	20	5562	4976	7063	0
+checkpoint acknowledge	20	3975844	3188035	4660940	337
+heartbeat after restart	20	462166	411709	701209	0

@@ -168,7 +168,9 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
         | Reply::ManagedNote(operation)
         | Reply::ManagedRegister(operation)
         | Reply::ManagedCheckpoint(operation)
-        | Reply::ManagedContinue(operation) => {
+        | Reply::ManagedContinue(operation)
+        | Reply::ManagedSupersede(operation)
+        | Reply::ManagedRecover(operation) => {
             let mut lines = fabric_client::sentences::managed_job(&operation.job);
             if operation.replayed {
                 lines.push(format!(
@@ -957,7 +959,9 @@ pub(crate) fn answer(reply: &Reply, job: Option<JobId>) -> Answer {
         | Reply::ManagedNote(operation)
         | Reply::ManagedRegister(operation)
         | Reply::ManagedCheckpoint(operation)
-        | Reply::ManagedContinue(operation) => Answer {
+        | Reply::ManagedContinue(operation)
+        | Reply::ManagedSupersede(operation)
+        | Reply::ManagedRecover(operation) => Answer {
             notes: lines.split_off(1),
             ..id(operation.job.job.to_string())
         },
@@ -1070,7 +1074,9 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         | Reply::ManagedNote(operation)
         | Reply::ManagedRegister(operation)
         | Reply::ManagedCheckpoint(operation)
-        | Reply::ManagedContinue(operation) => {
+        | Reply::ManagedContinue(operation)
+        | Reply::ManagedSupersede(operation)
+        | Reply::ManagedRecover(operation) => {
             let outcome = match (reply, operation.replayed) {
                 (_, true) => "unchanged",
                 (Reply::ManagedCreate(_) | Reply::ManagedSubmit(_), false) => "created",

@@ -169,11 +169,15 @@ pub enum Op {
     Inspect,
     /// [`Request::AuditExport`].
     AuditExport,
+    /// [`Request::ManagedSupersede`].
+    ManagedSupersede,
+    /// [`Request::ManagedRecover`].
+    ManagedRecover,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 39] = [
+    pub const ALL: [Op; 41] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -213,6 +217,8 @@ impl Op {
         Op::Gc,
         Op::Inspect,
         Op::AuditExport,
+        Op::ManagedSupersede,
+        Op::ManagedRecover,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -258,6 +264,8 @@ impl Op {
             Op::Gc => "gc",
             Op::Inspect => "inspect",
             Op::AuditExport => "audit_export",
+            Op::ManagedSupersede => "managed_supersede",
+            Op::ManagedRecover => "managed_recover",
         }
     }
 }
@@ -822,6 +830,66 @@ pub enum Request {
         )]
         pin: Option<NodeId>,
     },
+    /// The operator takes the grant away from an `unknown` attempt and
+    /// grants nothing (ADR 0028): its covered writes are refused from now
+    /// on, and the job waits with no live attempt.
+    ManagedSupersede {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+        /// The `unknown` attempt; the job's live attempt when absent.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        attempt: Option<AttemptId>,
+        /// Why, for the history.
+        reason: String,
+    },
+    /// The operator recovers an `unknown` attempt (ADR 0028), whatever
+    /// the job's recovery policy: its grant is taken and the task is placed
+    /// again as a failover from an acknowledged checkpoint, never on the
+    /// unavailable node.
+    ManagedRecover {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+        /// The `unknown` attempt; the job's live attempt when absent.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        attempt: Option<AttemptId>,
+        /// The acknowledged checkpoint to start from; the job's newest when absent.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        from: Option<SnapshotId>,
+        /// Why, for the history.
+        reason: String,
+    },
     /// Everything the journal holds about one managed job (M5; the read
     /// surface ADR 0022 carried): the job, its placements, continuations,
     /// notes, provider operations, blockers and residuals. Writes nothing
@@ -1077,6 +1145,8 @@ impl Request {
             | Request::ManagedRegister { .. }
             | Request::ManagedCheckpoint { .. }
             | Request::ManagedContinue { .. }
+            | Request::ManagedSupersede { .. }
+            | Request::ManagedRecover { .. }
             | Request::ManagedInspect { .. }
             | Request::ManagedImport { .. }
             | Request::FacadeMint { .. }
@@ -1122,6 +1192,8 @@ impl Request {
             Request::ManagedNote { .. } => Op::ManagedNote,
             Request::ManagedCheckpoint { .. } => Op::ManagedCheckpoint,
             Request::ManagedContinue { .. } => Op::ManagedContinue,
+            Request::ManagedSupersede { .. } => Op::ManagedSupersede,
+            Request::ManagedRecover { .. } => Op::ManagedRecover,
             Request::ManagedInspect { .. } => Op::ManagedInspect,
             Request::ManagedSubmit { .. } => Op::ManagedSubmit,
             Request::ManagedImport { .. } => Op::ManagedImport,
@@ -1508,6 +1580,10 @@ pub enum Reply {
     ManagedCheckpoint(Box<ManagedOperation>),
     /// For [`Request::ManagedContinue`].
     ManagedContinue(Box<ManagedOperation>),
+    /// For [`Request::ManagedSupersede`].
+    ManagedSupersede(Box<ManagedOperation>),
+    /// For [`Request::ManagedRecover`].
+    ManagedRecover(Box<ManagedOperation>),
     /// For [`Request::ManagedInspect`].
     ManagedInspect(Box<Inspection>),
     /// For [`Request::ManagedSubmit`].
@@ -1565,6 +1641,8 @@ impl Reply {
             Reply::ManagedNote(_) => Op::ManagedNote,
             Reply::ManagedCheckpoint(_) => Op::ManagedCheckpoint,
             Reply::ManagedContinue(_) => Op::ManagedContinue,
+            Reply::ManagedSupersede(_) => Op::ManagedSupersede,
+            Reply::ManagedRecover(_) => Op::ManagedRecover,
             Reply::ManagedInspect(_) => Op::ManagedInspect,
             Reply::ManagedSubmit(_) => Op::ManagedSubmit,
             Reply::ManagedImport(_) => Op::ManagedImport,
@@ -2066,6 +2144,20 @@ pub struct ManagedPolicy {
     /// the slot is visible, as docs/facade-protocol.md asks.
     #[serde(default, with = "text::option")]
     pub pin: Option<NodeId>,
+    /// What the authority does when an attempt's node goes silent (ADR
+    /// 0028); `block` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryName>,
+}
+
+/// A job's recovery policy by its name on the wire (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryName {
+    /// The job waits for an operator with its state visible.
+    Block,
+    /// The authority restarts from an acknowledged checkpoint by itself.
+    RestartFromAcknowledged,
 }
 
 /// A note on a managed job's history (ADR 0024). On the wire it is an
@@ -2796,6 +2888,7 @@ impl From<&ManagedState> for ManagedJob {
                         AttemptStatus::Checkpointed { .. } => "checkpointed",
                         AttemptStatus::Lost => "lost",
                         AttemptStatus::Unknown => "unknown",
+                        AttemptStatus::Superseded { .. } => "superseded",
                     }
                     .to_owned(),
                     snapshot: match attempt.status {

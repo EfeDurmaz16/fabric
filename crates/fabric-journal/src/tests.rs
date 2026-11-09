@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::{
-    AttemptStatus, Command, DomainError, Envelope, Generation, Intent, JobPolicy, ManagedEvent,
-    NewIds, Observation, OperationKey, OperationMark, OperationStatus, ResourceRef, RestartPolicy,
-    SourceBinding, StoredResult, TaskState, WorkRevision,
+    AttemptStatus, CheckpointAck, Command, CoveredPath, CutDigest, DomainError, Envelope,
+    FenceVerdict, Generation, GrantToken, Intent, JobPolicy, ManagedEvent, NewIds, Observation,
+    OperationKey, OperationMark, OperationStatus, ResourceRef, RestartPolicy, SourceBinding,
+    StoredResult, TaskState, WorkRevision,
 };
 use fabric_core::path::AbsPath;
 use rusqlite::Connection;
@@ -223,7 +224,7 @@ fn a_restart_keeps_identity_and_progress_and_makes_a_dispatch_unknown() {
     let primary = f.journal.job(job).unwrap().unwrap().job.primary;
     let grant = accepted(&f.submit("start-1", Some(job), start(primary))).operation;
     f.journal
-        .mark(job, grant, OperationMark::Dispatched, 2_000)
+        .mark_authority(job, grant, OperationMark::Dispatched, 2_000)
         .unwrap();
     let before = f.journal.job(job).unwrap().unwrap();
 
@@ -260,7 +261,7 @@ fn a_restart_keeps_identity_and_progress_and_makes_a_dispatch_unknown() {
     // The executor's late report settles it.
     let attempt = after.attempts[0].clone();
     f.journal
-        .observe(
+        .observe_authority(
             job,
             &Observation::Started {
                 attempt: attempt.id,
@@ -287,10 +288,10 @@ fn recovery_offers_an_accepted_grant_once_and_acts_only_on_a_verified_probe() {
     let recovery = f.journal.recover(2_000, |_| Liveness::CannotTell).unwrap();
     assert_eq!(recovery.to_dispatch, vec![(job, grant)]);
     f.journal
-        .mark(job, grant, OperationMark::Dispatched, 2_001)
+        .mark_authority(job, grant, OperationMark::Dispatched, 2_001)
         .unwrap();
     assert!(matches!(
-        f.journal.mark(job, grant, OperationMark::Dispatched, 2_002),
+        f.journal.mark_authority(job, grant, OperationMark::Dispatched, 2_002),
         Ok(t) if t.events.is_empty()
     ));
 
@@ -312,7 +313,7 @@ fn recovery_offers_an_accepted_grant_once_and_acts_only_on_a_verified_probe() {
     let old = state.attempts[0].clone();
     let t = f
         .journal
-        .observe(
+        .observe_authority(
             job,
             &Observation::Exited {
                 attempt: old.id,
@@ -365,11 +366,12 @@ fn recovery_never_offers_a_lost_grant_and_it_cannot_run_next_to_its_replacement(
     let recovery = f.journal.recover(3_000, |_| Liveness::CannotTell).unwrap();
     assert_eq!(recovery.to_dispatch, vec![(job, second)]);
     assert!(matches!(
-        f.journal.mark(job, first, OperationMark::Dispatched, 3_001),
+        f.journal
+            .mark_authority(job, first, OperationMark::Dispatched, 3_001),
         Err(CommitError::Domain(DomainError::OperationState { .. }))
     ));
     f.journal
-        .mark(job, second, OperationMark::Dispatched, 3_002)
+        .mark_authority(job, second, OperationMark::Dispatched, 3_002)
         .unwrap();
     f.journal.verify().unwrap();
 }
@@ -387,7 +389,8 @@ fn recovery_never_offers_the_grant_of_an_attempt_it_saw_running() {
         "a running attempt was offered for a second launch"
     );
     assert!(matches!(
-        f.journal.mark(job, grant, OperationMark::Dispatched, 2_001),
+        f.journal
+            .mark_authority(job, grant, OperationMark::Dispatched, 2_001),
         Err(CommitError::Domain(DomainError::OperationState { .. }))
     ));
     f.journal.verify().unwrap();
@@ -402,7 +405,7 @@ fn events_and_evidence_are_append_only_and_tampering_is_found() {
     let attempt = f.journal.job(job).unwrap().unwrap().attempts[0].clone();
     let snapshot = SnapshotId::of(b"manifest");
     f.journal
-        .observe(
+        .observe_authority(
             job,
             &Observation::Checkpointed {
                 attempt: attempt.id,
@@ -425,8 +428,9 @@ fn events_and_evidence_are_append_only_and_tampering_is_found() {
             2_000,
         )
         .unwrap();
-    // The snapshot's evidence row and the cut's.
-    assert_eq!(count(&f.path(), "evidence"), 2);
+    // The snapshot's evidence row, the cut's, and the capture the cut is
+    // (ADR 0028).
+    assert_eq!(count(&f.path(), "evidence"), 3);
 
     let conn = Connection::open(f.path()).unwrap();
     assert!(conn.execute("UPDATE events SET at_ms = 0", []).is_err());
@@ -562,6 +566,569 @@ fn events_page_in_order() {
     assert_eq!(page, all[2..4].to_vec());
     assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
     assert_eq!(all[0].frame.prev, None);
+}
+
+// M6 (ADR 0028): the fence on every journal operation, acknowledgements,
+// loss as availability and the derived key of an automatic recover.
+
+/// A job whose first attempt is dispatched and running on `NODE`.
+fn running(f: &mut Fixture) -> (JobId, GrantToken) {
+    let job = accepted(&f.submit("create", None, create())).job;
+    let primary = f.journal.job(job).unwrap().unwrap().job.primary;
+    let grant = accepted(&f.submit("start-1", Some(job), start(primary))).operation;
+    f.journal
+        .mark_authority(job, grant, OperationMark::Dispatched, 2_000)
+        .unwrap();
+    let attempt = f.journal.job(job).unwrap().unwrap().attempts[0].clone();
+    let token = GrantToken {
+        job,
+        attempt: attempt.id,
+        generation: attempt.generation,
+    };
+    f.journal
+        .observe(
+            &token,
+            Some(NODE),
+            &Observation::Started {
+                attempt: attempt.id,
+                generation: attempt.generation,
+            },
+            2_001,
+        )
+        .unwrap()
+        .unwrap();
+    (job, token)
+}
+
+fn captured(f: &mut Fixture, token: &GrantToken, n: u8) -> (SnapshotId, CutDigest) {
+    let snapshot = SnapshotId::of(&[n; 3]);
+    let cut = CutDigest::from_bytes([n; 32]);
+    f.journal
+        .observe(
+            token,
+            Some(NODE),
+            &Observation::Captured {
+                attempt: token.attempt,
+                generation: token.generation,
+                snapshot,
+                cut,
+            },
+            2_100 + u64::from(n),
+        )
+        .unwrap()
+        .unwrap();
+    (snapshot, cut)
+}
+
+fn ack(token: &GrantToken, snapshot: SnapshotId, cut: CutDigest) -> CheckpointAck {
+    CheckpointAck {
+        attempt: token.attempt,
+        generation: token.generation,
+        snapshot,
+        cut,
+        manifests: 2,
+        chunks: 7,
+        bytes: 4_096,
+        fetched_from: NODE,
+    }
+}
+
+fn silent(f: &mut Fixture, token: &GrantToken, at_ms: u64) {
+    f.journal
+        .observe_authority(
+            token.job,
+            &Observation::ResourceUnavailable {
+                attempt: token.attempt,
+                generation: token.generation,
+                last_heartbeat_ms: Some(at_ms - 10_000),
+                at_ms,
+            },
+            at_ms,
+        )
+        .unwrap();
+}
+
+fn rows(path: &Path, sql: &str) -> Vec<String> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn acknowledge_writes_the_event_the_evidence_and_the_column() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    let (snapshot, cut) = captured(&mut f, &token, 1);
+    let path = f.path();
+    assert_eq!(
+        rows(&path, "SELECT kind FROM evidence ORDER BY rowid"),
+        vec!["checkpoint"]
+    );
+    assert_eq!(
+        rows(&path, "SELECT hex(last_acknowledged) FROM attempts"),
+        vec![""],
+        "captured is not acknowledged"
+    );
+    assert!(f.journal.acknowledged(job).unwrap().is_empty());
+    let a = ack(&token, snapshot, cut);
+    let t = f.journal.acknowledge(job, &a, 3_000).unwrap();
+    assert!(matches!(
+        t.events.as_slice(),
+        [ManagedEvent::CheckpointAcknowledged { .. }]
+    ));
+    assert_eq!(f.journal.acknowledged(job).unwrap(), vec![a.clone()]);
+    assert_eq!(
+        rows(&path, "SELECT kind FROM evidence ORDER BY rowid"),
+        vec!["checkpoint", "checkpoint_ack"]
+    );
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT hex(digest) FROM evidence WHERE kind = 'checkpoint_ack'"
+        ),
+        vec![format!("{cut}").to_uppercase()]
+    );
+    assert_eq!(
+        rows(&path, "SELECT hex(last_acknowledged) FROM attempts"),
+        vec![format!("{snapshot}").to_uppercase()]
+    );
+    assert_eq!(
+        rows(&path, "SELECT kind FROM events ORDER BY seq")
+            .last()
+            .map(String::as_str),
+        Some("checkpoint_acknowledged")
+    );
+    // Again: nothing more written.
+    let events = count(&path, "events");
+    assert!(
+        f.journal
+            .acknowledge(job, &a, 3_001)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    assert_eq!(count(&path, "events"), events);
+    // The projection is the replay, before and after a reopen.
+    f.journal.verify().unwrap();
+    f.reopen();
+    f.journal.verify().unwrap();
+    assert_eq!(f.journal.acknowledged(job).unwrap(), vec![a]);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "every covered path and verdict is walked in one place"
+)]
+fn a_refused_covered_write_changes_nothing_else() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    let path = f.path();
+    let before = f.journal.job(job).unwrap().unwrap();
+    let other = NodeId::from_bytes([0x77; 32]);
+    // Every covered path from the wrong node: refused, recorded, nothing else.
+    for path_kind in CoveredPath::ALL {
+        let verdict = f
+            .journal
+            .fence(&token, path_kind, Some(other), 2_500)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            verdict,
+            FenceVerdict::WrongNode {
+                granted: NODE,
+                from: other
+            }
+        );
+    }
+    let after = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.operations, before.operations);
+    assert_eq!(after.job.generation, before.job.generation);
+    assert_eq!(after.job.revision.get(), before.job.revision.get() + 4);
+    let kinds = rows(&path, "SELECT kind FROM events ORDER BY seq");
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "covered_write_refused")
+            .count(),
+        4
+    );
+    // A live token from its node writes nothing for a bare fence.
+    let events = count(&path, "events");
+    f.journal
+        .fence(&token, CoveredPath::LedgerAppend, Some(NODE), 2_501)
+        .unwrap()
+        .unwrap();
+    assert_eq!(count(&path, "events"), events);
+    // Superseded: the report is refused on the journal path and the
+    // attempt's exit never reaches the projection.
+    silent(&mut f, &token, 12_600);
+    let superseded = f.submit(
+        "supersede",
+        Some(job),
+        Command::Supersede {
+            attempt: token.attempt,
+            reason: "test".into(),
+        },
+    );
+    accepted(&superseded);
+    let refused = f
+        .journal
+        .observe(
+            &token,
+            Some(NODE),
+            &Observation::Exited {
+                attempt: token.attempt,
+                generation: token.generation,
+                outcome: fabric_core::managed::ExitOutcome::Succeeded,
+            },
+            12_700,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refused, FenceVerdict::Superseded { by: None });
+    let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(
+        s.attempt(token.attempt).unwrap().status,
+        AttemptStatus::Superseded { by: None }
+    );
+    assert!(
+        rows(&path, "SELECT kind FROM evidence")
+            .iter()
+            .all(|k| k != "exit"),
+        "the superseded exit left no evidence"
+    );
+    // A mark through the fence is refused the same way.
+    let refused = f
+        .journal
+        .mark(
+            &token,
+            Some(NODE),
+            s.attempts[0].granted_by,
+            OperationMark::Failed,
+            12_701,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refused, FenceVerdict::Superseded { by: None });
+    // A later generation makes the old token stale, and a stale report is
+    // recorded as the M2 refusal.
+    let primary = s.job.primary;
+    accepted(&f.submit("start-2", Some(job), start(primary)));
+    let refused = f
+        .journal
+        .observe(
+            &token,
+            Some(NODE),
+            &Observation::Started {
+                attempt: token.attempt,
+                generation: token.generation,
+            },
+            12_800,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        FenceVerdict::Superseded { by: None },
+        "superseded wins over stale: it names the reason"
+    );
+    let ghost = GrantToken {
+        attempt: fabric_core::managed::AttemptId::from_bytes([0xee; 16]),
+        ..token
+    };
+    assert_eq!(
+        f.journal
+            .fence(&ghost, CoveredPath::FacadeOutcome, None, 12_801)
+            .unwrap()
+            .unwrap_err(),
+        FenceVerdict::UnknownAttempt
+    );
+    let no_job = GrantToken {
+        job: JobId::from_bytes([0xdd; 16]),
+        ..token
+    };
+    let events = count(&path, "events");
+    assert_eq!(
+        f.journal
+            .fence(&no_job, CoveredPath::FacadeOutcome, None, 12_802)
+            .unwrap()
+            .unwrap_err(),
+        FenceVerdict::UnknownJob
+    );
+    assert_eq!(
+        count(&path, "events"),
+        events,
+        "no job, nothing to record against"
+    );
+    f.journal.verify().unwrap();
+}
+
+/// A runner that keeps writing under a grant it lost, or any peer that
+/// makes tokens up, cannot grow a job's history without bound: the same
+/// refusal is recorded once per attempt, path and verdict while the
+/// journal is open, a token that names no attempt of the job is refused
+/// without a record, and a different verdict for the same attempt is
+/// recorded again.
+#[test]
+fn two_wrong_nodes_alternating_are_recorded_once() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    let x = NodeId::from_bytes([0x77; 32]);
+    let y = NodeId::from_bytes([0x78; 32]);
+    let revision = |f: &Fixture| f.journal.job(job).unwrap().unwrap().job.revision.get();
+    let before = revision(&f);
+    for i in 0..6 {
+        let from = if i % 2 == 0 { x } else { y };
+        let verdict = f
+            .journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(from), 3_000 + i)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(verdict, FenceVerdict::WrongNode { .. }));
+    }
+    assert_eq!(
+        revision(&f),
+        before + 1,
+        "a wrong node is one refusal whichever peer sent it"
+    );
+}
+
+#[test]
+fn a_repeated_refusal_is_recorded_once_and_a_made_up_attempt_never() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    let path = f.path();
+    let other = NodeId::from_bytes([0x77; 32]);
+    let revision = |f: &Fixture| f.journal.job(job).unwrap().unwrap().job.revision.get();
+    let before = revision(&f);
+    for i in 0..5 {
+        let verdict = f
+            .journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(other), 3_000 + i)
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(verdict, FenceVerdict::WrongNode { .. }));
+    }
+    assert_eq!(
+        revision(&f),
+        before + 1,
+        "five identical refusals, one record"
+    );
+    // Another path for the same token: its own record, once.
+    for i in 0..3 {
+        f.journal
+            .fence(&token, CoveredPath::BundlePublish, Some(other), 3_100 + i)
+            .unwrap()
+            .unwrap_err();
+    }
+    assert_eq!(revision(&f), before + 2);
+    // A token for an attempt the job does not have: refused, never recorded.
+    let ghost = GrantToken {
+        attempt: fabric_core::managed::AttemptId::from_bytes([0xee; 16]),
+        ..token
+    };
+    for i in 0..5 {
+        let verdict = f
+            .journal
+            .fence(&ghost, CoveredPath::LedgerAppend, Some(NODE), 3_200 + i)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(verdict, FenceVerdict::UnknownAttempt);
+        let ghost_report = f
+            .journal
+            .observe(
+                &ghost,
+                Some(NODE),
+                &Observation::Started {
+                    attempt: ghost.attempt,
+                    generation: ghost.generation,
+                },
+                3_300 + i,
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(ghost_report, FenceVerdict::UnknownAttempt);
+    }
+    assert_eq!(revision(&f), before + 2);
+    // A new verdict for the same attempt and path is recorded again.
+    silent(&mut f, &token, 13_000);
+    let supersede = f.submit(
+        "supersede",
+        Some(job),
+        Command::Supersede {
+            attempt: token.attempt,
+            reason: "test".into(),
+        },
+    );
+    accepted(&supersede);
+    let after_supersede = revision(&f);
+    for i in 0..3 {
+        let verdict = f
+            .journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(NODE), 13_100 + i)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(verdict, FenceVerdict::Superseded { by: None });
+    }
+    assert_eq!(revision(&f), after_supersede + 1);
+    let kinds = rows(&path, "SELECT kind FROM events ORDER BY seq");
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "covered_write_refused")
+            .count(),
+        3
+    );
+    // After a reopen the memory is gone: the first repeat is recorded
+    // once more, and the next ones are not.
+    f.reopen();
+    for i in 0..3 {
+        f.journal
+            .fence(&token, CoveredPath::LedgerAppend, Some(NODE), 13_200 + i)
+            .unwrap()
+            .unwrap_err();
+    }
+    assert_eq!(revision(&f), after_supersede + 2);
+}
+
+#[test]
+fn recover_never_marks_lost_from_a_missed_heartbeat() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    silent(&mut f, &token, 20_000);
+    let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    assert_eq!(s.attempts[0].unavailable_since_ms, Some(20_000));
+    // Restart recovery probes only what it can verify: an unknown attempt
+    // is not granted, running or lost; nothing is offered for dispatch.
+    f.reopen();
+    let recovery = f.journal.recover(21_000, |_| Liveness::Gone).unwrap();
+    assert_eq!(recovery, Recovery::default());
+    let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Unknown);
+    // The heartbeat returns: running again, the column cleared.
+    f.journal
+        .observe_authority(
+            job,
+            &Observation::ResourceReachable {
+                attempt: token.attempt,
+                generation: token.generation,
+            },
+            22_000,
+        )
+        .unwrap();
+    let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(s.attempts[0].status, AttemptStatus::Running);
+    assert_eq!(s.attempts[0].unavailable_since_ms, None);
+    assert_eq!(
+        rows(
+            &f.path(),
+            "SELECT CASE WHEN unavailable_since_ms IS NULL THEN 'null' ELSE 'set' END FROM attempts"
+        ),
+        vec!["null"]
+    );
+    f.journal.verify().unwrap();
+}
+
+#[test]
+fn an_automatic_recover_replays_under_its_derived_key() {
+    let mut f = Fixture::new();
+    let (job, token) = running(&mut f);
+    let (snapshot, cut) = captured(&mut f, &token, 1);
+    f.journal
+        .acknowledge(job, &ack(&token, snapshot, cut), 3_000)
+        .unwrap();
+    silent(&mut f, &token, 20_000);
+    let decided = fabric_core::managed::recovery_decision(
+        &f.journal.job(job).unwrap().unwrap(),
+        token.attempt,
+        fabric_core::managed::OutcomePolicy::Checkpoint,
+        &[],
+    )
+    .unwrap();
+    // The key is derived from (job, attempt, generation): the same decision
+    // after a restart replays the same operation and takes nothing twice.
+    let key = format!("recover.{job}.{}.{}", token.attempt, token.generation.get());
+    let first = f.submit(&key, Some(job), decided.clone());
+    assert!(!first.replayed);
+    let again = f.submit(&key, Some(job), decided);
+    assert!(again.replayed);
+    assert_eq!(again.bytes, first.bytes);
+    let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(s.attempts.len(), 1, "the grant follows the placement");
+    assert_eq!(s.attempts[0].status, AttemptStatus::Superseded { by: None });
+    // The failover placement grants once, from the acknowledged checkpoint.
+    let StoredResult::Accepted(accepted) = &first.result else {
+        panic!("not accepted: {:?}", first.result);
+    };
+    let here = NodeId::from_bytes([0x11; 32]);
+    f.journal
+        .observe_authority(
+            job,
+            &Observation::Placed {
+                operation: accepted.operation,
+                task: s.attempts[0].task,
+                decision: fabric_core::managed::PlacementDecision {
+                    kind: fabric_core::managed::PlacementKind::Failover,
+                    decided_at_ms: 21_000,
+                    candidates: Vec::new(),
+                    chosen: Some(here),
+                },
+            },
+            21_000,
+        )
+        .unwrap();
+    let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(s.attempts.len(), 2);
+    assert_eq!(s.job.generation.get(), 2);
+    assert_eq!(s.attempts[1].resource, ResourceRef::Node { node: here });
+    assert_eq!(s.attempts[1].initial_checkpoint, Some(snapshot));
+    assert_eq!(
+        rows(
+            &f.path(),
+            "SELECT kind FROM operations WHERE op_key LIKE 'recover.%'"
+        ),
+        vec!["recover"]
+    );
+    // A blocked decision is recorded and the job stays as it was.
+    let token2 = GrantToken {
+        job,
+        attempt: s.attempts[1].id,
+        generation: s.attempts[1].generation,
+    };
+    f.journal
+        .mark_authority(
+            job,
+            s.attempts[1].granted_by,
+            OperationMark::Dispatched,
+            20_001,
+        )
+        .unwrap();
+    silent(&mut f, &token2, 40_000);
+    let t = f
+        .journal
+        .recovery_blocked(
+            job,
+            token2.attempt,
+            fabric_core::managed::RecoveryBlock::NoAcknowledgedCheckpoint,
+            40_001,
+        )
+        .unwrap();
+    assert!(matches!(
+        t.events.as_slice(),
+        [ManagedEvent::RecoveryBlocked { .. }]
+    ));
+    let s = f.journal.job(job).unwrap().unwrap();
+    assert_eq!(s.attempts[1].status, AttemptStatus::Unknown);
+    f.journal.verify().unwrap();
+    f.reopen();
+    f.journal.verify().unwrap();
 }
 
 /// The receipts read of one job never scans the events table: it searches

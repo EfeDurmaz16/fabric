@@ -9,16 +9,16 @@
 
 use super::frame::request_digest;
 use super::ids::{AttemptId, Generation, OperationId, TaskId, WorkRevision};
-use super::lifecycle::{CheckpointCut, TaskClass};
+use super::lifecycle::{CheckpointCut, OutcomePolicy, TaskClass};
 use super::model::{
-    Attempt, AttemptStatus, Command, CommandKind, Dedupe, DomainError, EffectRequest, Envelope,
-    ExitOutcome, JobState, ManagedEvent, ManagedJob, ManagedState, NewIds, Observation, Operation,
-    OperationMark, OperationProgress, OperationStatus, ResourceRef, SourceBinding, Task, TaskKind,
-    TaskOutcome, TaskState, Transition,
+    Attempt, AttemptStatus, Checkpoint, CheckpointAck, Command, CommandKind, Dedupe, DomainError,
+    EffectRequest, Envelope, ExitOutcome, JobState, ManagedEvent, ManagedJob, ManagedState, NewIds,
+    Observation, Operation, OperationMark, OperationProgress, OperationStatus, RecoveryBlock,
+    RecoveryPolicy, ResourceRef, SourceBinding, Task, TaskKind, TaskOutcome, TaskState, Transition,
 };
 use super::package::{Fidelity, TEXT_MAX_BYTES};
 use crate::credential::looks_like_credential;
-use crate::id::JobId;
+use crate::id::{JobId, NodeId, SnapshotId};
 
 /// Decides what a command under a key that may have been seen gets.
 #[must_use]
@@ -95,6 +95,8 @@ pub fn accept_command(
                 field: "intent".into(),
             });
         }
+        // The primary task is a harness task (`TaskClass::Harness` below).
+        admit_recovery(policy.recovery, TaskClass::Harness.outcome_policy())?;
         // The create's effect is the initial placement (ADR 0026).
         return Ok(Transition {
             revision: WorkRevision::FIRST,
@@ -143,6 +145,86 @@ pub fn accept_command(
     let mut events = vec![accepted(effect)];
     events.extend(rest);
     Ok(Transition { revision, events })
+}
+
+/// `RestartFromAcknowledged` is admitted only for a primary task the
+/// authority may restart by itself: never an `opaque` one (ADR 0028).
+pub fn admit_recovery(recovery: RecoveryPolicy, outcome: OutcomePolicy) -> Result<(), DomainError> {
+    match (recovery, outcome) {
+        (RecoveryPolicy::RestartFromAcknowledged, OutcomePolicy::Block) => {
+            Err(DomainError::RecoveryUnsupported {
+                kind: outcome.name().to_owned(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The snapshot a `StartAttempt` resumes from. The first attempt may start
+/// from any snapshot the operator names (M2). Once the job has had an
+/// attempt, a start resumes only from a checkpoint the authority
+/// acknowledged: a captured one, or one the job never saw, restarts
+/// nothing (ADR 0028), the same gate `Recover` runs.
+fn resume_point(state: &ManagedState, from: Option<SnapshotId>) -> Result<(), DomainError> {
+    if let Some(snapshot) = from
+        && !state.attempts.is_empty()
+        && !state.acknowledged().iter().any(|a| a.snapshot == snapshot)
+    {
+        return Err(DomainError::NotAcknowledged { snapshot });
+    }
+    Ok(())
+}
+
+/// Where a continue of a task with no live attempt starts, and the node
+/// it must not be placed on (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinueStart {
+    /// The checkpoint the grant starts from; `None` when the task has none.
+    pub from: Option<SnapshotId>,
+    /// The node of the task's newest attempt when that attempt was
+    /// superseded: it may still run there, so the continue is placed as a
+    /// failover with this node excluded, as a recover is.
+    pub lost: Option<NodeId>,
+}
+
+/// The start of a continue of `task` placed once no attempt of it runs.
+/// The task's last cut is a restart point when the attempt that cut it
+/// ended by its own runner's word (checkpointed, exited, lost: the M5
+/// handoff, whose target fetches the cut from that runner), unless a
+/// later attempt of the task has an acknowledged checkpoint, which is
+/// newer. A cut of a superseded attempt may exist only on the lost
+/// runner, so it restarts nothing unacknowledged: the newest acknowledged
+/// checkpoint of the task is the start instead, and with none the
+/// continue is refused `NotAcknowledged` naming the cut (ADR 0028).
+pub fn continue_start(state: &ManagedState, task: TaskId) -> Result<ContinueStart, DomainError> {
+    let lost = state
+        .attempts
+        .iter()
+        .rev()
+        .find(|a| a.task == task)
+        .and_then(|a| match (&a.status, &a.resource) {
+            (AttemptStatus::Superseded { .. }, ResourceRef::Node { node }) => Some(*node),
+            _ => None,
+        });
+    let position = |attempt: AttemptId| state.attempts.iter().position(|a| a.id == attempt);
+    let newest_ack = state
+        .acknowledged()
+        .into_iter()
+        .find(|a| state.attempt(a.attempt).is_some_and(|x| x.task == task));
+    let start = |from: Option<SnapshotId>| Ok(ContinueStart { from, lost });
+    match last_checkpoint(state, task) {
+        Some((by, cut)) if !matches!(by.status, AttemptStatus::Superseded { .. }) => {
+            match newest_ack {
+                Some(ack) if position(ack.attempt) > position(by.id) => start(Some(ack.snapshot)),
+                _ => start(Some(cut)),
+            }
+        }
+        Some((_, cut)) => match newest_ack {
+            Some(ack) => start(Some(ack.snapshot)),
+            None => Err(DomainError::NotAcknowledged { snapshot: cut }),
+        },
+        None => start(newest_ack.map(|a| a.snapshot)),
+    }
 }
 
 /// The live attempt of `task`, if one may still run.
@@ -239,6 +321,110 @@ fn cut_covers(
     }
 }
 
+/// The marks that settle `op` as `mark`: an operation never dispatched
+/// is marked dispatched first, as an explicit grant settles a create.
+fn settle(op: &OperationProgress, mark: OperationMark) -> Vec<ManagedEvent> {
+    let mut events = Vec::with_capacity(2);
+    if op.status == OperationStatus::Accepted {
+        events.push(ManagedEvent::OperationMarked {
+            operation: op.id,
+            status: OperationMark::Dispatched,
+        });
+    }
+    events.push(ManagedEvent::OperationMarked {
+        operation: op.id,
+        status: mark,
+    });
+    events
+}
+
+/// The effect operations of `old` that are not settled: a checkpoint of
+/// it, a continue or a cancel of its task, a spawn of an open task under
+/// its task, or a cancel of the job.
+fn open_effects<'a>(
+    state: &'a ManagedState,
+    old: &'a Attempt,
+) -> impl Iterator<Item = (&'a OperationProgress, &'a EffectRequest)> + 'a {
+    state
+        .operations
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.status,
+                OperationStatus::Accepted | OperationStatus::Dispatched | OperationStatus::Unknown
+            )
+        })
+        .filter_map(move |o| {
+            let request = state.request(o.id)?;
+            let mine = match request {
+                EffectRequest::Checkpoint { attempt } => *attempt == old.id,
+                EffectRequest::Continue { task, .. }
+                | EffectRequest::CancelTask { task, .. }
+                | EffectRequest::Recover { task, .. } => *task == old.task,
+                EffectRequest::CancelJob { .. } => true,
+                // A spawn under the attempt's task is the attempt's to run.
+                EffectRequest::Spawn { task } => open_tasks_of(state, old.task).contains(task),
+            };
+            mine.then_some((o, request))
+        })
+}
+
+/// What a supersede of `old` does to its open effects (ADR 0028): a
+/// checkpoint of it, a continue of its task or a spawn under it can no
+/// longer be reported by it and fails; a cancel it was asked to obey is done, because the
+/// superseded attempt can write nothing more. A `Recover` is refused while
+/// a cancel is open (`EffectInFlight`): no work is granted again on a job
+/// or task someone asked to stop.
+fn settle_superseded(
+    state: &ManagedState,
+    old: &Attempt,
+    regrant: bool,
+) -> Result<Vec<ManagedEvent>, DomainError> {
+    let mut events = Vec::new();
+    for (op, request) in open_effects(state, old) {
+        match request {
+            EffectRequest::Checkpoint { .. }
+            | EffectRequest::Continue { .. }
+            | EffectRequest::Spawn { .. }
+            | EffectRequest::Recover { .. } => {
+                events.extend(settle(op, OperationMark::Failed));
+            }
+            EffectRequest::CancelJob { .. } | EffectRequest::CancelTask { .. } if regrant => {
+                return Err(DomainError::EffectInFlight { operation: op.id });
+            }
+            EffectRequest::CancelJob { reason } => {
+                events.push(ManagedEvent::JobCancelled {
+                    reason: reason.clone(),
+                });
+                events.extend(settle(op, OperationMark::Succeeded));
+            }
+            EffectRequest::CancelTask { task, .. } => {
+                events.push(ManagedEvent::TaskFinished {
+                    task: *task,
+                    outcome: TaskOutcome::Cancelled,
+                });
+                events.extend(settle(op, OperationMark::Succeeded));
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// The `unknown` live attempt a `Supersede` or `Recover` names; a
+/// reachable one is handed over, never recovered (ADR 0028).
+fn unknown_attempt(state: &ManagedState, attempt: AttemptId) -> Result<&Attempt, DomainError> {
+    let found = state
+        .attempt(attempt)
+        .ok_or(DomainError::UnknownAttempt { attempt })?;
+    if found.status != AttemptStatus::Unknown || found.generation != state.job.generation {
+        return Err(DomainError::AttemptReachable {
+            attempt,
+            status: found.status.clone(),
+        });
+    }
+    Ok(found)
+}
+
 /// The effect flag and the events a command other than `CreateJob` makes
 /// on an active job.
 #[allow(
@@ -252,6 +438,49 @@ fn command_events(
 ) -> Result<(bool, Vec<ManagedEvent>), DomainError> {
     Ok(match body {
         Command::CreateJob { .. } => return Err(DomainError::BadEnvelope),
+        Command::Supersede { attempt, reason } => {
+            let old = unknown_attempt(state, *attempt)?;
+            let mut events = vec![ManagedEvent::GrantSuperseded {
+                attempt: old.id,
+                generation: old.generation,
+                by: None,
+                reason: reason.clone(),
+            }];
+            events.extend(settle_superseded(state, old, false)?);
+            (false, events)
+        }
+        Command::Recover {
+            attempt,
+            from,
+            reason,
+        } => {
+            let old = unknown_attempt(state, *attempt)?;
+            if !state.acknowledged().iter().any(|a| a.snapshot == *from) {
+                return Err(DomainError::NotAcknowledged { snapshot: *from });
+            }
+            open_task(state, old.task)?;
+            let ResourceRef::Node { node: lost } = old.resource;
+            let settled = settle_superseded(state, old, true)?;
+            let mut events = vec![ManagedEvent::GrantSuperseded {
+                attempt: old.id,
+                generation: old.generation,
+                by: None,
+                reason: reason.clone(),
+            }];
+            events.extend(settled);
+            // The grant follows the failover placement, as a continue's
+            // does (`place`): the dispatch places the task with `lost`
+            // excluded and the domain grants from `from`.
+            events.push(ManagedEvent::EffectRequested {
+                operation: ids.operation,
+                request: EffectRequest::Recover {
+                    task: old.task,
+                    from: *from,
+                    lost,
+                },
+            });
+            return Ok((true, events));
+        }
         Command::StartAttempt {
             task,
             resource,
@@ -261,6 +490,7 @@ fn command_events(
             if let Some(live) = state.live_attempt() {
                 return Err(DomainError::AttemptStillLive { attempt: live.id });
             }
+            resume_point(state, *initial_checkpoint)?;
             let mut events = vec![ManagedEvent::AttemptGranted {
                 attempt: ids.attempt,
                 task: *task,
@@ -443,6 +673,11 @@ fn command_events(
                 return Err(DomainError::AttemptStillLive { attempt: live.id });
             }
             no_effect_in_flight(state)?;
+            if live_of(state, *task).is_none() {
+                // Placed at once from the task's restart point: refused
+                // here when it has none (`continue_start`).
+                continue_start(state, *task)?;
+            }
             (
                 true,
                 vec![ManagedEvent::EffectRequested {
@@ -559,6 +794,22 @@ pub fn apply_observation(
         Observation::Unknown { operation } => {
             return mark_operation(job, *operation, OperationMark::Unknown);
         }
+        Observation::Captured {
+            attempt,
+            generation,
+            snapshot,
+            cut,
+        } => return captured(job, *attempt, *generation, *snapshot, *cut),
+        Observation::ResourceUnavailable {
+            attempt,
+            generation,
+            last_heartbeat_ms,
+            at_ms,
+        } => return unavailable(job, *attempt, *generation, *last_heartbeat_ms, *at_ms),
+        Observation::ResourceReachable {
+            attempt,
+            generation,
+        } => return reachable(job, *attempt, *generation),
         Observation::Placed {
             operation,
             task,
@@ -586,6 +837,27 @@ pub fn apply_observation(
                 cut: cut.digest(),
                 receipts: cut.receipts.clone(),
             };
+            // The cut is the job's captured checkpoint (ADR 0028): the
+            // snapshot under the cut's own digest, the one the verifier
+            // acknowledges once the authority holds the snapshot's bytes.
+            // Recorded once per snapshot; a cut of a snapshot already
+            // captured by another attempt or under another digest is the
+            // `Captured` rule's refusal.
+            let capture = match job.checkpoint(*snapshot) {
+                Some(known) if known.attempt == *attempt && known.cut == cut.digest() => None,
+                Some(_) => {
+                    return Err(DomainError::UnknownCheckpoint {
+                        attempt: *attempt,
+                        snapshot: *snapshot,
+                    });
+                }
+                None => Some(ManagedEvent::CheckpointCaptured {
+                    attempt: *attempt,
+                    generation: *generation,
+                    snapshot: *snapshot,
+                    cut: cut.digest(),
+                }),
+            };
             if let Some(command) = checkpoint_of(job, *attempt) {
                 // This attempt's checkpoint command: the cut is recorded,
                 // the attempt goes on.
@@ -593,13 +865,13 @@ pub fn apply_observation(
                     return Err(DomainError::AttemptEnded { attempt: *attempt });
                 }
                 cut_covers(job, found, cut)?;
-                return transition(vec![
-                    recorded,
-                    ManagedEvent::OperationMarked {
-                        operation: command.id,
-                        status: OperationMark::Succeeded,
-                    },
-                ]);
+                let mut events = vec![recorded];
+                events.extend(capture);
+                events.push(ManagedEvent::OperationMarked {
+                    operation: command.id,
+                    status: OperationMark::Succeeded,
+                });
+                return transition(events);
             }
             let ended = AttemptStatus::Checkpointed {
                 snapshot: *snapshot,
@@ -611,14 +883,14 @@ pub fn apply_observation(
                 return Err(DomainError::AttemptEnded { attempt: *attempt });
             }
             cut_covers(job, found, cut)?;
-            let mut events = vec![
-                ManagedEvent::AttemptObserved {
-                    attempt: *attempt,
-                    generation: *generation,
-                    status: ended,
-                },
-                recorded,
-            ];
+            // Captured while the attempt may still capture, then ended at the cut.
+            let mut events: Vec<ManagedEvent> = capture.into_iter().collect();
+            events.push(ManagedEvent::AttemptObserved {
+                attempt: *attempt,
+                generation: *generation,
+                status: ended,
+            });
+            events.push(recorded);
             events.extend(grant_succeeded(job, found));
             return transition(events);
         }
@@ -719,15 +991,7 @@ pub fn apply_observation(
             attempt,
             generation,
             outcome,
-        } => (
-            *attempt,
-            *generation,
-            match outcome {
-                ExitOutcome::Succeeded => AttemptStatus::Succeeded,
-                ExitOutcome::Failed { .. } => AttemptStatus::Failed,
-                ExitOutcome::Cancelled => AttemptStatus::Cancelled,
-            },
-        ),
+        } => (*attempt, *generation, exit_status(*outcome)),
         Observation::Lost {
             attempt,
             generation,
@@ -838,12 +1102,13 @@ fn place(
     let op = job
         .operation(operation)
         .ok_or(DomainError::UnknownOperation { operation })?;
-    if !matches!(op.kind, CommandKind::CreateJob | CommandKind::Continue)
-        || !matches!(
-            op.status,
-            OperationStatus::Accepted | OperationStatus::Dispatched
-        )
-        || job.attempts.iter().any(|a| a.granted_by == operation)
+    if !matches!(
+        op.kind,
+        CommandKind::CreateJob | CommandKind::Continue | CommandKind::Recover
+    ) || !matches!(
+        op.status,
+        OperationStatus::Accepted | OperationStatus::Dispatched
+    ) || job.attempts.iter().any(|a| a.granted_by == operation)
     {
         return Err(DomainError::OperationState {
             operation,
@@ -853,6 +1118,26 @@ fn place(
     open_task(job, task)?;
     if let Some(live) = job.live_attempt() {
         return Err(DomainError::AttemptStillLive { attempt: live.id });
+    }
+    let recover = match job.request(operation) {
+        Some(EffectRequest::Recover { from, lost, .. }) if op.kind == CommandKind::Recover => {
+            Some((*from, *lost))
+        }
+        _ => None,
+    };
+    let resumed = match op.kind {
+        CommandKind::Continue => Some(continue_start(job, task)?),
+        _ => None,
+    };
+    let lost = recover
+        .map(|(_, lost)| lost)
+        .or(resumed.and_then(|r| r.lost));
+    if let (Some(lost), Some(chosen)) = (lost, decision.chosen)
+        && chosen == lost
+    {
+        // A failover never goes back to the node whose attempt it
+        // replaces: that attempt may still run there (ADR 0028).
+        return Err(DomainError::FailoverToLostNode { node: lost });
     }
     let mut events = vec![ManagedEvent::PlacementDecided {
         task,
@@ -866,8 +1151,9 @@ fn place(
     }
     match decision.chosen {
         Some(node) => {
-            let initial_checkpoint = match op.kind {
-                CommandKind::Continue => last_checkpoint(job, task),
+            let initial_checkpoint = match (op.kind, recover) {
+                (CommandKind::Recover, Some((from, _))) => Some(from),
+                (CommandKind::Continue, _) => resumed.and_then(|r| r.from),
                 _ => match job.job.source {
                     SourceBinding::Snapshot { snapshot } => Some(snapshot),
                     _ => None,
@@ -897,6 +1183,282 @@ fn place(
     })
 }
 
+fn exit_status(outcome: ExitOutcome) -> AttemptStatus {
+    match outcome {
+        ExitOutcome::Succeeded => AttemptStatus::Succeeded,
+        ExitOutcome::Failed { .. } => AttemptStatus::Failed,
+        ExitOutcome::Cancelled => AttemptStatus::Cancelled,
+    }
+}
+
+/// `check_generation` as a transition: `Ok(Some(..))` is the refusal to
+/// record; `Ok(None)` means the report is current.
+fn generation_check(
+    job: &ManagedState,
+    attempt: &Attempt,
+    generation: Generation,
+) -> Result<Option<Transition>, DomainError> {
+    match check_generation(job, attempt, generation)? {
+        Some(events) => Ok(Some(Transition {
+            revision: next_revision(job)?,
+            events,
+        })),
+        None => Ok(None),
+    }
+}
+
+fn one(job: &ManagedState, event: ManagedEvent) -> Result<Transition, DomainError> {
+    Ok(Transition {
+        revision: next_revision(job)?,
+        events: vec![event],
+    })
+}
+
+/// `Captured`: the attempt keeps running; the checkpoint is recorded as
+/// captured, a restart point for nothing until acknowledged (ADR 0028).
+fn captured(
+    job: &ManagedState,
+    attempt_id: AttemptId,
+    generation: Generation,
+    snapshot: SnapshotId,
+    cut: super::lifecycle::CutDigest,
+) -> Result<Transition, DomainError> {
+    let attempt = job.attempt(attempt_id).ok_or(DomainError::UnknownAttempt {
+        attempt: attempt_id,
+    })?;
+    if let Some(refused) = generation_check(job, attempt, generation)? {
+        return Ok(refused);
+    }
+    if let Some(known) = job.checkpoint(snapshot) {
+        if known.attempt == attempt_id && known.cut == cut {
+            return Ok(unchanged(job));
+        }
+        return Err(DomainError::UnknownCheckpoint {
+            attempt: attempt_id,
+            snapshot,
+        });
+    }
+    if !attempt.status.may_run() {
+        return Err(DomainError::AttemptEnded {
+            attempt: attempt_id,
+        });
+    }
+    one(
+        job,
+        ManagedEvent::CheckpointCaptured {
+            attempt: attempt_id,
+            generation,
+            snapshot,
+            cut,
+        },
+    )
+}
+
+/// `ResourceUnavailable`: `granted` or `running` becomes `unknown`; an
+/// attempt already `unknown` is unchanged; an ended one is refused.
+fn unavailable(
+    job: &ManagedState,
+    attempt_id: AttemptId,
+    generation: Generation,
+    last_heartbeat_ms: Option<u64>,
+    at_ms: u64,
+) -> Result<Transition, DomainError> {
+    let attempt = job.attempt(attempt_id).ok_or(DomainError::UnknownAttempt {
+        attempt: attempt_id,
+    })?;
+    if let Some(refused) = generation_check(job, attempt, generation)? {
+        return Ok(refused);
+    }
+    match attempt.status {
+        AttemptStatus::Granted | AttemptStatus::Running => one(
+            job,
+            ManagedEvent::AttemptUnavailable {
+                attempt: attempt_id,
+                generation,
+                last_heartbeat_ms,
+                since_ms: at_ms,
+            },
+        ),
+        AttemptStatus::Unknown => Ok(unchanged(job)),
+        _ => Err(DomainError::AttemptEnded {
+            attempt: attempt_id,
+        }),
+    }
+}
+
+/// `ResourceReachable`: only an attempt `AttemptUnavailable` made
+/// `unknown` returns, to `running` if its grant succeeded and to `granted`
+/// if it was never seen launched; any other `unknown` is unchanged.
+fn reachable(
+    job: &ManagedState,
+    attempt_id: AttemptId,
+    generation: Generation,
+) -> Result<Transition, DomainError> {
+    let attempt = job.attempt(attempt_id).ok_or(DomainError::UnknownAttempt {
+        attempt: attempt_id,
+    })?;
+    if let Some(refused) = generation_check(job, attempt, generation)? {
+        return Ok(refused);
+    }
+    match attempt.status {
+        AttemptStatus::Unknown if attempt.unavailable_since_ms.is_some() => one(
+            job,
+            ManagedEvent::AttemptReachable {
+                attempt: attempt_id,
+                generation,
+            },
+        ),
+        AttemptStatus::Granted | AttemptStatus::Running | AttemptStatus::Unknown => {
+            Ok(unchanged(job))
+        }
+        _ => Err(DomainError::AttemptEnded {
+            attempt: attempt_id,
+        }),
+    }
+}
+
+/// The authority's acceptance of a checkpoint it fetched and verified
+/// (ADR 0028): the fourth rule function. It refuses a snapshot the attempt
+/// never reported, a cut that differs from the reported one and a
+/// generation that is not the attempt's. It accepts an acknowledgement
+/// for an attempt in any status while its grant is the job's current
+/// generation: the bytes of a checkpoint an attempt made before it became
+/// `unknown`, `superseded` with nothing granted, or `lost` are still its
+/// checkpoint. Once a later generation is granted the acknowledgement is
+/// `StaleGeneration`, as the fence answers the old grant's covered
+/// writes: a verifier that finished after a regrant never makes the
+/// superseded attempt's bundle a restart point beside the new lineage.
+/// The same acknowledgement twice changes nothing.
+pub fn acknowledge(job: &ManagedState, ack: &CheckpointAck) -> Result<Transition, DomainError> {
+    let attempt = job
+        .attempt(ack.attempt)
+        .ok_or(DomainError::UnknownAttempt {
+            attempt: ack.attempt,
+        })?;
+    if attempt.generation != ack.generation {
+        return Err(DomainError::StaleGeneration {
+            given: ack.generation,
+            current: attempt.generation,
+        });
+    }
+    let known = job
+        .checkpoint(ack.snapshot)
+        .filter(|c| c.attempt == ack.attempt)
+        .ok_or(DomainError::UnknownCheckpoint {
+            attempt: ack.attempt,
+            snapshot: ack.snapshot,
+        })?;
+    if known.cut != ack.cut {
+        return Err(DomainError::CutMismatch {
+            snapshot: ack.snapshot,
+            reported: known.cut,
+            verified: ack.cut,
+        });
+    }
+    if known.ack.is_some() {
+        return Ok(unchanged(job));
+    }
+    if matches!(attempt.status, AttemptStatus::Superseded { .. })
+        && open_recover_of(job, attempt.task)
+    {
+        // A recover took its grant and its failover is still being
+        // placed: the job's generation does not say so yet, and the new
+        // lineage starts from the recover's own checkpoint.
+        return Err(DomainError::NotLive {
+            attempt: ack.attempt,
+        });
+    }
+    if ack.generation != job.job.generation {
+        return Err(DomainError::StaleGeneration {
+            given: ack.generation,
+            current: job.job.generation,
+        });
+    }
+    one(
+        job,
+        ManagedEvent::CheckpointAcknowledged { ack: ack.clone() },
+    )
+}
+
+/// Whether a `Recover` of `task` is accepted or dispatched and has not
+/// granted yet.
+fn open_recover_of(job: &ManagedState, task: TaskId) -> bool {
+    job.operations.iter().any(|o| {
+        o.kind == CommandKind::Recover
+            && matches!(
+                o.status,
+                OperationStatus::Accepted | OperationStatus::Dispatched
+            )
+            && matches!(job.request(o.id), Some(EffectRequest::Recover { task: t, .. }) if *t == task)
+            && !job.attempts.iter().any(|a| a.granted_by == o.id)
+    })
+}
+
+/// The admission rule of `RestartFromAcknowledged`, pure (ADR 0028): given
+/// the job, the unavailable attempt, its task's outcome policy and what
+/// the authority found, either the `Recover` to submit or why not. A
+/// `cancel_and_restart` task restarts from the job's newest acknowledged
+/// checkpoint, a `checkpoint` task only from the attempt's own newest one,
+/// and a `block` task never.
+pub fn recovery_decision(
+    state: &ManagedState,
+    attempt: AttemptId,
+    outcome: OutcomePolicy,
+    blockers: &[OperationId],
+) -> Result<Command, RecoveryBlock> {
+    let from = match outcome {
+        OutcomePolicy::Block => {
+            return Err(RecoveryBlock::OutcomeBlocks {
+                kind: outcome.name().to_owned(),
+            });
+        }
+        OutcomePolicy::CancelAndRestart => state.acknowledged().first().map(|a| a.snapshot),
+        OutcomePolicy::Checkpoint => state
+            .acknowledged()
+            .iter()
+            .find(|a| a.attempt == attempt)
+            .map(|a| a.snapshot),
+    };
+    let from = from.ok_or(RecoveryBlock::NoAcknowledgedCheckpoint)?;
+    if !blockers.is_empty() {
+        return Err(RecoveryBlock::ReplacementBlocked {
+            blockers: blockers.to_vec(),
+        });
+    }
+    // The supersede the `Recover` makes refuses while a cancel is open;
+    // judged here so the refusal is a recorded block that the next tick
+    // judges again, never a rejection stored under the recover's key.
+    if let Some(old) = state.attempt(attempt)
+        && let Err(DomainError::EffectInFlight { operation }) = settle_superseded(state, old, true)
+    {
+        return Err(RecoveryBlock::EffectInFlight { operation });
+    }
+    Ok(Command::Recover {
+        attempt,
+        from,
+        reason: format!("automatic restart from acknowledged checkpoint {from}"),
+    })
+}
+
+/// Records why the authority did not restart an unavailable attempt by
+/// itself (ADR 0028): the job stays under `Block` with the reason in its
+/// history. The attempt must be the job's live attempt in status `unknown`.
+pub fn record_recovery_block(
+    job: &ManagedState,
+    attempt: AttemptId,
+    reason: RecoveryBlock,
+) -> Result<Transition, DomainError> {
+    let found = unknown_attempt(job, attempt)?;
+    one(
+        job,
+        ManagedEvent::RecoveryBlocked {
+            attempt: found.id,
+            generation: found.generation,
+            reason,
+        },
+    )
+}
+
 /// The id of the attempt a placement grants: a function of the operation
 /// and the generation, so the authority needs no fresh id for an observation.
 fn derived_attempt(operation: OperationId, generation: Generation) -> AttemptId {
@@ -914,7 +1476,7 @@ fn derived_attempt(operation: OperationId, generation: Generation) -> AttemptId 
 /// task's newest attempt that has one, a checkpoint command's cut
 /// included, else that attempt's own checkpointed end (an M2 suspend
 /// records no cut).
-fn last_checkpoint(job: &ManagedState, task: TaskId) -> Option<crate::id::SnapshotId> {
+fn last_checkpoint(job: &ManagedState, task: TaskId) -> Option<(&Attempt, SnapshotId)> {
     job.attempts
         .iter()
         .rev()
@@ -929,6 +1491,7 @@ fn last_checkpoint(job: &ManagedState, task: TaskId) -> Option<crate::id::Snapsh
                     AttemptStatus::Checkpointed { snapshot } => Some(snapshot),
                     _ => None,
                 })
+                .map(|snapshot| (a, snapshot))
         })
 }
 
@@ -964,7 +1527,7 @@ pub fn mark_operation(
     // untouched grant; replay keeps the plain status rule, so stored
     // histories are read as before.
     if mark == OperationMark::Dispatched
-        && op.kind == CommandKind::StartAttempt
+        && op.kind.grants()
         && op.status == OperationStatus::Accepted
         && !job.grant_may_dispatch(operation)
     {
@@ -1083,6 +1646,7 @@ pub fn apply_batch(
                 tasks: Vec::new(),
                 attempts: Vec::new(),
                 operations: vec![op],
+                checkpoints: Vec::new(),
                 requests: Vec::new(),
                 cuts: Vec::new(),
             });
@@ -1171,9 +1735,28 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
             }
             if !matches!(
                 s.operation(*operation).map(|o| o.kind),
-                Some(CommandKind::StartAttempt | CommandKind::CreateJob | CommandKind::Continue)
+                Some(
+                    CommandKind::StartAttempt
+                        | CommandKind::CreateJob
+                        | CommandKind::Continue
+                        | CommandKind::Recover
+                )
             ) {
                 return Err(broken(format!("a grant by operation {operation}")));
+            }
+            // A recover's failover grant is the generation that took the
+            // superseded attempt's place: its `by` is named now.
+            if s.operation(*operation).map(|o| o.kind) == Some(CommandKind::Recover) {
+                let previous = s.job.generation;
+                for old in s.attempts.iter_mut().filter(|a| {
+                    a.task == *task
+                        && a.generation == previous
+                        && a.status == AttemptStatus::Superseded { by: None }
+                }) {
+                    old.status = AttemptStatus::Superseded {
+                        by: Some(*generation),
+                    };
+                }
             }
             s.attempts.push(Attempt {
                 id: *attempt,
@@ -1184,6 +1767,7 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 initial_checkpoint: *initial_checkpoint,
                 granted_by: *operation,
                 status: AttemptStatus::Granted,
+                unavailable_since_ms: None,
             });
             s.job.generation = *generation;
         }
@@ -1199,13 +1783,17 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 .ok_or_else(|| broken(format!("an observation of attempt {attempt}")))?;
             if found.generation != *generation
                 || !found.status.may_run()
-                || *status == AttemptStatus::Granted
+                || matches!(
+                    status,
+                    AttemptStatus::Granted | AttemptStatus::Superseded { .. }
+                )
             {
                 return Err(broken(format!(
                     "attempt {attempt} cannot become {status:?}"
                 )));
             }
             found.status = status.clone();
+            found.unavailable_since_ms = None;
         }
         ManagedEvent::TaskFinished { task, outcome } => {
             let primary = s.job.primary;
@@ -1254,6 +1842,138 @@ fn apply_one(s: &mut ManagedState, event: &ManagedEvent) -> Result<(), DomainErr
                 )));
             }
             found.status = status.status();
+        }
+        ManagedEvent::CheckpointCaptured {
+            attempt,
+            generation,
+            snapshot,
+            cut,
+        } => {
+            let found = s
+                .attempt(*attempt)
+                .ok_or_else(|| broken(format!("a checkpoint of attempt {attempt}")))?;
+            if found.generation != *generation || !found.status.may_run() {
+                return Err(broken(format!("attempt {attempt} cannot capture")));
+            }
+            if s.checkpoint(*snapshot).is_some() {
+                return Err(broken(format!("checkpoint {snapshot} captured twice")));
+            }
+            s.checkpoints.push(Checkpoint {
+                attempt: *attempt,
+                generation: *generation,
+                snapshot: *snapshot,
+                cut: *cut,
+                ack: None,
+            });
+        }
+        ManagedEvent::CheckpointAcknowledged { ack } => {
+            let found = s
+                .checkpoints
+                .iter_mut()
+                .find(|c| c.snapshot == ack.snapshot && c.attempt == ack.attempt)
+                .ok_or_else(|| broken(format!("an acknowledgement of {}", ack.snapshot)))?;
+            if found.generation != ack.generation || found.cut != ack.cut || found.ack.is_some() {
+                return Err(broken(format!(
+                    "checkpoint {} cannot be acknowledged so",
+                    ack.snapshot
+                )));
+            }
+            found.ack = Some(ack.clone());
+        }
+        ManagedEvent::CoveredWriteRefused { verdict, .. } => {
+            if verdict.allows() {
+                return Err(broken("a refused covered write with a live verdict"));
+            }
+        }
+        ManagedEvent::AttemptUnavailable {
+            attempt,
+            generation,
+            since_ms,
+            ..
+        } => {
+            let found = s
+                .attempts
+                .iter_mut()
+                .find(|a| a.id == *attempt)
+                .ok_or_else(|| broken(format!("an unavailable attempt {attempt}")))?;
+            if found.generation != *generation
+                || !matches!(
+                    found.status,
+                    AttemptStatus::Granted | AttemptStatus::Running
+                )
+            {
+                return Err(broken(format!(
+                    "attempt {attempt} cannot become unavailable"
+                )));
+            }
+            found.status = AttemptStatus::Unknown;
+            found.unavailable_since_ms = Some(*since_ms);
+        }
+        ManagedEvent::AttemptReachable {
+            attempt,
+            generation,
+        } => {
+            // Back to what it was: `running` once it was seen launched (its
+            // grant succeeded), `granted` otherwise, so a grant still
+            // waiting for its dispatch is dispatched and its `Started`
+            // settles it. A continue's grant settles on `Continued`, so an
+            // attempt seen started before that returns `granted` until its
+            // next report.
+            let launched = s
+                .attempt(*attempt)
+                .and_then(|a| s.operation(a.granted_by))
+                .is_some_and(|op| op.status == OperationStatus::Succeeded);
+            let found = s
+                .attempts
+                .iter_mut()
+                .find(|a| a.id == *attempt)
+                .ok_or_else(|| broken(format!("a reachable attempt {attempt}")))?;
+            if found.generation != *generation
+                || found.status != AttemptStatus::Unknown
+                || found.unavailable_since_ms.is_none()
+            {
+                return Err(broken(format!("attempt {attempt} cannot become reachable")));
+            }
+            found.status = if launched {
+                AttemptStatus::Running
+            } else {
+                AttemptStatus::Granted
+            };
+            found.unavailable_since_ms = None;
+        }
+        ManagedEvent::GrantSuperseded {
+            attempt,
+            generation,
+            by,
+            ..
+        } => {
+            let current = s.job.generation;
+            let found = s
+                .attempts
+                .iter_mut()
+                .find(|a| a.id == *attempt)
+                .ok_or_else(|| broken(format!("a superseded attempt {attempt}")))?;
+            if found.generation != *generation
+                || found.generation != current
+                || found.status != AttemptStatus::Unknown
+                || by.is_some_and(|by| Some(by) != current.next())
+            {
+                return Err(broken(format!("attempt {attempt} cannot be superseded")));
+            }
+            found.status = AttemptStatus::Superseded { by: *by };
+            found.unavailable_since_ms = None;
+        }
+        ManagedEvent::RecoveryBlocked {
+            attempt,
+            generation,
+            ..
+        } => {
+            let found = s
+                .attempt(*attempt)
+                .ok_or_else(|| broken(format!("a blocked recovery of attempt {attempt}")))?;
+            if found.generation != *generation {
+                return Err(broken(format!("a blocked recovery of attempt {attempt}")));
+            }
         }
         ManagedEvent::NoteRecorded { .. } => {}
         ManagedEvent::ReceiptsRecorded { attempt, .. } => {

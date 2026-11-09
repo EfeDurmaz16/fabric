@@ -40,6 +40,26 @@ pub enum OutcomePolicy {
     Block,
 }
 
+impl OutcomePolicy {
+    /// The name ADR 0023 uses; the recovery decision records it (ADR 0028).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            OutcomePolicy::CancelAndRestart => "cancel_and_restart",
+            OutcomePolicy::Checkpoint => "checkpoint",
+            OutcomePolicy::Block => "block",
+        }
+    }
+
+    /// The policy of a task, by its class: the recovery decision judges
+    /// an unavailable attempt by its own task, never by the job's primary
+    /// (ADR 0028).
+    #[must_use]
+    pub fn of_task(task: &super::model::Task) -> OutcomePolicy {
+        task.class.outcome_policy()
+    }
+}
+
 impl TaskClass {
     /// The policy of the class.
     #[must_use]
@@ -258,6 +278,20 @@ const CUT_DOMAIN: &[u8] = b"fabric.managed.cut.v1\0";
 /// The digest of a checkpoint cut's canonical JSON.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CutDigest(pub [u8; 32]);
+
+impl CutDigest {
+    /// A digest from its bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> CutDigest {
+        CutDigest(bytes)
+    }
+
+    /// The digest's bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
 
 impl std::fmt::Display for CutDigest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

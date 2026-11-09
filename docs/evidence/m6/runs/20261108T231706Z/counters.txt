@@ -1,0 +1,9 @@
+test partition::block_policy_waits_until_an_operator_recovers ... ok
+test partition::captured_but_not_acknowledged_is_never_restarted_and_says_why ... ok
+test partition::old_runner_sigkill_then_restart ... ok
+test partition::old_runner_sigstop_then_sigcont ... ok
+test partition::relay_paused_runner_alive ... recovered 26.289834125s after the pause
+relay while paused: RelayCounters { udp_forwarded: [32, 28], udp_dropped: [21, 19], tcp_forwarded: [0, 0], tcp_held: [0, 0] }
+test partition::two_daemons_talk_through_the_relay_and_lose_each_other_while_it_is_paused ... relay counters: RelayCounters { udp_forwarded: [65, 59], udp_dropped: [26, 20], tcp_forwarded: [0, 0], tcp_held: [0, 0] } (forwarded 124, dropped 46)
+test relay::the_relay_forwards_pauses_and_counts ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 105 filtered out; finished in 188.92s

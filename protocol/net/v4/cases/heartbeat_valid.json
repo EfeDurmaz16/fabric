@@ -14,7 +14,8 @@
         "attempt": "01K8W3A00000000000000000A2",
         "generation": "2"
       }
-    ]
+    ],
+    "running": true
   },
   "expect": {
     "outcome": "accept"

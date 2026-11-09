@@ -4,7 +4,8 @@
 use fabric_client::api::{Reason, Reply, Request};
 use fabric_core::id::JobId;
 use fabric_core::managed::{
-    Command, Envelope, ManagedEvent, Observation, OperationKey, StoredResult, Transition,
+    CheckpointAck, Command, Envelope, FenceVerdict, GrantToken, ManagedEvent, Observation,
+    OperationKey, RecoveryBlock, StoredResult, Transition,
 };
 use fabric_journal::{Answer, CommitError};
 
@@ -67,6 +68,17 @@ fn granted(span: &mut OpSpan, events: &[ManagedEvent]) {
                 span.attempt.get_or_insert(*attempt);
                 span.snapshot = Some(*snapshot);
                 span.checkpoint = Some(super::span::Digest(cut.0));
+            }
+            // A supersede or a recover takes a grant: the span names the
+            // attempt it ended and the generation, and links to its trace.
+            ManagedEvent::GrantSuperseded {
+                attempt,
+                generation,
+                ..
+            } => {
+                span.attempt.get_or_insert(*attempt);
+                span.supersedes = Some(generation.get());
+                span.links.push(attempt_context(*attempt));
             }
             ManagedEvent::CommandAccepted { kind, .. } => {
                 span.op = SpanOp::managed(*kind);
@@ -163,6 +175,20 @@ pub(crate) fn observation_begin(job: JobId, observation: &Observation) -> OpSpan
         | Observation::Lost {
             attempt,
             generation,
+        }
+        | Observation::Captured {
+            attempt,
+            generation,
+            ..
+        }
+        | Observation::ResourceUnavailable {
+            attempt,
+            generation,
+            ..
+        }
+        | Observation::ResourceReachable {
+            attempt,
+            generation,
         } => (Some(*attempt), Some(*generation)),
         Observation::Placed {
             operation, task, ..
@@ -183,8 +209,104 @@ pub(crate) fn observation_begin(job: JobId, observation: &Observation) -> OpSpan
         span.child_of(operation_context(operation));
     }
     span.generation = generation.map(fabric_core::managed::Generation::get);
-    if let Observation::Checkpointed { snapshot, .. } = observation {
-        span.snapshot = Some(*snapshot);
+    match observation {
+        Observation::Checkpointed { snapshot, .. } => span.snapshot = Some(*snapshot),
+        Observation::Captured { snapshot, cut, .. } => {
+            span.snapshot = Some(*snapshot);
+            span.checkpoint = Some(super::span::Digest(cut.0));
+        }
+        _ => {}
+    }
+    span
+}
+
+/// Ends an observation's span with the journal's own answer, for one the
+/// authority's thread made itself.
+pub(crate) fn observation_committed(
+    span: &mut OpSpan,
+    recorded: Result<&Transition, &CommitError>,
+) {
+    match recorded {
+        Ok(transition) => observation_end(span, Ok(transition)),
+        Err(CommitError::Domain(domain)) => span.refused(crate::managed::refusal_code(domain)),
+        Err(commit) => span.failed(SpanResult::Failed, type_name(commit)),
+    }
+}
+
+/// Ends the span of an executor's report the fence answered: what the
+/// journal recorded, or the fence's refusal by its verdict's name (ADR
+/// 0028). `from` is the peer the report came from, `None` for this node.
+pub(crate) fn report_end(
+    span: &mut OpSpan,
+    from: Option<fabric_core::id::NodeId>,
+    recorded: Result<Result<&Transition, &FenceVerdict>, &AuthorityError>,
+) {
+    span.peer = from;
+    match recorded {
+        Ok(Ok(transition)) => observation_end(span, Ok(transition)),
+        Ok(Err(verdict)) => span.refused(verdict.name()),
+        Err(error) => authority_failed(span, error),
+    }
+}
+
+/// The span of a checkpoint the authority fetched, verified and
+/// acknowledged, in its attempt's trace (ADR 0028). End it with
+/// [`observation_end`].
+pub(crate) fn acknowledge_begin(job: JobId, ack: &CheckpointAck) -> OpSpan {
+    let mut span = OpSpan::begin(
+        SpanOp::ACKNOWLEDGE,
+        SpanKind::Internal,
+        standalone_context(),
+    );
+    span.child_of(attempt_context(ack.attempt));
+    span.job = Some(job);
+    span.attempt = Some(ack.attempt);
+    span.generation = Some(ack.generation.get());
+    span.snapshot = Some(ack.snapshot);
+    span.checkpoint = Some(super::span::Digest(ack.cut.0));
+    span
+}
+
+/// The span of a recovery the authority's policy did not run, with the
+/// reason as its code, in the attempt's trace: the reason's variant name
+/// only, never the refusal text a `Refused` reason holds.
+pub(crate) fn recovery_blocked(
+    job: JobId,
+    attempt: fabric_core::managed::AttemptId,
+    reason: &RecoveryBlock,
+    recorded: Result<&Transition, &AuthorityError>,
+) -> OpSpan {
+    let mut span = OpSpan::begin(
+        SpanOp::RECOVERY_BLOCKED,
+        SpanKind::Internal,
+        standalone_context(),
+    );
+    span.child_of(attempt_context(attempt));
+    span.job = Some(job);
+    span.attempt = Some(attempt);
+    match recorded {
+        Ok(transition) => {
+            span.revision = Some(transition.revision.get());
+            span.refused(&snake(type_name(reason).as_str()));
+        }
+        Err(error) => authority_failed(&mut span, error),
+    }
+    span
+}
+
+/// The span of a restarted runner presenting a grant it had taken to its
+/// authority (ADR 0028), in the attempt's trace: done for a live grant,
+/// refused with the verdict's name for one it may no longer act on.
+pub(crate) fn present(
+    token: &GrantToken,
+    authority: Option<fabric_core::id::NodeId>,
+    verdict: &FenceVerdict,
+) -> OpSpan {
+    let mut span = launch_begin(SpanOp::PRESENT, token, authority);
+    if verdict.allows() {
+        span.end(SpanResult::Done);
+    } else {
+        span.refused(verdict.name());
     }
     span
 }
@@ -290,11 +412,11 @@ pub(crate) fn request_end(span: &mut OpSpan, reply: &Result<Reply, NodeError>) {
 /// attempt's trace, a server span for the authority that granted it.
 pub(crate) fn launch_begin(
     op: SpanOp,
-    token: &fabric_core::managed::launch::GrantToken,
+    token: &GrantToken,
     peer: Option<fabric_core::id::NodeId>,
 ) -> OpSpan {
     let context: SpanContext = attempt_context(token.attempt);
-    let kind = if op == SpanOp::REPORT {
+    let kind = if op == SpanOp::REPORT || op == SpanOp::PRESENT {
         SpanKind::Client
     } else {
         SpanKind::Server

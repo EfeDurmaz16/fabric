@@ -10,12 +10,13 @@
 
 use super::placement::{
     Candidate, CurrentPlacement, Exclusion, MAX_CANDIDATES, NodeAdvert, PROBE_BOUND_MS,
-    PlacementDecision, PlacementInput, Probe, RankReason, Verdict,
+    PlacementDecision, PlacementInput, PlacementKind, Probe, RankReason, Verdict,
 };
 use crate::harness::HarnessKind;
 
 /// Decides a placement from fresh probes: every exclusion of every node is
-/// listed; the eligible nodes are ranked by the current healthy placement,
+/// listed, and a failover excludes the node of the attempt it replaces
+/// (`current`, not healthy) whatever that node answers; the eligible nodes are ranked by the current healthy placement,
 /// then the bundle chain, then the workspace, then the lowest 1-minute
 /// load, then the node identity; the first wins. With no eligible node
 /// `chosen` is `None` and the job is parked.
@@ -116,6 +117,13 @@ fn exclusions(input: &PlacementInput<'_>, probe: &Probe) -> Vec<Exclusion> {
         && pinned != probe.node
     {
         out.push(Exclusion::Pin { pinned });
+    }
+    if input.kind == PlacementKind::Failover
+        && input
+            .current
+            .is_some_and(|c| !c.healthy && c.node == probe.node)
+    {
+        out.push(Exclusion::Unavailable);
     }
     out
 }

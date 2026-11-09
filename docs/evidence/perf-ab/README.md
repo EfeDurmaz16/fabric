@@ -687,6 +687,64 @@ attempt yet, so the continue stays accepted and its cut is never taken
 (docs/managed-jobs.md, "As built (M5)", and the question in
 docs/evidence/m5/README.md, "Blocked").
 
+## M6 (loss recovery), release, 2026-11-08
+
+| Directory | Anchor | Candidate | Pairs | Counted runs |
+|---|---|---|---:|---:|
+| `m6-release/` | `176622e` | `c4b79d7`, the M6 head before this step | 20 | 3 |
+| `m6-vs-m5-release/` | `c4283c2`, the local M5 head | `c4b79d7` | 20 | 3 |
+| `m6-release-fix1/` | `176622e` | `7e4f4e5`, after the fix below | 20 | 3 |
+| `m6-paths/` | none | `7e4f4e5` | 20 rounds | none |
+
+`machine.txt` in each directory has the load at the start and the end.
+Each run started when the 1-minute load was at or below 6 (5.88, 5.96 and
+5.99); other work on the machine raised it to 8.0, 8.3 and 16.5 by the
+end. The pairs give both builds the same load, so the ratios hold.
+
+Against the anchor, `m6-release/`: no op is slower; 23 of the 26 are
+faster and the other three hold 1. Both daemons are smaller in resident
+size and physical footprint. One CLI was larger: `cli version` peaked at
+3312 KiB against the anchor's 3168 with 553 allocations against 189. clap
+builds every subcommand and argument before it reads `--version`, and the
+managed and facade subcommands made that tree larger. `e24ff34` prints
+the version, clap's own text, before the parser is built when
+`--version` or `-V` is the only argument; anything else goes to clap as
+before.
+
+That fast path is no longer on the branch: when main's CLI contract and
+its footprint fix (the next section) were merged in, `fabric --version`
+went back to main's parser, and the e2e budget
+`footprint::version_allocates_under_its_budget` holds it. The numbers
+below are for `7e4f4e5`; the perf job in CI measures the current head.
+
+After the fix, `m6-release-fix1/`: 25 of the 26 ops are faster and `cli
+version` holds 1 (1.024, 0.877 to 1.073); its counted run is 10
+allocations and 2320 KiB. Every CLI peak is below the anchor's. Both
+daemons are smaller in resident size (0.938 and 0.944 counted, 0.933 and
+0.927 timed) and in timed physical footprint (0.987 and 0.888); the
+counted physical footprint, three runs, is 1.000 for both (0.997 to 1.003
+and 0.980 to 1.000), where `m6-release/` gave 0.995 and 0.961 for the same
+daemon code. The fix touches only the CLI's start.
+
+Against the M5 head, which is not the rule's reference: `c4283c2` is 56
+commits past the M5 merge in M6 (`7aa46d6`), with the launch path M6 does
+not have, so the two builds differ both ways. `acp pull` is 1.032 (1.000
+to 1.081) with the same spawns, flushes and bytes in the counted runs;
+daemon b is 2.4% larger in timed resident size and 1.9% in timed
+footprint, daemon a 0.5%. Every other op holds 1.
+
+The M6 paths, `m6-paths/paths.tsv`, have no reference build: neither the
+anchor nor the M5 head has a heartbeat, a fence or a checkpoint
+acknowledgement. `authority::tests::bench_m6_paths` (ignored; run with
+`FABRIC_M6_BENCH_OUT` set, `cargo test -p fabricd --lib --release --
+--ignored bench_m6_paths`) drives one authority in process, 20 rounds,
+medians: a heartbeat of a tracked, reachable attempt 16.8 us and no
+journal write; a covered write (the write is the stub of this base) 11.8
+us and no journal write; an idle tick 5.6 us; a checkpoint
+acknowledgement 4.0 ms and 337 journal bytes, one durable commit; the
+first heartbeat after a restart, one journal read, 0.46 ms and no write.
+The ledger append, bundle publish (suspend) and journal operation (new,
+approve) paths are the A/B ops above.
 ## CLI footprint
 
 The perf job of pull request #43 (`pr15/perf-in-ci`, run 42518821004) caught a regression that main took in PR #41, the CLI contract: every CLI op's peak physical footprint was 1.07x the anchor's, 176 to 368 KiB more a process, and `cli version` made 2408 allocations of 971 KB against 244 of 106 KB. No test had seen it: the time budget counts processes, not memory.

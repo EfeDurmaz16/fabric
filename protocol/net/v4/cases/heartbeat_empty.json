@@ -3,7 +3,8 @@
   "direction": "node_to_authority",
   "message": {
     "type": "heartbeat",
-    "attempts": []
+    "attempts": [],
+    "running": true
   },
   "expect": {
     "outcome": "accept"

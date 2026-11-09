@@ -10,7 +10,8 @@
         "generation": "1"
       },
       "count": 65
-    }
+    },
+    "running": true
   },
   "expect": {
     "outcome": "reject",

@@ -186,6 +186,9 @@ impl SpanOp {
     pub(crate) const PEER_MOVE_REQUEST: SpanOp = SpanOp("peer.move_request");
     pub(crate) const PEER_OFFER: SpanOp = SpanOp("peer.offer");
     pub(crate) const PEER_MOVE_ABORT: SpanOp = SpanOp("peer.move_abort");
+    pub(crate) const ACKNOWLEDGE: SpanOp = SpanOp("recovery.acknowledge");
+    pub(crate) const RECOVERY_BLOCKED: SpanOp = SpanOp("recovery.blocked");
+    pub(crate) const PRESENT: SpanOp = SpanOp("runner.present");
 
     /// The span of a managed command of `kind`.
     pub(crate) fn managed(kind: fabric_core::managed::CommandKind) -> SpanOp {
@@ -200,6 +203,8 @@ impl SpanOp {
             K::RecordNote => "managed.record_note",
             K::Checkpoint => "managed.checkpoint",
             K::Continue => "managed.continue",
+            K::Supersede => "managed.supersede",
+            K::Recover => "managed.recover",
         })
     }
 
@@ -216,6 +221,9 @@ impl SpanOp {
             O::Exited { .. } => "observe.exited",
             O::Lost { .. } => "observe.lost",
             O::Unknown { .. } => "observe.unknown",
+            O::Captured { .. } => "observe.captured",
+            O::ResourceUnavailable { .. } => "observe.resource_unavailable",
+            O::ResourceReachable { .. } => "observe.resource_reachable",
         })
     }
 

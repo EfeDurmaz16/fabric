@@ -1,0 +1,4 @@
+run 1 (relay:: partition::): relay counters: RelayCounters { udp_forwarded: [64, 58], udp_dropped: [26, 19], tcp_forwarded: [0, 0], tcp_dropped: [0, 0] } (forwarded 122, dropped 45)
+run 2 (partition::two_daemons): relay counters: RelayCounters { udp_forwarded: [70, 66], udp_dropped: [26, 19], tcp_forwarded: [0, 0], tcp_dropped: [0, 0] } (forwarded 136, dropped 45)
+run 3 (partition::two_daemons): relay counters: RelayCounters { udp_forwarded: [67, 58], udp_dropped: [24, 19], tcp_forwarded: [0, 0], tcp_dropped: [0, 0] } (forwarded 125, dropped 43)
+run 4 (partition::two_daemons): relay counters: RelayCounters { udp_forwarded: [66, 59], udp_dropped: [26, 19], tcp_forwarded: [0, 0], tcp_dropped: [0, 0] } (forwarded 125, dropped 45)

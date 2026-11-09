@@ -85,6 +85,7 @@
 
 mod canon;
 pub mod facade;
+mod fence;
 mod frame;
 mod ids;
 pub mod launch;
@@ -97,6 +98,7 @@ pub mod secret_ref;
 pub mod source;
 mod transition;
 
+pub use fence::{CoveredPath, FenceVerdict, fence};
 pub use frame::{
     EventFrame, FrameError, MANAGED_FORMAT, MANAGED_FORMAT_V1, StoredPart, request_digest, v1,
 };
@@ -110,12 +112,13 @@ pub use lifecycle::{
     OutcomePolicy, ReceiptStatus, TaskClass, TaskReceipt, WorkspaceRevision,
 };
 pub use model::{
-    AcceptedOperation, Attempt, AttemptStatus, Command, CommandKind, Dedupe, DomainError,
-    EffectRequest, Envelope, ExitOutcome, Intent, JobMode, JobPolicy, JobState,
-    MAX_EXPORT_ALLOWLIST, MAX_SECRETS, ManagedEvent, ManagedJob, ManagedState, NewIds, Note,
-    Observation, Operation, OperationMark, OperationProgress, OperationStatus, PlacementPolicy,
-    ResourceRef, RestartPolicy, SourceBinding, StoredResult, Task, TaskKind, TaskOutcome,
-    TaskState, Transition,
+    AcceptedOperation, Attempt, AttemptStatus, Checkpoint, CheckpointAck, Command, CommandKind,
+    Dedupe, DomainError, EffectRequest, Envelope, ExitOutcome, HEARTBEAT_INTERVAL_MS, Intent,
+    JobMode, JobPolicy, JobState, MAX_EXPORT_ALLOWLIST, MAX_SECRETS, ManagedEvent, ManagedJob,
+    ManagedState, NewIds, Note, Observation, Operation, OperationMark, OperationProgress,
+    OperationStatus, PlacementPolicy, RecoveryBlock, RecoveryPolicy, ResourceRef, RestartPolicy,
+    SourceBinding, StoredResult, Task, TaskKind, TaskOutcome, TaskState, Transition,
+    UNAVAILABLE_AFTER_MS,
 };
 pub use package::{
     AllowedFidelity, Fidelity, FidelityRefusal, PACKAGE_MAX_BYTES, PACKAGE_VERSION, PackageDigest,
@@ -126,5 +129,6 @@ pub use placement::{NodeAdvert, PlacementDecision, PlacementKind};
 pub use secret_ref::{SECRET_ENV_PREFIX, SecretName, SecretRef, SecretScope, SecretValue};
 pub use source::{CommitId, GitUri, SourceError};
 pub use transition::{
-    accept_command, apply_batch, apply_observation, dedupe, mark_operation, replay,
+    ContinueStart, accept_command, acknowledge, admit_recovery, apply_batch, apply_observation,
+    continue_start, dedupe, mark_operation, record_recovery_block, recovery_decision, replay,
 };

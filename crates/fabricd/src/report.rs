@@ -2,23 +2,24 @@
 //! the journal (docs/managed-jobs.md, "Launch path"): one report per
 //! observation, and a heartbeat that names every grant the node runs.
 //!
-//! Invariant: a report is applied only while its token is the job's
-//! live grant on the node that sends it. `Report::check` refuses a report
-//! whose observation names another attempt or generation than its token
-//! before the journal is read; a report from another node than the
-//! grant's is `WrongNode` and writes nothing; a report at an older
-//! generation is recorded as `StaleObservationRefused` by the domain
-//! (replay rule 7) and answered `StaleGeneration`, never applied. A
-//! heartbeat writes nothing.
+//! Invariant: both go through the authority's fence and presence (ADR
+//! 0028), the one place that judges a grant. `Report::check` refuses a
+//! report whose observation names another attempt or generation than its
+//! token before the journal is read; then `Authority::report` runs the
+//! fence in the write's own transaction: a report from another node than
+//! the grant's is `WrongNode`, a report at an older generation is
+//! recorded as `StaleObservationRefused` and answered `StaleGeneration`,
+//! a superseded or ended grant is refused and recorded, and nothing of
+//! it is applied. A report or a heartbeat from the node an `unknown`
+//! attempt was granted to is presence: the attempt is observed reachable
+//! before the fence runs. A heartbeat is answered with the fence's
+//! verdict per grant and writes nothing else.
 
-use std::collections::BTreeMap;
-
-use fabric_core::id::{JobId, NodeId};
+use fabric_core::id::NodeId;
 use fabric_core::managed::launch::{
-    GrantVerdict, Heartbeat, HeartbeatAnswer, MAX_HEARTBEAT_ATTEMPTS, Report, ReportAnswer,
-    ReportRefusal,
+    Heartbeat, HeartbeatAnswer, MAX_HEARTBEAT_ATTEMPTS, Report, ReportAnswer, ReportRefusal,
 };
-use fabric_core::managed::{DomainError, ManagedEvent, ManagedState, ResourceRef};
+use fabric_core::managed::{DomainError, Observation};
 use fabric_journal::CommitError;
 
 use crate::authority::{Authority, AuthorityError};
@@ -29,50 +30,30 @@ fn refused(reason: ReportRefusal) -> ReportAnswer {
     ReportAnswer::Refused { reason }
 }
 
-fn node_of(state: &ManagedState, attempt: fabric_core::managed::AttemptId) -> Option<NodeId> {
-    state.attempt(attempt).map(|a| match a.resource {
-        ResourceRef::Node { node } => node,
-    })
-}
-
-/// Accepts `report` from `from` (`None`: this node, `own`) into the
-/// authority's journal.
+/// Accepts `report` from `from` (`None`: this node) into the authority's
+/// journal, behind the fence.
 pub(crate) async fn accept(
     authority: &Authority,
-    own: NodeId,
     from: Option<NodeId>,
     report: Report,
 ) -> ReportAnswer {
     if let Err(reason) = report.check() {
         return refused(reason);
     }
-    let sender = from.unwrap_or(own);
-    let job = report.token.job;
-    let state = match authority.job(job).await {
-        Ok(Some(state)) => state,
-        Ok(None) => return refused(ReportRefusal::UnknownJob),
+    match authority
+        .report(report.token, from, report.observation)
+        .await
+    {
+        Ok(Ok(transition)) => ReportAnswer::Recorded {
+            revision: transition.revision,
+        },
+        Ok(Err(verdict)) => refused(ReportRefusal::fenced(&verdict).unwrap_or(
+            ReportRefusal::Domain {
+                reason: "fence_answered_live_without_a_write".to_owned(),
+            },
+        )),
         Err(AuthorityError::Commit(CommitError::Domain(DomainError::UnknownJob { .. }))) => {
-            return refused(ReportRefusal::UnknownJob);
-        }
-        Err(_) => return refused(ReportRefusal::Unavailable),
-    };
-    match node_of(&state, report.token.attempt) {
-        None => return refused(ReportRefusal::UnknownAttempt),
-        Some(node) if node != sender => return refused(ReportRefusal::WrongNode),
-        Some(_) => {}
-    }
-    match authority.observe(job, report.observation).await {
-        Ok(transition) => {
-            let refused_at = transition.events.iter().find_map(|e| match e {
-                ManagedEvent::StaleObservationRefused { current, .. } => Some(*current),
-                _ => None,
-            });
-            match refused_at {
-                Some(current) => refused(ReportRefusal::StaleGeneration { current }),
-                None => ReportAnswer::Recorded {
-                    revision: transition.revision,
-                },
-            }
+            refused(ReportRefusal::UnknownJob)
         }
         Err(AuthorityError::Commit(CommitError::Domain(DomainError::StaleGeneration {
             current,
@@ -85,13 +66,12 @@ pub(crate) async fn accept(
     }
 }
 
-/// One verdict per token of `beat`, in its order, at most
-/// `MAX_HEARTBEAT_ATTEMPTS`: `Live` for the job's live grant on the
-/// sender, `Stale` when the job moved to a later generation, `Unknown`
-/// for a job or attempt the journal does not hold as the sender's live
-/// grant. A token whose job cannot be read (the journal is closed,
-/// refused or unreadable) gets no verdict, which says nothing of it: a
-/// journal that failed to open is not a cancel. Writes nothing.
+/// The fence's verdict on each token of `beat` from `from` (`None`: this
+/// node, `own`), in its order, at most `MAX_HEARTBEAT_ATTEMPTS`, through
+/// `Authority::heartbeat`: presence first, then the fence. An authority
+/// that cannot read its journal (closed, refused or unreadable) answers
+/// no verdict, which says nothing of any grant: a journal that failed to
+/// open is not a cancel.
 pub(crate) async fn heartbeat(
     authority: &Authority,
     own: NodeId,
@@ -99,76 +79,84 @@ pub(crate) async fn heartbeat(
     beat: &Heartbeat,
 ) -> HeartbeatAnswer {
     let sender = from.unwrap_or(own);
-    let mut jobs: BTreeMap<JobId, Result<Option<ManagedState>, ()>> = BTreeMap::new();
-    let mut verdicts = Vec::new();
-    for token in beat.attempts.iter().take(MAX_HEARTBEAT_ATTEMPTS) {
-        if let std::collections::btree_map::Entry::Vacant(slot) = jobs.entry(token.job) {
-            slot.insert(match authority.job(token.job).await {
-                Ok(state) => Ok(state),
-                Err(AuthorityError::Commit(CommitError::Domain(DomainError::UnknownJob {
-                    ..
-                }))) => Ok(None),
-                Err(_) => Err(()),
-            });
+    let beat = Heartbeat {
+        attempts: beat
+            .attempts
+            .iter()
+            .take(MAX_HEARTBEAT_ATTEMPTS)
+            .copied()
+            .collect(),
+        running: beat.running,
+    };
+    match authority.heartbeat(sender, beat).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            tracing::warn!(error = %e, "a heartbeat was not judged: the journal cannot be read");
+            HeartbeatAnswer {
+                verdicts: Vec::new(),
+            }
         }
-        let Some(Ok(state)) = jobs.get(&token.job) else {
-            continue;
-        };
-        let verdict = match state.as_ref() {
-            None => GrantVerdict::Unknown,
-            Some(state) if state.job.generation > token.generation => GrantVerdict::Stale {
-                current: state.job.generation,
-            },
-            Some(state) => match state.attempt(token.attempt) {
-                Some(attempt)
-                    if attempt.generation == token.generation
-                        && attempt.status.may_run()
-                        && node_of(state, attempt.id) == Some(sender) =>
-                {
-                    GrantVerdict::Live
-                }
-                _ => GrantVerdict::Unknown,
-            },
-        };
-        verdicts.push((token.attempt, verdict));
     }
-    HeartbeatAnswer { verdicts }
 }
 
 impl Node {
-    /// `Report::check`, then the grant's node against `from` (`None` is
-    /// this node; another node is `WrongNode`), then `Authority::observe`;
-    /// a report at an older generation answers `StaleGeneration` (the
-    /// domain recorded it), another domain refusal answers `Domain` by
-    /// its snake-case name, a closed authority `Unavailable`.
-    #[allow(
-        dead_code,
-        reason = "the node's service takes reports through it once the runner lands (owner B)"
-    )]
+    /// `accept` for a report from `from` (`None` is this node). A recorded
+    /// cut or capture starts its verification (ADR 0028).
     pub(crate) async fn accept_report(&self, from: Option<NodeId>, report: Report) -> ReportAnswer {
-        accept(&self.authority, self.id, from, report).await
+        let job = report.token.job;
+        let captures = matches!(
+            report.observation,
+            Observation::Checkpointed { .. } | Observation::Captured { .. }
+        );
+        let answer = accept(&self.authority, from, report).await;
+        if captures && matches!(answer, ReportAnswer::Recorded { .. }) {
+            self.verifier.check(job);
+        }
+        answer
     }
 
-    /// One verdict per token: `Live` when the token is the job's live
-    /// grant on `from`, `Stale { current }` when the job's generation is
-    /// newer, `Unknown` otherwise. Writes nothing.
-    #[allow(
-        dead_code,
-        reason = "the node's service takes heartbeats through it once the runner lands (owner B)"
-    )]
+    /// `heartbeat` for a heartbeat from `from` (`None` is this node). Each
+    /// live grant's job of a running heartbeat has its unacknowledged
+    /// captures verified again, so a fetch that found the runner
+    /// unreachable is retried once it is back.
     pub(crate) async fn accept_heartbeat(
         &self,
         from: Option<NodeId>,
         beat: &Heartbeat,
     ) -> HeartbeatAnswer {
-        heartbeat(&self.authority, self.id, from, beat).await
+        let answer = heartbeat(&self.authority, self.id, from, beat).await;
+        if !beat.running {
+            // A presentation: the node runs nothing of these grants, so
+            // nothing of theirs can be fetched from it on its word.
+            return answer;
+        }
+        let mut jobs: Vec<_> = beat
+            .attempts
+            .iter()
+            .filter(|t| {
+                answer
+                    .verdicts
+                    .iter()
+                    .any(|(a, v)| *a == t.attempt && v.allows())
+            })
+            .map(|t| t.job)
+            .collect();
+        jobs.dedup();
+        for job in jobs {
+            self.verifier.check(job);
+        }
+        answer
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use fabric_core::id::JobId;
     use fabric_core::managed::launch::GrantToken;
-    use fabric_core::managed::{AttemptStatus, Generation, Observation, OperationStatus};
+    use fabric_core::managed::{
+        AttemptStatus, FenceVerdict, Generation, ManagedEvent, ManagedState, Observation,
+        OperationStatus,
+    };
 
     use super::*;
     use crate::launch::fixture::{OTHER, OWN, REMOTE, World};
@@ -192,7 +180,6 @@ mod tests {
         let old = token(&state, first);
         let answer = accept(
             &world.authority,
-            OWN,
             Some(REMOTE),
             Report {
                 token: old,
@@ -244,7 +231,7 @@ mod tests {
         };
         for from in [Some(OTHER), None] {
             assert_eq!(
-                accept(&world.authority, OWN, from, started.clone()).await,
+                accept(&world.authority, from, started.clone()).await,
                 ReportAnswer::Refused {
                     reason: ReportRefusal::WrongNode
                 }
@@ -256,7 +243,7 @@ mod tests {
         );
         // From the node the grant names, Started settles the grant.
         assert!(matches!(
-            accept(&world.authority, OWN, Some(REMOTE), started).await,
+            accept(&world.authority, Some(REMOTE), started).await,
             ReportAnswer::Recorded { .. }
         ));
         let state = world.state(job).await;
@@ -270,7 +257,6 @@ mod tests {
         assert!(matches!(
             accept(
                 &local.authority,
-                OWN,
                 None,
                 Report {
                     token: token(&state, attempt),
@@ -324,7 +310,6 @@ mod tests {
             assert_eq!(
                 accept(
                     &world.authority,
-                    OWN,
                     Some(REMOTE),
                     Report { token, observation }
                 )
@@ -339,7 +324,6 @@ mod tests {
         assert_eq!(
             accept(
                 &world.authority,
-                OWN,
                 Some(REMOTE),
                 Report {
                     token: unknown,
@@ -357,11 +341,12 @@ mod tests {
         assert_eq!(world.state(job).await.job.revision, before);
     }
 
-    /// A heartbeat is answered per token: the live grant on its node is
-    /// `Live`, a grant the job moved past is `Stale`, a grant on another
-    /// node or of a job this authority does not hold is `Unknown`.
+    /// A heartbeat is answered per token with the fence's verdict: the
+    /// live grant on its node is `Live`, a grant the job moved past is
+    /// `Stale`, a grant seen from another node is `WrongNode`, and a job
+    /// this authority does not hold is `UnknownJob`.
     #[tokio::test]
-    async fn a_heartbeat_names_each_grant_live_stale_or_unknown() {
+    async fn a_heartbeat_names_each_grant_by_the_fence() {
         let world = World::new();
         let job = world.created("create").await;
         let first = world.granted(job, REMOTE).await;
@@ -374,19 +359,32 @@ mod tests {
         };
         let beat = Heartbeat {
             attempts: vec![live, stranger],
+            running: true,
         };
         let answer = heartbeat(&world.authority, OWN, Some(REMOTE), &beat).await;
         assert_eq!(
             answer.verdicts,
-            vec![(first, GrantVerdict::Live), (first, GrantVerdict::Unknown)]
+            vec![
+                (first, FenceVerdict::Live),
+                (first, FenceVerdict::UnknownJob)
+            ]
         );
         let elsewhere = heartbeat(&world.authority, OWN, Some(OTHER), &beat).await;
-        assert_eq!(elsewhere.verdicts[0], (first, GrantVerdict::Unknown));
+        assert_eq!(
+            elsewhere.verdicts[0],
+            (
+                first,
+                FenceVerdict::WrongNode {
+                    granted: REMOTE,
+                    from: OTHER
+                }
+            )
+        );
         world.cut(job, first, REMOTE).await;
         let second = world.continued_to(job, OTHER).await;
         let current = world.state(job).await.attempt(second).unwrap().generation;
         let answer = heartbeat(&world.authority, OWN, Some(REMOTE), &beat).await;
-        assert_eq!(answer.verdicts[0], (first, GrantVerdict::Stale { current }));
+        assert_eq!(answer.verdicts[0], (first, FenceVerdict::Stale { current }));
         let revision = world.state(job).await.job.revision;
         let _ = heartbeat(&world.authority, OWN, Some(OTHER), &beat).await;
         assert_eq!(
@@ -397,9 +395,9 @@ mod tests {
     }
 
     /// An authority whose journal it cannot open answers a heartbeat with
-    /// no verdict for the tokens it cannot read, never `Unknown`: a node
-    /// obeys `Unknown` by stopping the attempt, and a journal that failed
-    /// to open is not a cancel.
+    /// no verdict for the tokens it cannot read, never `UnknownJob`: a
+    /// node obeys `UnknownJob` by stopping the attempt, and a journal that
+    /// failed to open is not a cancel.
     #[tokio::test]
     async fn a_heartbeat_to_an_authority_that_cannot_read_its_journal_names_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -427,6 +425,7 @@ mod tests {
             Some(REMOTE),
             &Heartbeat {
                 attempts: vec![token],
+                running: true,
             },
         )
         .await;

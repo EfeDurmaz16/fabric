@@ -1881,13 +1881,13 @@ async fn lose_attempt(journal: &Logged, scope: Scope) {
     journal
         .log()
         .call(move |j| {
-            j.mark(
+            j.mark_authority(
                 scope.job,
                 OperationId::from_bytes(START_OPERATION),
                 OperationMark::Dispatched,
                 1_770_000_000_001,
             )?;
-            j.observe(
+            j.observe_authority(
                 scope.job,
                 &Observation::Lost {
                     attempt: scope.attempt,

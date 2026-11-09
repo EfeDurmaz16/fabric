@@ -15,11 +15,11 @@ use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::managed::launch::{
-    GrantVerdict, Heartbeat, HeartbeatAnswer, Instruction, LaunchAnswer, LaunchRequest,
-    MAX_HEARTBEAT_ATTEMPTS,
+    Heartbeat, HeartbeatAnswer, Instruction, LaunchAnswer, LaunchRequest, MAX_HEARTBEAT_ATTEMPTS,
 };
 use fabric_core::managed::{
-    AttemptId, Generation, GrantToken, Intent, JobPolicy, RestartPolicy, SourceBinding, TaskId,
+    AttemptId, FenceVerdict, Generation, GrantToken, Intent, JobPolicy, RestartPolicy,
+    SourceBinding, TaskId,
 };
 use fabric_core::moves::MoveOffer;
 use fabric_net::endpoint::{DialOrder, Endpoint};
@@ -142,7 +142,7 @@ impl Service for FakeService {
                 verdicts: beat
                     .attempts
                     .iter()
-                    .map(|t| (t.attempt, GrantVerdict::Live))
+                    .map(|t| (t.attempt, FenceVerdict::Live))
                     .collect(),
             })
         })
@@ -1016,11 +1016,12 @@ async fn the_launch_path_messages_reach_the_service_and_are_answered() -> TestRe
         .heartbeat(
             Heartbeat {
                 attempts: vec![token],
+                running: true,
             },
             DEADLINE,
         )
         .await?;
-    assert_eq!(answer.verdicts, vec![(token.attempt, GrantVerdict::Live)]);
+    assert_eq!(answer.verdicts, vec![(token.attempt, FenceVerdict::Live)]);
     let refused = session
         .instruct(
             token,
@@ -1036,6 +1037,7 @@ async fn the_launch_path_messages_reach_the_service_and_are_answered() -> TestRe
     );
     let over = Heartbeat {
         attempts: vec![token; MAX_HEARTBEAT_ATTEMPTS + 1],
+        running: true,
     };
     assert!(matches!(
         session.heartbeat(over, DEADLINE).await,

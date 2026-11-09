@@ -93,8 +93,12 @@ carries one observation of an attempt back to the authority under the
 grant's token and is answered `Recorded` with the job's revision, or
 `Refused`; a token whose generation is not the job's is refused
 `StaleGeneration` and the node stops the attempt. `Heartbeat` names every
-grant a node runs, every two seconds while it runs one, and is answered
-with a verdict per grant (`Live`, `Stale`, `Unknown`); it writes nothing.
+grant a node runs, every two seconds while it runs one, with `running`
+true, and is answered with a verdict per grant (`Live`, `Stale`,
+`Unknown`); it writes nothing. A node that restarted presents the grants
+it had taken in the same message with `running` false: it stopped what
+was left of them, so the authority answers the verdicts and never takes
+the presentation as presence (ADR 0028).
 All four fit the control frame (a launch's package is at most 256 KiB)
 and run under the per-peer job work cap. The shapes are
 `fabric_core::managed::launch`; the receiving side checks every bound
@@ -117,7 +121,7 @@ request in a control frame, decodes it and compares, and checks that each
 rejected case is refused by the check its `reason` names
 (`Program::check`, `Report::check`, the list bounds). The manifest's
 sha256 as of this contract's commit is
-`972ed115913ac8cd4ca7aeb6e48923c5e0e82dcbcaa3839d502c5be55882b7aa`; the
+`0aae368ea37e5082c791a970b3a829800a85668cb16bb8f0e10d1293e427c6b1`; the
 pin test carries the same constant, and it moves only with the fixtures,
 in the same commit.
 

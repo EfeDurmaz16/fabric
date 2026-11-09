@@ -149,6 +149,7 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "token_id" | "TOKEN_ID" => "01JABCDEFGHJKMNPQRSTVWXYZ1".to_owned(),
         "parent" | "TASK" => "01JABCDEFGHJKMNPQRSTVWXYZ2".to_owned(),
         "attempt" | "ATTEMPT" => "01JABCDEFGHJKMNPQRSTVWXYZ3".to_owned(),
+        "SNAPSHOT" => "cd".repeat(32),
         "since" | "until" | "TIME" => "2026-11-08".to_owned(),
         "class" => "build".to_owned(),
         "argv" => "true".to_owned(),

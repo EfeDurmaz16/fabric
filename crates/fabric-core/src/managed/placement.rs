@@ -202,6 +202,10 @@ pub enum Exclusion {
         /// The pinned node.
         pinned: NodeId,
     },
+    /// A failover's own lost node: it runs the attempt the failover
+    /// replaces, whose resource went unavailable and which may still run
+    /// there (ADR 0028). Never chosen, however well it answers.
+    Unavailable,
 }
 
 /// Why an eligible node ranks where it does.

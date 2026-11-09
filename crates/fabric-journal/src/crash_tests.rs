@@ -51,7 +51,7 @@ fn crash_child() {
         "dispatch" => {
             let job = ids(1).job;
             journal
-                .mark(job, ids(2).operation, OperationMark::Dispatched, 3_000)
+                .mark_authority(job, ids(2).operation, OperationMark::Dispatched, 3_000)
                 .unwrap();
             // The effect: reached only when the dispatch is durable.
             std::fs::write(dir.join(EFFECT), "launched").unwrap();
@@ -60,7 +60,7 @@ fn crash_child() {
             let job = ids(1).job;
             let primary = journal.job(job).unwrap().unwrap().job.primary;
             journal
-                .observe(job, &placed(ids(1).operation, primary, Some(NODE)), 3_000)
+                .observe_authority(job, &placed(ids(1).operation, primary, Some(NODE)), 3_000)
                 .unwrap();
             // The launch: reached only when the placement is durable.
             std::fs::write(dir.join(EFFECT), "launched").unwrap();
@@ -69,7 +69,7 @@ fn crash_child() {
             let job = ids(1).job;
             let attempt = journal.job(job).unwrap().unwrap().attempts[0].clone();
             journal
-                .observe(job, &checkpointed(&attempt, b"cut"), 3_000)
+                .observe_authority(job, &checkpointed(&attempt, b"cut"), 3_000)
                 .unwrap();
             std::fs::write(dir.join(EFFECT), "placed").unwrap();
         }
@@ -160,11 +160,11 @@ fn journal_with_continue(dir: &Path) -> Journal {
     let job = ids(1).job;
     let primary = journal.job(job).unwrap().unwrap().job.primary;
     journal
-        .observe(job, &placed(ids(1).operation, primary, Some(NODE)), 10)
+        .observe_authority(job, &placed(ids(1).operation, primary, Some(NODE)), 10)
         .unwrap();
     let attempt = journal.job(job).unwrap().unwrap().attempts[0].clone();
     journal
-        .observe(
+        .observe_authority(
             job,
             &Observation::Started {
                 attempt: attempt.id,
@@ -188,7 +188,7 @@ fn journal_with_continue(dir: &Path) -> Journal {
         )
         .unwrap();
     journal
-        .mark(job, ids(3).operation, OperationMark::Dispatched, 12)
+        .mark_authority(job, ids(3).operation, OperationMark::Dispatched, 12)
         .unwrap();
     journal
 }
@@ -273,7 +273,7 @@ fn a_grant_killed_between_its_commit_and_its_dispatch_is_dispatched_once() {
     assert!(recovery.unknown.is_empty());
     // The one dispatch: recorded, then the effect.
     journal
-        .mark(job, ids(2).operation, OperationMark::Dispatched, 4_001)
+        .mark_authority(job, ids(2).operation, OperationMark::Dispatched, 4_001)
         .unwrap();
     // Another restart: the dispatched grant becomes unknown and is not offered again.
     drop(journal);
@@ -314,7 +314,7 @@ fn a_dispatch_killed_between_its_commit_and_its_effect_is_never_replayed() {
         StoredResult::Rejected(DomainError::AttemptStillLive { .. })
     ));
     assert!(matches!(
-        journal.mark(job, ids(2).operation, OperationMark::Dispatched, 4_001),
+        journal.mark_authority(job, ids(2).operation, OperationMark::Dispatched, 4_001),
         Err(CommitError::Domain(DomainError::OperationState { .. }))
     ));
 }
@@ -340,7 +340,7 @@ fn a_placement_killed_after_its_commit_never_places_or_launches_again() {
     assert_eq!(journal.placements(job).unwrap().len(), 1);
     let primary = state.job.primary;
     assert!(matches!(
-        journal.observe(job, &placed(ids(1).operation, primary, Some(NODE)), 4_001),
+        journal.observe_authority(job, &placed(ids(1).operation, primary, Some(NODE)), 4_001),
         Err(CommitError::Domain(DomainError::OperationState { .. }))
     ));
     let refused = journal
@@ -403,7 +403,7 @@ fn a_continue_killed_after_its_cut_is_retried_from_the_cut() {
         )]
     );
     journal
-        .mark(job, ids(6).operation, OperationMark::Dispatched, 4_003)
+        .mark_authority(job, ids(6).operation, OperationMark::Dispatched, 4_003)
         .unwrap();
     let decision = Observation::Placed {
         operation: ids(6).operation,
@@ -415,7 +415,7 @@ fn a_continue_killed_after_its_cut_is_retried_from_the_cut() {
             chosen: Some(NODE),
         },
     };
-    journal.observe(job, &decision, 4_004).unwrap();
+    journal.observe_authority(job, &decision, 4_004).unwrap();
     let state = journal.job(job).unwrap().unwrap();
     assert_eq!(state.attempts[1].initial_checkpoint, Some(snapshot));
     assert_eq!(state.attempts[1].generation.get(), 2);

@@ -43,6 +43,7 @@ mod package;
 pub mod paths;
 mod placement;
 mod psf;
+mod recovery;
 mod report;
 mod runner;
 pub mod secrets;

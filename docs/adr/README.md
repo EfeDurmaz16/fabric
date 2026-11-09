@@ -4,7 +4,7 @@
 
 Every architecture decision record on `main`, with the status line the ADR itself carries. An ADR that says `proposed` and `as built on main` records code that is on `main` while the decision is still open for amendment; the status line says which parts.
 
-No ADR on `main` has the number 0017, 0028.
+No ADR on `main` has the number 0017.
 
 How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions).
 
@@ -36,6 +36,7 @@ How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions
 | [0025](0025-source-bindings-and-secret-references.md) | Source bindings, secret references and the export policy | proposed 2026-11-03, built 2026-11-03 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). |
 | [0026](0026-resource-placement.md) | Resource placement among registered nodes | proposed, 2026-11-03. |
 | [0027](0027-job-facade-protocol.md) | The job facade: authenticated remote job operations over the node link | proposed, 2026-11-03. |
+| [0028](0028-unexpected-loss-recovery.md) | Capability-gated unexpected-loss recovery | proposed, 2026-11-02; implemented 2026-11-03 on the M4 base and 2026-11-09 on `main` with the M5 launch path, where the five scenarios run for real. |
 | [0029](0029-portable-session-format.md) | The Portable Session Format v1 | proposed 2026-11-08 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 4 of the 2026-11-08 roadmap. |
 | [0030](0030-residuals-and-gc.md) | Residuals and `fabric gc` | proposed 2026-11-09 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 11 of the 2026-11-08 roadmap, the Fabric side; the Capsule side merged as capsule#321. |
 | [0031](0031-observability-spans-inspect-and-audit-export.md) | Operation spans, inspect and the audit export | proposed 2026-11-09 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 12 of the 2026-11-08 roadmap, Fabric side; the Capsule side is capsule#322. |

@@ -61,6 +61,8 @@ export const OPS = [
   "gc",
   "inspect",
   "audit_export",
+  "managed_supersede",
+  "managed_recover",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -956,6 +958,8 @@ export const ManagedPolicy = z.object({
   export_allowlist: optional(z.array(UnicodeText)),
   disk_bytes: optional(count),
   pin: NodeId.nullable().default(null),
+  /** What the authority does when the job's node goes silent (ADR 0028); `block` when absent. */
+  recovery: optional(z.enum(["block", "restart_from_acknowledged"])),
 });
 export type ManagedPolicy = z.infer<typeof ManagedPolicy>;
 
@@ -1371,6 +1375,23 @@ export const Request = z.discriminatedUnion("op", [
   }),
   z.object({ op: z.literal("inspect"), job: JobId, attempt: optional(AttemptId) }),
   z.object({ op: z.literal("audit_export"), since_ms: optional(count), until_ms: optional(count), after: optional(UnicodeText) }),
+  z.object({
+    op: z.literal("managed_supersede"),
+    operation_key: OperationKey,
+    job: JobId,
+    expected_revision: optional(Counter),
+    attempt: optional(AttemptId),
+    reason: UnicodeText,
+  }),
+  z.object({
+    op: z.literal("managed_recover"),
+    operation_key: OperationKey,
+    job: JobId,
+    expected_revision: optional(Counter),
+    attempt: optional(AttemptId),
+    from: optional(SnapshotId),
+    reason: UnicodeText,
+  }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -1576,6 +1597,8 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("inspect"), ...inspectReport }),
   /** One page of the audit rows; `next` is the cursor of the next page, absent on the last. */
   z.object({ kind: z.literal("audit_export"), records: z.array(AuditRecord), next: optional(UnicodeText) }),
+  z.object({ kind: z.literal("managed_supersede"), ...managedOperation }),
+  z.object({ kind: z.literal("managed_recover"), ...managedOperation }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -1600,6 +1623,8 @@ export type ManagedOperation = ReplyTo<
   | "managed_register"
   | "managed_checkpoint"
   | "managed_continue"
+  | "managed_supersede"
+  | "managed_recover"
   | "managed_submit"
 >;
 export type ManagedInspection = ReplyTo<"managed_inspect">;

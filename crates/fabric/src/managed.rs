@@ -22,13 +22,13 @@ use clap::{Args, Subcommand};
 use fabric_client::Client;
 use fabric_client::api::{
     AnyWord, FidelityName, JobScopeWire, ManagedPolicy, ManagedSource, NoteWire, ProgramWire,
-    RegisterClass, Reply, Request, ResourceScopeWire, SecretRefWire,
+    RecoveryName, RegisterClass, Reply, Request, ResourceScopeWire, SecretRefWire,
 };
 use fabric_client::facade::{Bearer, ClientMessage, Submit};
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
-use fabric_core::managed::{EventSeq, OperationKey, TaskId, WorkRevision};
+use fabric_core::managed::{AttemptId, EventSeq, OperationKey, TaskId, WorkRevision};
 use fabric_core::path::RelPath;
 
 use crate::{Notes, ask, contract, harness_arg, repository, system_path};
@@ -116,6 +116,17 @@ pub(crate) struct PolicyArgs {
     /// The one node the job may run on.
     #[arg(long)]
     pin: Option<NodeId>,
+    /// What the authority does when the job's node goes silent; block by default.
+    #[arg(long, value_parser = recovery_arg, value_name = "POLICY")]
+    recovery: Option<RecoveryName>,
+}
+
+fn recovery_arg(text: &str) -> Result<RecoveryName, String> {
+    match text {
+        "block" => Ok(RecoveryName::Block),
+        "restart_from_acknowledged" => Ok(RecoveryName::RestartFromAcknowledged),
+        _ => Err("block or restart_from_acknowledged".to_owned()),
+    }
 }
 
 impl PolicyArgs {
@@ -125,7 +136,8 @@ impl PolicyArgs {
             || !self.secrets.is_empty()
             || !self.export.is_empty()
             || self.disk_bytes.is_some()
-            || self.pin.is_some();
+            || self.pin.is_some()
+            || self.recovery.is_some();
         given.then(|| ManagedPolicy {
             drain_budget_ms: self.drain_budget,
             allowed_fidelity: (!self.allow_fidelity.is_empty())
@@ -143,6 +155,7 @@ impl PolicyArgs {
             export_allowlist: (!self.export.is_empty()).then(|| self.export.clone()),
             disk_bytes: self.disk_bytes,
             pin: self.pin,
+            recovery: self.recovery,
         })
     }
 }
@@ -265,6 +278,47 @@ pub(crate) enum ManagedCommand {
         /// The one node the new attempt may run on.
         #[arg(long)]
         pin: Option<NodeId>,
+        /// Refuse unless the job is at this revision.
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
+        expected_revision: Option<WorkRevision>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
+    },
+    /// Take the grant from the job's unknown attempt and grant nothing; its writes are refused from then on.
+    Supersede {
+        /// The job.
+        job: JobId,
+        /// The unknown attempt; the job's live attempt without it.
+        #[arg(long)]
+        attempt: Option<AttemptId>,
+        /// Why, for the history.
+        #[arg(
+            long,
+            default_value = "superseded by the operator",
+            value_name = "TEXT"
+        )]
+        reason: String,
+        /// Refuse unless the job is at this revision.
+        #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
+        expected_revision: Option<WorkRevision>,
+        /// The command's key; the same key and arguments again give the same answer.
+        #[arg(long, value_parser = operation_key_arg, value_name = "KEY")]
+        operation_key: Option<OperationKey>,
+    },
+    /// Recover the job's unknown attempt from an acknowledged checkpoint on another node, whatever its policy.
+    Recover {
+        /// The job.
+        job: JobId,
+        /// The unknown attempt; the job's live attempt without it.
+        #[arg(long)]
+        attempt: Option<AttemptId>,
+        /// The acknowledged checkpoint to start from; the job's newest without it.
+        #[arg(long, value_name = "SNAPSHOT")]
+        from: Option<SnapshotId>,
+        /// Why, for the history.
+        #[arg(long, default_value = "recovered by the operator", value_name = "TEXT")]
+        reason: String,
         /// Refuse unless the job is at this revision.
         #[arg(long, value_parser = revision_arg, value_name = "REVISION")]
         expected_revision: Option<WorkRevision>,
@@ -664,6 +718,34 @@ fn request(command: ManagedCommand, notes: Notes) -> Result<(Request, Option<Ope
             expected_revision,
             fidelity: (!allow_fidelity.is_empty()).then_some(allow_fidelity),
             pin,
+        },
+        ManagedCommand::Supersede {
+            job,
+            attempt,
+            reason,
+            expected_revision,
+            operation_key,
+        } => Request::ManagedSupersede {
+            operation_key: key_for(operation_key, notes, &mut minted)?,
+            job,
+            expected_revision,
+            attempt,
+            reason,
+        },
+        ManagedCommand::Recover {
+            job,
+            attempt,
+            from,
+            reason,
+            expected_revision,
+            operation_key,
+        } => Request::ManagedRecover {
+            operation_key: key_for(operation_key, notes, &mut minted)?,
+            job,
+            expected_revision,
+            attempt,
+            from,
+            reason,
         },
         ManagedCommand::Inspect { job } => Request::ManagedInspect { job },
         ManagedCommand::Import { dir, export } => Request::ManagedImport {

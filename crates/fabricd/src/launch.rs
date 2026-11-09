@@ -143,8 +143,8 @@ pub(crate) fn token_of(state: &ManagedState, attempt: AttemptId) -> Option<Grant
 
 /// Builds the launch of `attempt` from the journal: intent, source and
 /// policy from the job; `initial_checkpoint` from the grant; `snapshot_at`
-/// the node of the attempt that cut it, or this node for an import's
-/// snapshot; `tasks` the open build and test tasks under the attempt's
+/// this node for an acknowledged checkpoint or an import's snapshot, else
+/// the node of the attempt that cut it; `tasks` the open build and test tasks under the attempt's
 /// task with a program; `continuation` and `package` for a grant a
 /// continue made.
 pub(crate) fn plan(
@@ -175,10 +175,11 @@ pub(crate) fn plan(
                 Some(EffectRequest::Continue { fidelity, .. }) => *fidelity,
                 _ => state.job.policy.allowed_fidelity,
             };
-            let package = build_for_continue(journal, state, from.id).map_err(|e| match e {
-                BuildError::Journal(e) => PlanError::from(e),
-                e => PlanError::Blocked(format!("no work package: {e}")),
-            })?;
+            let package = build_for_continue(journal, state, from.id, found.initial_checkpoint)
+                .map_err(|e| match e {
+                    BuildError::Journal(e) => PlanError::from(e),
+                    e => PlanError::Blocked(format!("no work package: {e}")),
+                })?;
             (
                 Some(ContinuationAsk {
                     from: from.id,
@@ -194,6 +195,11 @@ pub(crate) fn plan(
     };
     let snapshot_at = match (found.initial_checkpoint, from) {
         (None, _) => None,
+        // The authority holds and verified an acknowledged checkpoint's
+        // bytes; the node that cut it may be the one that was lost.
+        (Some(start), _) if state.acknowledged().iter().any(|a| a.snapshot == start) => {
+            Some(journal.authority()?)
+        }
         (Some(_), Some(from)) => {
             let ResourceRef::Node { node } = from.resource;
             Some(node)
@@ -460,7 +466,7 @@ pub(crate) mod fixture {
             let state = self.state(job).await;
             let create = state.operations[0].id;
             self.authority
-                .observe(
+                .observe_authority(
                     job,
                     Observation::Placed {
                         operation: create,
@@ -477,7 +483,7 @@ pub(crate) mod fixture {
             let state = self.state(job).await;
             let generation = state.attempt(attempt).unwrap().generation;
             self.authority
-                .observe(
+                .observe_authority(
                     job,
                     Observation::Started {
                         attempt,
@@ -548,7 +554,7 @@ pub(crate) mod fixture {
                 evidence: Vec::new(),
             };
             self.authority
-                .observe(
+                .observe_authority(
                     job,
                     Observation::Checkpointed {
                         attempt,
@@ -583,7 +589,7 @@ pub(crate) mod fixture {
                 .await
                 .unwrap();
             self.authority
-                .observe(
+                .observe_authority(
                     job,
                     Observation::Placed {
                         operation: cont,

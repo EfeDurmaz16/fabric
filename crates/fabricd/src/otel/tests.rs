@@ -189,9 +189,7 @@ async fn no_secret_raw_key_argv_path_or_message_reaches_a_span() {
     let tracer = Tracer::start(endpoint, NODE);
     let dir = tempfile::tempdir().unwrap();
     let state = StateDir::resolve(Some(dir.path().as_os_str()), Path::new("/")).unwrap();
-    let authority = Authority::start(&state, NODE)
-        .unwrap()
-        .traced(tracer.clone());
+    let authority = Authority::start_traced(&state, NODE, tracer.clone()).unwrap();
 
     let created = authority
         .submit(Envelope {
@@ -438,4 +436,271 @@ fn a_removing_gc_gets_a_span_and_a_dry_run_does_not() {
     assert!(hooks::request_begin(&gc(false)).is_none());
     let span = hooks::request_begin(&gc(true)).unwrap();
     assert_eq!(span.op, SpanOp::GC);
+}
+
+/// The node a remote attempt runs on in the recovery scenario.
+const RUNNER: NodeId = NodeId::from_bytes([8; 32]);
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loss, its block, its return and its recovery read as one script"
+)]
+async fn loss_recovery_gets_spans_under_the_same_rules() {
+    use fabric_core::id::SnapshotId;
+    use fabric_core::managed::launch::Heartbeat;
+    use fabric_core::managed::{
+        CheckpointAck, CutDigest, FenceVerdict, GrantToken, Observation, OperationMark,
+        RecoveryPolicy, ResourceRef, UNAVAILABLE_AFTER_MS,
+    };
+
+    let (endpoint, bodies) = receiver().await;
+    let tracer = Tracer::start(endpoint, NODE);
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::resolve(Some(dir.path().as_os_str()), Path::new("/")).unwrap();
+    let authority = Authority::start_traced(&state, NODE, tracer.clone()).unwrap();
+    let mut policy = JobPolicy::m2_defaults(RestartPolicy::ExplicitOnly);
+    policy.recovery = RecoveryPolicy::RestartFromAcknowledged;
+    let made = authority
+        .submit(Envelope {
+            key: key(KEY),
+            job: None,
+            expected: None,
+            body: Command::CreateJob {
+                intent: Intent {
+                    goal: format!("recover with {SECRET}"),
+                    harness: HarnessKind::Codex,
+                    acceptance: Vec::new(),
+                },
+                source: SourceBinding::Repository {
+                    path: AbsPath::parse(REPO).unwrap(),
+                },
+                policy,
+            },
+        })
+        .await
+        .unwrap();
+    let StoredResult::Accepted(created) = made.result else {
+        panic!("{made:?}");
+    };
+    let job = created.job;
+    let primary = authority.job(job).await.unwrap().unwrap().job.primary;
+    let granted = authority
+        .submit(Envelope {
+            key: key("start-1"),
+            job: Some(job),
+            expected: None,
+            body: Command::StartAttempt {
+                task: primary,
+                resource: ResourceRef::Node { node: RUNNER },
+                initial_checkpoint: None,
+            },
+        })
+        .await
+        .unwrap();
+    let StoredResult::Accepted(grant) = granted.result else {
+        panic!("{granted:?}");
+    };
+    authority
+        .mark_authority(job, grant.operation, OperationMark::Dispatched)
+        .await
+        .unwrap();
+    let attempt = authority.job(job).await.unwrap().unwrap().attempts[0].clone();
+    let token = GrantToken {
+        job,
+        attempt: attempt.id,
+        generation: attempt.generation,
+    };
+    authority
+        .report(
+            token,
+            Some(RUNNER),
+            Observation::Started {
+                attempt: token.attempt,
+                generation: token.generation,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    // Silent: unknown, then blocked with nothing acknowledged.
+    let now = crate::clock::mono_ms();
+    authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
+    authority
+        .tick(now + 2 * UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    // Back on its heartbeat; a checkpoint of its is acknowledged.
+    authority
+        .heartbeat(
+            RUNNER,
+            Heartbeat {
+                attempts: vec![token],
+                running: true,
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = SnapshotId::of(b"the runner's checkpoint");
+    let cut = CutDigest::from_bytes([0x1c; 32]);
+    authority
+        .report(
+            token,
+            Some(RUNNER),
+            Observation::Captured {
+                attempt: token.attempt,
+                generation: token.generation,
+                snapshot,
+                cut,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    authority
+        .acknowledge(
+            job,
+            CheckpointAck {
+                attempt: token.attempt,
+                generation: token.generation,
+                snapshot,
+                cut,
+                manifests: 1,
+                chunks: 1,
+                bytes: 1,
+                fetched_from: RUNNER,
+            },
+        )
+        .await
+        .unwrap();
+    // Silent again: unknown, then recovered from the acknowledged checkpoint.
+    let later = crate::clock::mono_ms() + UNAVAILABLE_AFTER_MS;
+    authority.tick(later).await.unwrap();
+    authority.tick(later + UNAVAILABLE_AFTER_MS).await.unwrap();
+    // The old runner's report is refused by the fence: its grant was taken.
+    let refused = authority
+        .report(
+            token,
+            Some(RUNNER),
+            Observation::Exited {
+                attempt: token.attempt,
+                generation: token.generation,
+                outcome: fabric_core::managed::ExitOutcome::Succeeded,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(refused.is_err(), "{refused:?}");
+    // A restarted runner presents the grant it had taken.
+    tracer.emit(hooks::present(
+        &token,
+        Some(NODE),
+        &FenceVerdict::Superseded { by: None },
+    ));
+    tracer.flush(FLUSH_DEADLINE).await;
+
+    let posted = serde_json::to_string(&*bodies.lock().unwrap()).unwrap();
+    let recover_key = format!("recover.{job}.{}.1", token.attempt);
+    for needle in [SECRET, KEY, REPO, recover_key.as_str(), "the domain"] {
+        assert!(
+            !posted.contains(needle),
+            "{needle} reached a span: {posted}"
+        );
+    }
+    let spans = spans(&bodies);
+    let names: Vec<&str> = spans.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            "fabric managed.create_job",
+            "fabric managed.start_attempt",
+            "fabric observe.started",
+            "fabric observe.resource_unavailable",
+            "fabric recovery.blocked",
+            "fabric observe.resource_reachable",
+            "fabric observe.captured",
+            "fabric recovery.acknowledge",
+            "fabric observe.resource_unavailable",
+            "fabric managed.recover",
+            "fabric observe.exited",
+            "fabric runner.present",
+        ]
+    );
+    let by = |name: &str| {
+        spans
+            .iter()
+            .find(|s| s["name"] == format!("fabric {name}"))
+            .unwrap()
+    };
+    let attempt_trace = attempt_context(token.attempt).trace.to_string();
+    for name in [
+        "observe.resource_unavailable",
+        "recovery.blocked",
+        "observe.resource_reachable",
+        "observe.captured",
+        "recovery.acknowledge",
+        "runner.present",
+    ] {
+        assert_eq!(by(name)["traceId"], attempt_trace.as_str(), "{name}");
+    }
+    assert_eq!(
+        attr(by("recovery.blocked"), "fabric.refusal.reason").unwrap()["stringValue"],
+        "no_acknowledged_checkpoint"
+    );
+    assert_eq!(
+        attr(by("observe.captured"), "fabric.snapshot").unwrap()["stringValue"],
+        snapshot.to_string().as_str()
+    );
+    assert_eq!(
+        attr(by("observe.captured"), "fabric.checkpoint").unwrap()["stringValue"],
+        super::span::Digest(cut.0).to_string().as_str()
+    );
+    // The authority's own recover: its key as a digest, in its operation's
+    // trace, linked to the attempt it grants, which supersedes generation 1.
+    let recover = by("managed.recover");
+    assert_eq!(
+        attr(recover, "fabric.operation.key_digest").unwrap()["stringValue"],
+        digest(&recover_key).to_string().as_str()
+    );
+    assert_eq!(
+        attr(recover, "fabric.result").unwrap()["stringValue"],
+        "done"
+    );
+    assert_eq!(
+        attr(recover, "fabric.generation.supersedes").unwrap()["intValue"],
+        "1"
+    );
+    assert!(recover["links"].as_array().is_some_and(|l| l.len() == 1));
+    let exited = by("observe.exited");
+    assert_eq!(
+        attr(exited, "fabric.result").unwrap()["stringValue"],
+        "refused"
+    );
+    assert_eq!(
+        attr(exited, "fabric.refusal.reason").unwrap()["stringValue"],
+        "superseded"
+    );
+    assert_eq!(
+        attr(exited, "fabric.peer").unwrap()["stringValue"],
+        RUNNER.to_string().as_str()
+    );
+    let present = by("runner.present");
+    assert_eq!(present["kind"], 3);
+    assert_eq!(
+        attr(present, "fabric.refusal.reason").unwrap()["stringValue"],
+        "superseded"
+    );
+}
+
+#[test]
+fn the_m6_commands_and_observations_have_their_own_ops() {
+    use fabric_core::managed::CommandKind;
+    assert_eq!(
+        SpanOp::managed(CommandKind::Supersede).name(),
+        "managed.supersede"
+    );
+    assert_eq!(
+        SpanOp::managed(CommandKind::Recover).name(),
+        "managed.recover"
+    );
 }

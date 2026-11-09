@@ -1,0 +1,65 @@
+   Compiling fabric-core v0.1.0 (<worktree>/crates/fabric-core)
+   Compiling tokio v1.54.1
+   Compiling rustix v1.1.5
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-parse v1.0.0
+   Compiling anstyle v1.0.14
+   Compiling colorchoice v1.0.5
+   Compiling nix v0.31.3
+   Compiling lazy_static v1.5.1
+   Compiling anstream v1.0.0
+   Compiling clap_lex v1.1.1
+   Compiling strsim v0.11.1
+   Compiling sharded-slab v0.1.7
+   Compiling clap_builder v4.6.7
+   Compiling thread_local v1.1.10
+   Compiling tracing-subscriber v0.3.23
+   Compiling anyhow v1.0.104
+   Compiling tempfile v3.27.0
+   Compiling fabric-env v0.1.0 (<worktree>/crates/fabric-env)
+   Compiling fabric-journal v0.1.0 (<worktree>/crates/fabric-journal)
+   Compiling fabric-store v0.1.0 (<worktree>/crates/fabric-store)
+   Compiling clap v4.6.7
+   Compiling tokio-rustls v0.26.6
+   Compiling quinn v0.11.12
+   Compiling fabric-client v0.1.0 (<worktree>/crates/fabric-client)
+   Compiling fabric-harness v0.1.0 (<worktree>/crates/fabric-harness)
+   Compiling fabric-net v0.1.0 (<worktree>/crates/fabric-net)
+   Compiling fabricd v0.1.0 (<worktree>/crates/fabricd)
+   Compiling fabric v0.1.0 (<worktree>/crates/fabric)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.29s
+     Running tests/e2e/main.rs (<target>/debug/deps/e2e-3eac00a6b76b5bfe)
+
+running 3 tests
+test relay::the_relay_forwards_pauses_and_counts ... ok
+unknown 11.235600042s after the pause; the silence counts from the grant, since nothing on the runner node heartbeats
+block: job 01M6Y0MM5GHWRA5G9WGJH8M7NZ, attempt 75E6J6RWZR2Y7ER9GRRCTHA954 unknown, 7 events, relay while paused RelayCounters { udp_forwarded: [20, 14], udp_dropped: [19, 17], tcp_forwarded: [0, 0], tcp_held: [0, 0] }
+test partition::block_policy_waits_with_the_state_visible ... ok
+relay counters: RelayCounters { udp_forwarded: [67, 61], udp_dropped: [24, 20], tcp_forwarded: [0, 0], tcp_held: [0, 0] } (forwarded 128, dropped 44)
+test partition::two_daemons_talk_through_the_relay_and_lose_each_other_while_it_is_paused ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 85 filtered out; finished in 39.59s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running tests/e2e/main.rs (<target>/debug/deps/e2e-3eac00a6b76b5bfe)
+
+running 3 tests
+Error: "needs an attempt that runs on the runner node and heartbeats to the authority: M5 places and grants, and no node launches a grant (docs/evidence/m5 and m6, Blocked)"
+Error: "needs an attempt that runs on the runner node and heartbeats to the authority: M5 places and grants, and no node launches a grant (docs/evidence/m5 and m6, Blocked)"
+Error: "needs an attempt that runs on the runner node and heartbeats to the authority: M5 places and grants, and no node launches a grant (docs/evidence/m5 and m6, Blocked)"
+test partition::old_runner_sigstop_then_sigcont ... FAILED
+test partition::relay_paused_runner_alive ... FAILED
+test partition::old_runner_sigkill_then_restart ... FAILED
+
+failures:
+
+failures:
+    partition::old_runner_sigkill_then_restart
+    partition::old_runner_sigstop_then_sigcont
+    partition::relay_paused_runner_alive
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p fabric --test e2e`

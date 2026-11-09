@@ -173,6 +173,14 @@ pub(crate) fn policy_from(policy: Option<&ManagedPolicy>) -> Result<JobPolicy, R
     if let Some(ms) = policy.drain_budget_ms {
         out.drain_budget_ms = ms;
     }
+    if let Some(recovery) = policy.recovery {
+        out.recovery = match recovery {
+            fabric_client::api::RecoveryName::Block => fabric_core::managed::RecoveryPolicy::Block,
+            fabric_client::api::RecoveryName::RestartFromAcknowledged => {
+                fabric_core::managed::RecoveryPolicy::RestartFromAcknowledged
+            }
+        };
+    }
     if let Some(allowed) = &policy.allowed_fidelity {
         out.allowed_fidelity = AllowedFidelity {
             native_session: allowed.contains(&FidelityName::NativeSession),
@@ -1011,6 +1019,7 @@ fn exclusion_wire(reason: &Exclusion) -> ExclusionWire {
             detailed(json!({ "disk": { "need": need, "free": free } }))
         }
         Exclusion::Pin { pinned } => detailed(json!({ "pin": { "pinned": pinned.to_string() } })),
+        Exclusion::Unavailable => ExclusionWire::Named("unavailable".into()),
     }
 }
 
@@ -1024,6 +1033,44 @@ fn attempt_status_name(status: &AttemptStatus) -> &'static str {
         AttemptStatus::Checkpointed { .. } => "checkpointed",
         AttemptStatus::Lost => "lost",
         AttemptStatus::Unknown => "unknown",
+        AttemptStatus::Superseded { .. } => "superseded",
+    }
+}
+
+fn verdict_json(verdict: &fabric_core::managed::FenceVerdict) -> Value {
+    use fabric_core::managed::FenceVerdict;
+    let mut map = object(json!({ "verdict": verdict.name() }));
+    match verdict {
+        FenceVerdict::Stale { current } => {
+            map.insert("current".into(), json!(current.to_string()));
+        }
+        FenceVerdict::Superseded { by } => {
+            map.insert("by".into(), json!(by.map(|g| g.to_string())));
+        }
+        FenceVerdict::NotWritable { status } => {
+            map.insert("status".into(), json!(attempt_status_name(status)));
+        }
+        FenceVerdict::WrongNode { granted, from } => {
+            map.insert("granted".into(), json!(granted.to_string()));
+            map.insert("from".into(), json!(from.to_string()));
+        }
+        _ => {}
+    }
+    Value::Object(map)
+}
+
+fn recovery_block_json(reason: &fabric_core::managed::RecoveryBlock) -> Value {
+    use fabric_core::managed::RecoveryBlock;
+    match reason {
+        RecoveryBlock::OutcomeBlocks { kind } => json!({ "outcome_blocks": { "kind": kind } }),
+        RecoveryBlock::NoAcknowledgedCheckpoint => json!("no_acknowledged_checkpoint"),
+        RecoveryBlock::ReplacementBlocked { blockers } => json!({ "replacement_blocked": {
+            "blockers": blockers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        } }),
+        RecoveryBlock::EffectInFlight { operation } => json!({ "effect_in_flight": {
+            "operation": operation.to_string(),
+        } }),
+        RecoveryBlock::Refused { refusal } => json!({ "refused": { "refusal": refusal } }),
     }
 }
 
@@ -1104,6 +1151,11 @@ fn policy_json(policy: &JobPolicy) -> Value {
         ),
         disk_bytes: Some(policy.placement.disk_bytes),
         pin: policy.placement.pin,
+        // Named only when it is not the default, so a block job reads as
+        // it did before the field existed.
+        recovery: (policy.recovery
+            == fabric_core::managed::RecoveryPolicy::RestartFromAcknowledged)
+            .then_some(fabric_client::api::RecoveryName::RestartFromAcknowledged),
     })
 }
 
@@ -1301,6 +1353,76 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
             "achieved": achieved.name(),
             "package": package.map(|p| hex(&p.0)),
         }),
+        ManagedEvent::CheckpointCaptured {
+            attempt,
+            generation,
+            snapshot,
+            cut,
+        } => json!({
+            "attempt": attempt.to_string(),
+            "generation": generation.to_string(),
+            "snapshot": snapshot.to_string(),
+            "cut": hex(&cut.0),
+        }),
+        ManagedEvent::CheckpointAcknowledged { ack } => json!({
+            "attempt": ack.attempt.to_string(),
+            "generation": ack.generation.to_string(),
+            "snapshot": ack.snapshot.to_string(),
+            "cut": hex(&ack.cut.0),
+            "manifests": ack.manifests.to_string(),
+            "chunks": ack.chunks.to_string(),
+            "bytes": ack.bytes.to_string(),
+            "fetched_from": ack.fetched_from.to_string(),
+        }),
+        ManagedEvent::CoveredWriteRefused {
+            path,
+            attempt,
+            generation,
+            verdict,
+        } => json!({
+            "path": path.name(),
+            "attempt": attempt.to_string(),
+            "generation": generation.to_string(),
+            "verdict": verdict_json(verdict),
+        }),
+        ManagedEvent::AttemptUnavailable {
+            attempt,
+            generation,
+            last_heartbeat_ms,
+            since_ms,
+        } => json!({
+            "attempt": attempt.to_string(),
+            "generation": generation.to_string(),
+            "last_heartbeat_ms": last_heartbeat_ms.map(|ms| ms.to_string()),
+            "since_ms": since_ms.to_string(),
+        }),
+        ManagedEvent::AttemptReachable {
+            attempt,
+            generation,
+        } => json!({
+            "attempt": attempt.to_string(),
+            "generation": generation.to_string(),
+        }),
+        ManagedEvent::GrantSuperseded {
+            attempt,
+            generation,
+            by,
+            reason,
+        } => json!({
+            "attempt": attempt.to_string(),
+            "generation": generation.to_string(),
+            "by": by.map(|g| g.to_string()),
+            "reason": reason,
+        }),
+        ManagedEvent::RecoveryBlocked {
+            attempt,
+            generation,
+            reason,
+        } => json!({
+            "attempt": attempt.to_string(),
+            "generation": generation.to_string(),
+            "reason": recovery_block_json(reason),
+        }),
         ManagedEvent::EffectRequested { operation, request } => json!({
             "operation": operation.to_string(),
             "request": match request {
@@ -1317,6 +1439,11 @@ pub(crate) fn event_json(frame: &EventFrame) -> Map<String, Value> {
                     "pin": pin.map(|n| n.to_string()),
                 } }),
                 EffectRequest::Spawn { task } => json!({ "spawn": { "task": task.to_string() } }),
+                EffectRequest::Recover { task, from, lost } => json!({ "recover": {
+                    "task": task.to_string(),
+                    "from": from.to_string(),
+                    "lost": lost.to_string(),
+                } }),
             },
         }),
     };
@@ -1687,7 +1814,7 @@ mod tests {
             .unwrap()
             .clone();
         node.authority
-            .observe(
+            .observe_authority(
                 job,
                 fabric_core::managed::Observation::Started {
                     attempt: attempt.id,
@@ -1934,7 +2061,7 @@ mod tests {
         };
         assert!(!replayed);
         node.authority
-            .observe(
+            .observe_authority(
                 job,
                 fabric_core::managed::Observation::Exited {
                     attempt: first.id,
@@ -2429,5 +2556,109 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 30, "{checked} cases");
+    }
+
+    /// Every M6 event kind renders with its kind and its fields as text
+    /// (ADR 0028), so a facade watch shows a loss and its handling.
+    #[test]
+    fn the_m6_event_kinds_render_with_their_fields() {
+        use fabric_core::id::{JobId, NodeId, SnapshotId};
+        use fabric_core::managed::{
+            AttemptId, CheckpointAck, CoveredPath, CutDigest, FenceVerdict, Generation,
+            RecoveryBlock, WorkRevision,
+        };
+        let attempt = AttemptId::from_bytes([1; 16]);
+        let g1 = Generation::FIRST;
+        let g2 = g1.next().unwrap();
+        let snapshot = SnapshotId::from_bytes([2; 32]);
+        let cut = CutDigest::from_bytes([3; 32]);
+        let node = NodeId::from_bytes([4; 32]);
+        let events = [
+            ManagedEvent::CheckpointCaptured {
+                attempt,
+                generation: g1,
+                snapshot,
+                cut,
+            },
+            ManagedEvent::CheckpointAcknowledged {
+                ack: CheckpointAck {
+                    attempt,
+                    generation: g1,
+                    snapshot,
+                    cut,
+                    manifests: 1,
+                    chunks: 2,
+                    bytes: 3,
+                    fetched_from: node,
+                },
+            },
+            ManagedEvent::CoveredWriteRefused {
+                path: CoveredPath::LedgerAppend,
+                attempt,
+                generation: g1,
+                verdict: FenceVerdict::Superseded { by: Some(g2) },
+            },
+            ManagedEvent::AttemptUnavailable {
+                attempt,
+                generation: g1,
+                last_heartbeat_ms: None,
+                since_ms: 7,
+            },
+            ManagedEvent::AttemptReachable {
+                attempt,
+                generation: g1,
+            },
+            ManagedEvent::GrantSuperseded {
+                attempt,
+                generation: g1,
+                by: Some(g2),
+                reason: "lost".into(),
+            },
+            ManagedEvent::RecoveryBlocked {
+                attempt,
+                generation: g1,
+                reason: RecoveryBlock::NoAcknowledgedCheckpoint,
+            },
+        ];
+        let rendered: Vec<_> = events
+            .into_iter()
+            .map(|event| {
+                event_json(&EventFrame {
+                    job: JobId::from_bytes([5; 16]),
+                    revision: WorkRevision::FIRST,
+                    operation: None,
+                    prev: None,
+                    at_ms: NOW,
+                    event,
+                })
+            })
+            .collect();
+        let kinds: Vec<_> = rendered.iter().map(|m| m["kind"].clone()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "checkpoint_captured",
+                "checkpoint_acknowledged",
+                "covered_write_refused",
+                "attempt_unavailable",
+                "attempt_reachable",
+                "grant_superseded",
+                "recovery_blocked",
+            ]
+        );
+        for map in &rendered {
+            assert_eq!(map["attempt"], attempt.to_string(), "{map:?}");
+            assert_eq!(map["generation"], "1", "{map:?}");
+        }
+        assert_eq!(rendered[0]["cut"], hex(&[3; 32]));
+        assert_eq!(rendered[1]["fetched_from"], node.to_string());
+        assert_eq!(rendered[1]["chunks"], "2");
+        assert_eq!(rendered[2]["path"], "ledger_append");
+        assert_eq!(rendered[2]["verdict"]["verdict"], "superseded");
+        assert_eq!(rendered[2]["verdict"]["by"], "2");
+        assert_eq!(rendered[3]["since_ms"], "7");
+        assert!(rendered[3].get("last_heartbeat_ms").is_none());
+        assert_eq!(rendered[5]["by"], "2");
+        assert_eq!(rendered[6]["reason"], "no_acknowledged_checkpoint");
     }
 }

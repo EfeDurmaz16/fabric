@@ -4,6 +4,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Abandoned.** The status of a provider operation the owner approved giving up on after its outcome stayed uncertain (ADR 0022). The approval names the status the owner saw and what may remain; abandoning never says that the effect did not happen or that anything stopped.
 
+**Acknowledged checkpoint.** A checkpoint whose bundle chain the authority node fetched through the store transfer, verified by digest and committed to the journal as `CheckpointAcknowledged` with what it verified (ADR 0028). The only restart point for recovery. A checkpoint the runner captured in its own store alone is captured, not acknowledged.
+
 **ACP** (Agent Client Protocol). A JSON-RPC protocol for driving coding agents. Fabric uses it as the generic harness path. Methods Fabric cares about: `session/new`, `session/load`, `session/prompt`, `session/cancel`.
 
 **Attach.** The bridge message that finds the resource an earlier create made, by the operation that made it, when its answer never reached Fabric (ADR 0022, docs/bridge-protocol.md). It reads and never creates; only a create whose profile dedupes by key or label can be attached.
@@ -26,6 +28,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Chunk.** One stored object: a whole file of 8 MiB or less, or one FastCDC piece of a larger file. Compressed with zstd and named by its blake3 hash.
 
+**Covered write.** One of exactly four write paths that carry a grant token and run the fence before writing: a ledger append of a managed job, a bundle publish accepted as the job's checkpoint, a journal operation an executor reports, and the outcome of a facade command (ADR 0028). On the merged tree the journal operation (every report, the cut among them) and the managed ledger append have writers behind the fence; no node holds a managed ledger yet, a bundle becomes the checkpoint only through the fenced cut report, and no runner writes a facade outcome. The harness's own files inside the workspace are not covered.
+
 **Escaped child.** A process in a managed task's process group that no registered task owns (ADR 0023). It blocks a strong handoff with its pid and is never adopted or killed in silence.
 
 **Exclusion.** The structured reason a node was not eligible for one placement: no answer in time, platform, a missing or old harness, path layout, an unresolvable secret, disk, or the user's pin (ADR 0026). Every exclusion of every candidate is in the decision.
@@ -44,11 +48,17 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Facade token.** The bearer the owner mints on the authority node for one actor, with the jobs and resources it may touch, an expiry and a revocation id (ADR 0027). The authority keeps its digest, never the bearer; revocation is immediate.
 
+**Fence.** The one rule every covered write runs first (ADR 0028): the grant token's attempt must be the job's live attempt at the job's generation, `granted` or `running`, from the node it was granted to. Any other verdict refuses the write, records it and changes nothing else.
+
 **Fidelity.** How much of a managed job a continuation carried: `native_session`, `new_native_session_with_package`, `workspace_only`, or `unsupported`, which is a refusal (ADR 0024). The job's policy says which are allowed; every continuation records the one achieved, and a refusal is never lowered into a weaker one.
+
+**Failover.** The placement of a `Recover`'s next attempt (ADR 0028): the M5 placement with the superseded attempt's node excluded whatever it answers (`Exclusion::Unavailable`), from an acknowledged checkpoint. Granted when placed, launched like any other grant; with no eligible node the job parks with every exclusion recorded.
 
 **Fencing.** Refusing work from a stale epoch. The fencing token is `(job_id, epoch)`. The mechanism that keeps exactly one live copy among Fabric processes; native tombstones cover the harness's own writers.
 
 **Generation.** The fencing counter of a managed job's canonical execution domain. It increases by one with every new attempt the authority grants; work reported under an older generation is refused (ADR 0020). Not an epoch, which belongs to standalone jobs.
+
+**Grant token.** The triple `(job, attempt, generation)` a runner presents with every covered write of a managed job (ADR 0028); the managed counterpart of the standalone fencing token, which carries an epoch and is never written for a managed job.
 
 **Harness.** The agent program that does the work: Claude Code, Codex, or any ACP agent.
 
@@ -136,9 +146,13 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Store.** A node's local blob directory plus catalog. Written by one process at a time, under the data directory lock.
 
+**Superseded.** The status of an attempt whose grant was taken away by `Supersede` or `Recover` while it may have been alive (ADR 0028). It does not `may_run`; its covered writes are refused; its task stays open. Never produced from a missed heartbeat alone: a heartbeat absence marks the attempt `unknown`, and only a command supersedes it.
+
 **Supervisor.** The process that kills a job's harness when a higher epoch is learned and keeps the harness record current. Always the holder of the data directory lock: the node process, or else the `fabric resume` command that launched the harness, which stays resident until the harness exits.
 
 **Suspend.** Stop the harness cleanly, publish a snapshot, push it to paired peers. The owner does not change.
+
+**Taken marker.** The record a node writes when it takes a grant (`runs/taken/<attempt>.json`): the grant token, the authority that granted it, and how this node's part ended. After a restart the node presents every grant whose marker has not ended to its authority, writes the verdict into the marker and resumes none (ADR 0028).
 
 **Task class.** What an interruption means for a managed task: `build` and `test` are cancelled and restarted and recorded interrupted, `harness` takes the supported checkpoint, `opaque` blocks (ADR 0023). Declared when the task is registered; never inferred from a process name.
 

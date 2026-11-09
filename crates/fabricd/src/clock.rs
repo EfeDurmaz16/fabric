@@ -5,7 +5,8 @@
 //! to it as a value. Times are informational (ADR 0002): nothing orders by
 //! them.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fabric_core::id::{EventId, JobId, MoveId};
 use fabric_core::managed::{OperationKey, OperationKeyError};
@@ -16,6 +17,17 @@ pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Milliseconds on a clock that only moves forward, counted from its
+/// first reading in this process. The authority measures a runner's
+/// silence with it (ADR 0028), so a wall-clock step or a host sleep never
+/// makes a healthy attempt overdue; the wall clock is kept for the times a
+/// record carries.
+pub(crate) fn mono_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// A new job id, time-sortable and collision-free.

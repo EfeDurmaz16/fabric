@@ -9,6 +9,7 @@
 //! carries no secret value and is never larger than `PACKAGE_MAX_BYTES`.
 //! It names no artifact in M5.
 
+use fabric_core::id::SnapshotId;
 use fabric_core::managed::{
     AttemptId, EvidenceKind, EvidenceRef, ManagedState, PackageError, PackageInput, WorkPackage,
     WorkspaceRevision, build_package,
@@ -31,23 +32,31 @@ pub(crate) enum BuildError {
 }
 
 /// The package of the continue that grants a new attempt after `from`:
-/// notes from the journal, `from`'s last receipts, the workspace at its
-/// newest cut and the job's head, the cut as evidence.
+/// notes from the journal, `from`'s last receipts, the workspace at the
+/// grant's start (`start`, the checkpoint `continue_start` chose, which
+/// may be an acknowledged one older than `from`'s newest cut) or else at
+/// `from`'s newest cut, and the job's head; that checkpoint as evidence.
 pub(crate) fn build_for_continue(
     journal: &Journal,
     state: &ManagedState,
     from: AttemptId,
+    start: Option<SnapshotId>,
 ) -> Result<WorkPackage, BuildError> {
     let job = state.job.id;
-    let (snapshot, cut) = journal
-        .last_cut(job, from)?
-        .ok_or(BuildError::NoCut(from))?;
+    let (snapshot, cut, cut_by) = if let Some(held) = start.and_then(|s| state.checkpoint(s)) {
+        (held.snapshot, held.cut, held.attempt)
+    } else {
+        let (snapshot, cut) = journal
+            .last_cut(job, from)?
+            .ok_or(BuildError::NoCut(from))?;
+        (snapshot, cut, from)
+    };
     let head = journal.head(job)?.ok_or(BuildError::NoCut(from))?;
     let notes = journal.notes(job)?;
     let receipts = journal.receipts(job, from)?;
     let evidence = [EvidenceRef {
         digest: cut.0,
-        attempt: from,
+        attempt: cut_by,
         kind: EvidenceKind::Checkpoint,
     }];
     Ok(build_package(&PackageInput {
@@ -122,7 +131,7 @@ mod tests {
             .with_journal(false, move |journal| {
                 let state = journal.job(job)?.expect("the job");
                 Ok((
-                    build_for_continue(journal, &state, first).map_err(|e| e.to_string()),
+                    build_for_continue(journal, &state, first, None).map_err(|e| e.to_string()),
                     journal.head(job)?,
                     journal.last_cut(job, first)?,
                 ))

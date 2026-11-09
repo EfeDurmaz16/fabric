@@ -21,6 +21,7 @@ The target writes one decision per move id and answers every later question abou
 - `before_placement`: An accepted managed create is about to be placed, and no decision is recorded yet.
 - `before_launch`: A grant is committed and its launch is not sent yet.
 - `while_stopping`: `fabric serve` was told to stop and still holds the state directory.
+- `before_acknowledge`: The authority's verifier is about to fetch a capture it has not acknowledged (ADR 0028).
 - `mid_harness_capture`: A suspend captured the harness state into `harness-state.next` and has not put it in place yet.
 <!-- faults:end -->
 

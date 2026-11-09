@@ -95,7 +95,10 @@ async fn end(node: &Node, g: &Granted) {
             outcome: ExitOutcome::Failed { code: Some(1) },
         },
     ] {
-        node.authority.observe(g.job, observation).await.unwrap();
+        node.authority
+            .observe_authority(g.job, observation)
+            .await
+            .unwrap();
     }
 }
 
@@ -360,6 +363,8 @@ async fn the_launch_path_leaves_residuals_only_for_ended_attempts() {
                 attempt: g.attempt,
                 generation: g.generation,
             },
+            from: None,
+            ended: None,
         },
     )
     .unwrap();

@@ -737,6 +737,32 @@ impl Client {
         }
     }
 
+    /// Takes the grant away from a managed job's `unknown` attempt and
+    /// grants nothing (ADR 0028). The request is the whole command.
+    pub async fn managed_supersede(
+        &self,
+        request: Request,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        match self.call(&request, on_event).await? {
+            Reply::ManagedSupersede(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedSupersede, &other)),
+        }
+    }
+
+    /// Recovers a managed job's `unknown` attempt from an acknowledged
+    /// checkpoint as a failover (ADR 0028). The request is the whole command.
+    pub async fn managed_recover(
+        &self,
+        request: Request,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        match self.call(&request, on_event).await? {
+            Reply::ManagedRecover(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedRecover, &other)),
+        }
+    }
+
     /// Continues a managed job on a newly placed attempt (M5).
     pub async fn managed_continue(
         &self,

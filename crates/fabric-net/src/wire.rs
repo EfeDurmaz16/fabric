@@ -20,6 +20,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
+use fabric_core::managed::FenceVerdict;
 use fabric_core::managed::launch::{
     GrantToken, Heartbeat, HeartbeatAnswer, InstructAnswer, Instruction, LaunchAnswer,
     LaunchRequest, MAX_HEARTBEAT_ATTEMPTS, MAX_TASK_LAUNCHES, Report, ReportAnswer,
@@ -37,7 +38,16 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// failing a push's preflight midway. Before version 4 was released,
 /// `FactsFor` also came to name the tools to measure (item 19 of the A/B
 /// lab), so a preflight measures only what the job reads.
-pub const PROTOCOL_VERSION: u16 = 4;
+///
+/// 5 added `RequestBody::ManagedJob` with `JobResponse::GrantRefused`,
+/// and the fence's verdict in `HeartbeatAnswer` (ADR 0028): a managed
+/// job's runner presents its grant with every covered write and learns
+/// from each heartbeat answer whether its grant still stands, and a node
+/// of version 4 knows neither. The launch path messages (`Launch`,
+/// `Instruct`, `Report`, `Heartbeat`) were never released under 4, and
+/// `Heartbeat::running` (a restarted node's presentation is not presence)
+/// was added before 5 was released.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
@@ -765,6 +775,17 @@ pub enum RequestBody {
     /// One facade message for the peer's authority (ADR 0027), carried
     /// without being read; answered with `Facade`. Protocol 4, unshipped.
     Facade(FacadeMessage),
+    /// A per-job message for a managed job, under the grant the sender
+    /// acts under (ADR 0028). An epoch is never written for a managed job,
+    /// so the grant takes the epoch's place; the receiver's authority runs
+    /// the fence before it reads the body and answers `GrantRefused` with
+    /// the verdict when the grant is not the job's live one.
+    ManagedJob {
+        /// The grant.
+        token: GrantToken,
+        /// The message.
+        body: JobRequest,
+    },
     /// The authority asks the node it granted an attempt to to run it
     /// (docs/managed-jobs.md, "Launch path"); answered with `Launch`.
     /// Protocol 4, unshipped.
@@ -983,7 +1004,7 @@ pub enum ResponseBody {
     Instruct(InstructAnswer),
     /// The authority's answer to `Report`: recorded or refused.
     Report(ReportAnswer),
-    /// The authority's verdicts on the grants a heartbeat names.
+    /// The authority's fence verdicts on the grants a heartbeat names.
     Heartbeat(HeartbeatAnswer),
 }
 
@@ -1043,6 +1064,13 @@ pub enum JobResponse {
         /// The version, as the harness prints it.
         version: Option<VersionText>,
     },
+    /// The receiver's authority refused the grant of a `ManagedJob`
+    /// request (ADR 0028). Never answered to a standalone request, as
+    /// `StaleEpoch` and `AheadOfUs` are never answered to a managed one.
+    GrantRefused {
+        /// Why.
+        verdict: FenceVerdict,
+    },
 }
 
 impl JobResponse {
@@ -1059,6 +1087,7 @@ impl JobResponse {
             JobResponse::MoveUndecided { .. } => "move undecided",
             JobResponse::SnapshotIncomplete { .. } => "snapshot incomplete",
             JobResponse::KnownWriter { .. } => "known writer",
+            JobResponse::GrantRefused { .. } => "grant refused",
         }
     }
 }
@@ -1081,6 +1110,11 @@ pub enum Fenced<T> {
         yours: Epoch,
         /// The receiver's epoch.
         current: Epoch,
+    },
+    /// The receiver's authority refused the grant of a managed request (ADR 0028).
+    GrantRefused {
+        /// Why.
+        verdict: FenceVerdict,
     },
 }
 
@@ -1308,6 +1342,7 @@ impl<T: JobAnswer> JobAnswer for Fenced<T> {
             Fenced::Answer(answer) => answer.into_response(),
             Fenced::StaleEpoch { yours, current } => JobResponse::StaleEpoch { yours, current },
             Fenced::AheadOfUs { yours, current } => JobResponse::AheadOfUs { yours, current },
+            Fenced::GrantRefused { verdict } => JobResponse::GrantRefused { verdict },
         }
     }
 
@@ -1315,6 +1350,7 @@ impl<T: JobAnswer> JobAnswer for Fenced<T> {
         match response {
             JobResponse::StaleEpoch { yours, current } => Ok(Fenced::StaleEpoch { yours, current }),
             JobResponse::AheadOfUs { yours, current } => Ok(Fenced::AheadOfUs { yours, current }),
+            JobResponse::GrantRefused { verdict } => Ok(Fenced::GrantRefused { verdict }),
             other => T::from_response(other).map(Fenced::Answer),
         }
     }
@@ -1472,8 +1508,9 @@ mod tests {
             (grant(), instruction())
                 .prop_map(|(token, instruction)| RequestBody::Instruct { token, instruction }),
             report().prop_map(|report| RequestBody::Report(Box::new(report))),
-            vec(grant(), 0..=MAX_HEARTBEAT_ATTEMPTS)
-                .prop_map(|attempts| RequestBody::Heartbeat(Heartbeat { attempts })),
+            (vec(grant(), 0..=MAX_HEARTBEAT_ATTEMPTS), any::<bool>()).prop_map(
+                |(attempts, running)| { RequestBody::Heartbeat(Heartbeat { attempts, running }) }
+            ),
         ]
     }
 
@@ -1582,9 +1619,7 @@ mod tests {
     }
 
     fn launch_path_answer() -> impl Strategy<Value = ResponseBody> {
-        use fabric_core::managed::launch::{
-            GrantVerdict, InstructRefusal, LaunchRefusal, ReportRefusal,
-        };
+        use fabric_core::managed::launch::{InstructRefusal, LaunchRefusal, ReportRefusal};
         prop_oneof![
             Just(ResponseBody::Launch(LaunchAnswer::Accepted)),
             Just(ResponseBody::Launch(LaunchAnswer::Refused {
@@ -1605,13 +1640,26 @@ mod tests {
             generation().prop_map(|current| ResponseBody::Report(ReportAnswer::Refused {
                 reason: ReportRefusal::StaleGeneration { current }
             })),
+            proptest::option::of(generation()).prop_map(|by| ResponseBody::Report(
+                ReportAnswer::Refused {
+                    reason: ReportRefusal::Superseded { by }
+                }
+            )),
             vec(
                 (
                     bytes16(fabric_core::managed::AttemptId::from_bytes),
                     prop_oneof![
-                        Just(GrantVerdict::Live),
-                        Just(GrantVerdict::Unknown),
-                        generation().prop_map(|current| GrantVerdict::Stale { current }),
+                        Just(FenceVerdict::Live),
+                        Just(FenceVerdict::UnknownJob),
+                        Just(FenceVerdict::UnknownAttempt),
+                        generation().prop_map(|current| FenceVerdict::Stale { current }),
+                        proptest::option::of(generation())
+                            .prop_map(|by| FenceVerdict::Superseded { by }),
+                        Just(FenceVerdict::NotWritable {
+                            status: fabric_core::managed::AttemptStatus::Unknown
+                        }),
+                        (bytes32(NodeId::from_bytes), bytes32(NodeId::from_bytes))
+                            .prop_map(|(granted, from)| FenceVerdict::WrongNode { granted, from }),
                     ]
                 ),
                 0..=MAX_HEARTBEAT_ATTEMPTS
@@ -2075,6 +2123,9 @@ mod tests {
                 yours: epoch,
                 current: epoch,
             },
+            JobResponse::GrantRefused {
+                verdict: FenceVerdict::Superseded { by: None },
+            },
         ];
         let takes: [(&str, Accepts, &[&str]); 6] = [
             ("pull", accepts::<Pulled>, &["records"]),
@@ -2100,7 +2151,9 @@ mod tests {
             for response in &all {
                 let fenced = matches!(
                     response,
-                    JobResponse::StaleEpoch { .. } | JobResponse::AheadOfUs { .. }
+                    JobResponse::StaleEpoch { .. }
+                        | JobResponse::AheadOfUs { .. }
+                        | JobResponse::GrantRefused { .. }
                 );
                 assert_eq!(
                     accepts(response),
@@ -2110,6 +2163,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A managed request presents the grant where a standalone one
+    /// presents the epoch, and the two verdicts never cross (ADR 0028).
+    #[test]
+    fn a_managed_request_carries_a_grant_and_never_an_epoch() {
+        use fabric_core::managed::Generation;
+        let token = GrantToken {
+            job: JobId::from_bytes([1; 16]),
+            attempt: fabric_core::managed::AttemptId::from_bytes([2; 16]),
+            generation: Generation::new(3).unwrap(),
+        };
+        let record = RecordPage::new(RecordBytes::new(vec![7u8; 8]).unwrap());
+        let managed = RequestBody::ManagedJob {
+            token,
+            body: JobRequest::Append {
+                records: record.clone(),
+            },
+        };
+        let bytes = encode(&managed).unwrap();
+        assert_eq!(decode::<RequestBody>(&bytes).unwrap(), managed);
+        // The bytes hold the grant's generation and no epoch: the standalone
+        // form of the same append differs in its token alone.
+        let standalone = RequestBody::Job {
+            token: FencingToken {
+                job_id: token.job,
+                epoch: Epoch::new(3).unwrap(),
+            },
+            body: JobRequest::Append { records: record },
+        };
+        assert_ne!(encode(&standalone).unwrap(), bytes);
+        // The grant verdict reads back inside Fenced for any answer kind,
+        // and names itself.
+        let refused = JobResponse::GrantRefused {
+            verdict: FenceVerdict::Stale {
+                current: Generation::new(4).unwrap(),
+            },
+        };
+        assert_eq!(refused.kind(), "grant refused");
+        let fenced: Fenced<Appended> = Fenced::from_response(refused.clone()).unwrap();
+        assert!(matches!(fenced, Fenced::GrantRefused { .. }));
+        assert_eq!(fenced.into_response(), refused);
+        // A heartbeat is bounded, carries grants alone, and is answered
+        // with the fence's own verdict: one heartbeat type, one verdict type.
+        let beat = RequestBody::Heartbeat(Heartbeat {
+            attempts: vec![token; 2],
+            running: true,
+        });
+        let bytes = encode(&beat).unwrap();
+        assert_eq!(decode::<RequestBody>(&bytes).unwrap(), beat);
+        let over = RequestBody::Heartbeat(Heartbeat {
+            attempts: vec![token; MAX_HEARTBEAT_ATTEMPTS + 1],
+            running: true,
+        });
+        assert!(matches!(
+            over.check_bounds(),
+            Err(WireError::TooMany { count, max }) if count == MAX_HEARTBEAT_ATTEMPTS + 1 && max == MAX_HEARTBEAT_ATTEMPTS
+        ));
+        let answer = ResponseBody::Heartbeat(HeartbeatAnswer {
+            verdicts: vec![
+                (token.attempt, FenceVerdict::Live),
+                (token.attempt, FenceVerdict::Superseded { by: None }),
+            ],
+        });
+        let bytes = encode(&answer).unwrap();
+        assert_eq!(decode::<ResponseBody>(&bytes).unwrap(), answer);
     }
 
     #[test]

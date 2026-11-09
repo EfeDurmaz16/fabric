@@ -7,17 +7,19 @@
 //! Invariant: every message from a node names its grant with a
 //! [`GrantToken`], and the authority acts on it only while that token is
 //! the job's live grant. A report at another generation is refused
-//! `StaleGeneration` and recorded, never applied (replay rule 7); a
-//! heartbeat at another generation is answered `Stale`, and the node
-//! stops what it reported. M6 widens [`GrantVerdict`] with its fence and
-//! adds `Captured` to the observations a report may carry; nothing here
-//! moves for it.
+//! `StaleGeneration` and recorded, never applied (replay rule 7). A
+//! heartbeat is answered with the fence's own verdict for each grant
+//! ([`FenceVerdict`], ADR 0028), the one verdict type a node obeys: a
+//! verdict that ends the grant ([`FenceVerdict::ends_grant`]) stops what
+//! the node runs under it. A report the fence refuses is answered with the refusal
+//! that names the same verdict ([`ReportRefusal::fenced`]).
 
 use serde::{Deserialize, Serialize};
 
+use super::fence::FenceVerdict;
 use super::ids::{AttemptId, Generation, TaskId, WorkRevision};
 use super::lifecycle::TaskClass;
-use super::model::{Intent, JobPolicy, Observation, SourceBinding};
+use super::model::{AttemptStatus, Intent, JobPolicy, Observation, SourceBinding};
 use super::package::{AllowedFidelity, PACKAGE_MAX_BYTES, WorkPackage};
 use super::secret_ref::SecretName;
 use crate::env::EnvVarName;
@@ -445,10 +447,24 @@ pub enum ReportRefusal {
     /// The reporting peer is not the node the attempt was granted to.
     #[error("the attempt was granted to another node")]
     WrongNode,
+    /// The attempt's grant was taken (ADR 0028); `by` is the generation
+    /// granted in its place, `None` when nothing was granted yet.
+    #[error("the grant was superseded")]
+    Superseded {
+        /// The generation granted in its place, if one was.
+        by: Option<Generation>,
+    },
+    /// The attempt is the job's but may not write: `unknown`, or ended.
+    #[error("the attempt may not write: it is {status:?}")]
+    NotWritable {
+        /// Its status.
+        status: AttemptStatus,
+    },
     /// The observation names another attempt or generation than the token.
     #[error("the observation does not match the token")]
     TokenMismatch,
-    /// The observation is not one a node may report (`Placed`, `Lost`, `Unknown`).
+    /// The observation is not one a node may report (`Placed`, `Lost`,
+    /// `Unknown`, `ResourceUnavailable`, `ResourceReachable`).
     #[error("not an attempt observation a node reports")]
     NotReportable,
     /// The domain refused it for another reason, by name.
@@ -460,6 +476,49 @@ pub enum ReportRefusal {
     /// The authority is not open; the node tries again after its next heartbeat.
     #[error("the authority is unavailable")]
     Unavailable,
+}
+
+impl ReportRefusal {
+    /// The refusal that names a fence verdict, `None` for `Live`: the
+    /// report path and the heartbeat path refuse a grant for the same
+    /// reasons (ADR 0028).
+    #[must_use]
+    pub fn fenced(verdict: &FenceVerdict) -> Option<Self> {
+        Some(match verdict {
+            FenceVerdict::Live => return None,
+            FenceVerdict::Stale { current } => ReportRefusal::StaleGeneration { current: *current },
+            FenceVerdict::Superseded { by } => ReportRefusal::Superseded { by: *by },
+            FenceVerdict::NotWritable { status } => ReportRefusal::NotWritable {
+                status: status.clone(),
+            },
+            FenceVerdict::WrongNode { .. } => ReportRefusal::WrongNode,
+            FenceVerdict::UnknownAttempt => ReportRefusal::UnknownAttempt,
+            FenceVerdict::UnknownJob => ReportRefusal::UnknownJob,
+        })
+    }
+
+    /// Whether the refusal ends the grant the report was sent under: every
+    /// refusal the fence makes whose verdict ends it
+    /// ([`FenceVerdict::ends_grant`]). The node stops the attempt and
+    /// reports nothing more under it. `NotWritable { Unknown }` waits (the
+    /// next heartbeat from the grant's node brings it back), and
+    /// `TokenMismatch`, `NotReportable`, `Domain` and `Unavailable` say
+    /// nothing of the grant.
+    #[must_use]
+    pub fn ends_grant(&self) -> bool {
+        match self {
+            ReportRefusal::StaleGeneration { .. }
+            | ReportRefusal::UnknownJob
+            | ReportRefusal::UnknownAttempt
+            | ReportRefusal::WrongNode
+            | ReportRefusal::Superseded { .. } => true,
+            ReportRefusal::NotWritable { status } => *status != AttemptStatus::Unknown,
+            ReportRefusal::TokenMismatch
+            | ReportRefusal::NotReportable
+            | ReportRefusal::Domain { .. }
+            | ReportRefusal::Unavailable => false,
+        }
+    }
 }
 
 impl Report {
@@ -496,10 +555,18 @@ impl Report {
                 attempt,
                 generation,
                 ..
-            } => Some((*attempt, *generation)),
-            Observation::Placed { .. } | Observation::Lost { .. } | Observation::Unknown { .. } => {
-                None
             }
+            | Observation::Captured {
+                attempt,
+                generation,
+                ..
+            } => Some((*attempt, *generation)),
+            // The authority makes these itself; a node never reports them.
+            Observation::Placed { .. }
+            | Observation::Lost { .. }
+            | Observation::Unknown { .. }
+            | Observation::ResourceUnavailable { .. }
+            | Observation::ResourceReachable { .. } => None,
         }
     }
 
@@ -519,35 +586,33 @@ impl Report {
 /// A node's heartbeat: every grant it runs, so the authority sees it is
 /// alive and the node learns which grants still stand. Sent every
 /// `HEARTBEAT_MS` while the node runs an attempt; never a journal write.
+/// The same message, with `running` false, is a restarted node's
+/// presentation of the grants it had taken: it asks for their verdicts
+/// and is never presence (ADR 0028).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heartbeat {
-    /// The grants the node runs; at most `MAX_HEARTBEAT_ATTEMPTS`.
+    /// The grants the node names; at most `MAX_HEARTBEAT_ATTEMPTS`.
     pub attempts: Vec<GrantToken>,
+    /// Whether the node runs these grants now. Only a heartbeat that runs
+    /// them is presence; a node that stopped what was left of them after
+    /// a restart (`Executor::recover`) says false, so the authority never
+    /// takes the presentation as the attempt coming back.
+    pub running: bool,
 }
 
-/// How often a node heartbeats while it runs an attempt.
-pub const HEARTBEAT_MS: u64 = 2_000;
+/// How often a node heartbeats while it runs an attempt: the interval
+/// the authority's presence counts silence in (ADR 0028), one constant.
+pub const HEARTBEAT_MS: u64 = super::model::HEARTBEAT_INTERVAL_MS;
 
-/// The authority's answer: one verdict per token, in the order asked.
+/// The authority's answer: the fence's verdict on each token, in the
+/// order asked (ADR 0028). A verdict that ends the grant
+/// ([`FenceVerdict::ends_grant`]) stops the attempt on the node, which
+/// reports nothing more under it. A token the authority could not judge
+/// (its journal is closed) gets no verdict, which says nothing of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatAnswer {
     /// The verdicts.
-    pub verdicts: Vec<(AttemptId, GrantVerdict)>,
-}
-
-/// What the authority says of a grant a node heartbeats. M6 widens it
-/// with its fence (`Superseded`, `NotWritable`, `WrongNode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GrantVerdict {
-    /// The job's live grant; carry on.
-    Live,
-    /// The job moved to a later generation; the node stops the attempt.
-    Stale {
-        /// The job's generation.
-        current: Generation,
-    },
-    /// No such job or attempt here; the node stops the attempt.
-    Unknown,
+    pub verdicts: Vec<(AttemptId, FenceVerdict)>,
 }
 
 #[cfg(test)]
@@ -630,6 +695,40 @@ mod tests {
             },
         };
         assert_eq!(lost.check(), Err(ReportRefusal::NotReportable));
+        Ok(())
+    }
+
+    /// M6's `Captured` is a node's report; the two presence observations
+    /// are the authority's own and never come from a node (ADR 0028).
+    #[test]
+    fn a_report_carries_captured_and_never_a_presence_observation() -> Result<(), ParseIdError> {
+        let job: JobId = "01K8W3A00000000000000000J1".parse()?;
+        let attempt: AttemptId = "01K8W3A00000000000000000A1".parse()?;
+        let token = GrantToken {
+            job,
+            attempt,
+            generation: Generation::FIRST,
+        };
+        let report = |observation| Report { token, observation };
+        let captured = report(Observation::Captured {
+            attempt,
+            generation: Generation::FIRST,
+            snapshot: SnapshotId::of(b"captured"),
+            cut: super::super::lifecycle::CutDigest::from_bytes([1; 32]),
+        });
+        assert_eq!(captured.check(), Ok(()));
+        let unavailable = report(Observation::ResourceUnavailable {
+            attempt,
+            generation: Generation::FIRST,
+            last_heartbeat_ms: None,
+            at_ms: 1,
+        });
+        assert_eq!(unavailable.check(), Err(ReportRefusal::NotReportable));
+        let reachable = report(Observation::ResourceReachable {
+            attempt,
+            generation: Generation::FIRST,
+        });
+        assert_eq!(reachable.check(), Err(ReportRefusal::NotReportable));
         Ok(())
     }
 }

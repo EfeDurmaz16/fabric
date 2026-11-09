@@ -1,0 +1,3 @@
+unknown 11.235600042s after the pause; the silence counts from the grant, since nothing on the runner node heartbeats
+block: job 01M6Y0MM5GHWRA5G9WGJH8M7NZ, attempt 75E6J6RWZR2Y7ER9GRRCTHA954 unknown, 7 events, relay while paused RelayCounters { udp_forwarded: [20, 14], udp_dropped: [19, 17], tcp_forwarded: [0, 0], tcp_held: [0, 0] }
+relay counters: RelayCounters { udp_forwarded: [67, 61], udp_dropped: [24, 20], tcp_forwarded: [0, 0], tcp_held: [0, 0] } (forwarded 128, dropped 44)

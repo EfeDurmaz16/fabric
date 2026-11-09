@@ -28,6 +28,7 @@ mod schema;
 #[cfg(test)]
 mod crash_tests;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,11 +36,12 @@ use std::path::{Path, PathBuf};
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::Command;
 use fabric_core::managed::{
-    AcceptedOperation, Attempt, AttemptId, AttemptStatus, CommandKind, CutDigest, DomainError,
-    Envelope, EventDigest, EventFrame, EventSeq, Fidelity, ManagedEvent, ManagedState, NewIds,
-    Note, Observation, Operation, OperationId, OperationKey, OperationMark, OperationStatus,
-    PackageDigest, PlacementDecision, RequestDigest, StoredResult, TaskReceipt, Transition,
-    WorkRevision, apply_observation, mark_operation, replay, request_digest,
+    AcceptedOperation, Attempt, AttemptId, AttemptStatus, CheckpointAck, CommandKind, CoveredPath,
+    CutDigest, DomainError, Envelope, EventDigest, EventFrame, EventSeq, FenceVerdict, Fidelity,
+    GrantToken, ManagedEvent, ManagedState, NewIds, Note, Observation, Operation, OperationId,
+    OperationKey, OperationMark, OperationStatus, PackageDigest, PlacementDecision, RecoveryBlock,
+    RequestDigest, StoredResult, TaskReceipt, Transition, WorkRevision, acknowledge,
+    apply_observation, fence, mark_operation, record_recovery_block, replay, request_digest,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -74,8 +76,9 @@ pub enum OpenError {
     #[error("{0} is not a Fabric managed journal")]
     NotAJournal(PathBuf),
     /// The journal was written by an unreleased draft of its schema
-    /// version (version 2 before ADR 0022 completed it); nothing released
-    /// wrote one, so it is refused rather than read with missing columns.
+    /// version (version 2 before ADR 0022 completed it, or version 3 with
+    /// codec format 2 frames from before ADR 0028 amended that format);
+    /// nothing released wrote one, so it is refused rather than misread.
     #[error(
         "the journal has a draft of schema version {version} that no release wrote; recreate it"
     )]
@@ -224,6 +227,12 @@ pub struct Recovery {
 pub struct Journal {
     conn: Connection,
     path: PathBuf,
+    /// The last refusal recorded per attempt and covered path while this
+    /// journal is open, so a runner that keeps writing under a grant it
+    /// lost grows the job's history by one event per verdict, not one per
+    /// write (ADR 0028). In memory: after a reopen the first repeat is
+    /// recorded once more.
+    refused: HashMap<(AttemptId, CoveredPath), FenceVerdict>,
 }
 
 impl std::fmt::Debug for Journal {
@@ -247,6 +256,19 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> OpenError + '_ {
 
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
+}
+
+/// Fails when any row violates a foreign key, as `PRAGMA foreign_key_check` reports.
+fn foreign_keys_hold(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = stmt.query([])?;
+    if rows.next()?.is_some() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some("a foreign key does not hold after the migration".into()),
+        ));
+    }
+    Ok(())
 }
 
 fn remove_if_present(path: &Path) -> Result<(), OpenError> {
@@ -277,11 +299,14 @@ impl Journal {
         }
         {
             let mut conn = connect(&tmp)?;
+            // A migration rebuilds tables with foreign keys off; see `open`.
+            conn.pragma_update(None, "foreign_keys", false)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(schema::V1)?;
             for step in schema::MIGRATIONS {
                 tx.execute_batch(step)?;
             }
+            foreign_keys_hold(&tx)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             for (key, value) in [
@@ -345,6 +370,27 @@ impl Journal {
                 known: SCHEMA_VERSION,
             });
         }
+        // Codec format 2 was amended in place by ADR 0028 before any
+        // release (`JobPolicy` gained `recovery`): a version 3 journal that
+        // holds a format 2 frame was written by the unreleased M5 build,
+        // whose frames this binary cannot decode, and is refused before
+        // anything is written. A version 3 journal with format 1 frames
+        // only migrates.
+        if version == 3 {
+            let draft: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM events WHERE substr(body, 1, 1) = x'02'
+                     UNION ALL
+                     SELECT 1 FROM operations WHERE substr(result, 1, 1) = x'02'
+                     LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if draft.is_some() {
+                return Err(OpenError::DraftSchema { version: 3 });
+            }
+        }
         for from in version..SCHEMA_VERSION {
             let Some(step) = usize::try_from(from)
                 .ok()
@@ -391,6 +437,7 @@ impl Journal {
         Ok(Journal {
             conn,
             path: path.to_owned(),
+            refused: HashMap::new(),
         })
     }
 
@@ -531,9 +578,75 @@ impl Journal {
         })
     }
 
-    /// Records what an executor, or the authority's own check, reports.
-    /// A report that changes nothing writes nothing.
+    /// Records what an executor reports about an attempt or an operation,
+    /// behind the fence (ADR 0028): `token` is the grant the executor
+    /// acts under and `from` the authenticated peer it reported from,
+    /// `None` on the authority's own host. A token the fence refuses
+    /// writes `StaleObservationRefused` (when stale) or
+    /// `CoveredWriteRefused` and nothing else, and the verdict is
+    /// returned. A report that changes nothing writes nothing.
     pub fn observe(
+        &mut self,
+        token: &GrantToken,
+        from: Option<NodeId>,
+        observation: &Observation,
+        at_ms: u64,
+    ) -> Result<Result<Transition, FenceVerdict>, CommitError> {
+        self.fenced_change(
+            token,
+            from,
+            CoveredPath::JournalOperation,
+            true,
+            at_ms,
+            |state| apply_observation(state, observation),
+        )
+    }
+
+    /// Marks an operation on an executor's report, behind the fence.
+    pub fn mark(
+        &mut self,
+        token: &GrantToken,
+        from: Option<NodeId>,
+        operation: OperationId,
+        mark: OperationMark,
+        at_ms: u64,
+    ) -> Result<Result<Transition, FenceVerdict>, CommitError> {
+        self.fenced_change(
+            token,
+            from,
+            CoveredPath::JournalOperation,
+            false,
+            at_ms,
+            |state| mark_operation(state, operation, mark),
+        )
+    }
+
+    /// Runs the fence for a covered write other than a journal operation
+    /// (a ledger append, a bundle publish, a facade outcome), in a
+    /// transaction of its own. `Live` returns `Ok(())` and the caller
+    /// writes; any other verdict commits `CoveredWriteRefused` and returns
+    /// the verdict. Nothing else changes.
+    pub fn fence(
+        &mut self,
+        token: &GrantToken,
+        path: CoveredPath,
+        from: Option<NodeId>,
+        at_ms: u64,
+    ) -> Result<Result<(), FenceVerdict>, CommitError> {
+        Ok(self
+            .fenced_change(token, from, path, false, at_ms, |state| {
+                Ok(Transition {
+                    revision: state.job.revision,
+                    events: Vec::new(),
+                })
+            })?
+            .map(|_| ()))
+    }
+
+    /// The authority's own observations (`ResourceUnavailable`,
+    /// `ResourceReachable`, and `Lost` from `recover`): no runner presents
+    /// a grant, so no fence runs; the M2 generation check still does.
+    pub fn observe_authority(
         &mut self,
         job: JobId,
         observation: &Observation,
@@ -583,9 +696,10 @@ impl Journal {
         Ok(transition)
     }
 
-    /// Marks an operation: `Dispatched` right before its effect is asked
-    /// for, so a crash after this commit can never dispatch it again.
-    pub fn mark(
+    /// The authority's own marks: `Dispatched` right before an effect is
+    /// asked for, so a crash after this commit can never dispatch it
+    /// again, and `Unknown` from `recover`. No fence runs.
+    pub fn mark_authority(
         &mut self,
         job: JobId,
         operation: OperationId,
@@ -597,6 +711,110 @@ impl Journal {
             crashpoint::reached("dispatch.after_commit");
         }
         Ok(transition)
+    }
+
+    /// Commits `CheckpointAcknowledged` for `ack` after the core rule
+    /// accepted it; the evidence row and the projection column are
+    /// written in the same transaction (ADR 0028).
+    pub fn acknowledge(
+        &mut self,
+        job: JobId,
+        ack: &CheckpointAck,
+        at_ms: u64,
+    ) -> Result<Transition, CommitError> {
+        self.change(job, at_ms, |state| acknowledge(state, ack))
+    }
+
+    /// Records why an automatic restart of `attempt` did not happen (ADR
+    /// 0028); the job stays under `Block`.
+    pub fn recovery_blocked(
+        &mut self,
+        job: JobId,
+        attempt: AttemptId,
+        reason: RecoveryBlock,
+        at_ms: u64,
+    ) -> Result<Transition, CommitError> {
+        self.change(job, at_ms, |state| {
+            record_recovery_block(state, attempt, reason)
+        })
+    }
+
+    /// The job's acknowledged checkpoints, newest first.
+    pub fn acknowledged(&self, job: JobId) -> Result<Vec<CheckpointAck>, CommitError> {
+        let state = load_state(&self.conn, job)?.ok_or(DomainError::UnknownJob { job })?;
+        Ok(state.acknowledged().into_iter().cloned().collect())
+    }
+
+    /// One covered write: the fence in the write's own transaction, then
+    /// `rule` when the token is live. `report` says a stale token is
+    /// recorded as `StaleObservationRefused` (a report) rather than
+    /// `CoveredWriteRefused`. A refusal is recorded once per attempt,
+    /// path and verdict while the journal is open, and a token that names
+    /// no attempt of the job (`UnknownAttempt`) is refused without a
+    /// record, as `UnknownJob` is: there is nothing to record it against,
+    /// and any peer can make such tokens up at wire speed.
+    fn fenced_change(
+        &mut self,
+        token: &GrantToken,
+        from: Option<NodeId>,
+        path: CoveredPath,
+        report: bool,
+        at_ms: u64,
+        rule: impl FnOnce(&ManagedState) -> Result<Transition, DomainError>,
+    ) -> Result<Result<Transition, FenceVerdict>, CommitError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = load_state(&tx, token.job)?;
+        let verdict = fence(state.as_ref(), token, from);
+        if !verdict.allows() {
+            // No job, or no such attempt: nothing to record it against.
+            let Some(state) = state else {
+                return Ok(Err(verdict));
+            };
+            if verdict == FenceVerdict::UnknownAttempt {
+                return Ok(Err(verdict));
+            }
+            // The same refusal again: refused, not recorded again.
+            if self
+                .refused
+                .get(&(token.attempt, path))
+                .is_some_and(|seen| same_refusal(seen, &verdict))
+            {
+                return Ok(Err(verdict));
+            }
+            let event = match verdict {
+                FenceVerdict::Stale { current } if report => {
+                    ManagedEvent::StaleObservationRefused {
+                        attempt: token.attempt,
+                        generation: token.generation,
+                        current,
+                    }
+                }
+                ref verdict => ManagedEvent::CoveredWriteRefused {
+                    path,
+                    attempt: token.attempt,
+                    generation: token.generation,
+                    verdict: verdict.clone(),
+                },
+            };
+            let refused = Transition {
+                revision: state.job.revision.next().ok_or(DomainError::Exhausted)?,
+                events: vec![event],
+            };
+            write_transition(&tx, Some(state), &refused, None, at_ms)?;
+            tx.commit()?;
+            self.refused.insert((token.attempt, path), verdict.clone());
+            return Ok(Err(verdict));
+        }
+        let state = state.ok_or(DomainError::UnknownJob { job: token.job })?;
+        let transition = rule(&state)?;
+        if transition.events.is_empty() {
+            return Ok(Ok(transition));
+        }
+        write_transition(&tx, Some(state), &transition, None, at_ms)?;
+        tx.commit()?;
+        Ok(Ok(transition))
     }
 
     fn change(
@@ -884,7 +1102,7 @@ impl Journal {
             };
             for op in &state.operations {
                 if op.status == OperationStatus::Dispatched {
-                    self.mark(job, op.id, OperationMark::Unknown, at_ms)?;
+                    self.mark_authority(job, op.id, OperationMark::Unknown, at_ms)?;
                     out.unknown.push((job, op.id));
                 }
             }
@@ -906,7 +1124,7 @@ impl Journal {
                     _ => continue,
                 };
                 let lost = matches!(report, Observation::Lost { .. });
-                self.observe(job, &report, at_ms)?;
+                self.observe_authority(job, &report, at_ms)?;
                 observed = true;
                 if lost {
                     out.lost.push((job, attempt.id));
@@ -1095,6 +1313,21 @@ impl Journal {
         })?;
         self.conn.execute("VACUUM INTO ?1", [text])?;
         Ok(())
+    }
+}
+
+/// Whether `verdict` repeats the refusal `seen` for one attempt and path.
+/// A wrong node is one refusal whichever node sent it: the sender is not
+/// part of the job's state, so two peers taking turns would otherwise grow
+/// the history at wire speed (ADR 0028). Every other verdict changes only
+/// as the job does.
+fn same_refusal(seen: &FenceVerdict, verdict: &FenceVerdict) -> bool {
+    match (seen, verdict) {
+        (
+            FenceVerdict::WrongNode { granted: a, .. },
+            FenceVerdict::WrongNode { granted: b, .. },
+        ) => a == b,
+        _ => seen == verdict,
     }
 }
 

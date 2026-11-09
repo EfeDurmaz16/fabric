@@ -45,7 +45,7 @@ use common::sha256;
 
 /// The sha256 of `protocol/net/v4/manifest.sha256`. It moves only with the
 /// fixtures, in the same commit, and docs/net.md records the same value.
-const MANIFEST_SHA256: &str = "972ed115913ac8cd4ca7aeb6e48923c5e0e82dcbcaa3839d502c5be55882b7aa";
+const MANIFEST_SHA256: &str = "0aae368ea37e5082c791a970b3a829800a85668cb16bb8f0e10d1293e427c6b1";
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
 
@@ -553,6 +553,9 @@ fn build(message: &Value) -> Fallible<RequestBody> {
         })),
         "heartbeat" => RequestBody::Heartbeat(Heartbeat {
             attempts: list(field(message, "attempts")?, token)?,
+            running: field(message, "running")?
+                .as_bool()
+                .ok_or("running is not a boolean")?,
         }),
         other => return Err(format!("no message type {other}").into()),
     })

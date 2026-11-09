@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::fence::{CoveredPath, FenceVerdict};
 use super::ids::{
     AttemptId, Generation, OperationId, OperationKey, RequestDigest, TaskId, WorkRevision,
 };
@@ -24,6 +25,12 @@ use crate::snapshot::Platform;
 pub const MAX_SECRETS: usize = 32;
 /// The most paths a job's export allowlist names.
 pub const MAX_EXPORT_ALLOWLIST: usize = 256;
+
+/// How often an executor node heartbeats for its live attempts (ADR 0028).
+pub const HEARTBEAT_INTERVAL_MS: u64 = 2_000;
+
+/// How long without a heartbeat makes an attempt's resource unavailable (ADR 0028).
+pub const UNAVAILABLE_AFTER_MS: u64 = 10_000;
 
 /// How a job is kept, fixed when it is made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -78,6 +85,30 @@ pub enum RestartPolicy {
     ExplicitOnly,
 }
 
+/// What the authority may do by itself when an attempt is unavailable (ADR 0028).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RecoveryPolicy {
+    /// Record it and wait for an operator's `Recover` or `Supersede`. The default.
+    #[default]
+    Block,
+    /// Issue `Recover` itself once the attempt has been `unknown` for
+    /// `UNAVAILABLE_AFTER_MS` (a silence of `UNAVAILABLE_AFTER_MS` made it
+    /// `unknown`, then as long again without a heartbeat), when every
+    /// admission condition of `recovery_decision` holds.
+    RestartFromAcknowledged,
+}
+
+impl RecoveryPolicy {
+    /// The name the evidence and the client API use.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            RecoveryPolicy::Block => "block",
+            RecoveryPolicy::RestartFromAcknowledged => "restart_from_acknowledged",
+        }
+    }
+}
+
 /// Where a job may be placed (ADR 0026).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementPolicy {
@@ -120,10 +151,13 @@ pub struct JobPolicy {
     pub export_allowlist: Vec<RelPath>,
     /// Where it may be placed (ADR 0026).
     pub placement: PlacementPolicy,
+    /// What the authority may do by itself when an attempt is unavailable (ADR 0028).
+    pub recovery: RecoveryPolicy,
 }
 
 impl JobPolicy {
-    /// The policy an M2 job had: `restart` and every M5 default.
+    /// The policy an M2 job had: `restart`, every M5 default and the
+    /// M6 default `RecoveryPolicy::Block`.
     #[must_use]
     pub fn m2_defaults(restart: RestartPolicy) -> JobPolicy {
         JobPolicy {
@@ -133,6 +167,7 @@ impl JobPolicy {
             secrets: Vec::new(),
             export_allowlist: Vec::new(),
             placement: PlacementPolicy::DEFAULT,
+            recovery: RecoveryPolicy::Block,
         }
     }
 
@@ -167,6 +202,80 @@ impl JobPolicy {
     pub fn drain_budget(&self) -> Result<DrainBudget, DomainError> {
         DrainBudget::new(self.drain_budget_ms)
     }
+}
+
+/// Why an automatic restart did not happen; the job stays under `Block`
+/// with this recorded, never under a weaker restart.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RecoveryBlock {
+    /// The task's outcome policy (ADR 0023) is `block`: an `opaque` task.
+    OutcomeBlocks {
+        /// The outcome policy's name.
+        kind: String,
+    },
+    /// Nothing acknowledged to restart from: for a `checkpoint` task, no
+    /// acknowledged checkpoint of this attempt; for a `cancel_and_restart`
+    /// task, none of the job.
+    NoAcknowledgedCheckpoint,
+    /// The M4 replacement barrier holds: these provider operations may still act.
+    ReplacementBlocked {
+        /// The blocking provider operations, oldest first.
+        blockers: Vec<OperationId>,
+    },
+    /// A cancel of the job or of the attempt's task is open: no work is
+    /// granted again on what someone asked to stop (`EffectInFlight`).
+    EffectInFlight {
+        /// The open cancel.
+        operation: OperationId,
+    },
+    /// The domain refused the authority's `Recover` for a reason the
+    /// decision did not foresee; the refusal is stored under the
+    /// recover's derived key, so it is final for this silence.
+    Refused {
+        /// The refusal, as the domain words it.
+        refusal: String,
+    },
+}
+
+/// What the authority verified before it accepted a checkpoint as the
+/// job's. Written to the journal as `CheckpointAcknowledged`, never to the
+/// store: the store's row says the bytes are complete on this node, the
+/// event says the authority accepted them under the generation that made them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CheckpointAck {
+    /// The attempt that captured it.
+    pub attempt: AttemptId,
+    /// The generation it was captured under.
+    pub generation: Generation,
+    /// The snapshot.
+    pub snapshot: SnapshotId,
+    /// Equal to the `cut` the runner reported in `Captured`.
+    pub cut: CutDigest,
+    /// How many manifests `fetch_snapshot` published, each after its bytes
+    /// hashed to the id asked for (ADR 0014).
+    pub manifests: u32,
+    /// How many chunks it kept, each after its bytes hashed to the id.
+    pub chunks: u64,
+    /// The bytes it fetched.
+    pub bytes: u64,
+    /// The node the bytes were fetched from: the attempt's resource.
+    pub fetched_from: NodeId,
+}
+
+/// One checkpoint of a job as the state keeps it: captured by its attempt,
+/// and acknowledged by the authority or not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    /// The attempt that captured it.
+    pub attempt: AttemptId,
+    /// The generation it was captured under.
+    pub generation: Generation,
+    /// The snapshot.
+    pub snapshot: SnapshotId,
+    /// The cut the runner reported.
+    pub cut: CutDigest,
+    /// What the authority verified, once it did.
+    pub ack: Option<CheckpointAck>,
 }
 
 /// Where a managed job is in its life.
@@ -280,6 +389,12 @@ pub enum AttemptStatus {
     Lost,
     /// The authority cannot tell.
     Unknown,
+    /// Its grant was taken away while it may have been alive (ADR 0028).
+    /// Does not `may_run`; the task stays open.
+    Superseded {
+        /// The generation granted in its place, `None` while nothing is.
+        by: Option<Generation>,
+    },
 }
 
 impl AttemptStatus {
@@ -312,6 +427,9 @@ pub struct Attempt {
     pub granted_by: OperationId,
     /// Where it is in its life.
     pub status: AttemptStatus,
+    /// When the authority last marked its resource unavailable, while it
+    /// is `unknown` for that reason (ADR 0028).
+    pub unavailable_since_ms: Option<u64>,
 }
 
 /// The kind of a command, as the journal's `operations.kind` names it.
@@ -335,12 +453,17 @@ pub enum CommandKind {
     Checkpoint,
     /// `Command::Continue`; M5.
     Continue,
+    /// `Command::Supersede`; M6.
+    Supersede,
+    /// `Command::Recover`; M6.
+    Recover,
 }
 
 impl CommandKind {
     /// Whether a command of this kind may ask an executor for an effect
     /// after it commits. Whether one did is `CommandAccepted::effect`: a
-    /// cancel has an effect only while an attempt is live.
+    /// cancel has an effect only while an attempt is live, and `Recover`
+    /// grants (ADR 0028).
     #[must_use]
     pub fn has_effect(self) -> bool {
         matches!(
@@ -351,8 +474,15 @@ impl CommandKind {
                 | CommandKind::CancelTask
                 | CommandKind::Checkpoint
                 | CommandKind::Continue
+                | CommandKind::Recover
                 | CommandKind::RegisterTask
         )
+    }
+
+    /// Whether the command grants an attempt.
+    #[must_use]
+    pub fn grants(self) -> bool {
+        matches!(self, CommandKind::StartAttempt | CommandKind::Recover)
     }
 
     /// The name the journal stores.
@@ -368,6 +498,8 @@ impl CommandKind {
             CommandKind::RecordNote => "record_note",
             CommandKind::Checkpoint => "checkpoint",
             CommandKind::Continue => "continue",
+            CommandKind::Supersede => "supersede",
+            CommandKind::Recover => "recover",
         }
     }
 
@@ -384,6 +516,8 @@ impl CommandKind {
             "record_note" => CommandKind::RecordNote,
             "checkpoint" => CommandKind::Checkpoint,
             "continue" => CommandKind::Continue,
+            "supersede" => CommandKind::Supersede,
+            "recover" => CommandKind::Recover,
             _ => return None,
         })
     }
@@ -590,6 +724,26 @@ pub enum Command {
         /// A node to pin it to.
         pin: Option<NodeId>,
     },
+    /// Takes the grant away from an `unknown` attempt and grants nothing (ADR 0028).
+    Supersede {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Why, for the history.
+        reason: String,
+    },
+    /// `Supersede`, then a failover placement from the acknowledged
+    /// checkpoint `from` (ADR 0028): the grant is taken now, and the next
+    /// attempt is granted when the M5 placement chooses a node for it, as
+    /// a `Continue` is, with the unavailable attempt's node excluded. A
+    /// recover's grant is launched like any other.
+    Recover {
+        /// The `unknown` attempt whose grant is taken.
+        attempt: AttemptId,
+        /// The acknowledged checkpoint the next attempt starts from.
+        from: SnapshotId,
+        /// Why, for the history.
+        reason: String,
+    },
 }
 
 impl Command {
@@ -606,6 +760,8 @@ impl Command {
             Command::RecordNote { .. } => CommandKind::RecordNote,
             Command::Checkpoint { .. } => CommandKind::Checkpoint,
             Command::Continue { .. } => CommandKind::Continue,
+            Command::Supersede { .. } => CommandKind::Supersede,
+            Command::Recover { .. } => CommandKind::Recover,
         }
     }
 }
@@ -698,6 +854,16 @@ pub enum EffectRequest {
     Spawn {
         /// The task.
         task: TaskId,
+    },
+    /// Place the task again as a failover from an acknowledged checkpoint
+    /// after its attempt on `lost` was superseded (ADR 0028, M6).
+    Recover {
+        /// The task.
+        task: TaskId,
+        /// The acknowledged checkpoint the next attempt starts from.
+        from: SnapshotId,
+        /// The node the superseded attempt ran on; never chosen.
+        lost: NodeId,
     },
 }
 
@@ -800,6 +966,40 @@ pub enum Observation {
     Unknown {
         /// The operation.
         operation: OperationId,
+    },
+    /// The attempt captured a checkpoint and keeps running (ADR 0028).
+    /// `Checkpointed` stays the report of an attempt that ended at one.
+    Captured {
+        /// The attempt.
+        attempt: AttemptId,
+        /// The generation the reporter acts under.
+        generation: Generation,
+        /// The snapshot it published into its own store.
+        snapshot: SnapshotId,
+        /// The digest of the cut.
+        cut: CutDigest,
+    },
+    /// Made by the authority itself, never by a reporter: no heartbeat for
+    /// the attempt in `UNAVAILABLE_AFTER_MS`. Moves `granted` or `running`
+    /// to `unknown`; says nothing about whether the attempt stopped.
+    ResourceUnavailable {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
+        /// The last heartbeat the authority holds; `None` for one never heard from.
+        last_heartbeat_ms: Option<u64>,
+        /// The authority's clock when it decided.
+        at_ms: u64,
+    },
+    /// Made by the authority itself: a heartbeat returned for an attempt
+    /// `unknown` by `ResourceUnavailable` and nothing else happened to it.
+    /// Moves it back to `running`.
+    ResourceReachable {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
     },
 }
 
@@ -976,6 +1176,75 @@ pub enum ManagedEvent {
         /// The request.
         request: EffectRequest,
     },
+    /// An attempt captured a checkpoint into its own store and keeps
+    /// running (ADR 0028); the bytes may exist only there.
+    CheckpointCaptured {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
+        /// The snapshot.
+        snapshot: SnapshotId,
+        /// The digest of the cut.
+        cut: CutDigest,
+    },
+    /// The authority fetched and verified a captured checkpoint (ADR 0028).
+    CheckpointAcknowledged {
+        /// What it verified.
+        ack: CheckpointAck,
+    },
+    /// A covered write other than a report was refused by the fence; a
+    /// refused report stays `StaleObservationRefused` (ADR 0028).
+    CoveredWriteRefused {
+        /// The path.
+        path: CoveredPath,
+        /// The attempt the token named.
+        attempt: AttemptId,
+        /// The generation the token named.
+        generation: Generation,
+        /// Why.
+        verdict: FenceVerdict,
+    },
+    /// No heartbeat for the attempt in `UNAVAILABLE_AFTER_MS` (ADR 0028).
+    AttemptUnavailable {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
+        /// The last heartbeat the authority holds.
+        last_heartbeat_ms: Option<u64>,
+        /// The authority's clock when it decided.
+        since_ms: u64,
+    },
+    /// A heartbeat returned for an attempt `AttemptUnavailable` made
+    /// `unknown` (ADR 0028): it is `running` again if its grant succeeded,
+    /// `granted` if it was never seen launched.
+    AttemptReachable {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
+    },
+    /// An attempt's grant was taken away while it may have been alive (ADR 0028).
+    GrantSuperseded {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
+        /// The generation granted in its place in the same batch, if one was.
+        by: Option<Generation>,
+        /// Why.
+        reason: String,
+    },
+    /// An automatic restart did not happen; the job waits under `Block` (ADR 0028).
+    RecoveryBlocked {
+        /// The unavailable attempt.
+        attempt: AttemptId,
+        /// Its generation.
+        generation: Generation,
+        /// Why.
+        reason: RecoveryBlock,
+    },
 }
 
 impl ManagedEvent {
@@ -999,6 +1268,13 @@ impl ManagedEvent {
             ManagedEvent::PlacementDecided { .. } => "placement_decided",
             ManagedEvent::ContinuationRecorded { .. } => "continuation_recorded",
             ManagedEvent::EffectRequested { .. } => "effect_requested",
+            ManagedEvent::CheckpointCaptured { .. } => "checkpoint_captured",
+            ManagedEvent::CheckpointAcknowledged { .. } => "checkpoint_acknowledged",
+            ManagedEvent::CoveredWriteRefused { .. } => "covered_write_refused",
+            ManagedEvent::AttemptUnavailable { .. } => "attempt_unavailable",
+            ManagedEvent::AttemptReachable { .. } => "attempt_reachable",
+            ManagedEvent::GrantSuperseded { .. } => "grant_superseded",
+            ManagedEvent::RecoveryBlocked { .. } => "recovery_blocked",
         }
     }
 }
@@ -1166,6 +1442,59 @@ pub enum DomainError {
         /// The operation.
         operation: OperationId,
     },
+    /// `Captured` repeats a snapshot the attempt already reported, or an
+    /// acknowledgement names one it never reported (ADR 0028).
+    #[error("attempt {attempt} has no reported checkpoint {snapshot}")]
+    UnknownCheckpoint {
+        /// The attempt.
+        attempt: AttemptId,
+        /// The snapshot.
+        snapshot: SnapshotId,
+    },
+    /// The acknowledgement's cut digest is not the one the runner reported.
+    #[error("checkpoint {snapshot} was reported with cut {reported}, verified as {verified}")]
+    CutMismatch {
+        /// The snapshot.
+        snapshot: SnapshotId,
+        /// What the runner reported.
+        reported: CutDigest,
+        /// What the authority verified.
+        verified: CutDigest,
+    },
+    /// A `Recover`, or a `StartAttempt` after the job's first attempt,
+    /// names a snapshot no `CheckpointAcknowledged` covers: a captured
+    /// checkpoint, or one the job never saw, is a restart point for nothing.
+    #[error("checkpoint {snapshot} is not acknowledged by the authority")]
+    NotAcknowledged {
+        /// The snapshot.
+        snapshot: SnapshotId,
+    },
+    /// A failover placement chose the node whose attempt it replaces: that
+    /// attempt may still run there, so the recover's grant goes elsewhere
+    /// or the job parks (ADR 0028).
+    #[error("a failover may not go back to node {node}, whose attempt it replaces")]
+    FailoverToLostNode {
+        /// The node.
+        node: NodeId,
+    },
+    /// `Supersede` or `Recover` on an attempt that is not `unknown`: a
+    /// reachable attempt is handed over by the M5 planned handoff, never recovered.
+    #[error(
+        "attempt {attempt} is {status:?}, not unknown; a reachable attempt is handed over, not recovered"
+    )]
+    AttemptReachable {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its status.
+        status: AttemptStatus,
+    },
+    /// `CreateJob` with `RestartFromAcknowledged` for a primary task whose
+    /// outcome policy is `block` (an `opaque` task). Refused at admission.
+    #[error("restart_from_acknowledged is not supported for a {kind} task")]
+    RecoveryUnsupported {
+        /// The outcome policy's name.
+        kind: String,
+    },
     /// A checkpoint cut has no receipt for an open task of its attempt
     /// (ADR 0023: one receipt per task); M5.
     #[error("the cut has no receipt for open task {task}")]
@@ -1226,6 +1555,8 @@ pub struct ManagedState {
     pub attempts: Vec<Attempt>,
     /// Its accepted operations, in the order they were accepted.
     pub operations: Vec<OperationProgress>,
+    /// Its checkpoints, in the order they were captured (ADR 0028).
+    pub checkpoints: Vec<Checkpoint>,
     /// The effects its M5 commands asked for, in order; M5.
     pub requests: Vec<(OperationId, EffectRequest)>,
     /// The snapshot of every checkpoint cut recorded, by attempt, in the
@@ -1235,6 +1566,34 @@ pub struct ManagedState {
 }
 
 impl ManagedState {
+    /// The checkpoint record of `snapshot`, if an attempt reported it.
+    #[must_use]
+    pub fn checkpoint(&self, snapshot: SnapshotId) -> Option<&Checkpoint> {
+        self.checkpoints.iter().find(|c| c.snapshot == snapshot)
+    }
+
+    /// Every acknowledged checkpoint of the job, newest first, each with
+    /// the attempt and generation that made it.
+    #[must_use]
+    pub fn acknowledged(&self) -> Vec<&CheckpointAck> {
+        self.checkpoints
+            .iter()
+            .rev()
+            .filter_map(|c| c.ack.as_ref())
+            .collect()
+    }
+
+    /// Checkpoints reported `Captured` and never acknowledged; listed, and
+    /// a restart point for nothing.
+    #[must_use]
+    pub fn captured_only(&self) -> Vec<(AttemptId, Generation, SnapshotId)> {
+        self.checkpoints
+            .iter()
+            .filter(|c| c.ack.is_none())
+            .map(|c| (c.attempt, c.generation, c.snapshot))
+            .collect()
+    }
+
     /// The effect `operation` asked for, if it is an M5 command.
     #[must_use]
     pub fn request(&self, operation: OperationId) -> Option<&EffectRequest> {
@@ -1298,13 +1657,13 @@ impl ManagedState {
     /// next to a newer one.
     #[must_use]
     pub fn grant_may_dispatch(&self, operation: OperationId) -> bool {
-        self.operation(operation).is_some_and(|op| {
-            op.status == OperationStatus::Accepted && op.kind == CommandKind::StartAttempt
-        }) && self.attempts.iter().any(|a| {
-            a.granted_by == operation
-                && a.status == AttemptStatus::Granted
-                && a.generation == self.job.generation
-        })
+        self.operation(operation)
+            .is_some_and(|op| op.status == OperationStatus::Accepted && op.kind.grants())
+            && self.attempts.iter().any(|a| {
+                a.granted_by == operation
+                    && a.status == AttemptStatus::Granted
+                    && a.generation == self.job.generation
+            })
     }
 }
 

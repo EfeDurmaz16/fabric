@@ -1,0 +1,20 @@
+One full gate run on c492ba2 (after merging main at fd4c799: fabric gc, the CLI footprint fix and the lazy command tree), 2026-11-09 00:54Z to 01:03Z UTC, CARGO_TARGET_DIR one shared target, cargo -j 4, load 6.19 7.11 7.72 from other work. Each line: the gate, its exit code, its last line. Every gate is green. The two docs gates read the CLI from DOCS_CLI because the shared target is not the worktree's target/. A run on the first merge (2c73a8f) failed three gates: cargo fmt (the merged gc test), the docs gates without DOCS_CLI, and one workspace test, fabric-bridge's a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lost, a race in the bridge on main fixed at the root in e19e6f2 with a test that drops the request only after the loss. GitHub CI not waited for; perf runs in CI.
+
+cargo fmt --all --check                                                                                        exit 0  
+cargo clippy --workspace --all-targets --locked -- -D warnings                                                 exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.36s
+cargo clippy -p fabric-harness per feature (none acp claude codex cursor gemini opencode pi)                   exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+cargo clippy -p fabric-sync --lib --bins --locked -- -D warnings                                               exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+cargo test --workspace --locked --no-fail-fast -- --skip e2e_                                                  exit 0  1606 passed, 0 failed across the workspace test targets
+cargo test -p fabric --test e2e --locked                                                                       exit 0  test result: ok. 107 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 81.42s
+cargo test -p fabric --test cli_contract --locked                                                              exit 0  test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.79s
+cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths                                exit 0  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 58.09s
+RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked                                              exit 0     Generated <target>/doc/fabric/index.html and 11 other files
+cargo deny check                                                                                               exit 0  advisories ok, bans ok, licenses ok, sources ok
+scripts/check-hygiene.sh origin/main                                                                           exit 0  
+scripts/check-budget.sh origin/main                                                                            exit 0  
+scripts/check-fixtures.sh origin/main                                                                          exit 0  
+scripts/docs/gen.py --check                                                                                    exit 0  
+cargo build -p fabric --locked; scripts/docs/cli-reference.sh --check                                          exit 0      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+scripts/check-docs.sh                                                                                          exit 0  site in target/docs-site
+scripts/test-check-docs.sh                                                                                     exit 0  ok   an em dash in a rendered page
+sdk/typescript: bun install --frozen-lockfile; bun run typecheck; bun test                                     exit 0  Ran 79 tests across 7 files. [11.24s]
