@@ -1061,7 +1061,7 @@ fn e2e_a_fakes_first_run_is_its_install_and_never_a_nodes_probe() -> Fallible {
     env.install(
         "rustc",
         &format!(
-            "#!/bin/sh\necho \"${{FABRIC_TOOL_WARM:-probe}}\" >> '{}'\n{WARM_GUARD}echo 'rustc 1.97.0-fake'\n",
+            "#!/bin/sh\necho \"${{FABRIC_TOOL_WARM:-probe}}\" >> '{0}'\n{WARM_GUARD}echo body >> '{0}'\necho 'rustc 1.97.0-fake'\n",
             runs.display()
         ),
     )?;
@@ -1076,10 +1076,21 @@ fn e2e_a_fakes_first_run_is_its_install_and_never_a_nodes_probe() -> Fallible {
         Some("1"),
         "a node's probe was the fake's first run: {runs:?}"
     );
-    let probes: Vec<&str> = lines.collect();
+    // The guard ended the install run before the body: no "body" line
+    // follows the install's "1" until a probe ran.
+    assert_eq!(
+        lines.next(),
+        Some("probe"),
+        "the fake's body ran at install: {runs:?}"
+    );
+    let rest: Vec<&str> = lines.collect();
     assert!(
-        !probes.is_empty() && probes.iter().all(|run| *run == "probe"),
+        rest.iter().all(|run| *run == "probe" || *run == "body"),
         "{runs:?}"
+    );
+    assert!(
+        rest.contains(&"body"),
+        "a probe never reached the body: {runs:?}"
     );
     Ok(())
 }
