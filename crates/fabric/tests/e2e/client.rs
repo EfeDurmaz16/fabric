@@ -16,11 +16,10 @@ use tokio::net::UnixStream;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::world::{Env, Fallible, Node, Wire, finish, pair, text};
+use crate::world::{Env, Fallible, Node, Wire, finish, pair, text, write_executable};
 
 /// A started node, and a client of it.
 fn started(env: &std::sync::Arc<Env>) -> Fallible<(Node, Client)> {
@@ -366,13 +365,11 @@ fn e2e_doctor_measures_in_the_clis_environment_not_the_nodes() {
     let (node, _client) = started(&env).unwrap();
     let bin = env.root.join("cli-bin");
     std::fs::create_dir(&bin).unwrap();
-    let pnpm = bin.join("pnpm");
-    std::fs::write(
-        &pnpm,
-        "#!/bin/sh\ncase \"$1\" in\n--version) echo 9.9.9 ;;\nstore) echo \"$PNPM_HOME/store\" ;;\nesac\n",
+    write_executable(
+        &bin.join("pnpm"),
+        b"#!/bin/sh\ncase \"$1\" in\n--version) echo 9.9.9 ;;\nstore) echo \"$PNPM_HOME/store\" ;;\nesac\n",
     )
     .unwrap();
-    std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut path = env.root.clone().into_os_string();
     path.push("//cli-bin/:");
     path.push(env.path());

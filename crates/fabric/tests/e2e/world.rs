@@ -92,9 +92,9 @@ impl Env {
         let bin = root.join("bin");
         fs::create_dir_all(&home)?;
         fs::create_dir_all(&bin)?;
-        std::os::unix::fs::symlink(
+        link_executable(
             env!("CARGO_BIN_EXE_fabric-fake-agent"),
-            bin.join("fabric-fake-agent"),
+            &bin.join("fabric-fake-agent"),
         )?;
         let git = find("git").ok_or("no git on the PATH")?;
         std::os::unix::fs::symlink(&git, bin.join("git"))?;
@@ -346,11 +346,11 @@ fn node_bin(state: &Path) -> PathBuf {
 pub const WARM_GUARD: &str = "[ -z \"$FABRIC_TOOL_WARM\" ] || exit 0\n";
 
 /// Writes `contents` to `path` with mode `0755` through a short `sh`, so
-/// this process never holds the file open for writing. Linux refuses to
-/// run a file open for writing (`ETXTBSY`), and a child another test
-/// forked while this process held it open would keep it open until that
-/// child ran its own program. A temporary file renamed into place would
-/// not help: the descriptor follows the file.
+/// this process never holds the file open for writing, and runs it once
+/// (`warm`). Linux refuses to run a file open for writing (`ETXTBSY`), and
+/// a child another test forked while this process held it open would keep
+/// it open until that child ran its own program. A temporary file renamed
+/// into place would not help: the descriptor follows the file.
 pub fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
     let mut writer = Command::new("/bin/sh")
         .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
@@ -364,11 +364,47 @@ pub fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
         .ok_or("no pipe to the writer")?
         .write_all(contents)?;
     let status = writer.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("writing {} failed: {status}", path.display()).into())
+    if !status.success() {
+        return Err(format!("writing {} failed: {status}", path.display()).into());
     }
+    warm(path)
+}
+
+/// Links `link` to the executable `target` and runs it once (`warm`).
+pub fn link_executable(target: impl AsRef<Path>, link: &Path) -> Fallible {
+    std::os::unix::fs::symlink(target, link)?;
+    warm(link)
+}
+
+/// Runs the new executable `path` once, with `FABRIC_TOOL_WARM` set, so its
+/// first run is this one and never a node's probe of it.
+///
+/// macOS checks a new executable the first time it runs, and that check
+/// waits on one system service every process on the machine queues on:
+/// 6 to 14 s were measured on a loaded host. A fake first run by a node's
+/// probe, which is bounded (placement's `PROBE_BOUND`, the facts'
+/// `COMMAND_TIMEOUT`, the harness's `PROBE_TIMEOUT`), then drops the fact
+/// or the candidate with nothing wrong in the code under test. The
+/// product's bounds stay as they are; the check is paid here instead.
+///
+/// The run has an empty environment but `FABRIC_TOOL_WARM` and a system
+/// `PATH`, runs in `/`, and its exit status and output are ignored, since a
+/// fake may fail on purpose: the kernel ran the file either way. A fake
+/// with effects puts `WARM_GUARD` first, so this run ends before them. No
+/// process the test starts for the product has `FABRIC_TOOL_WARM`: they all
+/// start from `Env::command`, which clears the environment.
+fn warm(path: &Path) -> Fallible {
+    Command::new(path)
+        .env_clear()
+        .env("FABRIC_TOOL_WARM", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("{} did not run once: {e}", path.display()))?;
+    Ok(())
 }
 
 fn find(program: &str) -> Option<PathBuf> {
@@ -1010,4 +1046,40 @@ fn a_killed_command_whose_child_keeps_its_pipes_fails_in_time() {
         "{:?}",
         started.elapsed()
     );
+}
+
+/// A fake's first run is its run at install, never a node's probe of it:
+/// a probe is bounded, and a first run that waited on macOS's check of a
+/// new executable outlasted the bound on a loaded host, so placement found
+/// no node that answered and the job parked. The probe's runs come later
+/// and never see `FABRIC_TOOL_WARM`, and the guard keeps the fake's body
+/// from the run at install.
+#[test]
+fn e2e_a_fakes_first_run_is_its_install_and_never_a_nodes_probe() -> Fallible {
+    let env = Env::new()?;
+    let runs = env.root.join("rustc-runs");
+    env.install(
+        "rustc",
+        &format!(
+            "#!/bin/sh\necho \"${{FABRIC_TOOL_WARM:-probe}}\" >> '{}'\n{WARM_GUARD}echo 'rustc 1.97.0-fake'\n",
+            runs.display()
+        ),
+    )?;
+    let mut node = Node::new(&env, "a", Wire::Quic)?;
+    node.start(None)?;
+    let printed = node.ok(&["doctor"])?;
+    assert!(printed.contains("rustc 1.97.0-fake"), "{printed}");
+    let runs = fs::read_to_string(&runs)?;
+    let mut lines = runs.lines();
+    assert_eq!(
+        lines.next(),
+        Some("1"),
+        "a node's probe was the fake's first run: {runs:?}"
+    );
+    let probes: Vec<&str> = lines.collect();
+    assert!(
+        !probes.is_empty() && probes.iter().all(|run| *run == "probe"),
+        "{runs:?}"
+    );
+    Ok(())
 }
