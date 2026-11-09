@@ -22,6 +22,7 @@ const DECOY: &str = "6f1d2c3b-0000-4000-8000-000000000001";
 /// `--version` with 0.67.0, or what `gemini-version` in the node's state
 /// directory says, and writes its arguments to `~/gemini-args`.
 const FAKE: &str = r#"#!/bin/sh
+[ -z "$FABRIC_TOOL_WARM" ] || exit 0
 version=0.67.0
 [ ! -f "$FABRIC_HOME/gemini-version" ] || version=$(cat "$FABRIC_HOME/gemini-version")
 if [ "$1" = --version ]; then echo "$version"; exit 0; fi

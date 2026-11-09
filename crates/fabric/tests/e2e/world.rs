@@ -137,8 +137,9 @@ impl Env {
     pub fn install_fake_claude(&self) -> Fallible {
         self.install(
             "claude",
-            "#!/bin/sh\n\
-             if [ \"$1\" = --version ]; then echo '2.1.294 (Claude Code)'; exit 0; fi\n\
+            &format!(
+                "#!/bin/sh\n{WARM_GUARD}{}",
+                "if [ \"$1\" = --version ]; then echo '2.1.294 (Claude Code)'; exit 0; fi\n\
              printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n\
              env > \"$HOME/claude-env\"\n\
              headless=; session=; prompt=\n\
@@ -156,6 +157,7 @@ impl Env {
              printf '{\"type\":\"user\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
              printf '{\"type\":\"assistant\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5-5\"}}\\n' \"$session\" >> \"$dir/$session.jsonl\"\n\
              printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"claude did: %s\",\"session_id\":\"%s\"}\\n' \"$prompt\" \"$session\"\n",
+            ),
         )
     }
 
@@ -200,6 +202,7 @@ impl Env {
             "codex",
             &format!(
                 "#!/bin/sh\n\
+                 {WARM_GUARD}\
                  version=0.155.1\n\
                  [ ! -f \"$FABRIC_HOME/codex-version\" ] || version=$(cat \"$FABRIC_HOME/codex-version\")\n\
                  [ ! -f .tool-versions ] || version=$(sed -n 's/^codex //p' .tool-versions)\n\
@@ -337,6 +340,10 @@ fn node_bin(state: &Path) -> PathBuf {
     name.push(".bin");
     state.with_file_name(name)
 }
+
+/// The line a fake with effects puts first after its `#!/bin/sh`: it ends
+/// the run at install (`warm`) before the fake does anything.
+pub const WARM_GUARD: &str = "[ -z \"$FABRIC_TOOL_WARM\" ] || exit 0\n";
 
 /// Writes `contents` to `path` with mode `0755` through a short `sh`, so
 /// this process never holds the file open for writing. Linux refuses to

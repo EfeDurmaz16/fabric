@@ -1,4 +1,5 @@
 #!/bin/sh
+[ -z "$FABRIC_TOOL_WARM" ] || exit 0
 # A fake pi 0.80.3 for the adapter's tests. It keeps pi's agent directory,
 # ${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}, with an auth.json that holds a
 # fake key and must never travel, and one v3 JSONL file per session under

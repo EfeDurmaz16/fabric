@@ -26,6 +26,7 @@ fn chat(n: u32) -> String {
 /// `sleep` closes that descriptor, so the store is held by the fake alone
 /// and is free once [`Holder`] has killed and reaped it.
 const FAKE: &str = r#"#!/bin/sh
+[ -z "$FABRIC_TOOL_WARM" ] || exit 0
 if [ "$1" = --version ]; then echo 2026.10.01-e373342; exit 0; fi
 printf '%s\n' "$@" > "$HOME/cursor-agent-args"
 resume=; prompt=; ended=

@@ -10,7 +10,7 @@ use std::io::{BufRead, Read};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::world::{Env, Fallible, Node, Wire, finish, text, wait_for};
+use crate::world::{Env, Fallible, Node, WARM_GUARD, Wire, finish, text, wait_for};
 
 /// A parent-session marker the CLI runs under, which no harness may inherit (ADR 0015).
 const MARKER: (&str, &str) = ("CODEX_THREAD_ID", "a-parent-thread");
@@ -249,6 +249,7 @@ fn e2e_a_pull_asks_the_guards_version_while_the_node_places_the_session() -> Fal
         "lsof",
         &format!(
             "#!/bin/sh\n\
+             {WARM_GUARD}\
              i=0\n\
              while [ ! -f '{asked}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\n\
              if [ -f '{asked}' ]; then echo together >> '{log}'; else echo alone >> '{log}'; fi\n\
