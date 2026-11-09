@@ -1016,6 +1016,7 @@ async fn the_launch_path_messages_reach_the_service_and_are_answered() -> TestRe
         .heartbeat(
             Heartbeat {
                 attempts: vec![token],
+                running: true,
             },
             DEADLINE,
         )
@@ -1036,6 +1037,7 @@ async fn the_launch_path_messages_reach_the_service_and_are_answered() -> TestRe
     );
     let over = Heartbeat {
         attempts: vec![token; MAX_HEARTBEAT_ATTEMPTS + 1],
+        running: true,
     };
     assert!(matches!(
         session.heartbeat(over, DEADLINE).await,

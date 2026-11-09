@@ -948,6 +948,7 @@ impl Runner {
                         taken.from,
                         Heartbeat {
                             attempts: vec![taken.token],
+                            running: false,
                         },
                     )
                     .await;
@@ -1012,6 +1013,7 @@ async fn heartbeat_loop(
                 to,
                 Heartbeat {
                     attempts: vec![token],
+                    running: true,
                 },
             )
             .await
@@ -1781,7 +1783,8 @@ mod tests {
     struct FakeHost {
         script: StdMutex<Script>,
         reports: StdMutex<Vec<Observation>>,
-        /// What happened, in order: `report`, `link-fail`, `heartbeat`.
+        /// What happened, in order: `report`, `link-fail`, `heartbeat`,
+        /// `presentation` (a heartbeat that does not run its grants).
         log: StdMutex<Vec<&'static str>>,
         harness_pids: StdMutex<Vec<u32>>,
         /// Whether the last harness ran when each cut was reported.
@@ -1873,7 +1876,11 @@ mod tests {
             beat: Heartbeat,
         ) -> BoxFuture<'_, Result<HeartbeatAnswer, String>> {
             Box::pin(async move {
-                self.log.lock().unwrap().push("heartbeat");
+                self.log.lock().unwrap().push(if beat.running {
+                    "heartbeat"
+                } else {
+                    "presentation"
+                });
                 let script = self.script.lock().unwrap();
                 let verdict = script.verdict.clone().unwrap_or(FenceVerdict::Live);
                 Ok(HeartbeatAnswer {
@@ -2374,6 +2381,11 @@ mod tests {
             b.host.harness_pids.lock().unwrap().is_empty(),
             "nothing resumed"
         );
+        // Presented as not running, so the authority never takes it as
+        // presence (review finding on PR #39).
+        let log = b.host.log.lock().unwrap().clone();
+        assert!(log.contains(&"presentation"), "{log:?}");
+        assert!(!log.contains(&"heartbeat"), "{log:?}");
         assert!(!names(&b.host).contains(&"report"), "nothing reported");
         // The markers say so on disk, and a second start presents nothing.
         let marker: Taken = local::read(

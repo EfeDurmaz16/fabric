@@ -1046,9 +1046,9 @@ fn presence_of(
     wrote
 }
 
-/// Answers a heartbeat: each token from the node its attempt was granted
-/// to is presence (`presence_of`), then every token gets its fence verdict
-/// from the projection. No other write.
+/// Answers a heartbeat: each token of a running heartbeat from the node
+/// its attempt was granted to is presence (`presence_of`), then every
+/// token gets its fence verdict from the projection. No other write.
 fn heartbeat(
     place: &Place,
     holder: &mut Holder,
@@ -1071,7 +1071,11 @@ fn heartbeat(
     };
     let mut verdicts = Vec::with_capacity(beat.attempts.len());
     for token in &beat.attempts {
-        *wrote |= presence_of(place, journal, presence, from, token);
+        // A presentation after a restart names grants the node no longer
+        // runs: it is answered, never taken as presence.
+        if beat.running {
+            *wrote |= presence_of(place, journal, presence, from, token);
+        }
         let state = journal.job(token.job)?;
         verdicts.push((token.attempt, fence(state.as_ref(), token, Some(from))));
     }

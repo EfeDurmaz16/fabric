@@ -586,10 +586,18 @@ impl Report {
 /// A node's heartbeat: every grant it runs, so the authority sees it is
 /// alive and the node learns which grants still stand. Sent every
 /// `HEARTBEAT_MS` while the node runs an attempt; never a journal write.
+/// The same message, with `running` false, is a restarted node's
+/// presentation of the grants it had taken: it asks for their verdicts
+/// and is never presence (ADR 0028).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heartbeat {
-    /// The grants the node runs; at most `MAX_HEARTBEAT_ATTEMPTS`.
+    /// The grants the node names; at most `MAX_HEARTBEAT_ATTEMPTS`.
     pub attempts: Vec<GrantToken>,
+    /// Whether the node runs these grants now. Only a heartbeat that runs
+    /// them is presence; a node that stopped what was left of them after
+    /// a restart (`Executor::recover`) says false, so the authority never
+    /// takes the presentation as the attempt coming back.
+    pub running: bool,
 }
 
 /// How often a node heartbeats while it runs an attempt: the interval

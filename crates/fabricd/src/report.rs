@@ -86,6 +86,7 @@ pub(crate) async fn heartbeat(
             .take(MAX_HEARTBEAT_ATTEMPTS)
             .copied()
             .collect(),
+        running: beat.running,
     };
     match authority.heartbeat(sender, beat).await {
         Ok(answer) => answer,
@@ -115,14 +116,20 @@ impl Node {
     }
 
     /// `heartbeat` for a heartbeat from `from` (`None` is this node). Each
-    /// live grant's job has its unacknowledged captures verified again, so
-    /// a fetch that found the runner unreachable is retried once it is back.
+    /// live grant's job of a running heartbeat has its unacknowledged
+    /// captures verified again, so a fetch that found the runner
+    /// unreachable is retried once it is back.
     pub(crate) async fn accept_heartbeat(
         &self,
         from: Option<NodeId>,
         beat: &Heartbeat,
     ) -> HeartbeatAnswer {
         let answer = heartbeat(&self.authority, self.id, from, beat).await;
+        if !beat.running {
+            // A presentation: the node runs nothing of these grants, so
+            // nothing of theirs can be fetched from it on its word.
+            return answer;
+        }
         let mut jobs: Vec<_> = beat
             .attempts
             .iter()
@@ -352,6 +359,7 @@ mod tests {
         };
         let beat = Heartbeat {
             attempts: vec![live, stranger],
+            running: true,
         };
         let answer = heartbeat(&world.authority, OWN, Some(REMOTE), &beat).await;
         assert_eq!(
@@ -417,6 +425,7 @@ mod tests {
             Some(REMOTE),
             &Heartbeat {
                 attempts: vec![token],
+                running: true,
             },
         )
         .await;

@@ -1506,8 +1506,9 @@ mod tests {
             (grant(), instruction())
                 .prop_map(|(token, instruction)| RequestBody::Instruct { token, instruction }),
             report().prop_map(|report| RequestBody::Report(Box::new(report))),
-            vec(grant(), 0..=MAX_HEARTBEAT_ATTEMPTS)
-                .prop_map(|attempts| RequestBody::Heartbeat(Heartbeat { attempts })),
+            (vec(grant(), 0..=MAX_HEARTBEAT_ATTEMPTS), any::<bool>()).prop_map(
+                |(attempts, running)| { RequestBody::Heartbeat(Heartbeat { attempts, running }) }
+            ),
         ]
     }
 
@@ -2206,11 +2207,13 @@ mod tests {
         // with the fence's own verdict: one heartbeat type, one verdict type.
         let beat = RequestBody::Heartbeat(Heartbeat {
             attempts: vec![token; 2],
+            running: true,
         });
         let bytes = encode(&beat).unwrap();
         assert_eq!(decode::<RequestBody>(&bytes).unwrap(), beat);
         let over = RequestBody::Heartbeat(Heartbeat {
             attempts: vec![token; MAX_HEARTBEAT_ATTEMPTS + 1],
+            running: true,
         });
         assert!(matches!(
             over.check_bounds(),

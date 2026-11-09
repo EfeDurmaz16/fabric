@@ -424,6 +424,7 @@ async fn running_on_runner(authority: &Authority, recovery: RecoveryPolicy) -> (
 fn beat(token: GrantToken) -> Heartbeat {
     Heartbeat {
         attempts: vec![token],
+        running: true,
     }
 }
 
@@ -913,6 +914,39 @@ async fn an_attempt_unknown_at_a_restart_comes_back_on_its_heartbeat_and_still_r
     let s = authority.job(job).await.unwrap().unwrap();
     assert_eq!(s.job.generation.get(), 2);
     assert_eq!(s.attempts[1].resource, ResourceRef::Node { node: NODE });
+}
+
+/// Review finding on PR #39: a restarted runner presents the grants it
+/// had taken after it stopped what was left of them, and the authority
+/// took that presentation as presence, so an `unknown` attempt whose
+/// harness the runner had just killed came back `running` and its
+/// recovery waited a full silence more. A presentation is answered and
+/// changes nothing; only a heartbeat from a runner that runs the grant
+/// brings it back.
+#[tokio::test]
+async fn a_restarted_runner_s_presentation_is_answered_and_never_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::Block).await;
+    authority
+        .tick(mono_ms() + UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    let before = revision(&authority, job).await;
+    let presented = Heartbeat {
+        attempts: vec![token],
+        running: false,
+    };
+    let answer = authority.heartbeat(RUNNER, presented).await.unwrap();
+    assert_eq!(answer.verdicts.len(), 1);
+    assert_ne!(answer.verdicts[0].1, FenceVerdict::Live, "{answer:?}");
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    assert_eq!(revision(&authority, job).await, before, "nothing recorded");
+    let answer = authority.heartbeat(RUNNER, beat(token)).await.unwrap();
+    assert_eq!(answer.verdicts, vec![(token.attempt, FenceVerdict::Live)]);
+    assert_eq!(status(&authority, token).await, AttemptStatus::Running);
 }
 
 /// A covered write from the node an `unknown` attempt was granted to is
