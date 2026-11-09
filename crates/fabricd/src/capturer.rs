@@ -489,14 +489,10 @@ mod tests {
         std::fs::write(&memory, "# memory\n").unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let claude = bin.join("claude");
-        std::fs::write(
-            &claude,
+        crate::fake_tool::write(
+            &bin.join("claude"),
             "#!/bin/sh\n[ \"$1\" = --version ] && echo \"2.1.294 (Claude Code)\"\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        );
         let home_abs = AbsPath::parse(home.to_str().unwrap()).unwrap();
         let adapter = {
             let home = home_abs.clone();

@@ -1710,13 +1710,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let pnpm = bin.join("pnpm");
-        std::fs::write(
-            &pnpm,
+        crate::fake_tool::write(
+            &bin.join("pnpm"),
             "#!/bin/sh\ncase \"$1\" in\n--version) echo 9.9.9 ;;\nstore) echo \"${PNPM_HOME:-unset}/store\" ;;\nesac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let path = vec![
             PathDir::parse(bin.to_str().unwrap()).unwrap(),
             PathDir::parse("/usr/bin").unwrap(),

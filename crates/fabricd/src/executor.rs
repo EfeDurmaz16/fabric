@@ -2059,7 +2059,6 @@ mod tests {
     /// for the stuck process.
     #[tokio::test]
     async fn a_group_that_outlives_sigkill_keeps_its_record() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let mut child = tokio::process::Command::new("sleep")
             .arg("30")
@@ -2068,8 +2067,7 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         let ps = dir.path().join("ps");
-        std::fs::write(&ps, format!("#!/bin/sh\necho '{pid} {pid} S'\n")).unwrap();
-        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_tool::write(&ps, &format!("#!/bin/sh\necho '{pid} {pid} S'\n"));
         let ps = ps.to_str().unwrap();
         let attempt = AttemptId::from_bytes([7; 16]);
         let record = LaunchRecord {

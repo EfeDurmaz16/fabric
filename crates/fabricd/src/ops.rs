@@ -4525,16 +4525,7 @@ pub(crate) mod tests {
     fn locking_codex(dir: &Path) -> ToolEnv {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let status = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                r#"printf '#!/bin/sh\necho codex-cli 0.155.1\n' > "$1/codex" && chmod 755 "$1/codex""#,
-                "sh",
-            ])
-            .arg(&bin)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        crate::fake_tool::write(&bin.join("codex"), "#!/bin/sh\necho codex-cli 0.155.1\n");
         on_path(
             &std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
                 .unwrap(),
@@ -4911,7 +4902,6 @@ pub(crate) mod tests {
     /// a node that restores the snapshot.
     #[tokio::test]
     async fn a_capture_raises_the_known_writer_to_the_version_it_records() {
-        use std::os::unix::fs::PermissionsExt;
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
         let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
@@ -4927,9 +4917,7 @@ pub(crate) mod tests {
         .unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let codex = bin.join("codex");
-        std::fs::write(&codex, "#!/bin/sh\necho 'codex-cli 0.160.0'\n").unwrap();
-        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_tool::write(&bin.join("codex"), "#!/bin/sh\necho 'codex-cli 0.160.0'\n");
         let mut path = bin.into_os_string();
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
@@ -6667,8 +6655,6 @@ pub(crate) mod tests {
     /// sent: here a `rustc` and a `CARGO_HOME` only that environment names.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_capture_for_a_peers_pull_measures_in_the_environment_a_client_sent() {
-        use std::os::unix::fs::PermissionsExt;
-
         use fabric_client::api::{PathDir, Roots, SystemPath};
         use fabric_core::path::AbsPath;
         use fabric_core::snapshot::CarryKey;
@@ -6688,19 +6674,7 @@ pub(crate) mod tests {
         std::fs::write(root.join("target").join("built"), "bytes\n").unwrap();
         let bin = dir_a.path().join("shell-bin");
         std::fs::create_dir(&bin).unwrap();
-        let rustc = bin.join("rustc");
-        std::fs::write(&rustc, "#!/bin/sh\necho rustc 1.0.0-shell\n").unwrap();
-        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // macOS checks a new executable the first time it runs; on a
-        // loaded machine that first run outlasted `COMMAND_TIMEOUT` inside
-        // the measure and the key came back `Unmeasured` (the M6 gate run).
-        // The check is paid here, as `CountingTools` pays it at install.
-        assert!(
-            std::process::Command::new(&rustc)
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::fake_tool::write(&bin.join("rustc"), "#!/bin/sh\necho rustc 1.0.0-shell\n");
         a.remember_env(&ClientEnv {
             path: vec![
                 PathDir::parse(bin.to_str().unwrap()).unwrap(),
@@ -6753,8 +6727,6 @@ pub(crate) mod tests {
     /// a link, and keeps the rest of the shell's environment.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_peer_never_has_the_node_run_a_program_from_a_workspace() {
-        use std::os::unix::fs::PermissionsExt;
-
         use fabric_client::api::{PathDir, Roots, SystemPath};
 
         let (dir_a, a) = node();
@@ -6767,9 +6739,12 @@ pub(crate) mod tests {
         let ran = dir_a.path().join("ran");
         for program in ["python3", "node", "rustc", "pnpm"] {
             let path = venv.join(program);
-            let script = format!("#!/bin/sh\necho \"$0\" >> '{}'\n", ran.display());
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let script = format!(
+                "#!/bin/sh\n{}echo \"$0\" >> '{}'\n",
+                crate::fake_tool::WARM_GUARD,
+                ran.display()
+            );
+            crate::fake_tool::write(&path, &script);
         }
         let linked = dir_a.path().join("linked");
         std::os::unix::fs::symlink(&root, &linked).unwrap();
