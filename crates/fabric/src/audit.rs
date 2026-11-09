@@ -15,7 +15,8 @@ use serde_json::json;
 
 use crate::contract;
 
-/// `fabric inspect`.
+// The arguments of `fabric inspect`. A plain comment: the command defers
+// its arguments, so a doc comment here would replace its summary.
 #[derive(Debug, Args)]
 pub(crate) struct InspectArgs {
     /// The managed job.
@@ -28,6 +29,7 @@ pub(crate) struct InspectArgs {
 
 /// `fabric audit`.
 #[derive(Debug, Subcommand)]
+#[command(defer = true)]
 pub(crate) enum AuditCommand {
     /// Export the journal's operations, events, evidence and provider
     /// operations as JSON lines, oldest first; `--json` wraps them as

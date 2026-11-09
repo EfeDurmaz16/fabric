@@ -704,3 +704,39 @@ Release builds of the anchor `176622e`, of main `b5debf2` and of this branch, on
 The footprint is under the anchor's on both. `--version` still allocates more than the anchor, whose tree had fewer commands and whose clap answered `--version` itself: 271 of the 442 build `Cli::command()`, about 80 are the parse that stops at the missing command, and 73 the lenient pass that finds `--version` in it.
 
 `footprint::version_allocates_under_its_budget` (e2e) loads the counter library into a test build's `fabric --version` and holds it to 1600 allocations and 600 KB. The test build made 466 of 145 KB on the tree the fix was written on, and 825 of 303 KB once main's M5 managed commands joined the tree; with the old parse it made 1948 of 784 KB and the test failed. The budget sits at about twice the current count and under the old parse's, so it still catches a return of the double build. It runs on macOS where `cc` builds the library, and elsewhere passes with a note that it counted nothing: on Linux CI the perf job's footprint table is the only check.
+
+## CLI start, lazy command tree
+
+What: the perf job still had every CLI op at 1.01 to 1.04 of the anchor's peak physical footprint after the fix above (family ratio 1.014). The tree had grown to 45 commands with the M5 managed and facade commands, and `Cli::command()` built all of them with every argument on every run: 618 allocations of 268 KB for `fabric --version`, each summary and help line a heap string. The freed pages stay dirty, so every op carried about 200 KiB of small-zone memory whatever it did next.
+
+The fix (`fix/cli-start-footprint`):
+
+- Every `Subcommand` enum of the CLI defers its commands' arguments (`#[command(defer = true)]`): a command below the root is a name and a summary until a parse enters it. The argument structs a command flattens carry plain comments, since clap would make a doc comment the summary of that command once its arguments are deferred.
+- `parsing_command(argv)` puts `--help` and the global options only on the commands the words name: from the root, the first word that is not an option names the next command. A parse that enters another command finds no global option there, so it can only refuse more than the whole tree does; a refusal starts again on the whole tree. The global options are flags with no default (`Set`, no values, `true` when given), so a parse records only the flags given instead of a `false` for every flag of every command it enters.
+- The whole tree, `command()`, gets the global options on every command before `build()`, then the help layout in place.
+- `--version` given with global options alone reads them from the words, with no second parse. `Modes` tests standard input with `isatty` instead of `std::io::stdin()`, whose first use allocates an 8 KiB buffer. A run keeps the argument vector `main` owns and only whether its command takes `--force`.
+
+Builds, all release on the M5 Pro: the anchor `176622e` (the build `scripts/bench-ab.sh` caches for it) and this branch are `cargo test -p fabric --test e2e --locked --no-run --release` (the fixture features on, as the perf job builds); main `1c933fd` is `cargo build -p fabric --release --locked --features counted-tools,faults,fixtures`. The two commands can give binaries a few bytes apart, since the dev-dependency features unify into the binary under `cargo test`, and the counts below do not move with it.
+
+Allocations and bytes are this branch's `scripts/perf-ab/counters.c` loaded with `DYLD_INSERT_LIBRARIES` (`mallocs`, `malloc_bytes`); the library counts only a program named `fabric`. The counted footprint is the same library as pull request #43's perf job carries it (`scripts/perf-ab/counters.c` on `pr15/perf-in-ci`, word `W_PHYS_FOOTPRINT`, `ri_lifetime_max_phys_footprint`), which this branch does not have. Every op ran three times with `FABRIC_HOME` an empty mode-700 directory under `/tmp`; bytes move with the length of that path. `--version` and `job --help` allocate the same in every run; `job ls` starts a runtime whose worker threads race, so its allocations move by a few (anchor 439 to 446, fix 352 to 353) and the counted footprint moves by 16 to 96 KiB on every op. The table gives the median of three. `time -l` is `/usr/bin/time -l`'s peak memory footprint, the median of 5. `fabric job ls` ran with no node and `TOKIO_WORKER_THREADS=3` for the anchor, as in CI, so it parses, connects, fails with exit 80 and prints the failure.
+
+| op | anchor `176622e` | main `1c933fd` | fix | fix / anchor |
+|---|---:|---:|---:|---:|
+| `--version` allocations | 189 | 801 | 125 | 0.66 |
+| `--version` bytes allocated | 87,663 | 300,886 | 79,707 | 0.91 |
+| `--version` footprint, counted | 2080 KiB | 2160 KiB | 1920 KiB | 0.92 |
+| `--version` footprint, `time -l` | 1744 KiB | 1856 KiB | 1584 KiB | 0.91 |
+| `job ls` allocations | 439 | 1071 | 352 | 0.80 |
+| `job ls` bytes allocated | 204,462 | 425,227 | 200,124 | 0.98 |
+| `job ls` footprint, counted | 2304 KiB | 2384 KiB | 2144 KiB | 0.93 |
+| `job ls` footprint, `time -l` | 1968 KiB | 2048 KiB | 1808 KiB | 0.92 |
+| `job --help` allocations | 360 | 4602 | 4366 | 12.1 |
+| `job --help` footprint, counted | 2096 KiB | 3680 KiB | 3088 KiB | 1.47 |
+
+The binary (its size on disk) is 18,959,040 bytes against main's 18,965,008 and the anchor's 19,773,920; no Cargo profile changed.
+
+Help and usage errors still build the whole decorated tree and stay well above the anchor (`job --help` about 1.5 times its footprint); they are better than main's, and the start of every other op no longer pays for them.
+
+`footprint::version_allocates_under_its_budget` now holds the test build's `fabric --version` to 300 allocations and 170,000 bytes, about twice the 147 of 81,121 it makes. Main's eager tree makes 825 of 303,274 there and fails it. The budget does not see one enum going eager again: the root enum without `defer` makes 173. `contract::tests::the_parsing_tree_builds_only_the_named_path` does: it fails when any command off the path the words name has its arguments built, and it found the `help` command's argument built on every run, now deferred too.
+
+After main's `fabric gc` (pull request #48) merged in, the same builds and counts give: `--version` 129 allocations of 91,688 bytes, counted footprint 1936 KiB; `job ls` 356 allocations of 213,824 bytes, counted footprint 2144 to 2176 KiB; the binary 19,762,544 bytes. Allocations and footprint stay under the anchor's on both ops; bytes allocated are now above it (1.05 on `--version`, 1.04 on `job ls`). Most of the new bytes are one allocation: `gc` makes the root's ninth command with `help`, so the vector of root commands grows from 8 slots to 16 (11,392 bytes, against 2400 before). The binary is 11 KB under the anchor's, where it was 815 KB under before `gc`.
