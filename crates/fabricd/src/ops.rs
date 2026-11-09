@@ -4483,16 +4483,7 @@ pub(crate) mod tests {
     fn locking_codex(dir: &Path) -> ToolEnv {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let status = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                r#"printf '#!/bin/sh\necho codex-cli 0.155.1\n' > "$1/codex" && chmod 755 "$1/codex""#,
-                "sh",
-            ])
-            .arg(&bin)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        crate::fake_tool::write(&bin.join("codex"), "#!/bin/sh\necho codex-cli 0.155.1\n");
         on_path(
             &std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
                 .unwrap(),
