@@ -290,17 +290,58 @@ impl Shared {
     /// Stops waiting on `id` because its caller did: nothing will settle
     /// the operation, so a request is also due to be recorded `unknown`,
     /// as one whose deadline passed, by the next call handed the log.
-    fn give_up(&self, id: &str) {
-        self.stop_waiting(id, true);
+    ///
+    /// A `dispatched` request whose waiter is gone already, because its
+    /// answer or the worker's loss came before the caller dropped it, is
+    /// due the same: what came sits unread in `rx`, and nothing else will
+    /// settle the operation. Each locator `rx` holds is kept for the log,
+    /// as a late answer's is.
+    fn give_up(
+        &self,
+        id: &str,
+        operation: OperationId,
+        dispatched: bool,
+        rx: &mut mpsc::Receiver<Incoming>,
+    ) {
+        let mut state = self.lock();
+        let request = match state.waiters.get(id) {
+            Some(waiter) => waiter.kind == Kind::Request,
+            None => dispatched,
+        };
+        if !Self::stop(&mut state, id, true) && dispatched {
+            state.dropped.push(operation);
+        }
+        if !request {
+            return;
+        }
+        while let Ok(incoming) = rx.try_recv() {
+            let resource = match incoming {
+                Incoming::Progress(resource) => Some(resource),
+                Incoming::Answer(message) => match *message {
+                    ToFabric::Result(r) => Some(r.resource),
+                    ToFabric::Error(e) => e.error.resource,
+                    _ => None,
+                },
+                Incoming::Lost(_) => None,
+            };
+            if let Some(resource) = resource {
+                keep_found(&mut state, operation, resource);
+            }
+        }
     }
 
     fn stop_waiting(&self, id: &str, by_caller: bool) {
-        let mut state = self.lock();
+        Self::stop(&mut self.lock(), id, by_caller);
+    }
+
+    /// `stop_waiting` under a lock the caller holds; whether `id` had a
+    /// waiter.
+    fn stop(state: &mut State, id: &str, by_caller: bool) -> bool {
         let Some(waiter) = state.waiters.remove(id) else {
-            return;
+            return false;
         };
         let (Kind::Request, Some(operation)) = (waiter.kind, waiter.operation) else {
-            return;
+            return true;
         };
         if state.expired.len() == EXPIRED {
             state.expired.pop_front();
@@ -313,6 +354,7 @@ impl Shared {
         if by_caller {
             state.dropped.push(operation);
         }
+        true
     }
 
     /// Whether a request of `operation` is in flight here, not yet
@@ -1004,6 +1046,7 @@ impl Bridge {
             rx,
             deadline: Instant::now() + wait,
             shared: Arc::clone(&self.shared),
+            dispatched: false,
             done: false,
         };
         let shared = Arc::clone(&self.shared);
@@ -1044,6 +1087,7 @@ impl Bridge {
             }
         });
         flight.deadline = begun.await??;
+        flight.dispatched = true;
         Ok(flight)
     }
 
@@ -1124,6 +1168,7 @@ impl Bridge {
             rx,
             deadline,
             shared: Arc::clone(&self.shared),
+            dispatched: false,
             done: false,
         })
     }
@@ -1212,6 +1257,7 @@ impl Bridge {
             rx,
             deadline,
             shared: Arc::clone(&self.shared),
+            dispatched: false,
             done: false,
         })
     }
@@ -1535,13 +1581,22 @@ pub struct InFlight {
     rx: mpsc::Receiver<Incoming>,
     deadline: Instant,
     shared: Arc<Shared>,
+    /// Whether its operation is recorded `dispatched` and its frame
+    /// queued: from then on only this settles it, or, dropped unsettled,
+    /// the next call handed the log.
+    dispatched: bool,
     done: bool,
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.done {
-            self.shared.give_up(&self.request_id);
+            self.shared.give_up(
+                &self.request_id,
+                self.operation,
+                self.dispatched,
+                &mut self.rx,
+            );
             if self.kind == Kind::Request {
                 self.shared.lock().open.remove(&self.operation);
             }
@@ -2100,12 +2155,18 @@ fn late(state: &mut State, id: &str, message: &ToFabric) -> Result<(), String> {
             state.expired.remove(at);
         }
     }
-    if let Some(resource) = resource
-        && (state.found.len() < EXPIRED || state.found.contains_key(&operation))
-    {
-        state.found.insert(operation, resource.clone());
+    if let Some(resource) = resource {
+        keep_found(state, operation, resource.clone());
     }
     Ok(())
+}
+
+/// Keeps `resource` as the locator `operation` is to be recorded with,
+/// unless `EXPIRED` operations wait on theirs already.
+fn keep_found(state: &mut State, operation: OperationId, resource: Locator) {
+    if state.found.len() < EXPIRED || state.found.contains_key(&operation) {
+        state.found.insert(operation, resource);
+    }
 }
 
 /// Keeps the first `cap` bytes the worker writes to stderr and drops the rest.

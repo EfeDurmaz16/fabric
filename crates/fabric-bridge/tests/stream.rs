@@ -452,6 +452,88 @@ async fn a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lo
     let _reader = script.await.unwrap();
 }
 
+/// A create in flight, the worker lost with it, and only then its caller
+/// gone: the loss is published before the caller drops the request, the
+/// order the test above leaves to the scheduler. `answer` is what the
+/// worker writes before it closes its output, if anything. Returns the
+/// operation's entry once the next call handed the log recorded it.
+async fn dropped_after_loss(answer: Option<fn(&Value) -> Value>) -> Entry {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let request = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(request["type"], "request", "{request}");
+        if let Some(answer) = answer {
+            let frame = frames::encode(&answer(&request), 1 << 20).unwrap();
+            frames::write(&mut writer, &frame).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        reader
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let held = bridge
+        .request(&mut log, create(1, "fixture/ok"))
+        .await
+        .unwrap();
+    // The reader routes the answer, if any, then reads the end of the
+    // output and publishes the loss: `lost` is set once both are done.
+    let started = std::time::Instant::now();
+    while bridge.lost().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the worker was never lost"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(held);
+    bridge.record_late(&mut log).await.unwrap();
+    let _reader = script.await.unwrap();
+    log.entry(OperationId::from_bytes([1; 16]))
+        .unwrap()
+        .unwrap()
+}
+
+/// The loss reached the request before its caller dropped it, so no
+/// waiter is left for the drop to find; the request is `unknown` all the
+/// same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_dropped_after_the_worker_was_lost_is_unknown() {
+    let entry = dropped_after_loss(None).await;
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    assert_eq!(entry.locator, None);
+}
+
+/// The answer reached the request, then the worker was lost, then its
+/// caller dropped it unread: it is `unknown`, as a request dropped before
+/// its answer, with the locator that answer named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_dropped_with_its_answer_unread_is_unknown_with_its_locator() {
+    fn answer(request: &Value) -> Value {
+        completed(
+            request,
+            &json!({
+                "provider": "fixture",
+                "scope": {"account": "acct-a", "project": "proj-1"},
+                "kind": "sandbox",
+                "native_id": "fx-unread",
+            }),
+            &json!({"status": "ready"}),
+        )
+    }
+    let entry = dropped_after_loss(Some(answer)).await;
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    let locator: Value = serde_json::from_str(&entry.locator.unwrap().text).unwrap();
+    assert_eq!(locator["native_id"], "fx-unread");
+}
+
 /// A worker that answers the handshake, then reads every frame until its
 /// input closes and answers none of them but a `shutdown`. That one it
 /// answers once the test lets it exit: an empty `shutdown_ack`, then the
