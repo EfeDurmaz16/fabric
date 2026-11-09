@@ -41,14 +41,18 @@ The resource names `service.name` `fabricd`, `service.version` and `service.inst
 
 | Op (`fabric.op`) | When |
 | --- | --- |
-| `managed.create_job`, `managed.start_attempt`, `managed.register_task`, `managed.finish_task`, `managed.cancel_job`, `managed.cancel_task`, `managed.record_note`, `managed.checkpoint`, `managed.continue` | The authority accepted, replayed or refused a command. |
+| `managed.create_job`, `managed.start_attempt`, `managed.register_task`, `managed.finish_task`, `managed.cancel_job`, `managed.cancel_task`, `managed.record_note`, `managed.checkpoint`, `managed.continue`, `managed.supersede`, `managed.recover` | The authority accepted, replayed or refused a command. `managed.recover` is also the authority's own automatic recover (ADR 0028), its derived key as a digest like any other. |
 | `managed.command` | A checkpoint or continue the journal refused before its kind was derived. |
-| `observe.started`, `observe.checkpointed`, `observe.receipts`, `observe.handoff_blocked`, `observe.placed`, `observe.continued`, `observe.exited`, `observe.lost`, `observe.unknown` | The authority recorded an observation: a report, a placement, a recovery. |
+| `observe.started`, `observe.checkpointed`, `observe.receipts`, `observe.handoff_blocked`, `observe.placed`, `observe.continued`, `observe.exited`, `observe.lost`, `observe.unknown`, `observe.captured` | The authority recorded an observation, or its fence refused a report: a report, a placement (a recover's failover placement is `observe.placed` in the recover's trace), a recovery. A report the fence refuses is `refused` with the verdict's name, such as `superseded`. |
+| `observe.resource_unavailable`, `observe.resource_reachable` | The authority's own observation of an attempt that went silent, or came back on a heartbeat or a covered write (ADR 0028). |
+| `recovery.blocked` | The recovery policy did not restart an unavailable attempt; the reason's variant is the refusal code, such as `no_acknowledged_checkpoint`, never the refusal text a `refused` reason holds. |
+| `recovery.acknowledge` | The authority acknowledged a checkpoint it fetched and verified. |
+| `runner.present` | A restarted runner presented a grant it had taken to its authority and wrote the answer into its taken marker: `done` for a live grant, `refused` with the verdict's name otherwise. |
 | `peer.launch`, `peer.instruct`, `report` | The launch path on the node that runs the attempt. |
-| `peer.append`, `peer.move_request`, `peer.offer`, `peer.move_abort` | A fenced standalone request a peer sent. |
+| `peer.append`, `peer.move_request`, `peer.offer`, `peer.move_abort` | A fenced request a peer sent. A managed one the authority's fence refused is `refused` with the verdict's name. |
 | `node.add`, `job.new`, `job.run`, `job.resume`, `job.suspend`, `job.move`, `job.steal`, `job.decide`, `job.repair`, `gc` (with `remove` only), `harness.started`, `harness.session`, `harness.exited` | A client request that changed standalone state. |
 
-Reads (status, list, log, inspect, audit export, pull, manifest, chunk, facts, ping) and heartbeats, which write nothing, get no span.
+Reads (status, list, log, inspect, audit export, pull, manifest, chunk, facts, ping) and heartbeats, which write nothing, get no span. An attempt a heartbeat brings back gets its `observe.resource_reachable`, and a restarted runner's presentation its `runner.present`, since each writes.
 
 | Attribute | Value |
 | --- | --- |
@@ -56,7 +60,7 @@ Reads (status, list, log, inspect, audit export, pull, manifest, chunk, facts, p
 | `fabric.job`, `fabric.operation.id`, `fabric.task`, `fabric.attempt` | ULIDs, when the operation has them. |
 | `fabric.operation.key_digest` | SHA-256 hex of the idempotency key. |
 | `fabric.generation`, `fabric.revision`, `fabric.epoch` | Integers. |
-| `fabric.generation.supersedes` | On a grant at generation n > 1 (a regrant, or a continue's new attempt): n - 1. |
+| `fabric.generation.supersedes` | On a grant at generation n > 1 (a regrant, or a continue's new attempt): n - 1. On a supersede or a recover: the generation whose grant it took, with a link to that attempt's trace. |
 | `fabric.peer`, `fabric.target` | Node ids: the other side, and a move's destination. |
 | `fabric.snapshot`, `fabric.checkpoint` | A snapshot id, and a cut's digest. |
 | `fabric.refusal.reason`, `fabric.error.type` | A snake-case code, and a type name. |

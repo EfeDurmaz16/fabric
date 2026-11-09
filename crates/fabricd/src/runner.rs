@@ -90,6 +90,10 @@ pub(crate) trait HarnessProcess: Send {
 /// and the link to the authority. The node wires the real one
 /// ([`NodeHost`]); the tests a fake.
 pub(crate) trait Host: Send + Sync {
+    /// Where the runner's own spans go (ADR 0031); off by default.
+    fn trace(&self) -> crate::otel::Tracer {
+        crate::otel::Tracer::off()
+    }
     /// Whether this node can start `harness`.
     fn has_harness(&self, harness: &HarnessKind) -> BoxFuture<'_, bool>;
     /// Prepares the attempt's root (the launch path, step 2).
@@ -979,6 +983,14 @@ impl Runner {
                     continue;
                 };
                 self.presented.fetch_add(1, Ordering::Relaxed);
+                let trace = host.trace();
+                if trace.on() {
+                    trace.emit(crate::otel::hooks::present(
+                        &taken.token,
+                        taken.from,
+                        &verdict,
+                    ));
+                }
                 let end = if verdict.ends_grant() {
                     TakenEnd::GrantEnded {
                         verdict: verdict.name().to_owned(),
@@ -1335,6 +1347,11 @@ fn set_aside(root: &std::path::Path, attempt: AttemptId) -> Result<(), String> {
 }
 
 impl Host for NodeHost {
+    fn trace(&self) -> crate::otel::Tracer {
+        self.node()
+            .map_or_else(|_| crate::otel::Tracer::off(), |node| node.trace.clone())
+    }
+
     fn has_harness(&self, harness: &HarnessKind) -> BoxFuture<'_, bool> {
         let harness = harness.clone();
         Box::pin(async move {

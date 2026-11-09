@@ -174,9 +174,12 @@ impl Node {
             .map_or_else(crate::otel::Tracer::off, |endpoint| {
                 crate::otel::Tracer::start(endpoint, identity.node_id())
             });
-        let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
-            .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?
-            .traced(trace.clone());
+        let authority = crate::authority::Authority::start_traced(
+            &cfg.state,
+            identity.node_id(),
+            trace.clone(),
+        )
+        .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
         // The launch path's runner: its executor's launch records, and the
         // records of the launches taken, live under the state directory.
         let runs = cfg.state.root().join("runs");

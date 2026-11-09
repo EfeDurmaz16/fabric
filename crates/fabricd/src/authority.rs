@@ -261,12 +261,26 @@ impl Drop for JoinOnDrop {
 }
 
 impl Authority {
-    /// The authority for `state`, on node `node`. Returns at once: with a
-    /// journal, its thread starts now and recovers it before any call;
-    /// without one, no thread starts until a managed command. The
-    /// authority's own automatic `Recover` takes the grant; the dispatch
-    /// places its failover with the M5 placement (`dispatch::pass`).
+    /// [`Authority::start_traced`] with no spans, for the tests.
+    #[cfg(test)]
     pub(crate) fn start(state: &StateDir, node: NodeId) -> std::io::Result<Authority> {
+        Authority::start_traced(state, node, crate::otel::Tracer::off())
+    }
+
+    /// The authority for `state`, on node `node`, its spans going to
+    /// `trace`. Returns at once: with a journal, its thread starts now and
+    /// recovers it before any call; without one, no thread starts until a
+    /// managed command. The thread holds `trace` too, for what the
+    /// authority records on its own (a tick's observations, its `Recover`,
+    /// a returned attempt), so it is given before the thread can start.
+    /// The authority's own automatic `Recover` takes the grant; the
+    /// dispatch places its failover with the M5 placement
+    /// (`dispatch::pass`).
+    pub(crate) fn start_traced(
+        state: &StateDir,
+        node: NodeId,
+        trace: crate::otel::Tracer,
+    ) -> std::io::Result<Authority> {
         // A journal whose presence cannot be read is left to the thread,
         // which fails closed on it.
         let journal = !matches!(managed_dir(state).join(FILE_NAME).try_exists(), Ok(false));
@@ -275,18 +289,12 @@ impl Authority {
             started: Arc::new(watch::channel(None).0),
             #[cfg(test)]
             spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            trace: crate::otel::Tracer::off(),
+            trace,
         };
         if journal {
             authority.running()?;
         }
         Ok(authority)
-    }
-
-    /// The authority with its spans going to `trace`.
-    pub(crate) fn traced(mut self, trace: crate::otel::Tracer) -> Authority {
-        self.trace = trace;
-        self
     }
 
     /// How many threads this authority started.
@@ -304,6 +312,7 @@ impl Authority {
                 dir: managed_dir(state),
                 jobs: state.jobs(),
                 node: *node,
+                trace: self.trace.clone(),
             },
         };
         let (calls, queue) = mpsc::channel(QUEUE);
@@ -572,8 +581,18 @@ impl Authority {
         if self.idle() {
             return Ok(Err(FenceVerdict::UnknownJob));
         }
-        self.call(|reply| Call::Report(token, from, observation, reply))
-            .await
+        let span = self
+            .trace
+            .on()
+            .then(|| crate::otel::hooks::observation_begin(token.job, &observation));
+        let recorded = self
+            .call(|reply| Call::Report(token, from, observation, reply))
+            .await;
+        if let Some(mut span) = span {
+            crate::otel::hooks::report_end(&mut span, from, recorded.as_ref().map(Result::as_ref));
+            self.trace.emit(span);
+        }
+        recorded
     }
 
     /// A covered write other than a journal operation (a ledger append, a
@@ -622,7 +641,16 @@ impl Authority {
         job: JobId,
         ack: CheckpointAck,
     ) -> Result<Transition, AuthorityError> {
-        self.call(|reply| Call::Acknowledge(job, ack, reply)).await
+        let span = self
+            .trace
+            .on()
+            .then(|| crate::otel::hooks::acknowledge_begin(job, &ack));
+        let recorded = self.call(|reply| Call::Acknowledge(job, ack, reply)).await;
+        if let Some(mut span) = span {
+            crate::otel::hooks::observation_end(&mut span, recorded.as_ref());
+            self.trace.emit(span);
+        }
+        recorded
     }
 
     /// Answers a heartbeat from `from` with the verdict of each grant it
@@ -742,6 +770,8 @@ struct Place {
     dir: PathBuf,
     jobs: PathBuf,
     node: NodeId,
+    /// Where the spans of what the thread records on its own go.
+    trace: crate::otel::Tracer,
 }
 
 impl Place {
@@ -1151,7 +1181,9 @@ fn presence_of(
                 attempt: token.attempt,
                 generation: token.generation,
             };
-            match journal.observe_authority(token.job, &back, wall) {
+            let recorded = journal.observe_authority(token.job, &back, wall);
+            observed_span(place, token.job, &back, &recorded);
+            match recorded {
                 Ok(t) => wrote = !t.events.is_empty(),
                 Err(e) => {
                     tracing::warn!(job = %token.job, attempt = %token.attempt, error = %e, "a returned attempt was not recorded");
@@ -1228,7 +1260,9 @@ fn tick(
             last_heartbeat_ms: o.last_heartbeat_ms,
             at_ms: wall,
         };
-        match journal.observe_authority(o.job, &unavailable, wall) {
+        let recorded = journal.observe_authority(o.job, &unavailable, wall);
+        observed_span(place, o.job, &unavailable, &recorded);
+        match recorded {
             Ok(t) => {
                 *wrote |= !t.events.is_empty();
                 presence.mark_unavailable(o.attempt, now);
@@ -1319,7 +1353,16 @@ fn recover(
                 operation: OperationId::from_bytes(ulid()),
                 at_ms: wall,
             };
-            let answer = journal.submit(&envelope, ids)?;
+            let span = place
+                .trace
+                .on()
+                .then(|| crate::otel::hooks::command_begin(&envelope));
+            let answer = journal.submit(&envelope, ids).map_err(AuthorityError::from);
+            if let Some(mut span) = span {
+                crate::otel::hooks::command_end(&mut span, answer.as_ref());
+                place.trace.emit(span);
+            }
+            let answer = answer?;
             *wrote |= !answer.replayed;
             match answer.result {
                 StoredResult::Accepted(accepted) => {
@@ -1342,7 +1385,7 @@ fn recover(
                         refusal: other.to_string(),
                     };
                     if presence.block_changed(o.attempt, &reason) {
-                        journal.recovery_blocked(o.job, o.attempt, reason, wall)?;
+                        blocked(place, journal, o, reason, wall)?;
                         *wrote = true;
                     }
                     presence.forget(o.attempt);
@@ -1353,10 +1396,49 @@ fn recover(
         Err(reason) => reason,
     };
     if presence.block_changed(o.attempt, &reason) {
-        journal.recovery_blocked(o.job, o.attempt, reason, wall)?;
+        blocked(place, journal, o, reason, wall)?;
         *wrote = true;
     }
     Ok(())
+}
+
+/// Records why the policy did not recover `o`, with its span.
+fn blocked(
+    place: &Place,
+    journal: &mut Journal,
+    o: &Overdue,
+    reason: RecoveryBlock,
+    wall: u64,
+) -> Result<(), AuthorityError> {
+    let span_reason = place.trace.on().then(|| reason.clone());
+    let recorded = journal
+        .recovery_blocked(o.job, o.attempt, reason, wall)
+        .map_err(AuthorityError::from);
+    if let Some(reason) = span_reason {
+        place.trace.emit(crate::otel::hooks::recovery_blocked(
+            o.job,
+            o.attempt,
+            &reason,
+            recorded.as_ref(),
+        ));
+    }
+    recorded.map(|_| ())
+}
+
+/// Emits the span of an observation the authority made on its own
+/// thread (ADR 0028): a tick's `ResourceUnavailable`, a returned
+/// attempt's `ResourceReachable`.
+fn observed_span(
+    place: &Place,
+    job: JobId,
+    observation: &Observation,
+    recorded: &Result<Transition, CommitError>,
+) {
+    if place.trace.on() {
+        let mut span = crate::otel::hooks::observation_begin(job, observation);
+        crate::otel::hooks::observation_committed(&mut span, recorded.as_ref());
+        place.trace.emit(span);
+    }
 }
 
 /// The body of [`Authority::submit_derived`] on the authority's thread.
