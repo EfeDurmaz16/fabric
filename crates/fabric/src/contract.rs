@@ -62,7 +62,7 @@ const GLOBALS: &[(&str, &str, Option<char>, &str)] = &[
 const GROUPS: &[(&str, &[&str])] = &[
     ("Set up a node", &["serve", "node", "doctor", "gc"]),
     ("Work on jobs", &["job", "psf"]),
-    ("Managed jobs", &["managed", "facade"]),
+    ("Managed jobs", &["managed", "facade", "inspect", "audit"]),
 ];
 
 /// The examples each command's help shows, by command path. A placeholder
@@ -338,6 +338,32 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
             "Read the job's placements and continuations",
             "fabric managed inspect <JOB>",
         )],
+    ),
+    (
+        "inspect",
+        &[
+            (
+                "Read a managed job's whole state as JSON",
+                "fabric inspect <JOB> --json",
+            ),
+            (
+                "Read one attempt of the job",
+                "fabric inspect <JOB> --attempt <ATTEMPT> --json",
+            ),
+        ],
+    ),
+    (
+        "audit export",
+        &[
+            (
+                "Export one week of the journal as JSON lines",
+                "fabric audit export --since 2026-11-01 --until 2026-11-08",
+            ),
+            (
+                "Export everything as one JSON document",
+                "fabric audit export --json",
+            ),
+        ],
     ),
     (
         "managed import",

@@ -258,7 +258,7 @@ async fn a_destroy_leaves_the_authority_serving_while_the_worker_acts() {
                     operation: made,
                     approval: "apr-gc-1".into(),
                 }],
-                Some(Worker::Ready(bridge)),
+                Some(Worker::Ready(Box::new(bridge))),
             )
             .await
         })

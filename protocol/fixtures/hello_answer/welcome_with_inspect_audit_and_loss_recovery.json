@@ -41,6 +41,8 @@
     "managed_register",
     "job_export_psf",
     "gc",
+    "inspect",
+    "audit_export",
     "managed_supersede",
     "managed_recover",
     "harness_started.planned",

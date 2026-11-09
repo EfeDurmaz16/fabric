@@ -71,6 +71,11 @@ pub struct Config {
     pub grace: Duration,
     /// How long a worker has between SIGTERM and SIGKILL.
     pub kill_grace: Duration,
+    /// The W3C `traceparent` the worker gets as `TRACEPARENT`, which links
+    /// its spans to the Fabric span that spawned it (docs/observability.md).
+    /// `None` removes any `TRACEPARENT` the command would inherit, so a
+    /// worker never links to a parent Fabric did not name.
+    pub traceparent: Option<String>,
 }
 
 impl Config {
@@ -85,6 +90,7 @@ impl Config {
             handshake_timeout: Duration::from_secs(10),
             grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(2),
+            traceparent: None,
         }
     }
 
@@ -577,6 +583,10 @@ impl Bridge {
     /// is dropped, and runs the handshake. A worker that refuses, breaks
     /// the handshake or does not answer in time is terminated.
     pub async fn spawn(mut command: Command, config: Config) -> Result<Bridge, BridgeError> {
+        match &config.traceparent {
+            Some(parent) => command.env("TRACEPARENT", parent),
+            None => command.env_remove("TRACEPARENT"),
+        };
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

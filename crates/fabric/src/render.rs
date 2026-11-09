@@ -182,6 +182,12 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
         }
         Reply::ManagedStatus(job) => fabric_client::sentences::managed_job(job),
         Reply::ManagedInspect(inspection) => inspection_lines(inspection),
+        Reply::Inspect(report) => inspect_lines(report),
+        Reply::AuditExport(page) => page
+            .records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap_or_default())
+            .collect(),
         Reply::ManagedImport(imported) => vec![format!("imported snapshot {}", imported.snapshot)],
         Reply::FacadeMint(minted) => vec![
             format!("token {}", minted.token_id),
@@ -570,6 +576,69 @@ fn ledger_event(event: &LedgerEvent) -> String {
     }
 }
 
+/// The lines of `fabric inspect`: the managed inspection, then each
+/// generation, operation and evidence row, and the last report.
+fn inspect_lines(report: &fabric_client::api::InspectReport) -> Vec<String> {
+    let mut lines = inspection_lines(&report.inspection);
+    for generation in &report.generations {
+        lines.push(format!(
+            "generation {}: attempt {} granted by {} ({}){}",
+            generation.generation,
+            generation.attempt,
+            generation.granted_by,
+            generation.granted_by_kind,
+            generation
+                .supersedes
+                .map_or_else(String::new, |g| format!(", supersedes {g}"))
+        ));
+    }
+    for attempt in &report.attempts {
+        lines.push(format!(
+            "attempt {} on {}: {}",
+            attempt.attempt, attempt.node, attempt.status
+        ));
+    }
+    if report.operations_omitted > 0 {
+        lines.push(format!(
+            "{} older operations not shown: fabric audit export has them",
+            report.operations_omitted
+        ));
+    }
+    for operation in &report.operations {
+        lines.push(match &operation.refusal {
+            Some(refusal) => format!(
+                "operation {} {} {}: refused {refusal}",
+                operation.operation, operation.kind, operation.operation_key
+            ),
+            None => format!(
+                "operation {} {} {}: {}",
+                operation.operation, operation.kind, operation.operation_key, operation.status
+            ),
+        });
+    }
+    if report.evidence_omitted > 0 {
+        lines.push(format!(
+            "{} older evidence rows not shown: fabric audit export has them",
+            report.evidence_omitted
+        ));
+    }
+    for evidence in &report.evidence {
+        lines.push(format!(
+            "evidence {} {} at event {}",
+            evidence.kind, evidence.reference, evidence.seq
+        ));
+    }
+    if let Some(last) = &report.last_report {
+        lines.push(format!(
+            "last report: {} at event {}, {}",
+            last.kind,
+            last.seq,
+            iso_utc(last.at_ms)
+        ));
+    }
+    lines
+}
+
 /// The lines an inspection prints after the job's own: whether it waits
 /// for a placement, each placement with its chosen node and why the rest
 /// were excluded, each continuation with the fidelity achieved, the
@@ -940,6 +1009,8 @@ pub(crate) fn answer(reply: &Reply, job: Option<JobId>) -> Answer {
         | Reply::ManagedStatus(_)
         | Reply::ManagedList(_)
         | Reply::ManagedInspect(_)
+        | Reply::Inspect(_)
+        | Reply::AuditExport(_)
         // A mint's result is the token and its bearer, shown this once;
         // a facade answer is the authority's JSON, which is the contract.
         | Reply::FacadeMint(_)
@@ -1024,6 +1095,8 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         }),
         // The authority's message as it wrote it (docs/facade-protocol.md).
         Reply::FacadeCall(envelope) => envelope.message.clone(),
+        // The inspect schema of docs/observability.md, under one key.
+        Reply::Inspect(_) => json!({ "inspection": fields }),
         // A list's fields are already keyed by its noun, and a doctor's
         // report is its own. No arm catches the rest, so a reply added
         // later fails to compile until it names its noun and outcome.
@@ -1032,6 +1105,7 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         | Reply::JobLog(_)
         | Reply::ManagedList(_)
         | Reply::Gc(_)
+        | Reply::AuditExport(_)
         | Reply::Doctor { .. }
         // A launch's own replies, which no `--json` command answers with.
         | Reply::JobRun(_)

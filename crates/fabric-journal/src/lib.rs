@@ -18,6 +18,7 @@
 //! `granted` or `running` changes only on what the caller's probe can
 //! verify; an operation left `accepted` is returned for its one dispatch.
 
+mod audit;
 mod crashpoint;
 mod facade;
 mod project;
@@ -44,6 +45,7 @@ use fabric_core::managed::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+pub use audit::{AttemptRow, AuditKey, AuditRow, EventRow, EvidenceRow, OperationRow, ProviderRow};
 pub use facade::KeyedRequest;
 pub use provider::{
     AbandonApproval, AbandonRefusal, Acknowledged, Blocker, CleanupRefusal, EffectClass,

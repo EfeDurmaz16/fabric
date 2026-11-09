@@ -1,0 +1,11 @@
+anchor: 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5
+candidate: working tree at 440281697b78c7dd4f9c47e043a810f7e01c5f28, 0 changed paths
+driver: e2e test of the working tree at 440281697b78c7dd4f9c47e043a810f7e01c5f28
+profile: release, pairs: 15, counted runs: 5
+binary bytes: anchor 19740848, candidate 15447952
+uname: Darwin 24.6.0 arm64
+cpu: Apple M1 (Virtual) 3 cores
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+sip: disabled.
+start: 2026-11-08T17:03:42Z, load: 21.01 30.39 20.87
+end: 2026-11-08T17:15:10Z, load: 2.84 6.76 12.23

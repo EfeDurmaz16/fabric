@@ -44,6 +44,7 @@ use crate::job::Job;
 use crate::local::ForkRecord;
 use crate::node::{Node, Out};
 use crate::ops::session_floor;
+use crate::otel::{self, OpSpan, SpanKind, SpanOp, SpanResult, hooks};
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
 fn internal(err: &impl std::fmt::Display) -> Fault {
@@ -90,15 +91,18 @@ impl Service for Node {
         token: FencingToken,
         records: RecordPage,
     ) -> JobFuture<'_, Appended> {
-        Box::pin(async move { self.answer_append(peer, token, records).await })
+        let span = self.peer_span(SpanOp::PEER_APPEND, peer, &token);
+        Box::pin(async move { self.traced(span, self.answer_append(peer, token, records).await) })
     }
 
     fn move_request(&self, peer: NodeId, token: FencingToken) -> JobFuture<'_, MoveRequested> {
-        Box::pin(async move { self.answer_move_request(peer, token).await })
+        let span = self.peer_span(SpanOp::PEER_MOVE_REQUEST, peer, &token);
+        Box::pin(async move { self.traced(span, self.answer_move_request(peer, token).await) })
     }
 
     fn offer(&self, peer: NodeId, token: FencingToken, offer: MoveOffer) -> JobFuture<'_, Offered> {
-        Box::pin(async move { self.answer_offer(peer, token, offer).await })
+        let span = self.peer_span(SpanOp::PEER_OFFER, peer, &token);
+        Box::pin(async move { self.traced(span, self.answer_offer(peer, token, offer).await) })
     }
 
     fn move_status(
@@ -116,7 +120,10 @@ impl Service for Node {
         token: FencingToken,
         move_id: MoveId,
     ) -> JobFuture<'_, RecordBytes> {
-        Box::pin(async move { self.answer_move_abort(peer, token, move_id).await })
+        let span = self.peer_span(SpanOp::PEER_MOVE_ABORT, peer, &token);
+        Box::pin(
+            async move { self.traced(span, self.answer_move_abort(peer, token, move_id).await) },
+        )
     }
 
     fn known_writer(&self, _peer: NodeId, token: FencingToken) -> JobFuture<'_, KnownWriter> {
@@ -261,7 +268,21 @@ impl Service for Node {
         peer: NodeId,
         request: LaunchRequest,
     ) -> BoxFuture<'_, Result<LaunchAnswer, Fault>> {
-        Box::pin(async move { Ok(self.runner.launch(self.peer_or_own(peer), request).await) })
+        let span = self.trace.on().then(|| {
+            hooks::launch_begin(SpanOp::PEER_LAUNCH, &request.token, self.peer_or_own(peer))
+        });
+        Box::pin(async move {
+            let answer = self.runner.launch(self.peer_or_own(peer), request).await;
+            if let Some(mut span) = span {
+                let refusal = match &answer {
+                    LaunchAnswer::Refused { reason } => Some(reason),
+                    LaunchAnswer::Accepted => None,
+                };
+                hooks::answer_end(&mut span, refusal);
+                self.trace.emit(span);
+            }
+            Ok(answer)
+        })
     }
 
     fn instruct(
@@ -270,11 +291,24 @@ impl Service for Node {
         token: GrantToken,
         instruction: Instruction,
     ) -> BoxFuture<'_, Result<InstructAnswer, Fault>> {
+        let span = self
+            .trace
+            .on()
+            .then(|| hooks::launch_begin(SpanOp::PEER_INSTRUCT, &token, self.peer_or_own(peer)));
         Box::pin(async move {
-            Ok(self
+            let answer = self
                 .runner
                 .instruct(self.peer_or_own(peer), token, instruction)
-                .await)
+                .await;
+            if let Some(mut span) = span {
+                let refusal = match &answer {
+                    InstructAnswer::Refused { reason } => Some(reason),
+                    InstructAnswer::Accepted => None,
+                };
+                hooks::answer_end(&mut span, refusal);
+                self.trace.emit(span);
+            }
+            Ok(answer)
         })
     }
 
@@ -305,6 +339,37 @@ fn job_request_name(body: &JobRequest) -> &'static str {
 }
 
 impl Node {
+    /// The span of a fenced job request a peer sent, when spans are on.
+    fn peer_span(&self, op: SpanOp, peer: NodeId, token: &FencingToken) -> Option<OpSpan> {
+        self.trace.on().then(|| {
+            let mut span = OpSpan::begin(op, SpanKind::Server, otel::standalone_context());
+            span.job = Some(token.job_id);
+            span.epoch = Some(token.epoch.get());
+            span.peer = Some(peer);
+            span
+        })
+    }
+
+    /// Ends `span` with a fenced answer: a fence is a refusal by its
+    /// name, a fault a failure by its type.
+    fn traced<T>(
+        &self,
+        span: Option<OpSpan>,
+        answer: Result<Fenced<T>, Fault>,
+    ) -> Result<Fenced<T>, Fault> {
+        if let Some(mut span) = span {
+            match &answer {
+                Ok(Fenced::Answer(_)) => span.end(SpanResult::Done),
+                Ok(Fenced::StaleEpoch { .. }) => span.refused("stale_epoch"),
+                Ok(Fenced::AheadOfUs { .. }) => span.refused("epoch_ahead"),
+                Ok(Fenced::GrantRefused { verdict }) => span.refused(verdict.name()),
+                Err(fault) => span.failed(SpanResult::Failed, otel::type_name(fault)),
+            }
+            self.trace.emit(span);
+        }
+        answer
+    }
+
     /// The peer a launch path message came from; `None` when this node's
     /// own authority or runner sent it through its own `Service`.
     fn peer_or_own(&self, peer: NodeId) -> Option<NodeId> {

@@ -1,0 +1,74 @@
+{
+  "kind": "audit_export",
+  "records": [
+    {
+      "type": "operation",
+      "at_ms": 1762560000000,
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "kind": "create_job",
+      "decision": "accept",
+      "status": "succeeded",
+      "key_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "type": "operation",
+      "at_ms": 1762560100000,
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ8",
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "kind": "start_attempt",
+      "decision": "reject",
+      "status": "rejected",
+      "refusal": "attempt_still_live",
+      "key_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "type": "event",
+      "at_ms": 1762560000000,
+      "seq": 1,
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "revision": 1,
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+      "kind": "command_accepted",
+      "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    {
+      "type": "event",
+      "at_ms": 1762560000000,
+      "seq": 2,
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "revision": 1,
+      "kind": "attempt_observed",
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "prev_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    {
+      "type": "evidence",
+      "at_ms": 1762560600000,
+      "seq": 9,
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "kind": "checkpoint",
+      "ref_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "type": "provider_operation",
+      "at_ms": 1762560300000,
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+      "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "generation": 1,
+      "profile": "docker",
+      "action": "sandbox.create",
+      "effect_class": "create",
+      "purpose": "effect",
+      "status": "succeeded",
+      "code": "ok",
+      "effect": "applied",
+      "locator_key": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "next": "1762560600000.3.0000000000000000000000000000abcd"
+}

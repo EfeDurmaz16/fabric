@@ -525,6 +525,7 @@ dependencies = [
  "fabric-psf",
  "fabric-store",
  "nix",
+ "ring",
  "rustix",
  "serde",
  "serde_json",

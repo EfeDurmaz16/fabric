@@ -66,6 +66,15 @@ const ELSEWHERE: &[(&str, &str)] = &[
         "psf inspect",
         "psf.rs: e2e_a_psf_export_never_carries_a_workspace_secret_and_imports_back",
     ),
+    // Both read a journal a scripted managed run filled.
+    (
+        "inspect",
+        "observability.rs: e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_secret",
+    ),
+    (
+        "audit export",
+        "observability.rs: e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_secret",
+    ),
     (
         "psf verdicts",
         "sdk/typescript/test/psf.test.ts: the verdict lines every reader prints",
