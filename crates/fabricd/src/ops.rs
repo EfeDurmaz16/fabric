@@ -6669,7 +6669,12 @@ pub(crate) mod tests {
         // loaded machine that first run outlasted `COMMAND_TIMEOUT` inside
         // the measure and the key came back `Unmeasured` (the M6 gate run).
         // The check is paid here, as `CountingTools` pays it at install.
-        assert!(std::process::Command::new(&rustc).status().unwrap().success());
+        assert!(
+            std::process::Command::new(&rustc)
+                .status()
+                .unwrap()
+                .success()
+        );
         a.remember_env(&ClientEnv {
             path: vec![
                 PathDir::parse(bin.to_str().unwrap()).unwrap(),
