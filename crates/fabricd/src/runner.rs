@@ -2468,14 +2468,10 @@ mod tests {
         .unwrap();
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let codex = bin.join("codex");
-        std::fs::write(
-            &codex,
+        crate::fake_tool::write(
+            &bin.join("codex"),
             "#!/bin/sh\n[ \"$1\" = --version ] && echo \"codex-cli 0.155.1\"\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        );
         let adapter = fabric_harness::codex::Codex::new(
             AbsPath::parse(home.to_str().unwrap()).unwrap(),
             bin.into_os_string(),

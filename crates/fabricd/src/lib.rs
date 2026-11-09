@@ -25,6 +25,8 @@ pub mod error;
 pub mod executor;
 mod facade;
 mod facts;
+#[cfg(test)]
+mod fake_tool;
 mod faults;
 mod gc;
 pub mod harnesses;
