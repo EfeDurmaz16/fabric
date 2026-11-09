@@ -437,5 +437,5 @@ fn a_removing_gc_gets_a_span_and_a_dry_run_does_not() {
     };
     assert!(hooks::request_begin(&gc(false)).is_none());
     let span = hooks::request_begin(&gc(true)).unwrap();
-    assert!(span.op == SpanOp::GC);
+    assert_eq!(span.op, SpanOp::GC);
 }
