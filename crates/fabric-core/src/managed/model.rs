@@ -222,6 +222,19 @@ pub enum RecoveryBlock {
         /// The blocking provider operations, oldest first.
         blockers: Vec<OperationId>,
     },
+    /// A cancel of the job or of the attempt's task is open: no work is
+    /// granted again on what someone asked to stop (`EffectInFlight`).
+    EffectInFlight {
+        /// The open cancel.
+        operation: OperationId,
+    },
+    /// The domain refused the authority's `Recover` for a reason the
+    /// decision did not foresee; the refusal is stored under the
+    /// recover's derived key, so it is final for this silence.
+    Refused {
+        /// The refusal, as the domain words it.
+        refusal: String,
+    },
 }
 
 /// What the authority verified before it accepted a checkpoint as the

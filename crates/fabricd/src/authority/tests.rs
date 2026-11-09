@@ -12,9 +12,9 @@ use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::managed::launch::Heartbeat;
 use fabric_core::managed::{
     AttemptStatus, CheckpointAck, Command, CutDigest, DomainError, Envelope, FenceVerdict,
-    Generation, GrantToken, Intent, JobPolicy, Observation, OperationKey, OperationMark,
-    OperationStatus, RecoveryPolicy, ResourceRef, RestartPolicy, SourceBinding, StoredResult,
-    UNAVAILABLE_AFTER_MS,
+    Generation, GrantToken, Intent, JobPolicy, ManagedEvent, Observation, OperationKey,
+    OperationMark, OperationStatus, RecoveryBlock, RecoveryPolicy, ResourceRef, RestartPolicy,
+    SourceBinding, StoredResult, UNAVAILABLE_AFTER_MS,
 };
 use fabric_core::path::AbsPath;
 use fabric_journal::Answer;
@@ -914,6 +914,84 @@ async fn an_attempt_unknown_at_a_restart_comes_back_on_its_heartbeat_and_still_r
     let s = authority.job(job).await.unwrap().unwrap();
     assert_eq!(s.job.generation.get(), 2);
     assert_eq!(s.attempts[1].resource, ResourceRef::Node { node: NODE });
+}
+
+/// The recovery reasons recorded for `job`, in order.
+async fn blocks(authority: &Authority, job: JobId) -> Vec<RecoveryBlock> {
+    authority
+        .with_journal(false, move |journal| {
+            Ok(journal
+                .events(job, None, 1_000)?
+                .into_iter()
+                .filter_map(|e| match e.frame.event {
+                    ManagedEvent::RecoveryBlocked { reason, .. } => Some(reason),
+                    _ => None,
+                })
+                .collect())
+        })
+        .await
+        .unwrap()
+}
+
+/// Review finding on PR #39: under `restart_from_acknowledged` an open
+/// cancel made the authority's `Recover` refused `EffectInFlight`; the
+/// refusal was logged, stored under the recover's key, and the attempt
+/// forgotten, so the job showed `unknown` with no reason and was never
+/// judged again. The open cancel is now a recorded block, judged again
+/// on the next tick, and the restart happens once the cancel has ended.
+#[tokio::test]
+async fn an_open_cancel_blocks_the_automatic_restart_with_its_reason_until_it_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let authority = Authority::start(&state, NODE).unwrap();
+    let (job, token) = running_on_runner(&authority, RecoveryPolicy::RestartFromAcknowledged).await;
+    acknowledged(&authority, job, token).await;
+    let cancel = authority
+        .submit(Envelope {
+            key: OperationKey::parse("cancel-1").unwrap(),
+            job: Some(job),
+            expected: None,
+            body: Command::CancelJob {
+                reason: "operator".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let StoredResult::Accepted(cancel) = &cancel.result else {
+        panic!("the cancel was refused");
+    };
+    let cancel = cancel.operation;
+    authority
+        .mark_authority(job, cancel, OperationMark::Dispatched)
+        .await
+        .unwrap();
+    let now = mono_ms();
+    authority.tick(now + UNAVAILABLE_AFTER_MS).await.unwrap();
+    authority
+        .tick(now + 2 * UNAVAILABLE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(status(&authority, token).await, AttemptStatus::Unknown);
+    assert_eq!(
+        blocks(&authority, job).await,
+        vec![RecoveryBlock::EffectInFlight { operation: cancel }],
+        "the reason is recorded"
+    );
+    // The stop never reached the runner and failed: judged again, the
+    // attempt is recovered.
+    authority
+        .mark_authority(job, cancel, OperationMark::Failed)
+        .await
+        .unwrap();
+    authority
+        .tick(now + 2 * UNAVAILABLE_AFTER_MS + 2_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&authority, token).await,
+        AttemptStatus::Superseded { by: None },
+        "recovered once the cancel ended"
+    );
 }
 
 /// Review finding on PR #39: a restarted runner presents the grants it

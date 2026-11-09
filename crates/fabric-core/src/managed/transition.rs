@@ -1425,6 +1425,14 @@ pub fn recovery_decision(
             blockers: blockers.to_vec(),
         });
     }
+    // The supersede the `Recover` makes refuses while a cancel is open;
+    // judged here so the refusal is a recorded block that the next tick
+    // judges again, never a rejection stored under the recover's key.
+    if let Some(old) = state.attempt(attempt)
+        && let Err(DomainError::EffectInFlight { operation }) = settle_superseded(state, old, true)
+    {
+        return Err(RecoveryBlock::EffectInFlight { operation });
+    }
     Ok(Command::Recover {
         attempt,
         from,

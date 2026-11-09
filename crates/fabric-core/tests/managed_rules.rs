@@ -1721,6 +1721,12 @@ fn an_open_cancel_refuses_a_recover_and_a_supersede_completes_it() {
     };
     kept.mark(operation, OperationMark::Dispatched).unwrap();
     gone_silent(&mut kept);
+    // The automatic decision sees it first and blocks with the cancel
+    // named, so no refusal is stored under the recover's key.
+    assert_eq!(
+        recovery_decision(kept.state(), a.id, OutcomePolicy::Checkpoint, &[]),
+        Err(RecoveryBlock::EffectInFlight { operation })
+    );
     assert_eq!(
         kept.submit(
             "r-1",

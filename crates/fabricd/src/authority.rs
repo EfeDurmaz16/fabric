@@ -1213,7 +1213,17 @@ fn recover(
                     }
                 }
                 StoredResult::Rejected(other) => {
+                    // Stored under the recover's derived key, so this
+                    // silence never recovers by itself: recorded as the
+                    // reason, then no longer judged.
                     tracing::warn!(job = %o.job, attempt = %o.attempt, refusal = %other, "the authority's recover was refused");
+                    let reason = RecoveryBlock::Refused {
+                        refusal: other.to_string(),
+                    };
+                    if presence.block_changed(o.attempt, &reason) {
+                        journal.recovery_blocked(o.job, o.attempt, reason, wall)?;
+                        *wrote = true;
+                    }
                     presence.forget(o.attempt);
                     return Ok(());
                 }

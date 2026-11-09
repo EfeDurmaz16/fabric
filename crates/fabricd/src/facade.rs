@@ -1064,6 +1064,10 @@ fn recovery_block_json(reason: &fabric_core::managed::RecoveryBlock) -> Value {
         RecoveryBlock::ReplacementBlocked { blockers } => json!({ "replacement_blocked": {
             "blockers": blockers.iter().map(ToString::to_string).collect::<Vec<_>>(),
         } }),
+        RecoveryBlock::EffectInFlight { operation } => json!({ "effect_in_flight": {
+            "operation": operation.to_string(),
+        } }),
+        RecoveryBlock::Refused { refusal } => json!({ "refused": { "refusal": refusal } }),
     }
 }
 
