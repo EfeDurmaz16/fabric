@@ -18,6 +18,7 @@
 - [Managed job](concepts/managed-job.md)
 - [Attempt](concepts/attempt.md)
 - [Fence](concepts/fence.md)
+- [Residuals](concepts/residuals.md)
 - [Glossary](glossary.md)
 
 # Guides
@@ -73,6 +74,7 @@
   - [ADR 0026: Resource placement among registered nodes](adr/0026-resource-placement.md)
   - [ADR 0027: The job facade: authenticated remote job operations over the node link](adr/0027-job-facade-protocol.md)
   - [ADR 0029: The Portable Session Format v1](adr/0029-portable-session-format.md)
+  - [ADR 0030: Residuals and `fabric gc`](adr/0030-residuals-and-gc.md)
   - [ADR 0031: Operation spans, inspect and the audit export](adr/0031-observability-spans-inspect-and-audit-export.md)
 <!-- adr:end -->
 

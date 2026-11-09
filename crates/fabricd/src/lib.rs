@@ -26,6 +26,7 @@ pub mod executor;
 mod facade;
 mod facts;
 mod faults;
+mod gc;
 pub mod harnesses;
 mod job;
 mod launch;

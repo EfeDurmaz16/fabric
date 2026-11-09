@@ -174,6 +174,7 @@ impl SpanOp {
     pub(crate) const JOB_STEAL: SpanOp = SpanOp("job.steal");
     pub(crate) const JOB_DECIDE: SpanOp = SpanOp("job.decide");
     pub(crate) const JOB_REPAIR: SpanOp = SpanOp("job.repair");
+    pub(crate) const GC: SpanOp = SpanOp("gc");
     pub(crate) const HARNESS_STARTED: SpanOp = SpanOp("harness.started");
     pub(crate) const HARNESS_SESSION: SpanOp = SpanOp("harness.session");
     pub(crate) const HARNESS_EXITED: SpanOp = SpanOp("harness.exited");

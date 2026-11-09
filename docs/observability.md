@@ -46,7 +46,7 @@ The resource names `service.name` `fabricd`, `service.version` and `service.inst
 | `observe.started`, `observe.checkpointed`, `observe.receipts`, `observe.handoff_blocked`, `observe.placed`, `observe.continued`, `observe.exited`, `observe.lost`, `observe.unknown` | The authority recorded an observation: a report, a placement, a recovery. |
 | `peer.launch`, `peer.instruct`, `report` | The launch path on the node that runs the attempt. |
 | `peer.append`, `peer.move_request`, `peer.offer`, `peer.move_abort` | A fenced standalone request a peer sent. |
-| `node.add`, `job.new`, `job.run`, `job.resume`, `job.suspend`, `job.move`, `job.steal`, `job.decide`, `job.repair`, `harness.started`, `harness.session`, `harness.exited` | A client request that changed standalone state. |
+| `node.add`, `job.new`, `job.run`, `job.resume`, `job.suspend`, `job.move`, `job.steal`, `job.decide`, `job.repair`, `gc` (with `remove` only), `harness.started`, `harness.session`, `harness.exited` | A client request that changed standalone state. |
 
 Reads (status, list, log, inspect, audit export, pull, manifest, chunk, facts, ping) and heartbeats, which write nothing, get no span.
 

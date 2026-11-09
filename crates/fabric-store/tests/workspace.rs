@@ -91,6 +91,7 @@ fn restore_into(
             verify: Verify::All,
             durability: Durability::ProcessCrash,
             carry: &|_| true,
+            label: None,
         },
     )
 }
@@ -270,18 +271,7 @@ fn git_state_survives_capture_and_restore() {
 
     let snapshot = store.publish(&manifest).unwrap();
     let target = dir.path().join("restored");
-    let restored = restore(
-        &store,
-        &RestoreRequest {
-            snapshot,
-            target: &target,
-            harness_state: None,
-            verify: Verify::All,
-            durability: Durability::PowerLoss,
-            carry: &|_| true,
-        },
-    )
-    .unwrap();
+    let restored = restore_flushed(&store, snapshot, &target).unwrap();
     assert_eq!(restored.ignored.files, 3);
     // Three ignored files, two directories of theirs, one of W and the nine entries of W.
     assert_eq!(restored.verified, 15);
@@ -1541,6 +1531,7 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
             verify: Verify::Sample(1),
             durability: Durability::PowerLoss,
             carry: &|_| true,
+            label: None,
         },
     )
     .unwrap();
@@ -1662,6 +1653,7 @@ fn restore_with_state(
             verify: Verify::All,
             durability: Durability::ProcessCrash,
             carry: &|_| true,
+            label: None,
         },
     )
 }
@@ -1682,6 +1674,7 @@ fn a_power_loss_rerun_keeps_and_flushes_a_complete_harness_directory() {
             verify: Verify::All,
             durability: Durability::PowerLoss,
             carry: &|_| true,
+            label: None,
         },
     )
     .unwrap();
@@ -1735,6 +1728,7 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
             verify: Verify::All,
             durability: Durability::ProcessCrash,
             carry: &|entry: &CacheEntry| entry.class != CacheClass::Deps,
+            label: None,
         },
     )
     .unwrap();
@@ -1807,6 +1801,7 @@ fn a_partial_cache_is_written_only_where_the_carry_rule_says() {
             verify: Verify::All,
             durability: Durability::ProcessCrash,
             carry: &|_| false,
+            label: None,
         },
     )
     .unwrap();
@@ -1840,6 +1835,7 @@ fn a_cache_of_empty_directories_gets_a_row_the_target_can_turn_down() {
             verify: Verify::All,
             durability: Durability::ProcessCrash,
             carry: &|_| false,
+            label: None,
         },
     )
     .unwrap();
@@ -2311,6 +2307,7 @@ fn restore_flushed(store: &Store, snapshot: SnapshotId, target: &Path) -> Fallib
             verify: Verify::All,
             durability: Durability::PowerLoss,
             carry: &|_| true,
+            label: None,
         },
     )?)
 }
@@ -3164,6 +3161,7 @@ fn the_harness_state_root_and_a_read_only_root_keep_their_mode_and_mtime() {
             verify: Verify::All,
             durability: Durability::PowerLoss,
             carry: &|_| true,
+            label: None,
         },
     );
     let meta = fs::metadata(&target).unwrap();

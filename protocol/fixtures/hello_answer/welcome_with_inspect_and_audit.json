@@ -40,6 +40,7 @@
     "facade_call",
     "managed_register",
     "job_export_psf",
+    "gc",
     "inspect",
     "audit_export",
     "harness_started.planned",

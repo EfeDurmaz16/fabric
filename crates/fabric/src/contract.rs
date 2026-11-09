@@ -60,7 +60,7 @@ const GLOBALS: &[(&str, &str, Option<char>, &str)] = &[
 
 /// How the root help groups the commands: in the order a user meets them.
 const GROUPS: &[(&str, &[&str])] = &[
-    ("Set up a node", &["serve", "node", "doctor"]),
+    ("Set up a node", &["serve", "node", "doctor", "gc"]),
     ("Work on jobs", &["job", "psf"]),
     ("Managed jobs", &["managed", "facade", "inspect", "audit"]),
 ];
@@ -97,6 +97,17 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
             (
                 "Check a move before making it",
                 "fabric doctor --peer <NODE> --job <JOB>",
+            ),
+        ],
+    ),
+    (
+        "gc",
+        &[
+            ("Report what crashed work left", "fabric gc"),
+            ("Remove what the report lists", "fabric gc --yes"),
+            (
+                "Remove a provider resource with an approval for it",
+                "fabric gc --yes --approve <OPERATION_APPROVAL> --worker <PATH> --profile <PROFILE>",
             ),
         ],
     ),

@@ -20,11 +20,11 @@ use tokio::net::UnixStream;
 
 use crate::api::{
     API_VERSION, Answer, AuditPage, ClientEnv, Decision, DoctorReport, Event, Exported,
-    FidelityName, Hello, HelloAnswer, Imported, InspectReport, Inspection, JobCreated, JobList,
-    JobLog, JobScopeWire, JobStatus, Lease, ManagedJob, ManagedJobs, ManagedOperation, Minted,
-    NodeIdentity, NoteWire, Op, Paired, PeerList, Pong, ProgramWire, PsfExported, Refusal,
-    RegisterClass, Registered, Repaired, Reply, Request, ResourceScopeWire, Revoked, RunPlan,
-    SessionRecorded, Suspended, SystemPath, Welcome,
+    FidelityName, GcApproval, GcReport, GcWorker, Hello, HelloAnswer, Imported, InspectReport,
+    Inspection, JobCreated, JobList, JobLog, JobScopeWire, JobStatus, Lease, ManagedJob,
+    ManagedJobs, ManagedOperation, Minted, NodeIdentity, NoteWire, Op, Paired, PeerList, Pong,
+    ProgramWire, PsfExported, Refusal, RegisterClass, Registered, Repaired, Reply, Request,
+    ResourceScopeWire, Revoked, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
 };
 use crate::facade::{ClientMessage, FacadeAnswer, ProtocolViolation, Submit};
 use crate::frame::{self, FrameError};
@@ -441,6 +441,27 @@ impl Client {
         {
             Reply::JobExportPsf(reply) => Ok(reply),
             other => Err(unexpected(Op::JobExportPsf, &other)),
+        }
+    }
+
+    /// Reports what crashed or ended work left on the node, and removes it
+    /// when `remove` is set; provider resources only through `worker`,
+    /// each with its own approval from `approvals` (ADR 0030).
+    pub async fn gc(
+        &self,
+        remove: bool,
+        approvals: Vec<GcApproval>,
+        worker: Option<GcWorker>,
+        on_event: impl FnMut(Event),
+    ) -> Result<GcReport, ClientError> {
+        let request = Request::Gc {
+            remove,
+            approvals,
+            worker,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::Gc(reply) => Ok(reply),
+            other => Err(unexpected(Op::Gc, &other)),
         }
     }
 

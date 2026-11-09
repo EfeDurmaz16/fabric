@@ -170,6 +170,47 @@ pub struct LaunchRecord {
     pub started: Option<String>,
 }
 
+impl LaunchRecord {
+    /// The group the record names, while it runs: its leader's pid still
+    /// starts when the record says, so a pid reused since is never it.
+    pub async fn group(&self) -> Option<NonZeroU32> {
+        let (Some(pid), Some(started)) = (self.pid, &self.started) else {
+            return None;
+        };
+        let pid = NonZeroU32::new(pid)?;
+        (local::process_started(pid).await.as_ref() == Some(started)).then_some(pid)
+    }
+
+    /// Stops the group the record names, when it still runs: `SIGTERM`,
+    /// then `SIGKILL` once `budget` passed. The record stays. A group that
+    /// outlives `SIGKILL` is an error, so no caller drops the record of a
+    /// group that still runs.
+    pub async fn stop(&self, budget: DrainBudget) -> Result<(), String> {
+        self.stop_with(budget, PS).await
+    }
+
+    async fn stop_with(&self, budget: DrainBudget, ps: &str) -> Result<(), String> {
+        let Some(pid) = self.group().await else {
+            return Ok(());
+        };
+        let Some(group) = pid_of(pid) else {
+            return Err(format!("pid {pid} is not a process id"));
+        };
+        signal_group(group, Signal::TERM);
+        if wait_group_gone_with(group, budget.duration(), ps).await {
+            return Ok(());
+        }
+        signal_group(group, Signal::KILL);
+        if wait_group_gone_with(group, KILL_WAIT, ps).await {
+            Ok(())
+        } else {
+            Err(format!(
+                "the group of pid {pid} outlived SIGKILL; stop it by hand, then run gc again"
+            ))
+        }
+    }
+}
+
 /// How the executor holds a task's process.
 enum Handle {
     /// A process the executor spawned and reaps.
@@ -331,6 +372,11 @@ impl Executor {
     pub async fn resume(&self, attempt: AttemptId) -> Result<(), ExecutorError> {
         self.run(attempt).await?.lock().await.frozen = false;
         Ok(())
+    }
+
+    /// The attempts open on this executor, whose records are its own.
+    pub async fn open(&self) -> Vec<AttemptId> {
+        self.attempts.lock().await.keys().copied().collect()
     }
 
     /// Forgets an attempt whose tasks all ended; its records are removed.
@@ -613,6 +659,14 @@ impl Executor {
         records: &Path,
         budget: DrainBudget,
     ) -> Result<Vec<LaunchRecord>, ExecutorError> {
+        Self::recover_with(records, budget, PS).await
+    }
+
+    async fn recover_with(
+        records: &Path,
+        budget: DrainBudget,
+        ps: &str,
+    ) -> Result<Vec<LaunchRecord>, ExecutorError> {
         let mut found = Vec::new();
         let Ok(attempts) = std::fs::read_dir(records) else {
             return Ok(found);
@@ -626,16 +680,11 @@ impl Executor {
                 let Some(record) = local::read::<LaunchRecord>(&path)? else {
                     continue;
                 };
-                if let (Some(pid), Some(started)) = (record.pid, &record.started)
-                    && let Some(pid) = NonZeroU32::new(pid)
-                    && local::process_started(pid).await.as_ref() == Some(started)
-                    && let Some(group) = pid_of(pid)
-                {
-                    signal_group(group, Signal::TERM);
-                    if !wait_group_gone(group, budget.duration()).await {
-                        signal_group(group, Signal::KILL);
-                        wait_group_gone(group, KILL_WAIT).await;
-                    }
+                // A group that outlives the stop keeps its record, so the
+                // next start or `fabric gc` still finds and stops it.
+                if let Err(why) = record.stop_with(budget, ps).await {
+                    tracing::warn!(attempt = %record.attempt, task = %record.task, %why, "a launch group outlived its stop; its record stays");
+                    continue;
                 }
                 local::remove(&path)?;
                 found.push(record);
@@ -1041,9 +1090,13 @@ fn signal_group(group: Pid, signal: Signal) {
 /// Whether nothing of the group runs within `limit`; a zombie leader whose
 /// parent has not reaped it yet counts as gone once nothing else does.
 async fn wait_group_gone(group: Pid, limit: Duration) -> bool {
+    wait_group_gone_with(group, limit, PS).await
+}
+
+async fn wait_group_gone_with(group: Pid, limit: Duration, ps: &str) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
-        if group_members(group.as_raw_nonzero().get().unsigned_abs())
+        if group_members_with(group.as_raw_nonzero().get().unsigned_abs(), ps)
             .await
             .is_empty()
         {
@@ -1059,7 +1112,11 @@ async fn wait_group_gone(group: Pid, limit: Duration) -> bool {
 /// The live pids in process group `group`, as `ps` lists them; zombies
 /// left out (state `Z`).
 async fn group_members(group: u32) -> Vec<u32> {
-    let Ok(output) = tokio::process::Command::new(PS)
+    group_members_with(group, PS).await
+}
+
+async fn group_members_with(group: u32, ps: &str) -> Vec<u32> {
+    let Ok(output) = tokio::process::Command::new(ps)
         .args(["-axo", "pid=,pgid=,stat="])
         .output()
         .await
@@ -1992,6 +2049,49 @@ mod tests {
         .unwrap();
         Executor::recover(&records, budget(1_000)).await.unwrap();
         assert!(walkdir(&records).is_empty());
+    }
+
+    /// A group that outlives `SIGKILL`, as one stuck in uninterruptible
+    /// I/O does, is an error of the stop, and recovery keeps its record so
+    /// a later start or `fabric gc` still finds it. Before, the stop
+    /// returned nothing and recovery removed the record of a group that
+    /// still ran. A `ps` that lists the group whatever happens stands in
+    /// for the stuck process.
+    #[tokio::test]
+    async fn a_group_that_outlives_sigkill_keeps_its_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let ps = dir.path().join("ps");
+        std::fs::write(&ps, format!("#!/bin/sh\necho '{pid} {pid} S'\n")).unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ps = ps.to_str().unwrap();
+        let attempt = AttemptId::from_bytes([7; 16]);
+        let record = LaunchRecord {
+            attempt,
+            task: task(1),
+            class: TaskClass::Test,
+            pid: Some(pid),
+            started: local::process_started(NonZeroU32::new(pid).unwrap()).await,
+        };
+        let records = dir.path().join("records");
+        let file = records
+            .join(attempt.to_string())
+            .join(format!("{}.json", task(1)));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        local::write(&file, &record).unwrap();
+
+        let found = Executor::recover_with(&records, budget(1_000), ps)
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        assert!(file.exists(), "the record of a group that runs stays");
+        let _ = child.wait().await;
     }
 
     /// A harness process its adapter spawned is registered as the

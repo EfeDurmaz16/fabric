@@ -16,6 +16,7 @@ Set up a node:
   serve    Run the node daemon in the foreground
   node     Read this node's identity and pair it with other nodes
   doctor   Print this node's facts, or compare them with a paired node's before a move
+  gc       Report what crashed or ended work left on this node; remove it with --yes
 
 Work on jobs:
   job      Make, run, suspend, move and resume jobs
@@ -180,6 +181,34 @@ Examples:
     fabric doctor --peer <NODE> --job <JOB>
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-doctor
+```
+
+### `fabric gc`
+
+```text
+Usage: fabric gc [OPTIONS]
+Report what crashed or ended work left on this node; remove it with --yes
+
+Options:
+      --approve <OPERATION=APPROVAL>  Remove the provider resource this create made, with an approval given for it in this run alone; repeat for each
+      --profile <PROFILE>             The capability profile the worker serves
+      --worker <PATH>                 The provider worker approved removals go through, such as Capsule's bridge worker
+      --worker-config <PATH>          The worker's configuration file
+      --yes                           Remove what the report lists; without it gc only reports
+
+Global Options: See `fabric --help`
+
+Examples:
+  Report what crashed work left
+    fabric gc
+
+  Remove what the report lists
+    fabric gc --yes
+
+  Remove a provider resource with an approval for it
+    fabric gc --yes --approve <OPERATION_APPROVAL> --worker <PATH> --profile <PROFILE>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-gc
 ```
 
 ### `fabric job`

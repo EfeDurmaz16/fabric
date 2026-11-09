@@ -58,6 +58,7 @@ export const OPS = [
   "facade_call",
   "managed_register",
   "job_export_psf",
+  "gc",
   "inspect",
   "audit_export",
 ] as const;
@@ -1179,6 +1180,55 @@ export type JobScope = z.infer<typeof JobScope>;
 export const ResourceScope = z.union([z.literal("any"), z.array(NodeId)]);
 export type ResourceScope = z.infer<typeof ResourceScope>;
 
+/** An approval for one provider resource, given for one `gc` call (ADR 0030). */
+export const GcApproval = z.object({ operation: OperationId, approval: UnicodeText });
+export type GcApproval = z.infer<typeof GcApproval>;
+
+/** The provider worker a `gc` call removes approved resources through. */
+export const GcWorker = z.object({ program: SystemPath, profile: UnicodeText, config: optional(SystemPath) });
+export type GcWorker = z.infer<typeof GcWorker>;
+
+/**
+ * Whose an item of a `gc` report is: the job, and the standalone tenure or the managed attempt
+ * it belongs to, and the node a staging label names.
+ */
+export const GcLabel = z.object({
+  job: JobId,
+  epoch: optional(Epoch),
+  node: optional(NodeId),
+  task: optional(TaskId),
+  attempt: optional(AttemptId),
+  generation: optional(Counter),
+});
+export type GcLabel = z.infer<typeof GcLabel>;
+
+/**
+ * A member of the live set: `tenure`, `moving`, `busy`, `attempt` or `launch`. Kinds, states and
+ * reasons stay text: the set grows with what Fabric makes.
+ */
+export const GcLive = z.object({ holds: UnicodeText, label: GcLabel });
+
+/** Something crashed or ended work left: `state` is `found`, `removed`, `failed` or `approval_required`. */
+export const GcResidual = z.object({
+  kind: UnicodeText,
+  path: optional(Path),
+  pid: optional(Pid),
+  operation: optional(OperationId),
+  locator: optional(UnicodeText),
+  label: GcLabel,
+  state: UnicodeText,
+  detail: optional(UnicodeText),
+});
+
+/** Something gc found and keeps, and why (`reason`). */
+export const GcKept = z.object({
+  kind: UnicodeText,
+  path: optional(Path),
+  operation: optional(OperationId),
+  label: optional(GcLabel),
+  reason: UnicodeText,
+});
+
 export const Request = z.discriminatedUnion("op", [
   z.object({ op: z.literal("node_id") }),
   z.object({ op: z.literal("node_add"), node: NodeId, addr: optional(UnicodeText) }),
@@ -1308,6 +1358,17 @@ export const Request = z.discriminatedUnion("op", [
     program: Program,
   }),
   z.object({ op: z.literal("job_export_psf"), job: JobId, dir: SystemPath }),
+  /**
+   * Reports what crashed or ended work left on the node, and removes it with `remove`
+   * (docs/concepts/residuals.md, ADR 0030). A provider resource goes only through `worker`,
+   * each with its own approval in `approvals`, given for this call alone.
+   */
+  z.object({
+    op: z.literal("gc"),
+    remove: z.boolean(),
+    approvals: optional(z.array(GcApproval)),
+    worker: optional(GcWorker),
+  }),
   z.object({ op: z.literal("inspect"), job: JobId, attempt: optional(AttemptId) }),
   z.object({ op: z.literal("audit_export"), since_ms: optional(count), until_ms: optional(count), after: optional(UnicodeText) }),
 ]);
@@ -1503,6 +1564,14 @@ export const Reply = z.discriminatedUnion("kind", [
     attachments: z.array(UnicodeText),
     left_behind: z.array(UnicodeText),
   }),
+  /** What `gc` found and did (ADR 0030). */
+  z.object({
+    kind: z.literal("gc"),
+    removing: z.boolean(),
+    live: z.array(GcLive),
+    residuals: z.array(GcResidual),
+    kept: z.array(GcKept),
+  }),
   /** The whole managed state of a job or one attempt (ADR 0031). */
   z.object({ kind: z.literal("inspect"), ...inspectReport }),
   /** One page of the audit rows; `next` is the cursor of the next page, absent on the last. */
@@ -1542,6 +1611,7 @@ export type ManagedJobs = ReplyTo<"managed_list">;
 export type Repaired = ReplyTo<"job_repair">;
 export type Exported = ReplyTo<"job_export">;
 export type PsfExported = ReplyTo<"job_export_psf">;
+export type GcReport = ReplyTo<"gc">;
 export type InspectReport = ReplyTo<"inspect">;
 export type AuditPage = ReplyTo<"audit_export">;
 

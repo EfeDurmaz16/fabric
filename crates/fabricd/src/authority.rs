@@ -114,6 +114,10 @@ enum Call {
     /// A command whose body is derived from the job's state, deduplicated
     /// by the caller's request (`Authority::submit_derived`).
     Derived(DerivedWork),
+    /// A read of the journal that also runs when there is none yet
+    /// (`Authority::read_journal`): `gc` reads its live set and its
+    /// residuals in one such call, so both are of one state (ADR 0030).
+    Read(ReadWork),
 }
 
 /// An accepted operation whose effect the node has not asked for yet: a
@@ -136,6 +140,10 @@ pub(crate) struct PendingEffect {
 type JournalWork = Box<dyn FnOnce(Result<&mut Journal, AuthorityError>) + Send>;
 
 type DerivedWork = Box<dyn FnOnce(&Place, &mut Holder) + Send>;
+
+/// A read for [`Authority::read_journal`]: the journal, `None` when there
+/// is none, or why the authority stopped.
+type ReadWork = Box<dyn FnOnce(Result<Option<&Journal>, AuthorityError>) + Send>;
 
 /// The digest of a caller's request for [`Authority::submit_derived`]:
 /// blake3 under its own domain over each part, length first, so two
@@ -324,6 +332,33 @@ impl Authority {
         self.journal_call(create, true, work).await
     }
 
+    /// Runs `work` on the journal inside the authority's thread, after
+    /// the calls before it, as one read: everything it reads is of one
+    /// state of the journal. With no journal it runs with `None` and
+    /// starts no thread. It never writes.
+    pub(crate) async fn read_journal<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Option<&Journal>) -> Result<T, AuthorityError> + Send + 'static,
+    ) -> Result<T, AuthorityError> {
+        if self.idle() {
+            return work(None);
+        }
+        self.call(|reply: Reply<T>| {
+            Call::Read(Box::new(move |journal| {
+                let _ = reply.send(journal.and_then(work));
+            }))
+        })
+        .await
+    }
+
+    /// The journal as the bridge client records into it (ADR 0030): each
+    /// call the client makes is one turn of the authority's thread, so
+    /// the thread serves every other call while a worker acts, and the
+    /// journal keeps its one writer.
+    pub(crate) fn recorder(&self) -> Recording {
+        Recording(self.clone())
+    }
+
     async fn journal_call<T: Send + 'static>(
         &self,
         create: bool,
@@ -504,6 +539,39 @@ impl Authority {
     }
 }
 
+/// The journal as the bridge client reaches it through the authority
+/// ([`Authority::recorder`]).
+#[derive(Debug)]
+pub(crate) struct Recording(Authority);
+
+impl fabric_bridge::Recorder for Recording {
+    type Log = Journal;
+
+    async fn reserve(
+        &mut self,
+    ) -> Result<fabric_bridge::Slot<'_, Journal>, fabric_bridge::LogError> {
+        let ended = || fabric_bridge::LogError::Storage("the managed authority stopped".into());
+        let (calls, _) = self.0.running().map_err(|_| ended())?;
+        let permit = calls.reserve_owned().await.map_err(|_| ended())?;
+        Ok(fabric_bridge::Slot::handed(Box::new(Turn(permit))))
+    }
+}
+
+/// Room for one call on the authority's queue.
+struct Turn(mpsc::OwnedPermit<Call>);
+
+impl fabric_bridge::Hand<Journal> for Turn {
+    fn hand(self: Box<Self>, call: fabric_bridge::Handed<Journal>) {
+        self.0.send(Call::With {
+            create: false,
+            writes: true,
+            work: Box::new(move |journal| {
+                call(journal.map_err(|e| fabric_bridge::LogError::Storage(e.to_string())));
+            }),
+        });
+    }
+}
+
 /// Where the authority keeps its journal and where standalone jobs live.
 struct Place {
     dir: PathBuf,
@@ -636,6 +704,11 @@ fn serve(
                 work(place, &mut holder);
                 tick();
             }
+            Call::Read(work) => work(match &holder {
+                Holder::Absent => Ok(None),
+                Holder::Open(journal) => Ok(Some(journal)),
+                Holder::Stopped(reason) => Err(AuthorityError::Unavailable(reason.clone())),
+            }),
             Call::Submit(envelope, reply) => {
                 let answer = submit(place, &mut holder, &envelope);
                 tick();

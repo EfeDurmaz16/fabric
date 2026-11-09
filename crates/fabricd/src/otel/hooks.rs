@@ -225,6 +225,8 @@ pub(crate) fn request_begin(request: &Request) -> Option<OpSpan> {
         Request::JobSteal { job, .. } => (SpanOp::JOB_STEAL, Some(*job)),
         Request::JobDecide { job, .. } => (SpanOp::JOB_DECIDE, Some(*job)),
         Request::JobRepair { job } => (SpanOp::JOB_REPAIR, Some(*job)),
+        // A dry run is a read; only a removing one changes state.
+        Request::Gc { remove: true, .. } => (SpanOp::GC, None),
         Request::HarnessStarted { job, .. } => (SpanOp::HARNESS_STARTED, Some(*job)),
         Request::HarnessSession { job, .. } => (SpanOp::HARNESS_SESSION, Some(*job)),
         Request::HarnessExited { job, .. } => (SpanOp::HARNESS_EXITED, Some(*job)),

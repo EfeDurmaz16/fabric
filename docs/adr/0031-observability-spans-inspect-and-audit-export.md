@@ -1,6 +1,6 @@
 # ADR 0031: Operation spans, inspect and the audit export
 
-Status: proposed 2026-11-09 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 12 of the 2026-11-08 roadmap, Fabric side; the Capsule side is capsule#322. Number 0030 is left to PR 11, which may land first; if it does not, this ADR can be renumbered at the merge.
+Status: proposed 2026-11-09 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 12 of the 2026-11-08 roadmap, Fabric side; the Capsule side is capsule#322.
 
 ## Context
 
@@ -26,7 +26,7 @@ An operation's span has trace id and span id `sha256("fabric.operation:" + id)[0
 
 ### Spans for operations, not reads
 
-The authority's commands and observations, the standalone client requests that change state, the fenced peer requests and the launch path get a span; reads and heartbeats do not, as Capsule's observe and attach do not. Bridge operations have no `fabricd` call site on `main` (the bridge crate is not linked into the node yet), so no bridge span is emitted; the worker side links to the derived context already.
+The authority's commands and observations, the standalone client requests that change state, the fenced peer requests and the launch path get a span; reads and heartbeats do not, as Capsule's observe and attach do not. A `gc` that removes (ADR 0030) is such a request and gets a `gc` span; a dry run is a read. `gc` is the only `fabricd` call site of the bridge, and its worker gets no `TRACEPARENT`, since the `Config` it spawns with names none, so no bridge span is emitted; the worker side links to the derived context already.
 
 ### Inspect and the audit export are client API ops
 

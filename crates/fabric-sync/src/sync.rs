@@ -547,6 +547,7 @@ pub fn pull(home: &Home, req: &PullRequest) -> Result<SyncReport, SyncError> {
             verify: Verify::Sample(32),
             durability: Durability::ProcessCrash,
             carry: &|_| true,
+            label: None,
         },
     );
     if let Err(e) = restored {

@@ -427,3 +427,15 @@ fn only_the_accepted_launch_is_the_attempt_root() {
     assert_ne!(again.context.span, root.span);
     assert_eq!(again.parent, Some(root.span));
 }
+
+#[test]
+fn a_removing_gc_gets_a_span_and_a_dry_run_does_not() {
+    let gc = |remove| Request::Gc {
+        remove,
+        approvals: Vec::new(),
+        worker: None,
+    };
+    assert!(hooks::request_begin(&gc(false)).is_none());
+    let span = hooks::request_begin(&gc(true)).unwrap();
+    assert!(span.op == SpanOp::GC);
+}

@@ -14,8 +14,9 @@
 //! never escapes a field itself.
 
 use fabric_client::api::{
-    CarryReport, DoctorReport, Event, JobStatus, LedgerEvent, Marker, PreflightRow, Process,
-    Registered, RepairOutcome, Reply, SessionRecorded, SnapshotSession, View, WorkspaceState,
+    CarryReport, DoctorReport, Event, GcLabel, GcReport, JobStatus, LedgerEvent, Marker,
+    PreflightRow, Process, Registered, RepairOutcome, Reply, SessionRecorded, SnapshotSession,
+    View, WorkspaceState,
 };
 use fabric_client::sentences::{NO_SESSION, carry_lines, named, row};
 use fabric_core::id::JobId;
@@ -262,6 +263,7 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             }
             lines
         }
+        Reply::Gc(report) => gc_lines(report).0,
         Reply::JobRun(_)
         | Reply::JobResume(_)
         | Reply::JobSuspend(_)
@@ -270,6 +272,100 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
         | Reply::HarnessExited
         | Reply::LaunchCheck => Vec::new(),
     }
+}
+
+/// Whose an item of a `gc` report is, in words: the job, then the tenure
+/// or the attempt and the node its label names.
+fn gc_whose(label: &GcLabel) -> String {
+    let mut words = vec![format!("job {}", label.job)];
+    words.extend(label.epoch.map(|epoch| format!("epoch {epoch}")));
+    words.extend(label.attempt.map(|attempt| format!("attempt {attempt}")));
+    words.extend(
+        label
+            .generation
+            .map(|generation| format!("generation {generation}")),
+    );
+    words.extend(label.node.map(|node| format!("node {node}")));
+    words.join(" ")
+}
+
+/// Where an item of a `gc` report is: its path, its process group, or
+/// the create and locator of a provider resource.
+fn gc_where(
+    path: Option<&std::path::Path>,
+    pid: Option<std::num::NonZeroU32>,
+    operation: Option<String>,
+    locator: Option<&str>,
+) -> String {
+    match (path, pid, operation) {
+        (Some(path), _, _) => path.display().to_string(),
+        (None, Some(pid), _) => format!("process group {pid}"),
+        (None, None, Some(operation)) => match locator {
+            Some(locator) => format!("operation {operation} at {locator}"),
+            None => format!("operation {operation}"),
+        },
+        (None, None, None) => "-".to_owned(),
+    }
+}
+
+/// A `gc` report as rows: one per residual (`<kind> <state> <where>
+/// <whose>`), the result, and the notes: what it keeps and why, the live
+/// set's size, and the next step.
+pub(crate) fn gc_lines(report: &GcReport) -> (Vec<String>, Vec<String>) {
+    let rows = report
+        .residuals
+        .iter()
+        .map(|residual| {
+            let line = format!(
+                "{} {} {} {}",
+                residual.kind,
+                residual.state,
+                gc_where(
+                    residual.path.as_deref(),
+                    residual.pid,
+                    residual.operation.map(|op| op.to_string()),
+                    residual.locator.as_deref()
+                ),
+                gc_whose(&residual.label)
+            );
+            match &residual.detail {
+                Some(detail) => format!("{line}: {detail}"),
+                None => line,
+            }
+        })
+        .collect();
+    let mut notes: Vec<String> = report
+        .kept
+        .iter()
+        .map(|kept| {
+            let whose = kept
+                .label
+                .as_ref()
+                .map(|label| format!(" {}", gc_whose(label)))
+                .unwrap_or_default();
+            format!(
+                "kept {} {}{whose}: {}",
+                kept.kind,
+                gc_where(
+                    kept.path.as_deref(),
+                    None,
+                    kept.operation.map(|op| op.to_string()),
+                    None
+                ),
+                kept.reason
+            )
+        })
+        .collect();
+    notes.push(format!(
+        "the live set holds {} items, never listed and never removed",
+        report.live.len()
+    ));
+    if report.residuals.is_empty() {
+        notes.push("no residuals: crashed or ended work left nothing to remove".to_owned());
+    } else if !report.removing {
+        notes.push("a dry run: remove the residuals listed with `fabric gc --yes`".to_owned());
+    }
+    (rows, notes)
 }
 
 /// The line for a launch the node recorded.
@@ -839,6 +935,10 @@ pub(crate) fn answer(reply: &Reply, job: Option<JobId>) -> Answer {
         _ => false,
     };
     match reply {
+        Reply::Gc(report) => {
+            let (result, notes) = gc_lines(report);
+            Answer { result, notes }
+        }
         Reply::NodeId(identity) => Answer {
             result: vec![identity.node.to_string()],
             notes: lines.split_off(1),
@@ -953,6 +1053,17 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         Reply::JobRepair(_) => json!({ "job": with_job(fields), "outcome": "repaired" }),
         Reply::JobExport(_) => json!({ "snapshot": with_job(fields), "outcome": "exported" }),
         Reply::JobExportPsf(_) => json!({ "container": with_job(fields), "outcome": "exported" }),
+        // The report's own fields are keyed by their nouns (`live`,
+        // `residuals`, `kept`); a dry run is a read and has no outcome,
+        // with the lists below, and so is a removal that left a residual
+        // it listed, whose failure carries the report as its data.
+        Reply::Gc(report) if report.removing && report.residuals.iter().all(|r| r.state == "removed") => {
+            let mut fields = fields;
+            if let Some(object) = fields.as_object_mut() {
+                object.insert("outcome".to_owned(), Value::from("removed"));
+            }
+            fields
+        }
         Reply::ManagedCreate(operation)
         | Reply::ManagedCancel(operation)
         | Reply::ManagedSubmit(operation)
@@ -987,6 +1098,7 @@ pub(crate) fn document(reply: &Reply, job: Option<JobId>) -> Value {
         | Reply::JobList(_)
         | Reply::JobLog(_)
         | Reply::ManagedList(_)
+        | Reply::Gc(_)
         | Reply::AuditExport(_)
         | Reply::Doctor { .. }
         // A launch's own replies, which no `--json` command answers with.
@@ -1069,6 +1181,71 @@ mod contract_tests {
         assert!(said.result.is_empty());
         assert_eq!(said.notes.len(), 1);
         assert_eq!(document(&reply, None)["jobs"], serde_json::json!([]));
+    }
+
+    /// A gc report prints one row per residual on standard output and what
+    /// it keeps as notes; a dry run is a read with no outcome, a removal a
+    /// change with `removed`.
+    #[test]
+    fn a_gc_report_prints_its_residuals_as_rows_and_the_rest_as_notes() {
+        use fabric_client::api::{GcKept, GcLabel, GcReport, GcResidual};
+        let job: JobId = "01JABCDEFGHJKMNPQRSTVWXYZ0".parse().unwrap();
+        let label = GcLabel {
+            job,
+            epoch: Some(Epoch::FIRST),
+            node: None,
+            task: None,
+            attempt: None,
+            generation: None,
+        };
+        let report = |removing: bool| {
+            Reply::Gc(GcReport {
+                removing,
+                live: Vec::new(),
+                residuals: vec![GcResidual {
+                    kind: "harness_state_next".into(),
+                    path: Some("/s/jobs/x/harness-state.next".into()),
+                    pid: None,
+                    operation: None,
+                    locator: None,
+                    label: label.clone(),
+                    state: if removing { "removed" } else { "found" }.into(),
+                    detail: None,
+                }],
+                kept: vec![GcKept {
+                    kind: "departed_copy".into(),
+                    path: Some("/h/departed/1".into()),
+                    operation: None,
+                    label: Some(label.clone()),
+                    reason: "preserved".into(),
+                }],
+            })
+        };
+        let said = answer(&report(false), None);
+        assert_eq!(
+            said.result,
+            vec![format!(
+                "harness_state_next found /s/jobs/x/harness-state.next job {job} epoch 1"
+            )]
+        );
+        assert!(
+            said.notes[0].starts_with("kept departed_copy /h/departed/1"),
+            "{:?}",
+            said.notes
+        );
+        assert!(said.notes.iter().any(|n| n.contains("fabric gc --yes")));
+        let doc = document(&report(false), None);
+        assert!(doc.get("outcome").is_none(), "{doc}");
+        assert_eq!(doc["residuals"][0]["kind"], "harness_state_next");
+        assert_eq!(document(&report(true), None)["outcome"], "removed");
+        // A removal that left a residual is no change done: the failure
+        // carries this document as its data, with no outcome.
+        let mut incomplete = report(true);
+        if let Reply::Gc(report) = &mut incomplete {
+            "approval_required".clone_into(&mut report.residuals[0].state);
+        }
+        let doc = document(&incomplete, None);
+        assert!(doc.get("outcome").is_none(), "{doc}");
     }
 
     #[test]
