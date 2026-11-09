@@ -23,8 +23,10 @@
 //!   page of counters, and each op records what all of them did while it
 //!   ran: the processes they started, by program; file flushes, by kind and
 //!   by class of file; opens, renames and unlinks; allocations; the bytes
-//!   and calls of every read and write, by class of file. Also the peak
-//!   resident size and CPU time of the CLI processes the op started, and
+//!   and calls of every read and write, by class of file; the instructions
+//!   all of them retired, where the machine counts them. Also the peak
+//!   resident size, peak physical footprint and CPU time of the CLI
+//!   processes the op started, and
 //!   each daemon's resident size and physical footprint after it. None of
 //!   this depends on how loaded the machine is. One warm-up run, then `FABRIC_AB_COUNTED` runs,
 //!   3 when unset.
@@ -91,7 +93,7 @@ const RESAMPLES: usize = 10_000;
 
 /// The scalar words of a counter page, by name, in the order of `enum
 /// word` in `scripts/perf-ab/counters.c`, which writes them.
-const WORDS: [&str; 17] = [
+const WORDS: [&str; 20] = [
     "magic",
     "pid",
     "exited",
@@ -109,6 +111,9 @@ const WORDS: [&str; 17] = [
     "malloc_bytes",
     "frees",
     "lock",
+    "instructions",
+    "cycles",
+    "phys_footprint",
 ];
 
 /// The classes of file a read, write or flush touches, in the order of
@@ -556,14 +561,17 @@ fn command(line: &str) -> String {
 
 /// The counters that add up across processes and over time.
 fn additive(name: &str) -> bool {
-    !matches!(name, "magic" | "pid" | "exited" | "maxrss" | "lock")
+    !matches!(
+        name,
+        "magic" | "pid" | "exited" | "maxrss" | "lock" | "phys_footprint"
+    )
 }
 
 /// What every process did between `before` and `after`: the change of each
 /// additive counter summed over the pages, each program's starts as
 /// `spawn:<program>`, and of the processes that started meanwhile but the
-/// daemons, how many there were, their CPU time and their largest peak
-/// resident size.
+/// daemons, how many there were, their CPU time, their largest peak
+/// resident size and their largest peak physical footprint.
 fn delta(before: &BTreeMap<String, Page>, after: &BTreeMap<String, Page>) -> BTreeMap<String, u64> {
     let mut out: BTreeMap<String, u64> = BTreeMap::new();
     let empty = BTreeMap::new();
@@ -590,6 +598,8 @@ fn delta(before: &BTreeMap<String, Page>, after: &BTreeMap<String, Page>) -> BTr
             *out.entry("cli_cpu_us".to_owned()).or_default() += page.counts["cpu_us"];
             let peak = out.entry("cli_maxrss_kib".to_owned()).or_default();
             *peak = (*peak).max(page.counts["maxrss"] / 1024);
+            let peak = out.entry("cli_footprint_kib".to_owned()).or_default();
+            *peak = (*peak).max(page.counts["phys_footprint"] / 1024);
         }
     }
     out
@@ -632,6 +642,11 @@ struct Setup {
     pairs: usize,
     counted: usize,
     counters: Option<PathBuf>,
+    /// True when the candidate's fixture starts before the anchor's
+    /// (`FABRIC_AB_CANDIDATE_FIRST=1`). A daemon that lives through a whole
+    /// phase is one process per build, so an order effect on its size does
+    /// not average out over the runs; the confirmation run swaps the order.
+    candidate_first: bool,
 }
 
 /// `name` as a count, or `default` when it is unset.
@@ -661,7 +676,22 @@ impl Setup {
             pairs: count_var("FABRIC_AB_PAIRS", DEFAULT_PAIRS)?,
             counted: count_var("FABRIC_AB_COUNTED", DEFAULT_COUNTED)?,
             counters: std::env::var_os("FABRIC_AB_COUNTERS").map(PathBuf::from),
+            candidate_first: std::env::var_os("FABRIC_AB_CANDIDATE_FIRST")
+                .is_some_and(|value| value == "1"),
         })
+    }
+
+    /// Both fixtures, anchor then candidate, started in the order
+    /// `candidate_first` says, with their processes counting when
+    /// `counters` names the counter library.
+    fn sides(&self, counters: Option<&Path>) -> Fallible<[Side; 2]> {
+        if self.candidate_first {
+            let candidate = Side::new(&self.builds[1], counters)?;
+            Ok([Side::new(&self.builds[0], counters)?, candidate])
+        } else {
+            let anchor = Side::new(&self.builds[0], counters)?;
+            Ok([anchor, Side::new(&self.builds[1], counters)?])
+        }
     }
 }
 
@@ -678,7 +708,9 @@ fn order(run: usize) -> [usize; 2] {
 /// Says how far the bench got, on standard error.
 fn progress(line: &str) -> Fallible {
     use std::io::Write as _;
-    writeln!(std::io::stderr(), "ab: {line}")?;
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let elapsed = STARTED.get_or_init(Instant::now).elapsed().as_secs();
+    writeln!(std::io::stderr(), "ab: [{elapsed} s] {line}")?;
     Ok(())
 }
 
@@ -723,10 +755,7 @@ fn counted_phase(
         progress("no FABRIC_AB_COUNTERS, so no counted phase")?;
         return Ok(());
     };
-    let mut sides = [
-        Side::new(&setup.builds[0], Some(library))?,
-        Side::new(&setup.builds[1], Some(library))?,
-    ];
+    let mut sides = setup.sides(Some(library))?;
     for run in 0..=runs {
         let first = SIDES[order(run)[0]];
         progress(&format!("counted run {run} of {runs}, {first} first"))?;
@@ -771,10 +800,7 @@ fn timed_phase(setup: &Setup, samples: &mut Samples) -> Fallible {
     if setup.pairs == 0 {
         return Ok(());
     }
-    let mut sides = [
-        Side::new(&setup.builds[0], None)?,
-        Side::new(&setup.builds[1], None)?,
-    ];
+    let mut sides = setup.sides(None)?;
     for run in 0..TIMED_WARM_UPS + setup.pairs {
         let first = SIDES[order(run)[0]];
         progress(&format!(
@@ -911,6 +937,14 @@ impl SplitMix {
 
 /// The 95% percentile bootstrap interval of the median of `values`.
 fn bootstrap(values: &[f64], resamples: usize) -> Fallible<(f64, f64)> {
+    bootstrap_tails(values, resamples, 1)
+}
+
+/// The percentile bootstrap interval of the median of `values` that holds
+/// the median with 95% confidence across `family` intervals at once: each
+/// leaves 2.5% / `family` of the resamples out on either side (Bonferroni).
+/// A `family` of 1 is the plain 95% interval.
+fn bootstrap_tails(values: &[f64], resamples: usize, family: usize) -> Fallible<(f64, f64)> {
     if values.is_empty() {
         return Ok((0.0, 0.0));
     }
@@ -924,8 +958,9 @@ fn bootstrap(values: &[f64], resamples: usize) -> Fallible<(f64, f64)> {
         medians.push(median(&mut drawn));
     }
     medians.sort_by(f64::total_cmp);
-    let low = resamples * 25 / 1000;
-    let high = (resamples * 975 / 1000).saturating_sub(1);
+    let out = resamples * 25 / (1000 * family.max(1));
+    let low = out;
+    let high = (resamples - out).saturating_sub(1);
     Ok((medians[low], medians[high]))
 }
 
@@ -1069,7 +1104,7 @@ fn counted_report(samples: &[Sample], out: &mut String) {
     if ops.is_empty() {
         return;
     }
-    let columns: [(&str, &[&str]); 8] = [
+    let columns: [(&str, &[&str]); 10] = [
         ("spawns", &["spawns"]),
         ("full flushes", &["fullfsync"]),
         ("fsyncs", &["fsync"]),
@@ -1089,7 +1124,9 @@ fn counted_report(samples: &[Sample], out: &mut String) {
         ),
         ("allocations", &["mallocs"]),
         ("CLI peak RSS KiB", &["cli_maxrss_kib"]),
+        ("CLI peak footprint KiB", &["cli_footprint_kib"]),
         ("CLI CPU ms", &["cli_cpu_us"]),
+        ("instructions M", &["instructions"]),
     ];
     out.push_str(
         "\n### Counted ops\n\n\
@@ -1113,6 +1150,8 @@ fn counted_report(samples: &[Sample], out: &mut String) {
             }
             if *title == "CLI CPU ms" {
                 let _ = write!(out, " {:.1} -> {:.1} |", sum[0] / 1000.0, sum[1] / 1000.0);
+            } else if *title == "instructions M" {
+                let _ = write!(out, " {:.1} -> {:.1} |", sum[0] / 1e6, sum[1] / 1e6);
             } else {
                 let _ = write!(out, " {:.0} -> {:.0} |", sum[0], sum[1]);
             }
@@ -1130,7 +1169,10 @@ fn counted_report(samples: &[Sample], out: &mut String) {
             .iter()
             .filter(|sample| sample.phase == "counted" && sample.op == *op)
             .map(|sample| sample.metric.as_str())
-            .filter(|metric| !metric.starts_with("daemon_") && *metric != "cpu_us")
+            .filter(|metric| {
+                !metric.starts_with("daemon_")
+                    && !matches!(*metric, "cpu_us" | "instructions" | "cycles")
+            })
             .collect();
         let mut differs = Vec::new();
         for metric in metrics {
@@ -1287,6 +1329,458 @@ fn counted_size_report(
     Ok(())
 }
 
+/// Resamples of each interval of the gate: its family intervals cut deeper
+/// into the tails than a 95% one, so they take more draws.
+const GATE_RESAMPLES: usize = 40_000;
+
+/// The load-free counters the gate holds per op: the candidate's median
+/// over the counted runs must not exceed the anchor's. Process starts and
+/// the flushes that reach the disk (`F_FULLFSYNC`, `F_BARRIERFSYNC`) are
+/// what a slower op costs on any machine, and neither depends on load or
+/// timing. A plain `fsync`, which macOS does not carry past the drive's
+/// cache, is tracked, not gated: M4 trades full flushes for plain ones
+/// (`resume` 24 full and 51 plain in the anchor, 22 full or barrier and 55
+/// plain in M4, at 0.40 to 0.56 of the anchor's time). Bytes, allocations
+/// and instructions are tracked in the report too.
+const GATED_COUNTERS: [(&str, &[&str]); 2] = [
+    ("process starts", &["spawns", "execs"]),
+    ("full and barrier flushes", &["fullfsync", "barrierfsync"]),
+];
+
+/// One check of the gate.
+struct Check {
+    /// What it holds, as its table row begins.
+    row: String,
+    /// True when it breaks the rule.
+    fails: bool,
+}
+
+/// One paired series the gate holds with a family interval: its row label
+/// and its (anchor, candidate) pairs.
+type Series = (String, Vec<(f64, f64)>);
+
+/// Judges `series` as one family: each interval at 95% across the family,
+/// failing when its low end lies above 1.
+fn family_checks(series: &[Series], out: &mut String) -> Fallible<Vec<Check>> {
+    let family = series.len();
+    let mut checks = Vec::new();
+    out.push_str(
+        "| what | pairs | anchor | candidate | ratio | 95% interval | family interval | verdict |\n\
+         |---|---:|---:|---:|---:|---|---|---|\n",
+    );
+    for (label, found) in series {
+        let judged = judge(found)?;
+        let ratios: Vec<f64> = found
+            .iter()
+            .filter(|pair| pair.0 > 0.0)
+            .map(|pair| pair.1 / pair.0)
+            .collect();
+        let (low, high) = bootstrap_tails(&ratios, GATE_RESAMPLES, family)?;
+        let fails = low > 1.0;
+        let verdict = if fails {
+            "**fail**"
+        } else if judged.low > 1.0 {
+            "pass; its 95% interval alone is above 1"
+        } else {
+            "pass"
+        };
+        let _ = writeln!(
+            out,
+            "| {label} | {} | {:.1} | {:.1} | {:.3} | {:.3} to {:.3} | {low:.3} to {high:.3} | {verdict} |",
+            judged.pairs, judged.anchor, judged.candidate, judged.ratio, judged.low, judged.high
+        );
+        checks.push(Check {
+            row: label.clone(),
+            fails,
+        });
+    }
+    Ok(checks)
+}
+
+/// The pairs of counted `metric` over every op and run, for a size that
+/// every op reports.
+fn counted_size_pairs(samples: &[Sample], metric: &str) -> Vec<(f64, f64)> {
+    let mut by_op: BTreeMap<(usize, &str), [Option<f64>; 2]> = BTreeMap::new();
+    for sample in samples {
+        if sample.phase == "counted" && sample.metric == metric {
+            by_op.entry((sample.run, sample.op.as_str())).or_default()[sample.side] =
+                Some(sample.value);
+        }
+    }
+    by_op
+        .values()
+        .filter_map(|pair| Some((pair[0]?, pair[1]?)))
+        .collect()
+}
+
+/// The daemons whose sizes after the timed runs the gate judges: daemon a
+/// restarts in every timed run (`restart`), so each of its pairs is two
+/// fresh processes. Daemon b lives through the whole timed phase, so its
+/// 15 readings per side are one process read 15 times: a constant offset
+/// between the two processes (heap layout, start order) gives an interval
+/// about 1% wide away from 1, and two equal builds failed it in a run and
+/// in its confirmation on the runner (perf-ab README, CI section). Its
+/// sizes stay in the report.
+const GATED_DAEMONS: [&str; 1] = ["daemon a"];
+
+/// The memory rows of the gate: the sizes after the timed runs of each
+/// daemon in [`GATED_DAEMONS`], and the CLI's peak sizes per counted op,
+/// a fresh process each. The daemons' sizes after the counted ops stay in
+/// the report only: each side has one daemon per node, read again after
+/// every op, so those pairs are not independent either, and two equal
+/// builds read 0.971 to 1.075 there on the runner (perf-ab README, CI
+/// section).
+fn memory_series(samples: &[Sample]) -> Vec<Series> {
+    let mut memory: Vec<Series> = Vec::new();
+    for (metric, _, title, _) in DAEMON_SIZES {
+        let daemons: BTreeSet<&str> = samples
+            .iter()
+            .filter(|sample| sample.phase == "timed" && sample.metric == metric)
+            .map(|sample| sample.op.as_str())
+            .filter(|daemon| GATED_DAEMONS.contains(daemon))
+            .collect();
+        for daemon in daemons {
+            let found = pairs(samples, "timed", daemon, metric);
+            memory.push((
+                format!("{title}, {daemon}, KiB after each timed run"),
+                found,
+            ));
+        }
+    }
+    for (metric, title) in CLI_SIZES {
+        let found = counted_size_pairs(samples, metric);
+        if !found.is_empty() {
+            memory.push((cli_row(title), found));
+        }
+    }
+    memory
+}
+
+/// The CLI's peak sizes the gate holds, as (metric, title): one row each,
+/// over every counted op.
+const CLI_SIZES: [(&str, &str); 2] = [
+    ("cli_maxrss_kib", "CLI peak resident size"),
+    ("cli_footprint_kib", "CLI peak physical footprint"),
+];
+
+fn cli_row(title: &str) -> String {
+    format!("{title}, KiB per counted op")
+}
+
+/// One op's CLI peak size: the medians of its counted runs and the median
+/// of their ratios.
+struct OpSize {
+    op: String,
+    anchor: f64,
+    candidate: f64,
+    ratio: f64,
+}
+
+/// The ops behind a failing CLI row: each op's counted pairs of `metric`,
+/// largest ratio first. The row pools every op, so its verdict alone names
+/// no op; these do.
+fn cli_sizes_by_op(samples: &[Sample], metric: &str) -> Vec<OpSize> {
+    let mut sizes: Vec<OpSize> = ops_in(samples, "counted")
+        .into_iter()
+        .filter_map(|op| {
+            let found = pairs(samples, "counted", &op, metric);
+            if found.is_empty() {
+                return None;
+            }
+            let mut anchor: Vec<f64> = found.iter().map(|pair| pair.0).collect();
+            let mut candidate: Vec<f64> = found.iter().map(|pair| pair.1).collect();
+            let mut ratios: Vec<f64> = found
+                .iter()
+                .filter(|pair| pair.0 > 0.0)
+                .map(|pair| pair.1 / pair.0)
+                .collect();
+            Some(OpSize {
+                op,
+                anchor: median(&mut anchor),
+                candidate: median(&mut candidate),
+                ratio: median(&mut ratios),
+            })
+        })
+        .collect();
+    sizes.sort_by(|a, b| b.ratio.total_cmp(&a.ratio));
+    sizes
+}
+
+/// How many ops of the CLI row `row` are larger, and the largest of them,
+/// as one sentence; `None` when `row` is not a CLI row.
+fn cli_ops_named(samples: &[Sample], row: &str) -> Option<String> {
+    let (metric, _) = CLI_SIZES.iter().find(|(_, title)| cli_row(title) == row)?;
+    let sizes = cli_sizes_by_op(samples, metric);
+    let larger: Vec<&OpSize> = sizes.iter().filter(|size| size.ratio > 1.0).collect();
+    let largest: Vec<String> = larger
+        .iter()
+        .take(5)
+        .map(|size| {
+            format!(
+                "`{}` {:.3} ({:.0} -> {:.0} KiB)",
+                size.op, size.ratio, size.anchor, size.candidate
+            )
+        })
+        .collect();
+    let spread = if larger.len() == sizes.len() {
+        "every op, so the cost is in every CLI process, not in one op's path"
+    } else {
+        "the ops below, so look in their paths first"
+    };
+    Some(format!(
+        "{row}: larger in {} of {} ops, {spread}; the largest: {}.",
+        larger.len(),
+        sizes.len(),
+        if largest.is_empty() {
+            "none".to_owned()
+        } else {
+            largest.join(", ")
+        }
+    ))
+}
+
+/// Each op's CLI peak size for the failing CLI rows in `failed`, as a table
+/// under the memory rows.
+fn cli_op_tables(samples: &[Sample], failed: &[String], out: &mut String) {
+    for (metric, title) in CLI_SIZES {
+        if !failed.contains(&cli_row(title)) {
+            continue;
+        }
+        let _ = write!(
+            out,
+            "\n#### {title} by op\n\n\
+             KiB, medians over each op's counted runs, largest ratio first.\n\n\
+             | op | anchor | candidate | ratio |\n|---|---:|---:|---:|\n"
+        );
+        for size in cli_sizes_by_op(samples, metric) {
+            let _ = writeln!(
+                out,
+                "| {} | {:.0} | {:.0} | {:.3} |",
+                size.op, size.anchor, size.candidate, size.ratio
+            );
+        }
+    }
+}
+
+/// The counter checks of the gate, one per counted op, with their table.
+fn counter_checks(samples: &[Sample], out: &mut String) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let counted = ops_in(samples, "counted");
+    if !counted.is_empty() {
+        out.push_str(
+            "\n#### Counters\n\n\
+             Medians over the counted runs, anchor -> candidate. An op fails when the \
+             candidate starts more processes or makes more full or barrier flushes than the anchor.\n\n\
+             | op |",
+        );
+        for (title, _) in GATED_COUNTERS {
+            let _ = write!(out, " {title} |");
+        }
+        out.push_str(" verdict |\n|---|");
+        out.push_str(&"---:|".repeat(GATED_COUNTERS.len()));
+        out.push_str("---|\n");
+        for op in &counted {
+            let _ = write!(out, "| {op} |");
+            let mut fails = false;
+            for (title, metrics) in GATED_COUNTERS {
+                let mut sum = [0.0, 0.0];
+                for metric in metrics {
+                    let [anchor, candidate] = counted_medians(samples, op, metric);
+                    sum[0] += anchor;
+                    sum[1] += candidate;
+                }
+                // One check per op and counter, named the same whatever
+                // the other counters did, so a confirmation matches an op
+                // that starts more processes in both runs even when its
+                // flushes differ between them.
+                let over = sum[1] > sum[0];
+                fails |= over;
+                checks.push(Check {
+                    row: format!("{op}: more {title}"),
+                    fails: over,
+                });
+                let _ = write!(out, " {:.0} -> {:.0} |", sum[0], sum[1]);
+            }
+            let _ = writeln!(out, " {} |", if fails { "**fail**" } else { "pass" });
+        }
+    }
+
+    checks
+}
+
+/// The ops behind the failing CLI rows in `failed`, a line each, after a
+/// blank line; empty when none of them is a CLI row.
+fn named(samples: &[Sample], failed: &[String]) -> String {
+    let lines: Vec<String> = failed
+        .iter()
+        .filter_map(|row| cli_ops_named(samples, row))
+        .collect();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", lines.join("\n\n"))
+    }
+}
+
+/// The verdict of a run against the performance rule, as markdown, and
+/// the rows that break it. Times: no op's family interval above 1, the 95%
+/// interval across all timed ops at once (Bonferroni). That bounds the
+/// false failures of independent, alike samples at one run in 20; a shared
+/// runner's are neither, and 6 of 15 single A/A runs failed a check there,
+/// so CI confirms a failing run ([`confirmed_verdict`]). Memory: no gated
+/// daemon's resident size or physical footprint and no CLI's peak resident size or
+/// physical footprint with a family interval above 1, across the memory
+/// rows. Counters: no op with more process starts or more full or
+/// barrier flushes than the anchor, medians over the counted runs, one
+/// check per op and counter.
+fn judge_run(text: &str) -> Fallible<(String, Vec<String>)> {
+    let samples = parse_samples(text)?;
+    let mut out = String::new();
+    let mut checks = Vec::new();
+
+    let timed: Vec<Series> = ops_in(&samples, "timed")
+        .into_iter()
+        .filter(|op| !op.starts_with("daemon "))
+        .map(|op| {
+            let found = pairs(&samples, "timed", &op, "us");
+            (op, found)
+        })
+        .filter(|(_, found)| !found.is_empty())
+        .map(|(op, found)| {
+            let ms = found
+                .iter()
+                .map(|(a, c)| (a / 1000.0, c / 1000.0))
+                .collect();
+            (op, ms)
+        })
+        .collect();
+    if !timed.is_empty() {
+        let _ = write!(
+            out,
+            "\n#### Times\n\n\
+             Medians in ms. The family interval is the 95% interval across all {} ops at \
+             once (Bonferroni); an op fails when it lies above 1.\n\n",
+            timed.len()
+        );
+        checks.extend(family_checks(&timed, &mut out)?);
+    }
+
+    let memory = memory_series(&samples);
+    if !memory.is_empty() {
+        let _ = write!(
+            out,
+            "\n#### Memory\n\n\
+             The family interval is the 95% interval across all {} rows at once; a row \
+             fails when it lies above 1.\n\n",
+            memory.len()
+        );
+        let rows = family_checks(&memory, &mut out)?;
+        let failed: Vec<String> = rows
+            .iter()
+            .filter(|check| check.fails)
+            .map(|check| check.row.clone())
+            .collect();
+        cli_op_tables(&samples, &failed, &mut out);
+        checks.extend(rows);
+    }
+
+    checks.extend(counter_checks(&samples, &mut out));
+
+    let failed: Vec<String> = checks
+        .iter()
+        .filter(|check| check.fails)
+        .map(|check| check.row.clone())
+        .collect();
+    let head = if checks.is_empty() {
+        return Err("no samples to judge".into());
+    } else if failed.is_empty() {
+        format!(
+            "### Perf gate: pass\n\nAll {} checks hold against the anchor.\n",
+            checks.len()
+        )
+    } else {
+        format!(
+            "### Perf gate: fail\n\n{} of {} checks break the performance rule \
+             (CONTRIBUTING.md): {}.\n{}",
+            failed.len(),
+            checks.len(),
+            failed.join("; "),
+            named(&samples, &failed)
+        )
+    };
+    Ok((head + &out, failed))
+}
+
+/// The verdict of a run, or of a run and its confirmation: a second run of
+/// both builds that CI makes when the first fails. With a confirmation a
+/// check breaks the rule only when it fails in both runs. A shared runner's
+/// times are noisy enough that one run of two equal builds failed one op in
+/// two A/A runs (`acp new`, family interval 1.001 to 1.708); a real
+/// regression fails again, noise rarely does.
+fn confirmed_verdict(first: &str, again: Option<&str>) -> Fallible<(String, Vec<String>)> {
+    let (first_verdict, first_failed) = judge_run(first)?;
+    let Some(again) = again else {
+        return Ok((first_verdict, first_failed));
+    };
+    let (again_verdict, again_failed) = judge_run(again)?;
+    let failed: Vec<String> = first_failed
+        .iter()
+        .filter(|row| again_failed.contains(row))
+        .cloned()
+        .collect();
+    let list = |rows: &[String]| {
+        if rows.is_empty() {
+            "none".to_owned()
+        } else {
+            rows.join("; ")
+        }
+    };
+    let mut out = format!(
+        "### Perf gate: {}\n\n\
+         The first run failed {}, so CI ran both builds again; the confirmation \
+         failed {}. A check fails only when it fails in both runs: {}.\n{}",
+        if failed.is_empty() { "pass" } else { "fail" },
+        list(&first_failed),
+        list(&again_failed),
+        list(&failed),
+        named(&parse_samples(again)?, &failed)
+    );
+    for (title, verdict) in [
+        ("First run", first_verdict),
+        ("Confirmation run", again_verdict),
+    ] {
+        let _ = write!(
+            out,
+            "
+{}",
+            verdict.replacen("### Perf gate:", &format!("### {title}:"), 1)
+        );
+    }
+    Ok((out, failed))
+}
+
+/// Judges the samples in `FABRIC_AB_OUT` against the performance rule,
+/// with the confirmation run in `FABRIC_AB_CONFIRM` when it is set, writes
+/// `verdict.md` in `FABRIC_AB_OUT` and fails when a check breaks the rule.
+#[test]
+#[ignore = "judges the samples of an A/B run; scripts/bench-ab.sh --gate runs it"]
+fn gate() -> Fallible {
+    let out = path_var("FABRIC_AB_OUT")?;
+    let first = fs::read_to_string(out.join("samples.tsv"))?;
+    let again = match std::env::var_os("FABRIC_AB_CONFIRM") {
+        Some(dir) => Some(fs::read_to_string(Path::new(&dir).join("samples.tsv"))?),
+        None => None,
+    };
+    let (verdict, failed) = confirmed_verdict(&first, again.as_deref())?;
+    fs::write(out.join("verdict.md"), &verdict)?;
+    println!("{verdict}");
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the perf gate fails: {}", failed.join("; ")).into())
+    }
+}
+
 /// The median and its interval follow the samples, and the same samples
 /// give the same interval every time.
 #[test]
@@ -1320,6 +1814,7 @@ fn a_counter_page_reads_back() -> Fallible {
     };
     set(&mut bytes, 3, 8 << 20);
     set(&mut bytes, 8, 2);
+    set(&mut bytes, 19, 6 << 20);
     // write_bytes.ledger: the second class of the first group.
     set(&mut bytes, WORDS.len() + 1, 300);
     bytes[ROLE.0..ROLE.0 + 11].copy_from_slice(b"job approve");
@@ -1337,6 +1832,7 @@ fn a_counter_page_reads_back() -> Fallible {
     assert_eq!(changed["spawn:git"], 3);
     assert_eq!(changed["cli_processes"], 1);
     assert_eq!(changed["cli_maxrss_kib"], 8192);
+    assert_eq!(changed["cli_footprint_kib"], 6144);
     assert_eq!(Page::parse(&[0_u8; 4096])?, None);
     Ok(())
 }
@@ -1442,4 +1938,162 @@ fn a_spawn_line_reads_as_its_command() {
         "sh holding claude"
     );
     assert_eq!(command("kill -KILL -- -42"), "kill");
+}
+
+/// Samples of a run in which the candidate is `slower` times the anchor on
+/// `cli ls`, `larger` times on daemon a's footprint, and starts `extra`
+/// more processes in `acp new`; every other value is equal, give or take
+/// a percent that alternates between the builds.
+fn gate_samples(slower: f64, larger: f64, extra: u64) -> String {
+    let mut text = String::from("phase\trun\top\tside\tfirst\tmetric\tvalue\n");
+    for run in 0..15_u32 {
+        let wobble = if run % 2 == 0 { 1.01 } else { 0.99 };
+        for (side, jitter, slower, larger) in [
+            ("anchor", wobble, 1.0, 1.0),
+            ("candidate", 2.0 - wobble, slower, larger),
+        ] {
+            let ls = 3000.0 * jitter * slower;
+            let version = 2000.0 * jitter;
+            let footprint = 4000.0 * jitter * larger;
+            let _ = writeln!(text, "timed\t{run}\tcli ls\t{side}\tanchor\tus\t{ls:.0}");
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tcli version\t{side}\tanchor\tus\t{version:.0}"
+            );
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tdaemon a\t{side}\tanchor\tfootprint_kib\t{footprint:.0}"
+            );
+            // Daemon b is one process per side for the whole timed phase:
+            // the candidate's reads a constant 2% above the anchor's.
+            let b = if side == "anchor" { 9000.0 } else { 9180.0 };
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tdaemon b\t{side}\tanchor\tfootprint_kib\t{b:.0}"
+            );
+        }
+    }
+    for run in 1..=3 {
+        for (side, spawns) in [("anchor", 1), ("candidate", 1 + extra)] {
+            let _ = writeln!(
+                text,
+                "counted\t{run}\tacp new\t{side}\tanchor\tspawns\t{spawns}"
+            );
+            let _ = writeln!(
+                text,
+                "counted\t{run}\tacp new\t{side}\tanchor\tfullfsync\t3"
+            );
+        }
+    }
+    text
+}
+
+/// The gate passes two builds that differ by noise, and fails each of a
+/// slower op, a larger daemon and an op that starts one more process.
+#[test]
+fn the_gate_fails_a_slower_op_a_larger_daemon_and_one_more_process() -> Fallible {
+    let (verdict, failed) = judge_run(&gate_samples(1.0, 1.0, 0))?;
+    assert!(failed.is_empty(), "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: pass"), "{verdict}");
+
+    let (verdict, failed) = judge_run(&gate_samples(1.05, 1.0, 0))?;
+    assert_eq!(failed, ["cli ls"], "{verdict}");
+
+    let (verdict, failed) = judge_run(&gate_samples(1.0, 1.05, 0))?;
+    assert_eq!(
+        failed,
+        ["Daemon physical footprint, daemon a, KiB after each timed run"],
+        "{verdict}"
+    );
+
+    let (verdict, failed) = judge_run(&gate_samples(1.0, 1.0, 1))?;
+    assert_eq!(failed, ["acp new: more process starts"], "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: fail"), "{verdict}");
+    Ok(())
+}
+
+/// Daemon b's timed readings are one process per side read again and
+/// again, so a constant offset between the two is not a regression: the
+/// report shows it, the gate does not judge it.
+#[test]
+fn the_gate_leaves_out_the_long_lived_daemon() -> Fallible {
+    let samples = gate_samples(1.0, 1.0, 0);
+    let (verdict, failed) = judge_run(&samples)?;
+    assert!(failed.is_empty(), "{verdict}");
+    assert!(!verdict.contains("daemon b"), "{verdict}");
+    let report = report(&samples)?;
+    assert!(report.contains("| daemon b | 9000 |"), "{report}");
+    Ok(())
+}
+
+/// With a confirmation run, a check fails only when it fails in both runs.
+#[test]
+fn a_confirmed_gate_fails_only_what_fails_twice() -> Fallible {
+    let noisy = gate_samples(1.05, 1.0, 0);
+    let quiet = gate_samples(1.0, 1.0, 0);
+    let (verdict, failed) = confirmed_verdict(&noisy, Some(&quiet))?;
+    assert!(failed.is_empty(), "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: pass"), "{verdict}");
+    assert!(verdict.contains("### First run: fail"), "{verdict}");
+    let (verdict, failed) = confirmed_verdict(&noisy, Some(&noisy))?;
+    assert_eq!(failed, ["cli ls"], "{verdict}");
+    Ok(())
+}
+
+/// A confirmation matches each counter of an op on its own: an op that
+/// starts one more process in both runs fails although only the first run
+/// also made one more flush.
+#[test]
+fn a_confirmed_gate_matches_each_counter_of_an_op() -> Fallible {
+    let spawn = gate_samples(1.0, 1.0, 1);
+    let spawn_and_flush = spawn.replace(
+        "acp new\tcandidate\tanchor\tfullfsync\t3",
+        "acp new\tcandidate\tanchor\tfullfsync\t4",
+    );
+    let (verdict, failed) = judge_run(&spawn_and_flush)?;
+    assert_eq!(
+        failed,
+        [
+            "acp new: more process starts",
+            "acp new: more full and barrier flushes"
+        ],
+        "{verdict}"
+    );
+    let (verdict, failed) = confirmed_verdict(&spawn_and_flush, Some(&spawn))?;
+    assert_eq!(failed, ["acp new: more process starts"], "{verdict}");
+    assert!(verdict.starts_with("### Perf gate: fail"), "{verdict}");
+    Ok(())
+}
+
+/// A failing CLI row pools every op, so the verdict names the ops behind
+/// it, largest ratio first, and says when every op is larger.
+#[test]
+fn a_failing_cli_row_names_its_ops() -> Fallible {
+    let mut samples = gate_samples(1.0, 1.0, 0);
+    for run in 1..=5 {
+        for (op, larger) in [("cli version", 1.14), ("cli ls", 1.07), ("acp new", 1.07)] {
+            for (side, kib) in [("anchor", 3000.0), ("candidate", 3000.0 * larger)] {
+                let _ = writeln!(
+                    samples,
+                    "counted\t{run}\t{op}\t{side}\tanchor\tcli_footprint_kib\t{kib:.0}"
+                );
+            }
+        }
+    }
+    let row = "CLI peak physical footprint, KiB per counted op";
+    let (verdict, failed) = confirmed_verdict(&samples, Some(&samples))?;
+    assert_eq!(failed, [row], "{verdict}");
+    let (head, _) = verdict.split_once("### First run").ok_or("no first run")?;
+    assert!(
+        head.contains(&format!(
+            "{row}: larger in 3 of 3 ops, every op, so the cost is in every CLI process, \
+             not in one op's path; the largest: `cli version` 1.140 (3000 -> 3420 KiB), "
+        )),
+        "{verdict}"
+    );
+    assert!(
+        verdict.contains("| cli version | 3000 | 3420 | 1.140 |"),
+        "{verdict}"
+    );
+    Ok(())
 }

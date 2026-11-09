@@ -24,6 +24,15 @@ else
   echo "FAIL check-budget.sh names anchor '$anchor', bench-ab.sh '$bench_anchor'" >&2
   failures=$((failures + 1))
 fi
+# The perf job passes its own copy to bench-ab.sh and keys the anchor's
+# cached build on it.
+workflow_anchor=$(sed -n 's/^  ANCHOR: \([0-9a-f]\{40\}\)$/\1/p' "$scripts/../.github/workflows/perf.yml")
+if [ -n "$anchor" ] && [ "$anchor" = "$workflow_anchor" ]; then
+  echo "ok   the perf workflow names the same anchor"
+else
+  echo "FAIL the perf workflow names anchor '$workflow_anchor', check-budget.sh '$anchor'" >&2
+  failures=$((failures + 1))
+fi
 budget=crates/fabric/tests/e2e/budget.toml
 
 git_() {
