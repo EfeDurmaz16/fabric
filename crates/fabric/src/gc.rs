@@ -19,7 +19,8 @@ use fabric_core::managed::OperationId;
 
 use crate::{Refused, contract, render};
 
-/// The options of `fabric gc`.
+// The options of `fabric gc`. A plain comment: the command defers its
+// arguments, so a doc comment here would replace its summary.
 #[derive(Debug, Args)]
 pub(crate) struct GcArgs {
     /// Remove what the report lists; without it gc only reports.
