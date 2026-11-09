@@ -13,7 +13,8 @@
 
 mod common;
 
-use std::sync::mpsc as std_mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 
 use common::{Logged, create, journal, operation};
@@ -450,6 +451,280 @@ async fn a_request_whose_caller_stopped_waiting_is_unknown_once_the_worker_is_lo
     assert_eq!(entry.status, ProviderStatus::Unknown);
     assert_eq!(entry.locator, None);
     let _reader = script.await.unwrap();
+}
+
+/// A create in flight, the worker lost with it, and only then its caller
+/// gone: the loss is published before the caller drops the request, the
+/// order the test above leaves to the scheduler. `answer` is what the
+/// worker writes before it closes its output, if anything. Returns the
+/// operation's entry once the next call handed the log recorded it.
+async fn dropped_after_loss(answer: Option<fn(&Value) -> Value>) -> Entry {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let request = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(request["type"], "request", "{request}");
+        if let Some(answer) = answer {
+            let frame = frames::encode(&answer(&request), 1 << 20).unwrap();
+            frames::write(&mut writer, &frame).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        reader
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let mut log = MemoryLog::new();
+    let held = bridge
+        .request(&mut log, create(1, "fixture/ok"))
+        .await
+        .unwrap();
+    // The reader routes the answer, if any, then reads the end of the
+    // output and publishes the loss: `lost` is set once both are done.
+    let started = std::time::Instant::now();
+    while bridge.lost().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the worker was never lost"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(held);
+    bridge.record_late(&mut log).await.unwrap();
+    let _reader = script.await.unwrap();
+    log.entry(OperationId::from_bytes([1; 16]))
+        .unwrap()
+        .unwrap()
+}
+
+/// The loss reached the request before its caller dropped it, so no
+/// waiter is left for the drop to find; the request is `unknown` all the
+/// same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_dropped_after_the_worker_was_lost_is_unknown() {
+    let entry = dropped_after_loss(None).await;
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    assert_eq!(entry.locator, None);
+}
+
+/// The answer reached the request, then the worker was lost, then its
+/// caller dropped it unread: it is `unknown`, as a request dropped before
+/// its answer, with the locator that answer named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_dropped_with_its_answer_unread_is_unknown_with_its_locator() {
+    fn answer(request: &Value) -> Value {
+        completed(
+            request,
+            &json!({
+                "provider": "fixture",
+                "scope": {"account": "acct-a", "project": "proj-1"},
+                "kind": "sandbox",
+                "native_id": "fx-unread",
+            }),
+            &json!({"status": "ready"}),
+        )
+    }
+    let entry = dropped_after_loss(Some(answer)).await;
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    let locator: Value = serde_json::from_str(&entry.locator.unwrap().text).unwrap();
+    assert_eq!(locator["native_id"], "fx-unread");
+}
+
+/// A log in memory whose next `record`s, or next `locate`s, fail as
+/// storage does, as many as the test arms.
+struct Faulty {
+    log: MemoryLog,
+    records: Arc<AtomicU32>,
+    locates: Arc<AtomicU32>,
+}
+
+/// Takes one armed failure from `armed`, if any.
+fn fails(armed: &AtomicU32) -> bool {
+    armed
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+impl OperationLog for Faulty {
+    fn begin(
+        &mut self,
+        dispatch: &ProviderDispatch,
+        refusal: Option<&ProviderAnswer>,
+    ) -> Result<(), LogError> {
+        self.log.begin(dispatch, refusal)
+    }
+
+    fn record(
+        &mut self,
+        operation: OperationId,
+        status: ProviderStatus,
+        answer: &ProviderAnswer,
+        locator: Option<&LocatorRecord>,
+    ) -> Result<(), LogError> {
+        if fails(&self.records) {
+            return Err(LogError::Storage("the disk is full".into()));
+        }
+        self.log.record(operation, status, answer, locator)
+    }
+
+    fn searched(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.log.searched(operation, answer, searched)
+    }
+
+    fn absent(
+        &mut self,
+        operation: OperationId,
+        answer: &ProviderAnswer,
+        searched: &str,
+    ) -> Result<(), LogError> {
+        self.log.absent(operation, answer, searched)
+    }
+
+    fn locate(&mut self, operation: OperationId, locator: &LocatorRecord) -> Result<(), LogError> {
+        if fails(&self.locates) {
+            return Err(LogError::Storage("the disk is full".into()));
+        }
+        self.log.locate(operation, locator)
+    }
+
+    fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
+        self.log.entry(operation)
+    }
+
+    fn cleanup_target(
+        &self,
+        creating: OperationId,
+    ) -> Result<Result<(Scope, LocatorRecord), CleanupRefusal>, LogError> {
+        self.log.cleanup_target(creating)
+    }
+}
+
+/// A fixture locator named `native_id`.
+fn sandbox(native_id: &str) -> Value {
+    json!({
+        "provider": "fixture",
+        "scope": {"account": "acct-a", "project": "proj-1"},
+        "kind": "sandbox",
+        "native_id": native_id,
+    })
+}
+
+/// A create whose worker writes what `say` makes of the request, then
+/// keeps its output open; the log fails what `arm` arms before the
+/// caller's next step. Returns the bridge, the log, the request and the
+/// worker's halves, kept so the worker is not lost.
+async fn faulty_step(
+    say: fn(&Value) -> Value,
+) -> (
+    Bridge,
+    LogThread<Faulty>,
+    fabric_bridge::InFlight,
+    Arc<AtomicU32>,
+    Arc<AtomicU32>,
+    tokio::task::JoinHandle<impl Send>,
+) {
+    let (fabric, worker) = tokio::io::duplex(64 << 10);
+    let (from_worker, to_worker) = tokio::io::split(fabric);
+    let (mut reader, mut writer) = tokio::io::split(worker);
+    let script = tokio::spawn(async move {
+        let hello = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&ack(&hello), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        let request = frames::read(&mut reader, 1 << 20).await.unwrap().unwrap();
+        let frame = frames::encode(&say(&request), 1 << 20).unwrap();
+        frames::write(&mut writer, &frame).await.unwrap();
+        (reader, writer)
+    });
+    let bridge = Bridge::connect(from_worker, Box::new(to_worker), config())
+        .await
+        .unwrap();
+    let (records, locates) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    let mut log = LogThread::spawn(Faulty {
+        log: MemoryLog::new(),
+        records: Arc::clone(&records),
+        locates: Arc::clone(&locates),
+    })
+    .unwrap();
+    let flight = bridge
+        .request(&mut log, create(1, "fixture/ok"))
+        .await
+        .unwrap();
+    (bridge, log, flight, records, locates, script)
+}
+
+/// The operation's entry, read on the log's thread.
+async fn entry_of(log: &LogThread<Faulty>) -> Entry {
+    log.call(|log| log.entry(OperationId::from_bytes([1; 16])))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+}
+
+/// The answer is taken from the worker, but the log fails to record it.
+/// Nothing else will settle the request, so the next call handed the log
+/// records it `unknown`, with the locator the answer named, instead of
+/// leaving it `dispatched` until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_whose_answer_the_log_failed_to_record_is_unknown_with_its_locator() {
+    fn answer(request: &Value) -> Value {
+        completed(request, &sandbox("fx-settle"), &json!({"status": "ready"}))
+    }
+    let (bridge, mut log, flight, records, _, script) = faulty_step(answer).await;
+    records.store(1, Ordering::SeqCst);
+    let failed = flight.finish(&mut log).await;
+    assert!(
+        matches!(failed, Err(BridgeError::Log(LogError::Storage(_)))),
+        "{failed:?}"
+    );
+    bridge.record_late(&mut log).await.unwrap();
+    let entry = entry_of(&log).await;
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    let locator: Value = serde_json::from_str(&entry.locator.unwrap().text).unwrap();
+    assert_eq!(locator["native_id"], "fx-settle");
+    let _worker = script.await.unwrap();
+    assert!(bridge.lost().is_none(), "{:?}", bridge.lost());
+}
+
+/// A `progress` is taken from the worker, but the log fails to record
+/// its locator. The locator is kept: once the caller drops the request,
+/// the next call handed the log records it `unknown` with that locator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_progress_locator_the_log_failed_to_record_is_kept() {
+    fn progress(request: &Value) -> Value {
+        json!({
+            "type": "progress",
+            "request_id": request["request_id"],
+            "operation_id": request["operation"]["id"],
+            "seq": 1,
+            "state": "creating",
+            "resource": sandbox("fx-progress"),
+        })
+    }
+    let (bridge, mut log, mut flight, _, locates, script) = faulty_step(progress).await;
+    locates.store(1, Ordering::SeqCst);
+    let failed = flight.next(&mut log).await;
+    assert!(
+        matches!(failed, Err(BridgeError::Log(LogError::Storage(_)))),
+        "{failed:?}"
+    );
+    drop(flight);
+    bridge.record_late(&mut log).await.unwrap();
+    let entry = entry_of(&log).await;
+    assert_eq!(entry.status, ProviderStatus::Unknown);
+    let locator: Value = serde_json::from_str(&entry.locator.unwrap().text).unwrap();
+    assert_eq!(locator["native_id"], "fx-progress");
+    let _worker = script.await.unwrap();
 }
 
 /// A worker that answers the handshake, then reads every frame until its
