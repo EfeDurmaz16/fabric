@@ -44,7 +44,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// job's runner presents its grant with every covered write and learns
 /// from each heartbeat answer whether its grant still stands, and a node
 /// of version 4 knows neither. The launch path messages (`Launch`,
-/// `Instruct`, `Report`, `Heartbeat`) were never released under 4.
+/// `Instruct`, `Report`, `Heartbeat`) were never released under 4, and
+/// `Heartbeat::running` (a restarted node's presentation is not presence)
+/// was added before 5 was released.
 pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The most chunk ids one `WantChunks` request may name.
