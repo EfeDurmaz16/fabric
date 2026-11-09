@@ -37,3 +37,4 @@ How to write one is in [CONTRIBUTING, Decisions](../../CONTRIBUTING.md#decisions
 | [0026](0026-resource-placement.md) | Resource placement among registered nodes | proposed, 2026-11-03. |
 | [0027](0027-job-facade-protocol.md) | The job facade: authenticated remote job operations over the node link | proposed, 2026-11-03. |
 | [0029](0029-portable-session-format.md) | The Portable Session Format v1 | proposed 2026-11-08 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 4 of the 2026-11-08 roadmap. |
+| [0030](0030-residuals-and-gc.md) | Residuals and `fabric gc` | proposed 2026-11-09 (selections by the implementation agent under Efe's delegation of 2026-11-02; Efe can veto any of them at the pull request). PR 11 of the 2026-11-08 roadmap, the Fabric side; the Capsule side merged as capsule#321. |

@@ -63,6 +63,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub mod contract;
+mod gc;
 mod managed;
 mod psf;
 mod render;
@@ -105,6 +106,8 @@ enum Command {
         #[arg(long, requires = "peer", value_name = "JOB")]
         job: Option<JobId>,
     },
+    /// Report what crashed or ended work left on this node; remove it with --yes.
+    Gc(gc::GcArgs),
 }
 
 #[derive(Debug, Args)]
@@ -632,6 +635,7 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Psf(command) => psf::run(command, run),
+        Command::Gc(args) => gc::run(&client, args, run).await,
     }
 }
 

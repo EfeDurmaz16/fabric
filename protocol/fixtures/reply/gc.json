@@ -1,0 +1,83 @@
+{
+  "kind": "gc",
+  "removing": true,
+  "live": [
+    {
+      "holds": "tenure",
+      "label": {
+        "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "epoch": 3
+      }
+    },
+    {
+      "holds": "attempt",
+      "label": {
+        "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+        "generation": "2"
+      }
+    }
+  ],
+  "residuals": [
+    {
+      "kind": "restore_staging",
+      "path": "/Users/me/fabric/jobs/x/work.fabric-restoring",
+      "label": {
+        "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "epoch": 2,
+        "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq"
+      },
+      "state": "removed"
+    },
+    {
+      "kind": "harness_group",
+      "pid": 4242,
+      "label": {
+        "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "epoch": 1
+      },
+      "state": "failed",
+      "detail": "the group did not stop"
+    },
+    {
+      "kind": "provider_resource",
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+      "locator": "{\"kind\":\"sandbox\"}",
+      "label": {
+        "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+        "generation": "1"
+      },
+      "state": "removed"
+    }
+  ],
+  "kept": [
+    {
+      "kind": "departed_copy",
+      "path": "/Users/me/fabric/jobs/x/departed/1",
+      "label": {
+        "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "epoch": 1
+      },
+      "reason": "preserved"
+    },
+    {
+      "kind": "provider_resource",
+      "operation": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+      "label": {
+        "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+        "task": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+        "attempt": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+        "generation": "1"
+      },
+      "reason": "unlocated"
+    },
+    {
+      "kind": "unknown",
+      "path": "/Users/me/.local/state/fabric/jobs/stray",
+      "reason": "unlabeled"
+    }
+  ]
+}

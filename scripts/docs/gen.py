@@ -9,6 +9,9 @@
 - The fault points in docs/concepts/ledger.md, from the node's fault
   module and the end-to-end tests that arm them, so the page never counts
   them by hand.
+- The residual inventory in docs/concepts/residuals.md, from the `Kind`
+  and `Keep` enums of the node's gc module, so a kind gc learns is listed
+  the day it is added.
 
 Usage: scripts/docs/gen.py [--check]
 With --check nothing is written, and the script fails when a generated
@@ -27,6 +30,8 @@ ROOT = subprocess.run(
 # Where the fault points are defined and where the end-to-end test arms them.
 FAULTS = "crates/fabricd/src/faults.rs"
 E2E = "crates/fabric/tests/e2e"
+# Where gc names what a residual is and why it keeps what it keeps.
+GC = "crates/fabricd/src/gc.rs"
 
 GENERATED = "<!-- This page is written by scripts/docs/gen.py. Do not edit it; run the script. -->"
 
@@ -172,6 +177,56 @@ def fault_points():
     return "\n" + "\n".join(lines) + "\n"
 
 
+def variants(text, enum, rel):
+    """(variant, doc lines) for each variant of `enum` in `text`."""
+    m = re.search(r"pub\(crate\) enum %s \{(.*?)\n\}" % enum, text, re.S)
+    if not m:
+        sys.exit("error: %s: no `pub(crate) enum %s`" % (rel, enum))
+    out, doc = [], []
+    for line in m.group(1).split("\n"):
+        line = line.strip()
+        if line.startswith("///"):
+            doc.append(line[3:].strip())
+        elif re.match(r"^\w+,$", line):
+            out.append((line[:-1], doc))
+            doc = []
+    return out
+
+
+def residuals():
+    """The residual inventory: a table of every kind gc knows (what, where,
+    label, owner, when it is garbage), then the reasons it keeps what it
+    keeps, each from the doc comments in the gc module."""
+    text = read(GC)
+    kinds = dict(re.findall(r'Kind::(\w+) => "(\w+)"', text))
+    reasons = dict(re.findall(r'Keep::(\w+) => "(\w+)"', text))
+    fields = ["Where", "Label", "Owner", "Garbage"]
+    rows = [
+        "| Kind | What | Where | Label | Owner | When it is garbage |",
+        "|---|---|---|---|---|---|",
+    ]
+    for variant, doc in variants(text, "Kind", GC):
+        if variant not in kinds:
+            sys.exit("error: %s: Kind::%s has no name" % (GC, variant))
+        what = doc[0] if doc else ""
+        found = {}
+        for line in doc[1:]:
+            for field in fields:
+                if line.startswith(field + ": "):
+                    found[field] = line[len(field) + 2 :]
+        missing = [field for field in fields if field not in found]
+        if not what or missing:
+            sys.exit("error: %s: Kind::%s lacks %s" % (GC, variant, ", ".join(missing) or "a first line"))
+        cells = [what] + [found[field].replace("|", "\\|") for field in fields]
+        rows.append("| `%s` | %s |" % (kinds[variant], " | ".join(cells)))
+    keep = []
+    for variant, doc in variants(text, "Keep", GC):
+        if variant not in reasons or not doc:
+            sys.exit("error: %s: Keep::%s has no name or no doc" % (GC, variant))
+        keep.append("- `%s`: %s" % (reasons[variant], " ".join(doc)))
+    return "\n" + "\n".join(rows) + "\n\nWhy gc keeps what it keeps, the `reason` of each kept item:\n\n" + "\n".join(keep) + "\n"
+
+
 def main():
     check = sys.argv[1:] == ["--check"]
     if sys.argv[1:] not in ([], ["--check"]):
@@ -186,6 +241,9 @@ def main():
         "docs/README.md": replace_block(read("docs/README.md"), "matrix", matrix, "docs/README.md"),
         "docs/concepts/ledger.md": replace_block(
             read("docs/concepts/ledger.md"), "faults", fault_points(), "docs/concepts/ledger.md"
+        ),
+        "docs/concepts/residuals.md": replace_block(
+            read("docs/concepts/residuals.md"), "residuals", residuals(), "docs/concepts/residuals.md"
         ),
     }
     stale = []
