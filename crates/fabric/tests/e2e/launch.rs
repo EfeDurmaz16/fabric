@@ -21,7 +21,7 @@ use fabric_client::api::Inspection;
 use fabric_core::id::JobId;
 use serde_json::Value;
 
-use crate::world::{Env, Fallible, Node, Wire, pair};
+use crate::world::{Env, Fallible, Node, Wire, pair, wait_for};
 
 /// How long a step may take to show.
 const WITHIN: Duration = Duration::from_secs(40);
@@ -447,6 +447,11 @@ async fn e2e_a_handoff_an_escaped_child_blocks_leaves_the_attempt_running_on_b()
         i.job.attempts.last().is_some_and(|x| x.status == "running")
     })
     .await?;
+    // The attempt is visible before the fixture finishes spawning its child.
+    wait_for(
+        &env.home.join("codex-waiting"),
+        "the fixture's child launch",
+    )?;
     let from = first.job.attempts[0].attempt;
     let job_text = job.to_string();
     a.ok(&[

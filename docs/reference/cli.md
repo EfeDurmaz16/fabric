@@ -13,20 +13,22 @@ Usage: fabric [OPTIONS] <COMMAND>
 Move a development job between your machines and harnesses
 
 Set up a node:
-  serve    Run the node daemon in the foreground
-  node     Read this node's identity and pair it with other nodes
-  doctor   Print this node's facts, or compare them with a paired node's before a move
-  gc       Report what crashed or ended work left on this node; remove it with --yes
+  serve          Run the node daemon in the foreground
+  node           Read this node's identity and pair it with other nodes
+  doctor         Print this node's facts, or compare them with a paired node's before a move
+  gc             Report what crashed or ended work left on this node; remove it with --yes
 
 Work on jobs:
-  job      Make, run, suspend, move and resume jobs
-  psf      Read Portable Session Format containers
+  job            Make, run, suspend, move and resume jobs
+  psf            Read Portable Session Format containers
+  codex-handoff  Continue a local Codex thread in a Vercel Sandbox (experimental)
+  codex-runner   Submit and process detached Codex handoffs on a trusted SSH runner
 
 Managed jobs:
-  managed  Make, cancel and read managed jobs, and the M5 operations on them (experimental)
-  facade   Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
-  inspect  Read a managed job's whole state, or one attempt's, from its authority
-  audit    Export the authority's journal for an audit, as JSON lines
+  managed        Make, cancel and read managed jobs, and the M5 operations on them (experimental)
+  facade         Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
+  inspect        Read a managed job's whole state, or one attempt's, from its authority
+  audit          Export the authority's journal for an audit, as JSON lines
 
 Global Options:
   -d, --debug            Print diagnostic detail on stderr
@@ -573,6 +575,147 @@ Examples:
     fabric psf inspect <CONTAINER>
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-psf-inspect
+```
+
+### `fabric codex-handoff`
+
+```text
+Usage: fabric codex-handoff [OPTIONS] --thread <THREAD> --prompt <PROMPT>
+Continue a local Codex thread in a Vercel Sandbox (experimental)
+
+Options:
+      --cwd <CWD>
+          Absolute workspace path inside the sandbox
+      --executor <EXECUTOR>
+          WSS URL of a prepared Vercel Sandbox exec-server
+      --model <MODEL>
+          Override the thread's model with one available to the local account
+      --output <OUTPUT>
+          New local directory for the returned checkout archive and answer
+      --prompt <PROMPT>
+          Prompt for the next turn. Pass the executor bearer on stdin
+      --thread <THREAD>
+          ID of an idle Codex thread saved on this machine
+      --vercel-project <VERCEL_PROJECT>
+          Directory linked to the Vercel project for local SDK authentication
+      --worker <WORKER>
+          Capsule worker executable or built .js entry point [default: capsule-bridge-worker]
+      --workspace <WORKSPACE>
+          Idle local Git checkout to checkpoint and send to a new sandbox
+
+Global Options: See `fabric --help`
+
+Examples:
+  Run a saved thread in a new Vercel Sandbox and save the result
+    fabric codex-handoff --thread <THREAD> --workspace <PATH> --output <OUTPUT> --prompt <TEXT>
+
+  Continue a saved thread on a prepared executor, with its token on stdin
+    fabric codex-handoff --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <TEXT>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-codex-handoff
+```
+
+### `fabric codex-runner`
+
+```text
+Usage: fabric codex-runner <COMMAND>
+Submit and process detached Codex handoffs on a trusted SSH runner
+
+Commands:
+  submit  Checkpoint and submit a local thread to a runner over SSH
+  accept  Receive a handoff from Fabric on stdin and durably acknowledge it
+  serve   Process the runner's persisted jobs independently of clients
+  status  Read a job's saved state on the runner
+
+Global Options: See `fabric --help`
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-codex-runner
+```
+
+#### `fabric codex-runner submit`
+
+```text
+Usage: fabric codex-runner submit [OPTIONS] --host <HOST> --thread <THREAD> --workspace <WORKSPACE> --prompt <PROMPT>
+Checkpoint and submit a local thread to a runner over SSH
+
+Options:
+      --host <HOST>            SSH host or alias for the trusted Linux runner
+      --model <MODEL>          Optional model available to the runner account
+      --prompt <PROMPT>        Prompt for the next Codex turn
+      --thread <THREAD>        Saved Codex thread ID on the submitting machine
+      --workspace <WORKSPACE>  Git checkout root to checkpoint
+
+Global Options: See `fabric --help`
+
+Examples:
+  Submit a saved thread to a running SSH host
+    fabric codex-runner submit --host <HOST> --thread <THREAD> --workspace <PATH> --prompt <TEXT>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-codex-runner-submit
+```
+
+#### `fabric codex-runner accept`
+
+```text
+Usage: fabric codex-runner accept [OPTIONS]
+Receive a handoff from Fabric on stdin and durably acknowledge it
+
+Options:
+      --root <ROOT>  Private persistent queue directory
+
+Global Options: See `fabric --help`
+
+Examples:
+  Receive a submission on the runner
+    fabric codex-runner accept
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-codex-runner-accept
+```
+
+#### `fabric codex-runner serve`
+
+```text
+Usage: fabric codex-runner serve [OPTIONS]
+Process the runner's persisted jobs independently of clients
+
+Options:
+      --once
+          Process jobs already queued and then exit
+      --root <ROOT>
+          Private persistent queue directory
+      --vercel-project <VERCEL_PROJECT>
+          Vercel project directory on the runner
+      --worker <WORKER>
+          Capsule worker executable or compiled JavaScript entry point [default: capsule-bridge-worker]
+
+Global Options: See `fabric --help`
+
+Examples:
+  Process jobs on the runner
+    fabric codex-runner serve --worker <PATH>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-codex-runner-serve
+```
+
+#### `fabric codex-runner status`
+
+```text
+Usage: fabric codex-runner status [OPTIONS] <JOB>
+Read a job's saved state on the runner
+
+Arguments:
+  <JOB>  Job ID returned after a durable submission
+
+Options:
+      --root <ROOT>  Private persistent queue directory
+
+Global Options: See `fabric --help`
+
+Examples:
+  Read the runner's durable job state
+    fabric codex-runner status <RUNNER_JOB>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-codex-runner-status
 ```
 
 ### `fabric managed`

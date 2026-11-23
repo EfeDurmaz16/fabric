@@ -61,7 +61,10 @@ const GLOBALS: &[(&str, &str, Option<char>, &str)] = &[
 /// How the root help groups the commands: in the order a user meets them.
 const GROUPS: &[(&str, &[&str])] = &[
     ("Set up a node", &["serve", "node", "doctor", "gc"]),
-    ("Work on jobs", &["job", "psf"]),
+    (
+        "Work on jobs",
+        &["job", "psf", "codex-handoff", "codex-runner"],
+    ),
     ("Managed jobs", &["managed", "facade", "inspect", "audit"]),
 ];
 
@@ -80,6 +83,47 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
             (
                 "Move a job to a paired node",
                 "fabric job move <JOB> --to <NODE>",
+            ),
+        ],
+    ),
+    (
+        "codex-runner submit",
+        &[(
+            "Submit a saved thread to a running SSH host",
+            "fabric codex-runner submit --host <HOST> --thread <THREAD> --workspace <PATH> --prompt <TEXT>",
+        )],
+    ),
+    (
+        "codex-runner accept",
+        &[(
+            "Receive a submission on the runner",
+            "fabric codex-runner accept",
+        )],
+    ),
+    (
+        "codex-runner serve",
+        &[(
+            "Process jobs on the runner",
+            "fabric codex-runner serve --worker <PATH>",
+        )],
+    ),
+    (
+        "codex-runner status",
+        &[(
+            "Read the runner's durable job state",
+            "fabric codex-runner status <RUNNER_JOB>",
+        )],
+    ),
+    (
+        "codex-handoff",
+        &[
+            (
+                "Run a saved thread in a new Vercel Sandbox and save the result",
+                "fabric codex-handoff --thread <THREAD> --workspace <PATH> --output <OUTPUT> --prompt <TEXT>",
+            ),
+            (
+                "Continue a saved thread on a prepared executor, with its token on stdin",
+                "fabric codex-handoff --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <TEXT>",
             ),
         ],
     ),

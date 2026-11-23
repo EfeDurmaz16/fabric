@@ -96,6 +96,87 @@ impl Sandbox {
     }
 }
 
+#[test]
+fn codex_runner_keeps_job_output_on_stdout() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let sandbox = Sandbox::new();
+    let root = sandbox.path("queue");
+    let root = root.to_str().unwrap();
+    let thread = "018e23e0-51ca-7a78-bce5-ffde3ddc1f8b";
+    let submit = sandbox.run(&words(&[
+        "codex-runner",
+        "submit",
+        "--host=-bad",
+        "--thread",
+        thread,
+        "--workspace",
+        sandbox.path("repo").to_str().unwrap(),
+        "--prompt",
+        "continue",
+    ]));
+    assert_eq!(submit.status.code(), Some(1));
+    assert!(submit.stdout.is_empty());
+    assert!(stderr(&submit).contains("expected an SSH alias"));
+
+    let mut accept = sandbox
+        .command(&words(&["codex-runner", "accept", "--root", root]))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if cfg!(target_os = "linux") {
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "thread": thread, "prompt": "continue",
+            "rollouts": [format!("rollout-2026-11-23T00-00-01-{thread}.jsonl")],
+        }))
+        .unwrap();
+        let mut input = accept.stdin.take().unwrap();
+        for part in [meta.as_slice(), b"checkpoint", b"thread"] {
+            input.write_all(&(part.len() as u64).to_be_bytes()).unwrap();
+            input.write_all(part).unwrap();
+        }
+        drop(input);
+    }
+    let accepted = accept.wait_with_output().unwrap();
+    let serve = sandbox.run(&words(&[
+        "codex-runner",
+        "serve",
+        "--root",
+        sandbox.path("empty-queue").to_str().unwrap(),
+        "--once",
+    ]));
+    assert!(serve.stdout.is_empty());
+
+    if cfg!(target_os = "linux") {
+        assert!(accepted.status.success(), "{}", stderr(&accepted));
+        assert!(accepted.stderr.is_empty());
+        assert!(serve.status.success(), "{}", stderr(&serve));
+        assert!(serve.stderr.is_empty());
+        let job = stdout(&accepted);
+        let job = job.trim();
+        assert!(job.starts_with("job-") && job.len() == 24);
+        let status = sandbox.run(&words(&["codex-runner", "status", "--root", root, job]));
+        assert!(status.status.success(), "{}", stderr(&status));
+        assert!(status.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(result["job"], job);
+        assert_eq!(result["status"], "queued");
+    } else {
+        for output in [accepted, serve] {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(stderr(&output).contains("the Codex runner requires Linux"));
+        }
+        let status = sandbox.run(&words(&["codex-runner", "status", "bad-id"]));
+        assert_eq!(status.status.code(), Some(1));
+        assert!(status.stdout.is_empty());
+        assert!(stderr(&status).contains("invalid runner job ID"));
+    }
+}
+
 fn words(text: &[&str]) -> Vec<String> {
     text.iter().map(|word| (*word).to_owned()).collect()
 }
@@ -139,7 +220,9 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
     match id {
         "job" | "JOB" => JOB.to_owned(),
         "node" | "to" | "on" | "peer" | "NODE" | "authority" => node(),
-        "repo" | "path" | "PATH" | "dir" => sandbox.path("repo").display().to_string(),
+        "repo" | "path" | "PATH" | "dir" | "workspace" => {
+            sandbox.path("repo").display().to_string()
+        }
         "goal" | "prompt" | "reason" | "note" | "TEXT" | "label" | "question" => "demo".to_owned(),
         "addr" | "HOST:PORT" => "127.0.0.1:7777".to_owned(),
         "KEY" => "retry-1".to_owned(),
@@ -157,6 +240,12 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "psf" | "container" | "DIR" | "CONTAINER" => sandbox.path("psf").display().to_string(),
         "OPERATION_APPROVAL" => "01JABCDEFGHJKMNPQRSTVWXYZ3=apr-demo".to_owned(),
         "PROFILE" => "docker".to_owned(),
+        "thread" | "THREAD" => "018e23e0-51ca-7a78-bce5-ffde3ddc1f8b".to_owned(),
+        "executor" | "EXECUTOR" => "wss://example.vercel.run".to_owned(),
+        "cwd" | "CWD" => "/vercel/sandbox/work".to_owned(),
+        "host" | "HOST" => "runner.example.invalid".to_owned(),
+        "RUNNER_JOB" => "job-example0000000000000".to_owned(),
+        "OUTPUT" => sandbox.path("output").display().to_string(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
 }
@@ -200,6 +289,14 @@ fn remove_option(args: &mut Vec<String>, option: &str) {
 fn runnable(path: &[String], sandbox: &Sandbox) -> Vec<String> {
     let cmd = find(path);
     let mut args = path.to_vec();
+    if path == ["codex-handoff"] {
+        args.extend([
+            "--executor".to_owned(),
+            sample("executor", sandbox),
+            "--cwd".to_owned(),
+            sample("cwd", sandbox),
+        ]);
+    }
     // A required group, such as a create's source, is given by its first member.
     let firsts: Vec<&clap::Arg> = cmd
         .get_groups()
@@ -577,8 +674,31 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
             assert_eq!(doc["reason"], "failed", "{name}: {doc}");
         }
 
+        if path == ["codex-handoff"] {
+            let output = sandbox.run(&args);
+            let doc = error_document(&output, &name);
+            assert_eq!(output.status.code(), Some(2), "{name}: {doc}");
+            assert_eq!(doc["reason"], "invalid_arguments", "{name}: {doc}");
+            remove_option(&mut args, "--json");
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(1), "{name}");
+            assert!(stdout(&output).is_empty(), "{name}");
+            assert!(
+                stderr(&output).contains("expected the executor capability token on stdin"),
+                "{name}"
+            );
+            continue;
+        }
+
         // `serve` is the node, so it is the one command no node is missing for.
         if path == ["serve"] {
+            continue;
+        }
+        if path.first().is_some_and(|name| name == "codex-runner") {
+            let output = sandbox.run(&args);
+            let doc = error_document(&output, &name);
+            assert_eq!(output.status.code(), Some(2), "{name}: {doc}");
+            assert_eq!(doc["reason"], "invalid_arguments", "{name}: {doc}");
             continue;
         }
         // A command that asks no node fails on input that does not read.
@@ -641,7 +761,11 @@ fn no_color_removes_every_escape_sequence() {
             continue;
         }
         let name = joined(&path);
-        let args = runnable(&path, &sandbox);
+        let mut args = runnable(&path, &sandbox);
+        if path == ["codex-runner", "serve"] {
+            // A valid runner would keep serving on Linux. Exercise its local error path.
+            args.extend(words(&["--root", "relative"]));
+        }
         let forced = sandbox
             .command(&args)
             .env("FORCE_COLOR", "1")

@@ -1356,16 +1356,17 @@ fn gc_taken(dir: &Path, managed: &Managed, found: &mut Found) {
     }
 }
 
-/// Starts the worker `spec` names, with `PATH`, `HOME` and the `DOCKER_*`
-/// variables of the node and nothing else, so no credential of the node's
-/// environment reaches it.
+/// Starts the worker with basic process settings and only its provider's
+/// credentials. Harness credentials stay with the node.
 async fn spawn(spec: &GcWorker) -> Result<Bridge, fabric_bridge::BridgeError> {
     let mut command = tokio::process::Command::new(spec.program.as_path());
     command.env_clear();
     for (name, value) in std::env::vars_os() {
-        let keep = name
-            .to_str()
-            .is_some_and(|n| n == "PATH" || n == "HOME" || n.starts_with("DOCKER_"));
+        let keep = name.to_str().is_some_and(|name| match name {
+            "PATH" | "HOME" => true,
+            "VERCEL_OIDC_TOKEN" | "VERCEL_TOKEN" => spec.profile == "vercel",
+            _ => spec.profile == "docker" && name.starts_with("DOCKER_"),
+        });
         if keep {
             command.env(name, value);
         }

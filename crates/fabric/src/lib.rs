@@ -64,6 +64,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod audit;
+mod codex_checkpoint;
+mod codex_handoff;
+mod codex_runner;
+mod codex_vm;
 pub mod contract;
 mod gc;
 mod managed;
@@ -115,6 +119,11 @@ enum Command {
     },
     /// Report what crashed or ended work left on this node; remove it with --yes.
     Gc(gc::GcArgs),
+    /// Continue a local Codex thread in a Vercel Sandbox (experimental).
+    CodexHandoff(codex_handoff::HandoffArgs),
+    /// Submit and process detached Codex handoffs on a trusted SSH runner.
+    #[command(subcommand)]
+    CodexRunner(codex_runner::RunnerCommand),
 }
 
 #[derive(Debug, Args)]
@@ -599,6 +608,24 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
     let client = client(&state);
     match cli.command {
         Command::Serve(args) => serve(state, home, args, run).await,
+        Command::CodexRunner(args) => {
+            if run.modes.json {
+                return Err(contract::Usage(
+                    "Can't use --json with fabric codex-runner.".to_owned(),
+                )
+                .into());
+            }
+            codex_runner::run(args, &home).await
+        }
+        Command::CodexHandoff(args) => {
+            if run.modes.json {
+                return Err(contract::Usage(
+                    "Can't use --json with fabric codex-handoff.".to_owned(),
+                )
+                .into());
+            }
+            codex_handoff::run(args).await
+        }
         Command::Node(command) => {
             let request = match command {
                 NodeCommand::Id => Request::NodeId,

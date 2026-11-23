@@ -241,13 +241,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: EfeDurmaz16/capsule
-          # Capsule's m4/reconciliation head: the M4 worker with its review
-          # fixes (an approval ref bound to the first operation it resolves
-          # for, a container kept when its start timed out), merged with
-          # Capsule main (M1 and M3), and itself on Capsule main since its
-          # #318 merge on 2026-11-08. Move it, and the pin below, whenever
-          # the worker or a package it bundles changes.
-          ref: b5d436cf5e44146e61db783e5992537255059f59
+          # Capsule #323 adds the named Vercel handoff and recovery worker.
+          # Move this pin and the Docker smoke pin together.
+          ref: 5b73569003c69acd30a45ea52a15b5bb97e9668e
           path: capsule
           persist-credentials: false
 
@@ -299,7 +295,7 @@ jobs:
         with:
           repository: EfeDurmaz16/capsule
           # The same worker as bridge-interop; move both pins together.
-          ref: b5d436cf5e44146e61db783e5992537255059f59
+          ref: 5b73569003c69acd30a45ea52a15b5bb97e9668e
           path: capsule
           persist-credentials: false
 

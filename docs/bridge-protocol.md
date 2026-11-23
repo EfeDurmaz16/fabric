@@ -433,6 +433,14 @@ CAPSULE_BRIDGE_WORKER=<capsule>/packages/bridge-worker/dist/bin.js \
 | a killed worker | an exec in flight when the worker is killed stays `unknown` with the locator its progress reported; the job, attempt and generation do not change; the restarted worker is never sent the operation again, and observing the exec by its original id is answered `unknown`, since that worker never ran it; a create whose reply was lost is reconciled by `observe`, not created twice |
 | the Docker profile | with `CAPSULE_BRIDGE_DOCKER_IMAGE` naming an image the engine already holds: refusals leave no container, a missing image is a definite failure and is not pulled, the container carries the four `fabric.*` labels and the engine scope, an artifact is written and read back within `max_output_bytes`, an exec still running at its `deadline_ms` is answered `running` and settled by observing it, a worker killed mid-exec leaves the container and the exec running while its `docker exec` client ends with the worker's process group, the exec runs once after a restart, and destroy needs its own grant and is observed gone |
 
+The Capsule Vercel profile uses the same bridge client. Its opt-in smoke test provisions two short-lived VMs, transfers a synthetic Git checkpoint from the local machine to the first VM and then to the second, and verifies staged, unstaged and untracked changes at both destinations. Both resources are destroyed through the bridge. The test exercises transport and cleanup. It does not start a Codex model turn.
+
+For a live run, set `CAPSULE_BRIDGE_WORKER` to the built Capsule worker, `CAPSULE_BRIDGE_VERCEL_ACCOUNT` to the Vercel team ID, `CAPSULE_BRIDGE_VERCEL_PROJECT` to the project ID, and supply the matching `VERCEL_OIDC_TOKEN` or `VERCEL_TOKEN` in the environment. Then run:
+
+```sh
+cargo test -p fabric-bridge --test capsule_worker vercel_sandbox_transport_between_clean_vms -- --ignored --nocapture
+```
+
 CI builds the worker from a pinned Capsule commit and runs these tests on Linux (job `bridge-interop`), where the Docker test skips: no image is on that runner and nothing pulls one. Job `bridge-docker` runs the Docker test against the runner's own engine with the same worker: it pulls one tiny public image by digest first (busybox 1.37.0), because the worker never pulls, and fails if any container with a `fabric.job` label is left. `scripts/bench-bridge.sh` measures the same worker when `CAPSULE_BRIDGE_WORKER` is set.
 
 ## Reconciliation (M4)

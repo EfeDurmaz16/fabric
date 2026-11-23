@@ -21,6 +21,26 @@ use crate::{AGENT, setup};
 
 /// The leaf commands whose answer another test holds, and where.
 const ELSEWHERE: &[(&str, &str)] = &[
+    (
+        "codex-handoff",
+        "tests/cli_contract.rs: executor token refusal and JSON contract",
+    ),
+    (
+        "codex-runner accept",
+        "tests/cli_contract.rs: codex_runner_keeps_job_output_on_stdout",
+    ),
+    (
+        "codex-runner serve",
+        "tests/cli_contract.rs: codex_runner_keeps_job_output_on_stdout",
+    ),
+    (
+        "codex-runner status",
+        "tests/cli_contract.rs: codex_runner_keeps_job_output_on_stdout",
+    ),
+    (
+        "codex-runner submit",
+        "tests/cli_contract.rs: codex_runner_keeps_job_output_on_stdout",
+    ),
     ("help", "tests/cli_contract.rs: help prints on stdout"),
     ("job run", "headless.rs: the harness owns standard output"),
     (

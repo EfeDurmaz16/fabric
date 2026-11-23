@@ -343,8 +343,16 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
     if (inspected.type !== "inspection") throw new Error(`not an inspection: ${JSON.stringify(inspected)}`);
     expect(inspected.inspection.job).toMatchObject({ job: accepted.job, goal: "submitted over the facade" });
     expect(inspected.inspection.job.tasks[0]?.class).toBe("harness");
-    const local = await client.managedInspect(accepted.job);
-    expect(local.job).toStrictEqual(inspected.inspection.job);
+    let facadeJob = inspected.inspection.job;
+    let local = await client.managedInspect(accepted.job);
+    // Background placement can advance the job between the two reads.
+    for (let retry = 0; retry < 5 && local.job.revision !== facadeJob.revision; retry++) {
+      const refreshed = await client.facadeCall(welcome.node, { type: "inspect", token: minted.bearer, job: accepted.job });
+      if (refreshed.type !== "inspection") throw new Error(`not an inspection: ${JSON.stringify(refreshed)}`);
+      facadeJob = refreshed.inspection.job;
+      local = await client.managedInspect(accepted.job);
+    }
+    expect(local.job).toStrictEqual(facadeJob);
     const events = await client.facadeCall(welcome.node, {
       type: "watch",
       token: minted.bearer,
