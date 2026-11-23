@@ -96,6 +96,87 @@ impl Sandbox {
     }
 }
 
+#[test]
+fn codex_runner_keeps_job_output_on_stdout() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let sandbox = Sandbox::new();
+    let root = sandbox.path("queue");
+    let root = root.to_str().unwrap();
+    let thread = "018e23e0-51ca-7a78-bce5-ffde3ddc1f8b";
+    let submit = sandbox.run(&words(&[
+        "codex-runner",
+        "submit",
+        "--host=-bad",
+        "--thread",
+        thread,
+        "--workspace",
+        sandbox.path("repo").to_str().unwrap(),
+        "--prompt",
+        "continue",
+    ]));
+    assert_eq!(submit.status.code(), Some(1));
+    assert!(submit.stdout.is_empty());
+    assert!(stderr(&submit).contains("expected an SSH alias"));
+
+    let mut accept = sandbox
+        .command(&words(&["codex-runner", "accept", "--root", root]))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if cfg!(target_os = "linux") {
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "thread": thread, "prompt": "continue",
+            "rollouts": [format!("rollout-2026-11-23T00-00-01-{thread}.jsonl")],
+        }))
+        .unwrap();
+        let mut input = accept.stdin.take().unwrap();
+        for part in [meta.as_slice(), b"checkpoint", b"thread"] {
+            input.write_all(&(part.len() as u64).to_be_bytes()).unwrap();
+            input.write_all(part).unwrap();
+        }
+        drop(input);
+    }
+    let accepted = accept.wait_with_output().unwrap();
+    let serve = sandbox.run(&words(&[
+        "codex-runner",
+        "serve",
+        "--root",
+        sandbox.path("empty-queue").to_str().unwrap(),
+        "--once",
+    ]));
+    assert!(serve.stdout.is_empty());
+
+    if cfg!(target_os = "linux") {
+        assert!(accepted.status.success(), "{}", stderr(&accepted));
+        assert!(accepted.stderr.is_empty());
+        assert!(serve.status.success(), "{}", stderr(&serve));
+        assert!(serve.stderr.is_empty());
+        let job = stdout(&accepted);
+        let job = job.trim();
+        assert!(job.starts_with("job-") && job.len() == 24);
+        let status = sandbox.run(&words(&["codex-runner", "status", "--root", root, job]));
+        assert!(status.status.success(), "{}", stderr(&status));
+        assert!(status.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(result["job"], job);
+        assert_eq!(result["status"], "queued");
+    } else {
+        for output in [accepted, serve] {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(stderr(&output).contains("the Codex runner requires Linux"));
+        }
+        let status = sandbox.run(&words(&["codex-runner", "status", "bad-id"]));
+        assert_eq!(status.status.code(), Some(1));
+        assert!(status.stdout.is_empty());
+        assert!(stderr(&status).contains("invalid runner job ID"));
+    }
+}
+
 fn words(text: &[&str]) -> Vec<String> {
     text.iter().map(|word| (*word).to_owned()).collect()
 }
