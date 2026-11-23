@@ -64,6 +64,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod audit;
+mod codex_handoff;
 pub mod contract;
 mod gc;
 mod managed;
@@ -115,6 +116,8 @@ enum Command {
     },
     /// Report what crashed or ended work left on this node; remove it with --yes.
     Gc(gc::GcArgs),
+    /// Continue a local Codex thread on a prepared Vercel executor (experimental).
+    CodexHandoff(codex_handoff::HandoffArgs),
 }
 
 #[derive(Debug, Args)]
@@ -599,6 +602,15 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
     let client = client(&state);
     match cli.command {
         Command::Serve(args) => serve(state, home, args, run).await,
+        Command::CodexHandoff(args) => {
+            if run.modes.json {
+                return Err(contract::Usage(
+                    "Can't use --json with fabric codex-handoff.".to_owned(),
+                )
+                .into());
+            }
+            codex_handoff::run(args).await
+        }
         Command::Node(command) => {
             let request = match command {
                 NodeCommand::Id => Request::NodeId,

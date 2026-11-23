@@ -157,6 +157,9 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "psf" | "container" | "DIR" | "CONTAINER" => sandbox.path("psf").display().to_string(),
         "OPERATION_APPROVAL" => "01JABCDEFGHJKMNPQRSTVWXYZ3=apr-demo".to_owned(),
         "PROFILE" => "docker".to_owned(),
+        "thread" | "THREAD" => "018e23e0-51ca-7a78-bce5-ffde3ddc1f8b".to_owned(),
+        "executor" | "EXECUTOR" => "wss://example.vercel.run".to_owned(),
+        "cwd" | "CWD" => "/vercel/sandbox/work".to_owned(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
 }
@@ -575,6 +578,22 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
         } else {
             assert_eq!(output.status.code(), Some(1), "{name}: {doc}");
             assert_eq!(doc["reason"], "failed", "{name}: {doc}");
+        }
+
+        if path == ["codex-handoff"] {
+            let output = sandbox.run(&args);
+            let doc = error_document(&output, &name);
+            assert_eq!(output.status.code(), Some(2), "{name}: {doc}");
+            assert_eq!(doc["reason"], "invalid_arguments", "{name}: {doc}");
+            remove_option(&mut args, "--json");
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(1), "{name}");
+            assert!(stdout(&output).is_empty(), "{name}");
+            assert!(
+                stderr(&output).contains("expected the executor capability token on stdin"),
+                "{name}"
+            );
+            continue;
         }
 
         // `serve` is the node, so it is the one command no node is missing for.

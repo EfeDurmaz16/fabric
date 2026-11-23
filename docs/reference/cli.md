@@ -13,20 +13,21 @@ Usage: fabric [OPTIONS] <COMMAND>
 Move a development job between your machines and harnesses
 
 Set up a node:
-  serve    Run the node daemon in the foreground
-  node     Read this node's identity and pair it with other nodes
-  doctor   Print this node's facts, or compare them with a paired node's before a move
-  gc       Report what crashed or ended work left on this node; remove it with --yes
+  serve          Run the node daemon in the foreground
+  node           Read this node's identity and pair it with other nodes
+  doctor         Print this node's facts, or compare them with a paired node's before a move
+  gc             Report what crashed or ended work left on this node; remove it with --yes
 
 Work on jobs:
-  job      Make, run, suspend, move and resume jobs
-  psf      Read Portable Session Format containers
+  job            Make, run, suspend, move and resume jobs
+  psf            Read Portable Session Format containers
+  codex-handoff  Continue a local Codex thread on a prepared Vercel executor (experimental)
 
 Managed jobs:
-  managed  Make, cancel and read managed jobs, and the M5 operations on them (experimental)
-  facade   Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
-  inspect  Read a managed job's whole state, or one attempt's, from its authority
-  audit    Export the authority's journal for an audit, as JSON lines
+  managed        Make, cancel and read managed jobs, and the M5 operations on them (experimental)
+  facade         Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
+  inspect        Read a managed job's whole state, or one attempt's, from its authority
+  audit          Export the authority's journal for an audit, as JSON lines
 
 Global Options:
   -d, --debug            Print diagnostic detail on stderr
@@ -573,6 +574,28 @@ Examples:
     fabric psf inspect <CONTAINER>
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-psf-inspect
+```
+
+### `fabric codex-handoff`
+
+```text
+Usage: fabric codex-handoff [OPTIONS] --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <PROMPT>
+Continue a local Codex thread on a prepared Vercel executor (experimental)
+
+Options:
+      --cwd <CWD>            Absolute workspace path inside the sandbox
+      --executor <EXECUTOR>  WSS URL of a prepared Vercel Sandbox exec-server
+      --model <MODEL>        Override the thread's model with one available to the local account
+      --prompt <PROMPT>      Prompt for the next turn. Pass the executor bearer on stdin
+      --thread <THREAD>      ID of an idle Codex thread saved on this machine
+
+Global Options: See `fabric --help`
+
+Examples:
+  Continue a saved thread on a prepared executor, with its token on stdin
+    fabric codex-handoff --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <TEXT>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-codex-handoff
 ```
 
 ### `fabric managed`

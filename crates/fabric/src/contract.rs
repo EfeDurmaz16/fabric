@@ -61,7 +61,7 @@ const GLOBALS: &[(&str, &str, Option<char>, &str)] = &[
 /// How the root help groups the commands: in the order a user meets them.
 const GROUPS: &[(&str, &[&str])] = &[
     ("Set up a node", &["serve", "node", "doctor", "gc"]),
-    ("Work on jobs", &["job", "psf"]),
+    ("Work on jobs", &["job", "psf", "codex-handoff"]),
     ("Managed jobs", &["managed", "facade", "inspect", "audit"]),
 ];
 
@@ -82,6 +82,13 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
                 "fabric job move <JOB> --to <NODE>",
             ),
         ],
+    ),
+    (
+        "codex-handoff",
+        &[(
+            "Continue a saved thread on a prepared executor, with its token on stdin",
+            "fabric codex-handoff --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <TEXT>",
+        )],
     ),
     (
         "serve",

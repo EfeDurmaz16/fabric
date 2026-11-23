@@ -20,3 +20,32 @@ Nobody is there to answer a permission prompt:
 - Codex runs `exec` with approvals off, except on a node that sends approvals to auto review, where it keeps that node's policy. It runs in a workspace-write sandbox, because the trust override marks the workspace trusted, unless it resumes a thread, which keeps its own model, effort and sandbox.
 
 A headless Claude turn on a node whose `claude` login has lapsed, or that was started over SSH, fails with Claude's own `Failed to authenticate`. Check `fabric doctor` first: `claude.login` and `codex.login` say what the harness itself answers.
+
+## Continue a Codex thread on a Vercel executor
+
+`fabric codex-handoff` is an experimental, one-turn command. Close the original
+Codex client after its current turn and wait for the thread to be saved. The
+local Codex app-server resumes that thread using the machine's existing
+ChatGPT login. It selects the supplied Vercel exec-server for the turn.
+
+Prepare a dedicated Sandbox with its workspace already restored and
+`codex exec-server` listening on a published port with capability-token
+authentication. Use a fresh token for each sandbox, configure its SHA-256
+digest on the executor, and restrict outbound access at the sandbox provider.
+Codex uses external-sandbox mode for that turn, so the VM provides isolation.
+Use the same compatible Codex release on the host and executor.
+
+```sh
+printf '%s\n' "$FABRIC_EXECUTOR_TOKEN" |
+  fabric codex-handoff --thread <THREAD_ID> \
+    --executor wss://<SANDBOX>.vercel.run --cwd <REMOTE_WORKSPACE> \
+    --prompt 'Continue from the last turn'
+```
+
+Use `--model` if you need to select a model available to the local ChatGPT
+account. Only the executor capability token goes on stdin. Vercel provisioning,
+workspace restoration, and final deletion remain the caller's responsibility.
+For a second executor, run the command again with the same thread ID, the
+second route and token, and its restored workspace. Each invocation runs after
+the previous turn has completed. Keeping the macOS host available is required
+while the turn runs.

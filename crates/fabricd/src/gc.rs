@@ -1357,7 +1357,7 @@ fn gc_taken(dir: &Path, managed: &Managed, found: &mut Found) {
 }
 
 /// Starts the worker with basic process settings and only its provider's
-/// credentials. OpenAI and other harness credentials stay with the node.
+/// credentials. Harness credentials stay with the node.
 async fn spawn(spec: &GcWorker) -> Result<Bridge, fabric_bridge::BridgeError> {
     let mut command = tokio::process::Command::new(spec.program.as_path());
     command.env_clear();
