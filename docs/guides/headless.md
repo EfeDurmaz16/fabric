@@ -86,7 +86,7 @@ the Vercel project credentials and authorize Codex with ChatGPT once as the
 dedicated runner user. See [Codex headless sign-in](https://learn.chatgpt.com/docs/auth#login-on-headless-devices).
 The worker and SSH commands must use the same user and private state directory.
 Keep the worker running independently of SSH, for example with a systemd
-service configured to restart it.
+service enabled at boot and configured to restart it after a failure.
 
 ```sh
 fabric codex-runner serve --worker /path/to/capsule-bridge-worker --vercel-project /path/to/linked-project
@@ -112,8 +112,11 @@ ssh my-runner fabric codex-runner status JOB_ID
 The report gives the runner's result directory, which you can copy over SSH.
 The runner's default queue is `~/.local/share/fabric-codex-runner`. It processes
 one job at a time. Use a dedicated Codex home on the runner, and avoid editing
-the transferred thread concurrently on the Mac. After a runner crash, a
-previously running job is marked interrupted, since repeating a turn might
-repeat its effects. Inspect the saved results before resubmitting. If result
-persistence fails, the temporary VM remains available until its configured
-lifetime expires.
+the transferred thread concurrently on the Mac. On restart, the runner
+recovers a running job under its original ID without starting another Codex
+turn. The runner collects the original sandbox workspace and saves the latest
+durable thread. If that attempt needs to be retried, the status is `recovering`.
+An `interrupted` job with a saved result can be inspected locally. If the sandbox expired or never
+restored its workspace, the result includes the submitted Git checkpoint
+and the saved thread. The status detail identifies which workspace was saved.
+Use a Capsule worker that supports named handoffs and recovery.

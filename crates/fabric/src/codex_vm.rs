@@ -43,7 +43,8 @@ impl Vm {
         let checkpoint = codex_checkpoint::capture(&root, stage.path())?;
         let output = create_output(request.output)?;
         let (vm, ready) =
-            Self::launch_checkpoint(&checkpoint, &output, request.worker, request.project).await?;
+            Self::launch_checkpoint(&checkpoint, &output, request.worker, request.project, None)
+                .await?;
         Ok((vm, output, ready))
     }
 
@@ -52,8 +53,63 @@ impl Vm {
         output: &Path,
         worker: &Path,
         project: Option<&Path>,
+        name: Option<&str>,
     ) -> Result<(Self, Value)> {
         let version = codex_version().await?;
+        let mut vm = Self::spawn(worker, project)?;
+        let mut request = json!({
+            "action": "start", "version": version, "checkpoint": checkpoint,
+            "output": output.join(".workspace.partial")
+        });
+        if let Some(name) = name {
+            request["name"] = json!(name);
+        }
+        vm.send(&request.to_string()).await?;
+        let ready = vm.expect("ready").await?;
+        if let Some(name) = name {
+            ensure!(
+                ready["name"] == name,
+                "Capsule worker did not acknowledge the sandbox name"
+            );
+        }
+        Ok((vm, ready))
+    }
+
+    pub async fn recover(
+        name: &str,
+        output: &Path,
+        worker: &Path,
+        project: Option<&Path>,
+        cleanup_only: bool,
+    ) -> Result<Option<Self>> {
+        let mut vm = Self::spawn(worker, project)?;
+        vm.send(
+            &json!({
+                "action": if cleanup_only { "cleanup" } else { "recover" },
+                "name": name, "output": output.join(".workspace.partial")
+            })
+            .to_string(),
+        )
+        .await?;
+        let response = vm.receive().await?;
+        match response["state"].as_str() {
+            Some("collected") => {
+                persist_workspace(output)?;
+                Ok(Some(vm))
+            }
+            Some("unavailable") => Ok(Some(vm)),
+            Some("missing") => {
+                ensure!(
+                    vm.worker.wait().await?.success(),
+                    "Capsule recovery exited unsuccessfully"
+                );
+                Ok(None)
+            }
+            _ => bail!("unexpected Capsule recovery state"),
+        }
+    }
+
+    fn spawn(worker: &Path, project: Option<&Path>) -> Result<Self> {
         let mut command = if worker
             .extension()
             .is_some_and(|ext| ext == "js" || ext == "mjs")
@@ -92,28 +148,17 @@ impl Vm {
         let mut worker = command
             .spawn()
             .context("start the Capsule Vercel handoff worker")?;
-        let mut vm = Self {
+        Ok(Self {
             input: worker.stdin.take().context("missing Capsule stdin")?,
             output: BufReader::new(worker.stdout.take().context("missing Capsule stdout")?).lines(),
             worker,
-        };
-        vm.send(&serde_json::to_string(&json!({
-            "action": "start",
-            "version": version,
-            "checkpoint": checkpoint,
-            "output": output.join(".workspace.partial")
-        }))?)
-        .await?;
-        let ready = vm.expect("ready").await?;
-        Ok((vm, ready))
+        })
     }
 
     pub async fn collect(&mut self, output: &Path, answer: &str) -> Result<()> {
         self.send("collect").await?;
         self.expect("collected").await?;
-        let partial = output.join(".workspace.partial");
-        File::open(&partial)?.sync_all()?;
-        std::fs::rename(&partial, output.join("workspace.tar.gz"))?;
+        persist_workspace(output)?;
         fabric_store::write_atomic(&output.join("answer.txt"), answer.as_bytes())?;
         File::open(output)?.sync_all()?;
         Ok(())
@@ -140,16 +185,31 @@ impl Vm {
     }
 
     async fn expect(&mut self, state: &str) -> Result<Value> {
-        let Some(line) = tokio::time::timeout(Duration::from_secs(150), self.output.next_line())
+        let reply = self
+            .receive()
             .await
-            .with_context(|| format!("Capsule did not reach {state}"))??
-        else {
-            bail!("Capsule stopped before {state}");
-        };
-        let reply: Value = serde_json::from_str(&line).context("invalid handoff worker reply")?;
+            .with_context(|| format!("waiting for Capsule state {state}"))?;
         ensure!(reply["state"] == state, "expected Capsule state {state}");
         Ok(reply)
     }
+
+    async fn receive(&mut self) -> Result<Value> {
+        let Some(line) = tokio::time::timeout(Duration::from_secs(150), self.output.next_line())
+            .await
+            .context("Capsule did not respond")??
+        else {
+            bail!("Capsule stopped before replying");
+        };
+        serde_json::from_str(&line).context("invalid handoff worker reply")
+    }
+}
+
+fn persist_workspace(output: &Path) -> Result<()> {
+    let partial = output.join(".workspace.partial");
+    File::open(&partial)?.sync_all()?;
+    std::fs::rename(&partial, output.join("workspace.tar.gz"))?;
+    File::open(output)?.sync_all()?;
+    Ok(())
 }
 
 fn create_output(path: &Path) -> Result<PathBuf> {

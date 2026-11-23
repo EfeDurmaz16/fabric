@@ -1,7 +1,7 @@
 //! Personal SSH runner for detached Codex handoffs.
 use std::fs::{self, DirBuilder, File};
 use std::io::Write;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
@@ -359,19 +359,19 @@ async fn serve(
             let job = entry.path();
             let raw = fs::read(job.join("state.json"))?;
             let doc: Value = serde_json::from_slice(&raw)?;
-            if doc["status"] == "running" {
-                state(
-                    &job,
-                    "interrupted",
-                    Some(
-                        "worker restarted; inspect saved files and the VM before submitting another turn",
-                    ),
-                )?;
+            if doc["status"] == "running" || doc["status"] == "recovering" {
+                if let Err(error) = recover(&job, home, worker, project).await {
+                    state(&job, "recovering", Some(&format!("{error:#}")))?;
+                }
             } else if doc["status"] == "queued" {
                 state(&job, "running", None)?;
-                match execute(&job, home, worker, project).await {
-                    Ok(()) => state(&job, "completed", None)?,
-                    Err(error) => state(&job, "failed", Some(&format!("{error:#}")))?,
+                if let Err(error) = execute(&job, home, worker, project).await {
+                    let status = if job.join("sandbox-name").exists() {
+                        "recovering"
+                    } else {
+                        "failed"
+                    };
+                    state(&job, status, Some(&format!("{error:#}")))?;
                 }
             }
         }
@@ -388,8 +388,25 @@ async fn execute(job: &Path, home: &Path, worker: &Path, project: Option<&Path>)
     import_rollouts(job, home, &names)?;
     let results = job.join("result");
     fs::create_dir(&results)?;
-    let (mut vm, ready) =
-        Vm::launch_checkpoint(&job.join("checkpoint.tar.gz"), &results, worker, project).await?;
+    let id = job
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .context("invalid job id")?;
+    let encoded = id[4..]
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("");
+    let name = format!("fabric-handoff-{encoded}");
+    fabric_store::write_atomic(&job.join("sandbox-name"), name.as_bytes())?;
+    let (mut vm, ready) = Vm::launch_checkpoint(
+        &job.join("checkpoint.tar.gz"),
+        &results,
+        worker,
+        project,
+        Some(&name),
+    )
+    .await?;
     let field = |name: &str| {
         ready[name]
             .as_str()
@@ -411,24 +428,123 @@ async fn execute(job: &Path, home: &Path, worker: &Path, project: Option<&Path>)
             .unwrap_or("Codex turn failed; workspace recovered."),
     )
     .await?;
-    let saved = results.join("thread");
-    fs::create_dir(&saved)?;
-    let files = codex(home)?
-        .portable_rollouts(&SessionId::parse(thread)?, &results, &saved)
-        .await?;
-    ensure!(!files.is_empty(), "Codex export returned no rollouts");
+    let files = save_thread(home, thread, &results).await?;
     if turn.is_ok() {
         ensure!(
             thread_advanced(job, &files)?,
             "Codex completed without saving an updated thread"
         );
     }
-    sync_directories(&saved)?;
-    File::open(&results)?.sync_all()?;
+    let (status, detail) = match turn {
+        Ok(_) => ("completed", None),
+        Err(error) => ("failed", Some(format!("{error:#}"))),
+    };
+    save_outcome(job, status, detail.as_deref())?;
     vm.delete()
         .await
         .context("results saved, but VM deletion failed")?;
-    turn?;
+    state(job, status, detail.as_deref())
+}
+
+async fn recover(job: &Path, home: &Path, worker: &Path, project: Option<&Path>) -> Result<()> {
+    let name = match fs::read_to_string(job.join("sandbox-name")) {
+        Ok(name) => Some(name),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let results = job.join("result");
+    fs::create_dir_all(&results)?;
+    let saved = job.join("outcome.json");
+    let cleanup_only = saved.exists();
+    let mut recovery = None;
+    if let Some(name) = name {
+        recovery = Vm::recover(&name, &results, worker, project, cleanup_only).await?;
+    }
+    if !cleanup_only {
+        let meta: Value = serde_json::from_slice(&fs::read(job.join("request.json"))?)?;
+        let (thread, names) = validate(&meta)?;
+        seed_missing_rollouts(job, home, &names)?;
+        save_thread(home, thread, &results).await?;
+        let checkpoint = job.join("checkpoint.tar.gz");
+        let workspace = results.join("workspace.tar.gz");
+        let original = fs::metadata(&checkpoint)?;
+        let has_workspace = match fs::metadata(&workspace) {
+            Ok(saved) => (saved.dev(), saved.ino()) != (original.dev(), original.ino()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::hard_link(&checkpoint, &workspace)?;
+                false
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let detail = if has_workspace {
+            "Recovered the interrupted turn's sandbox workspace and saved Codex thread."
+        } else {
+            "Sandbox output unavailable; recovered the submitted Git checkpoint and saved Codex thread."
+        };
+        fabric_store::write_atomic(&results.join("answer.txt"), detail.as_bytes())?;
+        File::open(&results)?.sync_all()?;
+        save_outcome(job, "interrupted", Some(detail))?;
+    }
+    if let Some(vm) = recovery {
+        vm.delete().await?;
+    }
+    let outcome: Value = serde_json::from_slice(&fs::read(saved)?)?;
+    state(
+        job,
+        outcome["status"]
+            .as_str()
+            .context("invalid saved job status")?,
+        outcome["detail"].as_str(),
+    )
+}
+
+fn save_outcome(job: &Path, status: &str, detail: Option<&str>) -> Result<()> {
+    fabric_store::write_atomic(
+        &job.join("outcome.json"),
+        &serde_json::to_vec(&json!({"status": status, "detail": detail}))?,
+    )?;
+    Ok(())
+}
+
+async fn save_thread(home: &Path, thread: &str, results: &Path) -> Result<Vec<PathBuf>> {
+    let saved = results.join("thread");
+    let staging = tempfile::tempdir_in(results)?;
+    let files = codex(home)?
+        .portable_rollouts(&SessionId::parse(thread)?, results, staging.path())
+        .await?;
+    ensure!(!files.is_empty(), "Codex export returned no rollouts");
+    sync_directories(staging.path())?;
+    let relative = files
+        .iter()
+        .map(|file| {
+            file.strip_prefix(staging.path())
+                .map(|part| saved.join(part))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if saved.exists() {
+        fs::remove_dir_all(&saved)?;
+    }
+    fs::rename(staging.path(), &saved)?;
+    File::open(results)?.sync_all()?;
+    Ok(relative)
+}
+
+fn rollout_directory(home: &Path) -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map_or_else(|| home.join(".codex"), PathBuf::from)
+        .join("sessions")
+        .join("fabric-runner")
+}
+
+fn seed_missing_rollouts(job: &Path, home: &Path, names: &[&str]) -> Result<()> {
+    let target = rollout_directory(home);
+    fs::create_dir_all(&target)?;
+    for name in names {
+        let path = target.join(name);
+        if !path.exists() {
+            fabric_store::write_atomic(&path, &fs::read(job.join("input-thread").join(name))?)?;
+        }
+    }
     Ok(())
 }
 
@@ -447,9 +563,7 @@ fn thread_advanced(job: &Path, files: &[PathBuf]) -> Result<bool> {
 }
 
 fn import_rollouts(job: &Path, home: &Path, names: &[&str]) -> Result<()> {
-    let codex_home =
-        std::env::var_os("CODEX_HOME").map_or_else(|| home.join(".codex"), PathBuf::from);
-    let target = codex_home.join("sessions").join("fabric-runner");
+    let target = rollout_directory(home);
     fs::create_dir_all(&target)?;
     for name in names {
         let incoming = fs::read(job.join("input-thread").join(name))?;
@@ -487,7 +601,7 @@ fn sync_directories(root: &Path) -> Result<()> {
     reason = "assert fixture construction and test success"
 )]
 mod tests {
-    use super::{accept, state, valid_job_id};
+    use super::{accept, recover, save_outcome, state, valid_job_id};
     use serde_json::{Value, json};
     use std::fs;
 
@@ -532,6 +646,28 @@ mod tests {
         let value: Value =
             serde_json::from_slice(&fs::read(job.join("state.json")).unwrap()).unwrap();
         assert_eq!(value["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn finalized_recovery_does_not_require_a_worker_or_a_model_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runner");
+        let id = accept(&root, &mut request(ROLLOUT).as_slice())
+            .await
+            .unwrap();
+        let job = root.join("jobs").join(id);
+        state(&job, "recovering", None).unwrap();
+        save_outcome(&job, "interrupted", Some("saved partial output")).unwrap();
+        let nonexistent_worker = temp.path().join("must-not-start");
+        for _ in 0..2 {
+            recover(&job, temp.path(), &nonexistent_worker, None)
+                .await
+                .unwrap();
+        }
+        let doc: Value =
+            serde_json::from_slice(&fs::read(job.join("state.json")).unwrap()).unwrap();
+        assert_eq!(doc["status"], "interrupted");
+        assert_eq!(doc["detail"], "saved partial output");
     }
 
     #[tokio::test]
