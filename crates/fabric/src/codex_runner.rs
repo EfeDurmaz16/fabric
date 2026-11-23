@@ -19,6 +19,7 @@ use crate::{codex_checkpoint, codex_handoff, codex_vm::Vm};
 const FILE_LIMIT: u64 = 64 * 1024 * 1024;
 const META_LIMIT: u64 = 65_536;
 const MAX_ROLLOUTS: usize = 16;
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Subcommand)]
 #[command(defer = true)]
@@ -392,12 +393,11 @@ async fn execute(job: &Path, home: &Path, worker: &Path, project: Option<&Path>)
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .context("invalid job id")?;
-    let encoded = id[4..]
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("");
-    let name = format!("fabric-handoff-{encoded}");
+    let mut name = String::from("fabric-handoff-");
+    for byte in id[4..].bytes() {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
     fabric_store::write_atomic(&job.join("sandbox-name"), name.as_bytes())?;
     let (mut vm, ready) = Vm::launch_checkpoint(
         &job.join("checkpoint.tar.gz"),
