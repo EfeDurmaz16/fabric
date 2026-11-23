@@ -160,6 +160,7 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "thread" | "THREAD" => "018e23e0-51ca-7a78-bce5-ffde3ddc1f8b".to_owned(),
         "executor" | "EXECUTOR" => "wss://example.vercel.run".to_owned(),
         "cwd" | "CWD" => "/vercel/sandbox/work".to_owned(),
+        "OUTPUT" => sandbox.path("output").display().to_string(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
 }
@@ -203,6 +204,14 @@ fn remove_option(args: &mut Vec<String>, option: &str) {
 fn runnable(path: &[String], sandbox: &Sandbox) -> Vec<String> {
     let cmd = find(path);
     let mut args = path.to_vec();
+    if path == ["codex-handoff"] {
+        args.extend([
+            "--executor".to_owned(),
+            sample("executor", sandbox),
+            "--cwd".to_owned(),
+            sample("cwd", sandbox),
+        ]);
+    }
     // A required group, such as a create's source, is given by its first member.
     let firsts: Vec<&clap::Arg> = cmd
         .get_groups()

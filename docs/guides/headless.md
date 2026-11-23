@@ -23,6 +23,33 @@ A headless Claude turn on a node whose `claude` login has lapsed, or that was st
 
 ## Continue a Codex thread on a Vercel executor
 
+Close the original Codex client after its current turn so its thread is saved.
+Choose an output directory outside the source checkout. Run the managed
+handoff from a directory linked to the Vercel project, or point `--vercel-project` at a linked directory. Install the matching Capsule
+worker on PATH or pass its path with `--worker`.
+
+```sh
+fabric codex-handoff --thread <THREAD_ID> --workspace <GIT_ROOT> --output <NEW_DIR> --prompt 'Continue from the last turn'
+```
+
+The local app-server keeps the existing login and thread. Capsule starts a
+fresh VM, installs the matching stable Codex release, restricts network egress,
+and restores a checkpoint before accepting the turn. Fabric writes
+`answer.txt` and `workspace.tar.gz` locally before telling Capsule to delete the
+sandbox. The source checkout stays in place. The archive contains the returned
+checkout with its Git index. It is not extracted automatically.
+
+The checkpoint carries a shallow checkout of HEAD, staged and unstaged changes,
+and non-ignored untracked files filtered by Fabric's default secret paths and
+`.fabricignore`.
+It supports UTF-8 regular files and a 64 MiB limit, rejects submodules, special index entries, and tracked paths
+blocked by the policy, and omits ignored files and Git history.
+Keep the workspace idle during capture. The host must stay awake for the model
+turn. If Fabric cannot save the output, Capsule reports the sandbox name and
+leaves the VM available until its 10-minute lifetime expires.
+
+### Use a prepared executor
+
 `fabric codex-handoff` is an experimental, one-turn command. Close the original
 Codex client after its current turn and wait for the thread to be saved. The
 local Codex app-server resumes that thread using the machine's existing

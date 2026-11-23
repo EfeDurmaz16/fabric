@@ -13,17 +13,36 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use crate::codex_vm::{Request, Vm};
+
 #[derive(Debug, Args)]
 pub(crate) struct HandoffArgs {
     /// ID of an idle Codex thread saved on this machine.
     #[arg(long)]
     thread: String,
     /// WSS URL of a prepared Vercel Sandbox exec-server.
-    #[arg(long)]
-    executor: String,
+    #[arg(
+        long,
+        conflicts_with = "workspace",
+        requires = "cwd",
+        required_unless_present = "workspace"
+    )]
+    executor: Option<String>,
     /// Absolute workspace path inside the sandbox.
-    #[arg(long)]
-    cwd: PathBuf,
+    #[arg(long, requires = "executor")]
+    cwd: Option<PathBuf>,
+    /// Idle local Git checkout to checkpoint and send to a new sandbox.
+    #[arg(long, requires = "output", conflicts_with_all = ["executor", "cwd"])]
+    workspace: Option<PathBuf>,
+    /// New local directory for the returned checkout archive and answer.
+    #[arg(long, requires = "workspace")]
+    output: Option<PathBuf>,
+    /// Capsule worker executable or built .js entry point.
+    #[arg(long, default_value = "capsule-bridge-worker")]
+    worker: PathBuf,
+    /// Directory linked to the Vercel project for local SDK authentication.
+    #[arg(long, requires = "workspace")]
+    vercel_project: Option<PathBuf>,
     /// Prompt for the next turn. Pass the executor bearer on stdin.
     #[arg(long)]
     prompt: String,
@@ -46,15 +65,53 @@ fn vercel_executor(endpoint: &str) -> bool {
 }
 
 pub(crate) async fn run(args: HandoffArgs) -> Result<ExitCode> {
-    ensure!(
-        vercel_executor(&args.executor),
-        "expected wss://<sandbox>.vercel.run"
-    );
-    ensure!(
-        args.cwd.is_absolute(),
-        "--cwd must be absolute inside the sandbox"
-    );
     ensure!(!args.prompt.trim().is_empty(), "--prompt must not be empty");
+    let answer = if let Some(workspace) = &args.workspace {
+        managed(&args, workspace).await?
+    } else {
+        let executor = args.executor.as_deref().context("missing executor URL")?;
+        let cwd = args
+            .cwd
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .context("missing executor cwd")?;
+        prepared(&args, executor, cwd).await?
+    };
+    writeln!(std::io::stdout().lock(), "{answer}")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn managed(args: &HandoffArgs, workspace: &std::path::Path) -> Result<String> {
+    let (mut vm, output, ready) = Vm::launch(&Request {
+        workspace,
+        output: args.output.as_deref().context("missing output directory")?,
+        worker: &args.worker,
+        project: args.vercel_project.as_deref(),
+    })
+    .await?;
+    let executor = ready["url"]
+        .as_str()
+        .context("Capsule omitted the executor URL")?;
+    let cwd = ready["cwd"]
+        .as_str()
+        .context("Capsule omitted the workspace path")?;
+    let token = ready["token"]
+        .as_str()
+        .context("Capsule omitted the executor token")?;
+    let turn = run_turn(args, executor, cwd, token).await;
+    let answer = turn
+        .as_deref()
+        .unwrap_or("Codex turn failed. The archive contains the workspace at recovery.");
+    vm.collect(&output, answer)
+        .await
+        .with_context(|| format!("recover output into {}", output.display()))?;
+    vm.delete()
+        .await
+        .with_context(|| format!("output saved to {}", output.display()))?;
+    turn.with_context(|| format!("recovered workspace saved to {}", output.display()))
+}
+
+async fn prepared(args: &HandoffArgs, executor: &str, cwd: &str) -> Result<String> {
     let mut bearer = String::new();
     tokio::io::stdin()
         .take(4097)
@@ -66,6 +123,18 @@ pub(crate) async fn run(args: HandoffArgs) -> Result<ExitCode> {
         "expected the executor capability token on stdin"
     );
 
+    run_turn(args, executor, cwd, token).await
+}
+
+async fn run_turn(args: &HandoffArgs, executor: &str, cwd: &str, token: &str) -> Result<String> {
+    ensure!(
+        vercel_executor(executor),
+        "expected wss://<sandbox>.vercel.run"
+    );
+    ensure!(
+        std::path::Path::new(cwd).is_absolute(),
+        "executor cwd must be absolute"
+    );
     let (mut child, mut rpc) = start_app_server()?;
     rpc.call(
         "initialize",
@@ -91,7 +160,7 @@ pub(crate) async fn run(args: HandoffArgs) -> Result<ExitCode> {
         "environment/add",
         json!({
             "environmentId": environment,
-            "execServerUrl": args.executor,
+            "execServerUrl": executor,
             "authBearerToken": token,
             "connectTimeoutMs": 10_000
         }),
@@ -111,8 +180,8 @@ pub(crate) async fn run(args: HandoffArgs) -> Result<ExitCode> {
         "approvalPolicy": "never",
         "config": {"mcp_servers": {}, "web_search": "disabled"}
     });
-    if let Some(model) = args.model {
-        resume["model"] = model.into();
+    if let Some(model) = &args.model {
+        resume["model"] = model.as_str().into();
     }
     let resumed = rpc.call("thread/resume", resume).await?;
     ensure!(
@@ -126,7 +195,7 @@ pub(crate) async fn run(args: HandoffArgs) -> Result<ExitCode> {
             json!({
                 "threadId": args.thread,
                 "input": [{"type": "text", "text": args.prompt}],
-                "environments": [{"environmentId": environment, "cwd": args.cwd}],
+                "environments": [{"environmentId": environment, "cwd": cwd}],
                 "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "restricted"}
             }),
         )
@@ -139,8 +208,7 @@ pub(crate) async fn run(args: HandoffArgs) -> Result<ExitCode> {
         .context("Codex handoff turn timed out")??;
     drop(rpc);
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    writeln!(std::io::stdout().lock(), "{answer}")?;
-    Ok(ExitCode::SUCCESS)
+    Ok(answer)
 }
 
 fn start_app_server() -> Result<(Child, Rpc)> {

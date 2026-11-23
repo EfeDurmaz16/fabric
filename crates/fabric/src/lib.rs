@@ -64,7 +64,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod audit;
+mod codex_checkpoint;
 mod codex_handoff;
+mod codex_vm;
 pub mod contract;
 mod gc;
 mod managed;
@@ -116,7 +118,7 @@ enum Command {
     },
     /// Report what crashed or ended work left on this node; remove it with --yes.
     Gc(gc::GcArgs),
-    /// Continue a local Codex thread on a prepared Vercel executor (experimental).
+    /// Continue a local Codex thread in a Vercel Sandbox (experimental).
     CodexHandoff(codex_handoff::HandoffArgs),
 }
 

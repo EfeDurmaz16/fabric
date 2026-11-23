@@ -85,10 +85,16 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "codex-handoff",
-        &[(
-            "Continue a saved thread on a prepared executor, with its token on stdin",
-            "fabric codex-handoff --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <TEXT>",
-        )],
+        &[
+            (
+                "Run a saved thread in a new Vercel Sandbox and save the result",
+                "fabric codex-handoff --thread <THREAD> --workspace <PATH> --output <OUTPUT> --prompt <TEXT>",
+            ),
+            (
+                "Continue a saved thread on a prepared executor, with its token on stdin",
+                "fabric codex-handoff --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <TEXT>",
+            ),
+        ],
     ),
     (
         "serve",

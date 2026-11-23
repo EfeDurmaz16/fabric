@@ -21,7 +21,7 @@ Set up a node:
 Work on jobs:
   job            Make, run, suspend, move and resume jobs
   psf            Read Portable Session Format containers
-  codex-handoff  Continue a local Codex thread on a prepared Vercel executor (experimental)
+  codex-handoff  Continue a local Codex thread in a Vercel Sandbox (experimental)
 
 Managed jobs:
   managed        Make, cancel and read managed jobs, and the M5 operations on them (experimental)
@@ -579,19 +579,35 @@ Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.m
 ### `fabric codex-handoff`
 
 ```text
-Usage: fabric codex-handoff [OPTIONS] --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <PROMPT>
-Continue a local Codex thread on a prepared Vercel executor (experimental)
+Usage: fabric codex-handoff [OPTIONS] --thread <THREAD> --prompt <PROMPT>
+Continue a local Codex thread in a Vercel Sandbox (experimental)
 
 Options:
-      --cwd <CWD>            Absolute workspace path inside the sandbox
-      --executor <EXECUTOR>  WSS URL of a prepared Vercel Sandbox exec-server
-      --model <MODEL>        Override the thread's model with one available to the local account
-      --prompt <PROMPT>      Prompt for the next turn. Pass the executor bearer on stdin
-      --thread <THREAD>      ID of an idle Codex thread saved on this machine
+      --cwd <CWD>
+          Absolute workspace path inside the sandbox
+      --executor <EXECUTOR>
+          WSS URL of a prepared Vercel Sandbox exec-server
+      --model <MODEL>
+          Override the thread's model with one available to the local account
+      --output <OUTPUT>
+          New local directory for the returned checkout archive and answer
+      --prompt <PROMPT>
+          Prompt for the next turn. Pass the executor bearer on stdin
+      --thread <THREAD>
+          ID of an idle Codex thread saved on this machine
+      --vercel-project <VERCEL_PROJECT>
+          Directory linked to the Vercel project for local SDK authentication
+      --worker <WORKER>
+          Capsule worker executable or built .js entry point [default: capsule-bridge-worker]
+      --workspace <WORKSPACE>
+          Idle local Git checkout to checkpoint and send to a new sandbox
 
 Global Options: See `fabric --help`
 
 Examples:
+  Run a saved thread in a new Vercel Sandbox and save the result
+    fabric codex-handoff --thread <THREAD> --workspace <PATH> --output <OUTPUT> --prompt <TEXT>
+
   Continue a saved thread on a prepared executor, with its token on stdin
     fabric codex-handoff --thread <THREAD> --executor <EXECUTOR> --cwd <CWD> --prompt <TEXT>
 
