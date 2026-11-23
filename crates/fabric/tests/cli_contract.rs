@@ -761,7 +761,11 @@ fn no_color_removes_every_escape_sequence() {
             continue;
         }
         let name = joined(&path);
-        let args = runnable(&path, &sandbox);
+        let mut args = runnable(&path, &sandbox);
+        if path == ["codex-runner", "serve"] {
+            // A valid runner would keep serving on Linux. Exercise its local error path.
+            args.extend(words(&["--root", "relative"]));
+        }
         let forced = sandbox
             .command(&args)
             .env("FORCE_COLOR", "1")
