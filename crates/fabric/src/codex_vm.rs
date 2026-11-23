@@ -42,23 +42,30 @@ impl Vm {
         let stage = tempfile::tempdir().context("create private checkpoint staging directory")?;
         let checkpoint = codex_checkpoint::capture(&root, stage.path())?;
         let output = create_output(request.output)?;
+        let (vm, ready) =
+            Self::launch_checkpoint(&checkpoint, &output, request.worker, request.project).await?;
+        Ok((vm, output, ready))
+    }
+
+    pub async fn launch_checkpoint(
+        checkpoint: &Path,
+        output: &Path,
+        worker: &Path,
+        project: Option<&Path>,
+    ) -> Result<(Self, Value)> {
         let version = codex_version().await?;
-        let mut command = if request
-            .worker
+        let mut command = if worker
             .extension()
             .is_some_and(|ext| ext == "js" || ext == "mjs")
         {
-            let path = request
-                .worker
-                .canonicalize()
-                .context("locate Capsule worker")?;
+            let path = worker.canonicalize().context("locate Capsule worker")?;
             let mut command = Command::new("node");
             command.arg(path);
             command
         } else {
-            Command::new(request.worker)
+            Command::new(worker)
         };
-        if let Some(project) = request.project {
+        if let Some(project) = project {
             command.current_dir(project);
         }
         command
@@ -98,7 +105,7 @@ impl Vm {
         }))?)
         .await?;
         let ready = vm.expect("ready").await?;
-        Ok((vm, output, ready))
+        Ok((vm, ready))
     }
 
     pub async fn collect(&mut self, output: &Path, answer: &str) -> Result<()> {

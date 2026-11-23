@@ -76,3 +76,44 @@ For a second executor, run the command again with the same thread ID, the
 second route and token, and its restored workspace. Each invocation runs after
 the previous turn has completed. Keeping the macOS host available is required
 while the turn runs.
+
+## Detach a handoff onto a personal Linux runner
+
+Use an always-available Linux host you trust, with SSH key authentication,
+persistent storage, `lsof`, and compatible Fabric, Codex and Capsule builds. Make
+`fabric` available to non-interactive SSH commands. On the runner, configure
+the Vercel project credentials and authorize Codex with ChatGPT once as the
+dedicated runner user. See [Codex headless sign-in](https://learn.chatgpt.com/docs/auth#login-on-headless-devices).
+The worker and SSH commands must use the same user and private state directory.
+Keep the worker running independently of SSH, for example with a systemd
+service configured to restart it.
+
+```sh
+fabric codex-runner serve --worker /path/to/capsule-bridge-worker --vercel-project /path/to/linked-project
+```
+
+On your Mac, close the thread's original Codex client after its current turn.
+Submit from the local checkout:
+
+```sh
+fabric codex-runner submit --host my-runner --thread THREAD_ID --workspace /path/to/repo --prompt 'Continue the task'
+```
+
+Fabric prints the job ID after the runner syncs the checkpoint, thread and
+request to its disk and publishes the job. You can disconnect after receiving
+that ID. The runner processes the job, saves `answer.txt`,
+`workspace.tar.gz`, and the updated native thread under `result/thread/`,
+then gives Capsule permission to delete the work VM. Check the status.
+
+```sh
+ssh my-runner fabric codex-runner status JOB_ID
+```
+
+The report gives the runner's result directory, which you can copy over SSH.
+The runner's default queue is `~/.local/share/fabric-codex-runner`. It processes
+one job at a time. Use a dedicated Codex home on the runner, and avoid editing
+the transferred thread concurrently on the Mac. After a runner crash, a
+previously running job is marked interrupted, since repeating a turn might
+repeat its effects. Inspect the saved results before resubmitting. If result
+persistence fails, the temporary VM remains available until its configured
+lifetime expires.

@@ -139,7 +139,9 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
     match id {
         "job" | "JOB" => JOB.to_owned(),
         "node" | "to" | "on" | "peer" | "NODE" | "authority" => node(),
-        "repo" | "path" | "PATH" | "dir" => sandbox.path("repo").display().to_string(),
+        "repo" | "path" | "PATH" | "dir" | "workspace" => {
+            sandbox.path("repo").display().to_string()
+        }
         "goal" | "prompt" | "reason" | "note" | "TEXT" | "label" | "question" => "demo".to_owned(),
         "addr" | "HOST:PORT" => "127.0.0.1:7777".to_owned(),
         "KEY" => "retry-1".to_owned(),
@@ -160,6 +162,8 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
         "thread" | "THREAD" => "018e23e0-51ca-7a78-bce5-ffde3ddc1f8b".to_owned(),
         "executor" | "EXECUTOR" => "wss://example.vercel.run".to_owned(),
         "cwd" | "CWD" => "/vercel/sandbox/work".to_owned(),
+        "host" | "HOST" => "runner.example.invalid".to_owned(),
+        "RUNNER_JOB" => "job-example0000000000000".to_owned(),
         "OUTPUT" => sandbox.path("output").display().to_string(),
         other => panic!("tests/cli_contract.rs has no sample for {other:?}; add one to `sample`"),
     }
@@ -607,6 +611,13 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
 
         // `serve` is the node, so it is the one command no node is missing for.
         if path == ["serve"] {
+            continue;
+        }
+        if path.first().is_some_and(|name| name == "codex-runner") {
+            let output = sandbox.run(&args);
+            let doc = error_document(&output, &name);
+            assert_eq!(output.status.code(), Some(2), "{name}: {doc}");
+            assert_eq!(doc["reason"], "invalid_arguments", "{name}: {doc}");
             continue;
         }
         // A command that asks no node fails on input that does not read.

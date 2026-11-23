@@ -621,6 +621,33 @@ impl Codex {
         lineage_in(&all, session, &self.store.join("sessions"))
     }
 
+    /// Export only the native rollout lineage of an idle thread, without
+    /// authentication, configuration, or other threads.
+    ///
+    /// # Errors
+    ///
+    /// Refuses active writers, secret-shaped content and unrecognized rollouts.
+    pub async fn portable_rollouts(
+        &self,
+        session: &SessionId,
+        workspace: &Path,
+        staging: &Path,
+    ) -> Result<Vec<PathBuf>, HarnessError> {
+        let manifest = self.capture_impl(workspace, session, staging).await?;
+        Ok(manifest
+            .files()
+            .iter()
+            .map(|file| staging.join(file.rel_path.as_str()))
+            .collect())
+    }
+
+    /// Validate the filename expected by the native reader and identify the
+    /// thread it belongs to.
+    #[must_use]
+    pub fn rollout_thread(name: &str) -> Option<SessionId> {
+        rollout::parse_name(name).map(|parsed| parsed.thread_id)
+    }
+
     /// Takes the thread writer lock as Codex's `acquire` does: the
     /// coordination lock only around opening and trying the thread lock.
     fn hold_writer_lock(&self, session: &SessionId) -> Result<WriterLock, HarnessError> {

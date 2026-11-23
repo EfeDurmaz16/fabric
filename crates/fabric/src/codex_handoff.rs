@@ -98,7 +98,16 @@ async fn managed(args: &HandoffArgs, workspace: &std::path::Path) -> Result<Stri
     let token = ready["token"]
         .as_str()
         .context("Capsule omitted the executor token")?;
-    let turn = run_turn(args, executor, cwd, token).await;
+    let turn = run_turn(
+        &args.thread,
+        &args.prompt,
+        args.model.as_deref(),
+        executor,
+        cwd,
+        token,
+        None,
+    )
+    .await;
     let answer = turn
         .as_deref()
         .unwrap_or("Codex turn failed. The archive contains the workspace at recovery.");
@@ -123,10 +132,27 @@ async fn prepared(args: &HandoffArgs, executor: &str, cwd: &str) -> Result<Strin
         "expected the executor capability token on stdin"
     );
 
-    run_turn(args, executor, cwd, token).await
+    run_turn(
+        &args.thread,
+        &args.prompt,
+        args.model.as_deref(),
+        executor,
+        cwd,
+        token,
+        None,
+    )
+    .await
 }
 
-async fn run_turn(args: &HandoffArgs, executor: &str, cwd: &str, token: &str) -> Result<String> {
+pub(crate) async fn run_turn(
+    thread: &str,
+    prompt: &str,
+    model: Option<&str>,
+    executor: &str,
+    cwd: &str,
+    token: &str,
+    local_workspace: Option<&std::path::Path>,
+) -> Result<String> {
     ensure!(
         vercel_executor(executor),
         "expected wss://<sandbox>.vercel.run"
@@ -175,17 +201,20 @@ async fn run_turn(args: &HandoffArgs, executor: &str, cwd: &str, token: &str) ->
     );
 
     let mut resume = json!({
-        "threadId": args.thread,
+        "threadId": thread,
         "sandbox": "read-only",
         "approvalPolicy": "never",
         "config": {"mcp_servers": {}, "web_search": "disabled"}
     });
-    if let Some(model) = &args.model {
-        resume["model"] = model.as_str().into();
+    if let Some(local_workspace) = local_workspace {
+        resume["cwd"] = serde_json::to_value(local_workspace)?;
+    }
+    if let Some(model) = model {
+        resume["model"] = model.into();
     }
     let resumed = rpc.call("thread/resume", resume).await?;
     ensure!(
-        resumed["thread"]["id"] == args.thread,
+        resumed["thread"]["id"] == thread,
         "Codex resumed a different thread"
     );
 
@@ -193,8 +222,8 @@ async fn run_turn(args: &HandoffArgs, executor: &str, cwd: &str, token: &str) ->
         .call(
             "turn/start",
             json!({
-                "threadId": args.thread,
-                "input": [{"type": "text", "text": args.prompt}],
+                "threadId": thread,
+                "input": [{"type": "text", "text": prompt}],
                 "environments": [{"environmentId": environment, "cwd": cwd}],
                 "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "restricted"}
             }),
@@ -203,7 +232,7 @@ async fn run_turn(args: &HandoffArgs, executor: &str, cwd: &str, token: &str) ->
     let turn = started["turn"]["id"]
         .as_str()
         .context("Codex omitted the turn ID")?;
-    let answer = tokio::time::timeout(Duration::from_mins(5), rpc.answer(&args.thread, turn))
+    let answer = tokio::time::timeout(Duration::from_mins(5), rpc.answer(thread, turn))
         .await
         .context("Codex handoff turn timed out")??;
     drop(rpc);

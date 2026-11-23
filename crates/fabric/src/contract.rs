@@ -61,7 +61,10 @@ const GLOBALS: &[(&str, &str, Option<char>, &str)] = &[
 /// How the root help groups the commands: in the order a user meets them.
 const GROUPS: &[(&str, &[&str])] = &[
     ("Set up a node", &["serve", "node", "doctor", "gc"]),
-    ("Work on jobs", &["job", "psf", "codex-handoff"]),
+    (
+        "Work on jobs",
+        &["job", "psf", "codex-handoff", "codex-runner"],
+    ),
     ("Managed jobs", &["managed", "facade", "inspect", "audit"]),
 ];
 
@@ -82,6 +85,34 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
                 "fabric job move <JOB> --to <NODE>",
             ),
         ],
+    ),
+    (
+        "codex-runner submit",
+        &[(
+            "Submit a saved thread to a running SSH host",
+            "fabric codex-runner submit --host <HOST> --thread <THREAD> --workspace <PATH> --prompt <TEXT>",
+        )],
+    ),
+    (
+        "codex-runner accept",
+        &[(
+            "Receive a submission on the runner",
+            "fabric codex-runner accept",
+        )],
+    ),
+    (
+        "codex-runner serve",
+        &[(
+            "Process jobs on the runner",
+            "fabric codex-runner serve --worker <PATH>",
+        )],
+    ),
+    (
+        "codex-runner status",
+        &[(
+            "Read the runner's durable job state",
+            "fabric codex-runner status <RUNNER_JOB>",
+        )],
     ),
     (
         "codex-handoff",
