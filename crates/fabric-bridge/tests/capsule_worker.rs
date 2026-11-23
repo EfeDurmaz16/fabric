@@ -2518,3 +2518,208 @@ async fn a_docker_destroy_lost_with_its_worker_blocks_a_replacement_until_no_con
     );
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
+
+/// Opt-in live test. Costs two short-lived Vercel Sandbox sessions. Sends only
+/// synthetic bytes; no provider key, login state, or user workspace is copied.
+#[tokio::test]
+#[ignore = "live Vercel test; requires a built Capsule worker and Vercel credentials"]
+async fn vercel_sandbox_transport_between_clean_vms() {
+    use fabric_bridge::MemoryLog;
+
+    let Some(account) = std::env::var("CAPSULE_BRIDGE_VERCEL_ACCOUNT").ok() else {
+        eprintln!("skipped Vercel smoke: CAPSULE_BRIDGE_VERCEL_ACCOUNT is unset");
+        return;
+    };
+    let project =
+        std::env::var("CAPSULE_BRIDGE_VERCEL_PROJECT").expect("set the Vercel project ID");
+    let (credential_name, credential) = ["VERCEL_OIDC_TOKEN", "VERCEL_TOKEN"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name, value))
+        })
+        .expect("set VERCEL_OIDC_TOKEN or VERCEL_TOKEN");
+
+    let dir = tempfile::tempdir().unwrap();
+    let image = "vercel/sandbox/universal";
+    let checkpoint = std::process::Command::new("sh")
+        .current_dir(dir.path())
+        .args([
+            "-eu",
+            "-c",
+            "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+            git init -q --template= -b main work
+            cd work
+            git -c user.name=Fabric -c user.email=fabric@example.invalid commit -q --allow-empty -m base
+            printf staged > staged
+            git add staged
+            printf base > edited
+            git add edited
+            printf unstaged > edited
+            printf untracked > untracked
+            cd ..
+            COPYFILE_DISABLE=1 tar -czf checkpoint.tar.gz work
+            base64 < checkpoint.tar.gz | tr -d '\n'",
+        ])
+        .output()
+        .unwrap();
+    assert!(checkpoint.status.success(), "{:?}", checkpoint.stderr);
+    let checkpoint = String::from_utf8(checkpoint.stdout).unwrap();
+    let config_path = write_config(
+        dir.path(),
+        "vercel.json",
+        &json!({
+            "binding": {"account": account, "project": project},
+            "policy": {"images": [image]},
+            "approvals": [
+                {"ref": "clean-vm-a", "action": "sandbox.destroy", "native_id": null},
+                {"ref": "clean-vm-b", "action": "sandbox.destroy", "native_id": null}
+            ]
+        }),
+    );
+    let mut command = capsule_worker("vercel", &config_path);
+    command.env(credential_name, credential);
+    let bridge = Bridge::spawn(command, config("vercel")).await.unwrap();
+    assert_eq!(bridge.profile().provider, "vercel");
+
+    let scope = Scope {
+        job: JobId::from_bytes(fresh("vercel-smoke-job")),
+        task: TaskId::from_bytes(fresh("vercel-smoke-task")),
+        attempt: AttemptId::from_bytes(fresh("vercel-smoke-attempt")),
+        generation: Generation::FIRST,
+    };
+    let unique = |mut effect: Effect, salt: &str| {
+        effect.operation.id = OperationId::from_bytes(fresh(salt));
+        effect.operation.key =
+            OperationKey::parse(&format!("{salt}-{}", effect.operation.id)).unwrap();
+        effect.scope = scope;
+        effect.deadline_ms = 90_000;
+        effect
+    };
+    let mut log = MemoryLog::new();
+    let mut resources = Vec::new();
+    let check: Result<(), String> = async {
+        for (n, salt) in [(1, "vercel-smoke-create-a"), (2, "vercel-smoke-create-b")] {
+            let request = unique(create(n, image), salt);
+            let outcome = bridge
+                .request(&mut log, request)
+                .await
+                .map_err(|error| error.to_string())?
+                .finish(&mut log)
+                .await
+                .map_err(|error| error.to_string())?;
+            match outcome.answer {
+                Answer::Result(reply) if reply.state == ResultState::Completed => {
+                    resources.push(reply.resource);
+                }
+                other => return Err(format!("create failed: {other:?}")),
+            }
+        }
+        if resources[0] == resources[1] {
+            return Err("provider reused the first sandbox".into());
+        }
+
+        // The test transfers a synthetic repo. Production must use Fabric's
+        // checkpoint and secret filter instead of archiving a worktree directly.
+        let restore = |n, target, input, salt| {
+            let mut request = unique(
+                exec(
+                    n,
+                    target,
+                    &[
+                        "sh",
+                        "-eu",
+                        "-c",
+                        concat!(
+                            r#"test -z "${VERCEL_OIDC_TOKEN-}${VERCEL_TOKEN-}${OPENAI_API_KEY-}"; "#,
+                            "test ! -e work; base64 -d > checkpoint.tar.gz; ",
+                            "tar -xzf checkpoint.tar.gz; cd work; ",
+                            r#"test "$(git show :edited)" = base; test "$(cat edited)" = unstaged; "#,
+                            r#"test "$(cat staged)" = staged; test "$(cat untracked)" = untracked; "#,
+                            "git status --porcelain",
+                        ),
+                    ],
+                    4096,
+                ),
+                salt,
+            );
+            if let Action::Exec { params, .. } = &mut request.action {
+                params.stdin = Some(input);
+            }
+            request
+        };
+        let first = restore(
+            3,
+            &resources[0],
+            checkpoint.clone(),
+            "vercel-smoke-restore-a",
+        );
+        let status = vercel_smoke_exec(&bridge, &mut log, first).await?;
+        if status != "AM edited\nA  staged\n?? untracked\n" {
+            return Err(format!("VM A Git index or worktree changed: {status:?}"));
+        }
+
+        let export = unique(
+            exec(
+                4,
+                &resources[0],
+                &["sh", "-eu", "-c", "tar -czf - work | base64 -w0"],
+                60_000,
+            ),
+            "vercel-smoke-checkpoint",
+        );
+        let output = vercel_smoke_exec(&bridge, &mut log, export).await?;
+        if output.is_empty() {
+            return Err("empty checkpoint".into());
+        }
+        let second = restore(5, &resources[1], output, "vercel-smoke-restore-b");
+        let status = vercel_smoke_exec(&bridge, &mut log, second).await?;
+        if status != "AM edited\nA  staged\n?? untracked\n" {
+            return Err(format!("VM B Git index or worktree changed: {status:?}"));
+        }
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup = Vec::new();
+    for (index, resource) in resources.iter().enumerate() {
+        let (n, approval) = [(6, "clean-vm-a"), (7, "clean-vm-b")][index];
+        let request = unique(destroy(n, resource, Some(approval)), approval);
+        let outcome = match bridge.request(&mut log, request).await {
+            Ok(pending) => pending.finish(&mut log).await,
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(outcome) if matches!(outcome.answer, Answer::Result(ref reply) if reply.state == ResultState::Completed) =>
+                {}
+            other => cleanup.push(format!("{other:?}")),
+        }
+    }
+    assert!(cleanup.is_empty(), "Vercel cleanup failed: {cleanup:?}");
+    check.unwrap();
+}
+
+async fn vercel_smoke_exec(
+    bridge: &Bridge,
+    log: &mut fabric_bridge::MemoryLog,
+    request: Effect,
+) -> Result<String, String> {
+    let outcome = bridge
+        .request(log, request)
+        .await
+        .map_err(|error| error.to_string())?
+        .finish(log)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Answer::Result(reply) = outcome.answer else {
+        return Err(format!("exec failed: {:?}", outcome.answer));
+    };
+    if reply.output["exit_code"] != 0 || reply.output["stdout"]["truncated"] == true {
+        return Err(format!("exec failed: {:?}", reply.output));
+    }
+    reply.output["stdout"]["text"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "exec did not return stdout".into())
+}
