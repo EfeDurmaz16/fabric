@@ -2599,87 +2599,14 @@ async fn vercel_sandbox_transport_between_clean_vms() {
     };
     let mut log = MemoryLog::new();
     let mut resources = Vec::new();
-    let check: Result<(), String> = async {
-        for (n, salt) in [(1, "vercel-smoke-create-a"), (2, "vercel-smoke-create-b")] {
-            let request = unique(create(n, image), salt);
-            let outcome = bridge
-                .request(&mut log, request)
-                .await
-                .map_err(|error| error.to_string())?
-                .finish(&mut log)
-                .await
-                .map_err(|error| error.to_string())?;
-            match outcome.answer {
-                Answer::Result(reply) if reply.state == ResultState::Completed => {
-                    resources.push(reply.resource);
-                }
-                other => return Err(format!("create failed: {other:?}")),
-            }
-        }
-        if resources[0] == resources[1] {
-            return Err("provider reused the first sandbox".into());
-        }
-
-        // The test transfers a synthetic repo. Production must use Fabric's
-        // checkpoint and secret filter instead of archiving a worktree directly.
-        let restore = |n, target, input, salt| {
-            let mut request = unique(
-                exec(
-                    n,
-                    target,
-                    &[
-                        "sh",
-                        "-eu",
-                        "-c",
-                        concat!(
-                            r#"test -z "${VERCEL_OIDC_TOKEN-}${VERCEL_TOKEN-}${OPENAI_API_KEY-}"; "#,
-                            "test ! -e work; base64 -d > checkpoint.tar.gz; ",
-                            "tar -xzf checkpoint.tar.gz; cd work; ",
-                            r#"test "$(git show :edited)" = base; test "$(cat edited)" = unstaged; "#,
-                            r#"test "$(cat staged)" = staged; test "$(cat untracked)" = untracked; "#,
-                            "git status --porcelain",
-                        ),
-                    ],
-                    4096,
-                ),
-                salt,
-            );
-            if let Action::Exec { params, .. } = &mut request.action {
-                params.stdin = Some(input);
-            }
-            request
-        };
-        let first = restore(
-            3,
-            &resources[0],
-            checkpoint.clone(),
-            "vercel-smoke-restore-a",
-        );
-        let status = vercel_smoke_exec(&bridge, &mut log, first).await?;
-        if status != "AM edited\nA  staged\n?? untracked\n" {
-            return Err(format!("VM A Git index or worktree changed: {status:?}"));
-        }
-
-        let export = unique(
-            exec(
-                4,
-                &resources[0],
-                &["sh", "-eu", "-c", "tar -czf - work | base64 -w0"],
-                60_000,
-            ),
-            "vercel-smoke-checkpoint",
-        );
-        let output = vercel_smoke_exec(&bridge, &mut log, export).await?;
-        if output.is_empty() {
-            return Err("empty checkpoint".into());
-        }
-        let second = restore(5, &resources[1], output, "vercel-smoke-restore-b");
-        let status = vercel_smoke_exec(&bridge, &mut log, second).await?;
-        if status != "AM edited\nA  staged\n?? untracked\n" {
-            return Err(format!("VM B Git index or worktree changed: {status:?}"));
-        }
-        Ok(())
-    }
+    let check = vercel_smoke_transfer(
+        &bridge,
+        &mut log,
+        &mut resources,
+        image,
+        checkpoint,
+        &unique,
+    )
     .await;
 
     let mut cleanup = Vec::new();
@@ -2698,6 +2625,90 @@ async fn vercel_sandbox_transport_between_clean_vms() {
     }
     assert!(cleanup.is_empty(), "Vercel cleanup failed: {cleanup:?}");
     check.unwrap();
+}
+
+async fn vercel_smoke_transfer(
+    bridge: &Bridge,
+    log: &mut fabric_bridge::MemoryLog,
+    resources: &mut Vec<Locator>,
+    image: &str,
+    checkpoint: String,
+    unique: &impl Fn(Effect, &str) -> Effect,
+) -> Result<(), String> {
+    for (n, salt) in [(1, "vercel-smoke-create-a"), (2, "vercel-smoke-create-b")] {
+        let request = unique(create(n, image), salt);
+        let outcome = bridge
+            .request(log, request)
+            .await
+            .map_err(|error| error.to_string())?
+            .finish(log)
+            .await
+            .map_err(|error| error.to_string())?;
+        match outcome.answer {
+            Answer::Result(reply) if reply.state == ResultState::Completed => {
+                resources.push(reply.resource);
+            }
+            other => return Err(format!("create failed: {other:?}")),
+        }
+    }
+    if resources[0] == resources[1] {
+        return Err("provider reused the first sandbox".into());
+    }
+
+    // The test transfers a synthetic repo. Production must use Fabric's
+    // checkpoint and secret filter instead of archiving a worktree directly.
+    let restore = |n, target, input, salt| {
+        let mut request = unique(
+            exec(
+                n,
+                target,
+                &[
+                    "sh",
+                    "-eu",
+                    "-c",
+                    concat!(
+                        r#"test -z "${VERCEL_OIDC_TOKEN-}${VERCEL_TOKEN-}${OPENAI_API_KEY-}"; "#,
+                        "test ! -e work; base64 -d > checkpoint.tar.gz; ",
+                        "tar -xzf checkpoint.tar.gz; cd work; ",
+                        r#"test "$(git show :edited)" = base; test "$(cat edited)" = unstaged; "#,
+                        r#"test "$(cat staged)" = staged; test "$(cat untracked)" = untracked; "#,
+                        "git status --porcelain",
+                    ),
+                ],
+                4096,
+            ),
+            salt,
+        );
+        if let Action::Exec { params, .. } = &mut request.action {
+            params.stdin = Some(input);
+        }
+        request
+    };
+    let first = restore(3, &resources[0], checkpoint, "vercel-smoke-restore-a");
+    let status = vercel_smoke_exec(bridge, log, first).await?;
+    if status != "AM edited\nA  staged\n?? untracked\n" {
+        return Err(format!("VM A Git index or worktree changed: {status:?}"));
+    }
+
+    let export = unique(
+        exec(
+            4,
+            &resources[0],
+            &["sh", "-eu", "-c", "tar -czf - work | base64 -w0"],
+            60_000,
+        ),
+        "vercel-smoke-checkpoint",
+    );
+    let output = vercel_smoke_exec(bridge, log, export).await?;
+    if output.is_empty() {
+        return Err("empty checkpoint".into());
+    }
+    let second = restore(5, &resources[1], output, "vercel-smoke-restore-b");
+    let status = vercel_smoke_exec(bridge, log, second).await?;
+    if status != "AM edited\nA  staged\n?? untracked\n" {
+        return Err(format!("VM B Git index or worktree changed: {status:?}"));
+    }
+    Ok(())
 }
 
 async fn vercel_smoke_exec(
