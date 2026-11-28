@@ -112,6 +112,12 @@ describe("the package", () => {
     });
   });
 
+  test("uses certificate-verified HTTPS and bounds transport failures in an installed consumer", () => {
+    copyFileSync(join(SDK, "test", "gateway-consumer.mjs"), join(app, "gateway-consumer.mjs"));
+    const result = run("node", ["gateway-consumer.mjs"], app);
+    expect({ status: result.status, stderr: result.stderr }).toStrictEqual({ status: 0, stderr: "" });
+  });
+
   test("gives a TypeScript consumer its declarations", () => {
     writeFileSync(
       join(app, "consumer.ts"),

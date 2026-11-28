@@ -1,9 +1,24 @@
 # Fabric job client
 
-Connect a trusted Node.js 22+ backend to the private socket of a local Fabric node.
-The node routes requests to the job's authority, which checks the facade token.
-The application holding the socket has the local OS user's privileges. Run the
-client in that trusted process and keep the socket and bearer within that boundary.
+Agents can use six managed-job methods over HTTPS with a scoped facade token.
+The gateway selects the authority. Use its printed endpoint and a token minted
+for the agent's jobs and operations.
+
+```js
+import { FabricJobs, JobId } from "@fabric-jobs/client";
+
+const jobs = new FabricJobs({ endpoint: process.env.FABRIC_ENDPOINT, token: process.env.FABRIC_TOKEN });
+const state = await jobs.inspect(JobId.parse(process.argv[2]));
+```
+
+For a private certificate authority, pass its PEM as `ca`. The default uses
+Node's trusted roots. `timeoutMs` sets the total request deadline (35 seconds
+by default). `GatewayError.reason` distinguishes HTTP status, transport, timeout,
+and content-type errors. Read `status` for an HTTP failure. The client sends
+one request and checks the certificate and hostname before sending the bearer.
+
+A trusted Node.js 22+ backend can also connect to a local Fabric node's private
+socket. The application holding the socket has the local OS user's privileges.
 
 To try a checkout, run `bun install --frozen-lockfile` and `npm pack` in this
 directory. Install the resulting `fabric-jobs-client-0.1.0.tgz` from your own

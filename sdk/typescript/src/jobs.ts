@@ -4,7 +4,11 @@ import {
 } from "./facade.ts";
 import type { Counter, Fidelity, Inspection, JobId, ManagedSource, NodeId, OperationKey, TaskId } from "./schema.ts";
 
-export type JobClientOptions = ClientOptions & { readonly authority: NodeId; readonly token: string };
+import { gatewayCaller, type GatewayOptions } from "./gateway.ts";
+
+export type JobClientOptions =
+  | (ClientOptions & { readonly authority: NodeId; readonly token: string; readonly endpoint?: never })
+  | (GatewayOptions & { readonly authority?: never; readonly socketPath?: never });
 /** Remote facade submissions accept a snapshot, pinned Git commit or empty workspace. */
 export type JobSpec = Omit<Submit, "source"> & { source: Extract<ManagedSource, { kind: "git" | "snapshot" | "empty" }> };
 export type AcceptedOperation = Extract<FacadeAnswer, { type: "accepted" }>;
@@ -24,16 +28,23 @@ function expectType<T extends "accepted" | "events" | "inspection">(
   if (answer.type !== type) throw new ProtocolViolation("unexpected_answer", `expected ${type}, received ${answer.type}`);
 }
 
-/** Six operations on a managed authority. Connect through the trusted backend's private node socket. */
+/** Six operations on a managed authority. Connect through a private node socket or an HTTPS gateway. */
 export class FabricJobs {
-  readonly #client: FabricClient;
-  readonly #authority: NodeId;
+  readonly #call: (message: ClientMessage) => Promise<FacadeAnswer>;
   readonly #token: string;
 
-  constructor({ authority, token, ...options }: JobClientOptions) {
-    this.#client = new FabricClient(options);
-    this.#authority = authority;
-    this.#token = token;
+  constructor(options: JobClientOptions) {
+    this.#token = options.token;
+    if (options.endpoint !== undefined) {
+      if (options.socketPath !== undefined || options.authority !== undefined) {
+        throw new TypeError("the gateway owns its authority and socket path");
+      }
+      this.#call = gatewayCaller(options);
+    } else {
+      const client = new FabricClient(options);
+      const authority = options.authority;
+      this.#call = (message) => client.facadeCall(authority, message);
+    }
   }
 
   /** Persist the key before submitting. Reuse it with the identical spec after an uncertain reply. */
@@ -42,7 +53,7 @@ export class FabricJobs {
   }
 
   async inspect(job: JobId): Promise<Inspection> {
-    const answer = await this.#client.facadeCall(this.#authority, { type: "inspect", token: this.#token, job });
+    const answer = await this.#call({ type: "inspect", token: this.#token, job });
     expectType(answer, "inspection");
     if (answer.inspection.job.job !== job) throw new ProtocolViolation("job_mismatch", "inspection names a different job");
     return answer.inspection;
@@ -50,7 +61,7 @@ export class FabricJobs {
 
   /** Read one bounded page. Persist next after applying the events to resume after disconnect. */
   async watch(job: JobId, options: { after?: Counter | null; waitMs?: number } = {}): Promise<JobEvents> {
-    const answer = await this.#client.facadeCall(this.#authority, {
+    const answer = await this.#call({
       type: "watch", token: this.#token, job, after: options.after ?? null,
       ...(options.waitMs === undefined ? {} : { wait_ms: options.waitMs }),
     });
@@ -80,7 +91,7 @@ export class FabricJobs {
   }
 
   async #effect(message: Effect): Promise<AcceptedOperation> {
-    const answer = await this.#client.facadeCall(this.#authority, message);
+    const answer = await this.#call(message);
     expectType(answer, "accepted");
     if (answer.key !== message.key || ("job" in message && answer.job !== message.job)) {
       throw new ProtocolViolation("operation_mismatch", "acceptance names a different operation key or job");
