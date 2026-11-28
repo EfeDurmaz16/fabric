@@ -5,6 +5,8 @@ Facade v1. Use a Fabric HTTPS gateway or client API 2 over the local Unix
 control socket. A local node can also forward calls to a paired authority.
 There are no runtime dependencies.
 
+[Run your first job over HTTPS](../../examples/first-https-job/README.md) walks through a clean install, authority startup, token grants, submission and a completed turn.
+
 ## Install the wheel
 
 From the Fabric repository root, build to a directory outside the checkout:
@@ -25,7 +27,7 @@ file. For a private CA, add `--ca-file ca.pem` before the command.
 
 ```sh
 fbrc --endpoint "$gateway" inspect "$job" < "$token_file"
-fbrc --endpoint "$gateway" watch "$job" --after "$cursor" --wait-ms 1000 < "$token_file"
+fbrc --endpoint "$gateway" watch "$job" --wait-ms 1000 < "$token_file"
 fbrc --endpoint "$gateway" submit --key ci-run-1 --spec job.json < "$token_file"
 ```
 
@@ -71,12 +73,14 @@ try:
         page = client.watch(job, after=cursor, wait_ms=1000)
         for event in page.events:
             print(event.seq, event.kind)
-        cursor = page.next
-        if page.closed or (not page.events and not page.lagged):
+        cursor = page.next or cursor
+        if page.closed:
             break
 except FacadeRefusedError as error:
     print(error.code, error.reason)
 ```
+
+An idle page may be followed by new events. The loop above observes the job until it closes. For a single turn, inspect the latest attempt status as in the first-job guide.
 
 Persist the last fully handled cursor if the consumer needs to resume after
 a process exit. Each watch is a bounded call with at most 256 events and an
@@ -117,6 +121,9 @@ gateway selects the authority. All six job methods work with either
 transport.
 
 ```python
+import os
+from fabric_jobs import FabricClient
+
 client = FabricClient.from_https(
     os.environ["FABRIC_ENDPOINT"],
     os.environ["FABRIC_FACADE_TOKEN"],

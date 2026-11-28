@@ -1,5 +1,7 @@
 # Fabric job client
 
+[Run your first job over HTTPS](../../examples/first-https-job/README.md) builds this package, installs it in a fresh Node project and reads a completed turn from the gateway.
+
 Agents can use six managed-job methods over HTTPS with a scoped facade token.
 The gateway selects the authority. Use its printed endpoint and a token minted
 for the agent's jobs and operations.
@@ -7,8 +9,11 @@ for the agent's jobs and operations.
 ```js
 import { FabricJobs, JobId } from "@fabric-jobs/client";
 
-const jobs = new FabricJobs({ endpoint: process.env.FABRIC_ENDPOINT, token: process.env.FABRIC_TOKEN });
-const state = await jobs.inspect(JobId.parse(process.argv[2]));
+const { FABRIC_ENDPOINT: endpoint, FABRIC_TOKEN: token } = process.env;
+if (!endpoint || !token) throw new Error("Set FABRIC_ENDPOINT and FABRIC_TOKEN");
+const jobs = new FabricJobs({ endpoint, token });
+const { job } = await jobs.inspect(JobId.parse(process.argv[2]));
+console.log(JSON.stringify({ job: job.job, state: job.state }));
 ```
 
 For a private certificate authority, pass its PEM as `ca`. The default uses
