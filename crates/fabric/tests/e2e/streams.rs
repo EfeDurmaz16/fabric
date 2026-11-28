@@ -41,6 +41,10 @@ const ELSEWHERE: &[(&str, &str)] = &[
         "codex-runner submit",
         "tests/cli_contract.rs: codex_runner_keeps_job_output_on_stdout",
     ),
+    (
+        "gateway",
+        "sdk/python/tests/https_smoke.py: the gateway announces its HTTPS endpoint on stdout",
+    ),
     ("help", "tests/cli_contract.rs: help prints on stdout"),
     ("job run", "headless.rs: the harness owns standard output"),
     (
