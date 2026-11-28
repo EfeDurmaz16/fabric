@@ -41,6 +41,9 @@ export class FabricJobs {
       }
       this.#call = gatewayCaller(options);
     } else {
+      if (!options.socketPath || !options.authority) {
+        throw new TypeError("set endpoint to an HTTPS gateway URL or provide both socketPath and authority");
+      }
       const client = new FabricClient(options);
       const authority = options.authority;
       this.#call = (message) => client.facadeCall(authority, message);

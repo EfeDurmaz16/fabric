@@ -23,6 +23,10 @@ _HEADER = struct.Struct("<I")
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
+class InputError(ValueError):
+    """Invalid client input. Messages name the field without including its value."""
+
+
 class FabricError(Exception):
     """A Fabric transport, protocol, or application error."""
 

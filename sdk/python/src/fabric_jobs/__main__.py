@@ -7,16 +7,25 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import FabricClient, FabricError, FacadeRefusedError, HttpStatusError
-from ._wire import MAX_FRAME, decode_json
+from ._wire import InputError, MAX_FRAME, decode_json
 
 
-class UsageError(ValueError):
+class UsageError(InputError):
     pass
 
 
 class Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         # argparse can echo arbitrary argv, including accidentally supplied credentials.
+        names = {name for action in self._actions for name in (*action.option_strings, action.dest)}
+        required = "the following arguments are required: "
+        if message.startswith(required):
+            missing = message[len(required):].split(", ")
+            if all(field in names for field in missing):
+                raise UsageError("required: " + ", ".join(missing))
+        field = message.partition(":")[0].removeprefix("argument ")
+        if field in names:
+            raise UsageError(f"invalid or missing value for {field}; see --help")
         raise UsageError("invalid arguments; see --help")
 
 
@@ -53,8 +62,11 @@ def _parser() -> Parser:
 
 
 def _submit_spec(path: Path) -> dict:
-    with path.open("rb") as source:
-        body = source.read(MAX_FRAME + 1)
+    try:
+        with path.open("rb") as source:
+            body = source.read(MAX_FRAME + 1)
+    except OSError as error:
+        raise UsageError("cannot read --spec file") from error
     if len(body) > MAX_FRAME:
         raise UsageError("spec exceeds frame limit")
     try:
@@ -94,7 +106,10 @@ def main() -> int:
         if sys.stdin.isatty():
             raise UsageError("pipe the bearer on standard input")
         token = sys.stdin.readline(67).rstrip("\r\n")
-        client = FabricClient.from_https(args.endpoint, token, ca_file=args.ca_file)
+        try:
+            client = FabricClient.from_https(args.endpoint, token, ca_file=args.ca_file)
+        except OSError as error:
+            raise UsageError("cannot load TLS trust roots; check --ca-file") from error
         print(json.dumps(asdict(_run(client, args)), separators=(",", ":")))
         return 0
     except FacadeRefusedError as exc:
@@ -104,7 +119,7 @@ def main() -> int:
     except FabricError as exc:
         error = {"error": type(exc).__name__}
     except (ValueError, OSError) as exc:
-        print(json.dumps({"error": "invalid_input", "message": str(exc) if isinstance(exc, UsageError) else "check input and file paths"}), file=sys.stderr)
+        print(json.dumps({"error": "invalid_input", "message": str(exc) if isinstance(exc, InputError) else "check input and file paths"}), file=sys.stderr)
         return 2
     print(json.dumps(error), file=sys.stderr)
     return 1

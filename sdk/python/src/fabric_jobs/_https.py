@@ -11,6 +11,7 @@ import time
 from urllib.parse import urlsplit
 
 from ._wire import (
+    InputError,
     MAX_FRAME,
     FabricError,
     JsonObject,
@@ -108,12 +109,12 @@ class HttpsEndpoint:
 
     def __init__(self, endpoint: str, ca_file: str | os.PathLike[str] | None) -> None:
         if not isinstance(endpoint, str) or any(ord(char) <= 32 or ord(char) == 127 for char in endpoint):
-            raise ValueError("endpoint must be an HTTPS URL without whitespace or control characters")
+            raise InputError("endpoint must be an HTTPS URL without whitespace or control characters")
         try:
             url = urlsplit(endpoint)
             port = url.port if url.port is not None else 443
         except ValueError:
-            raise ValueError("invalid Fabric HTTPS endpoint") from None
+            raise InputError("invalid Fabric HTTPS endpoint") from None
         if (
             url.scheme != "https"
             or url.hostname is None
@@ -124,7 +125,7 @@ class HttpsEndpoint:
             or url.netloc.endswith(":")
             or any(char in endpoint for char in ("?", "#", "\\", "%"))
         ):
-            raise ValueError(f"endpoint must be an HTTPS URL ending in {_ROUTE}, with no credentials, query, or fragment")
+            raise InputError(f"endpoint must be an HTTPS URL ending in {_ROUTE}, with no credentials, query, or fragment")
 
         # A default client SSL context enables peer and hostname validation.
         # Use an explicit context so ambient SSLKEYLOGFILE cannot turn on key logging.

@@ -79,3 +79,9 @@ test("watch enforces the shared cursor contract", async () => {
     else await expect(page).rejects.toMatchObject({ reason: "bad_cursor" });
   }
 });
+
+test("a missing HTTPS endpoint fails at construction with a transport hint", () => {
+  // JavaScript consumers can pass an unset environment variable.
+  // @ts-expect-error Deliberately exercise an incomplete options object.
+  expect(() => new FabricJobs({ endpoint: undefined, token })).toThrow("set endpoint");
+});

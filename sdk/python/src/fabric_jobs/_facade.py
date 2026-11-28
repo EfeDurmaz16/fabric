@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from ._https import HttpsEndpoint
-from ._wire import NODE_ID, FabricError, JsonObject, JsonValue, ProtocolError, exchange
+from ._wire import InputError, NODE_ID, FabricError, JsonObject, JsonValue, ProtocolError, exchange
 
 FACADE_VERSION = 1
 MAX_WAIT_MS = 25_000
@@ -85,7 +85,7 @@ def _is_counter(value: object) -> bool:
 
 def _optional_counter(value: str | None, field: str) -> None:
     if value is not None and not _is_counter(value):
-        raise ValueError(f"{field} must be a canonical decimal counter or None")
+        raise InputError(f"{field} must be a canonical decimal counter or None")
 
 
 def _check_counters(value: JsonValue) -> None:
@@ -225,7 +225,7 @@ class FabricClient:
         timeout: float = 35.0,
     ) -> None:
         if not _matches(authority, NODE_ID):
-            raise ValueError("authority must be a canonical Fabric node ID")
+            raise InputError("authority must be a canonical Fabric node ID")
         path = Path(os.path.abspath(socket_path))
 
         def send(message: JsonObject, bearer: str, budget: float) -> JsonObject:
@@ -251,9 +251,9 @@ class FabricClient:
         self, send: Callable[[JsonObject, str, float], JsonObject], token: str, timeout: float,
     ) -> None:
         if not _matches(token, _TOKEN):
-            raise ValueError("token must contain 64 lowercase hexadecimal characters")
+            raise InputError("token must contain 64 lowercase hexadecimal characters")
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("timeout must be finite and positive")
+            raise InputError("timeout must be finite and positive")
         self._send = send
         self.__token = token
         self._timeout = timeout
@@ -264,7 +264,7 @@ class FabricClient:
 
     def _command(self, operation: str, key: str, fields: JsonObject, job: str | None = None) -> Accepted:
         if not _matches(key, _KEY):
-            raise ValueError("operation key must have 1 to 128 characters from A-Z, a-z, 0-9, . _ : -")
+            raise InputError("operation key must have 1 to 128 characters from A-Z, a-z, 0-9, . _ : -")
         result = self._call(operation, {"key": key, **fields})
         if not isinstance(result, Accepted) or result.key != key or (job is not None and result.job != job):
             raise ProtocolError("unexpected_answer", "expected acceptance for this operation key and job")
@@ -273,7 +273,7 @@ class FabricClient:
     @staticmethod
     def _job_fields(job: str, expected_revision: str | None) -> JsonObject:
         if not _matches(job, _ID):
-            raise ValueError("job must be a canonical ULID")
+            raise InputError("job must be a canonical ULID")
         _optional_counter(expected_revision, "expected_revision")
         return {"job": job, "expected_revision": expected_revision}
 
@@ -299,7 +299,7 @@ class FabricClient:
     def inspect(self, job: str) -> Inspection:
         """Read the authority's current managed-job projection."""
         if not _matches(job, _ID):
-            raise ValueError("job must be a canonical ULID")
+            raise InputError("job must be a canonical ULID")
         result = self._call("inspect", {"job": job})
         if not isinstance(result, Inspection) or result.job_id != job:
             raise ProtocolError("unexpected_answer", "expected inspection for this job")
@@ -308,12 +308,12 @@ class FabricClient:
     def watch(self, job: str, *, after: str | None = None, wait_ms: int | None = None) -> WatchPage:
         """Read one bounded event page. Pass next as after on the following call."""
         if not _matches(job, _ID):
-            raise ValueError("job must be a canonical ULID")
+            raise InputError("job must be a canonical ULID")
         _optional_counter(after, "after")
         fields: JsonObject = {"job": job, "after": after}
         if wait_ms is not None:
             if type(wait_ms) is not int or not 0 <= wait_ms <= MAX_WAIT_MS:
-                raise ValueError(f"wait_ms must be an integer from 0 to {MAX_WAIT_MS}")
+                raise InputError(f"wait_ms must be an integer from 0 to {MAX_WAIT_MS}")
             fields["wait_ms"] = wait_ms
         result = self._call("watch", fields)
         if not isinstance(result, WatchPage) or result.job != job:
@@ -341,7 +341,7 @@ class FabricClient:
     ) -> Accepted:
         """Request cancellation of a whole job or an explicitly named task."""
         if task is not None and not _matches(task, _ID):
-            raise ValueError("task must be a canonical ULID or None")
+            raise InputError("task must be a canonical ULID or None")
         fields: JsonObject = {**self._job_fields(job, expected_revision), "reason": reason, "task": task}
         return self._command("cancel", key, fields, job)
 
@@ -360,7 +360,7 @@ class FabricClient:
     ) -> Accepted:
         """Request continuation using Facade's continue operation."""
         if pin is not None and not _matches(pin, NODE_ID):
-            raise ValueError("pin must be a canonical Fabric node ID or None")
+            raise InputError("pin must be a canonical Fabric node ID or None")
         fields: JsonObject = {**self._job_fields(job, expected_revision), "pin": pin}
         if fidelity is not None:
             fields["fidelity"] = list(fidelity)

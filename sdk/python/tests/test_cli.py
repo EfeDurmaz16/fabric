@@ -61,3 +61,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual((code, stdout), (2, ""))
         self.assertIn("acceptance", json.loads(stderr)["message"])
         connect.return_value.submit.assert_not_called()
+
+    def test_argument_errors_name_the_field_without_echoing_values(self):
+        cases = [
+            (["watch", "job", "--wait-ms", self.token], "--wait-ms"),
+            (["checkpoint", "job"], "--key"),
+            (["submit", "--spec", "missing", "--key", "k"], "--spec"),
+            (["--endpoint", "http://localhost/v1/facade", "inspect", "job"], "endpoint"),
+            (["inspect", self.token], "job"),
+            (["--ca-file", "/missing/" + self.token, "inspect", "job"], "--ca-file"),
+        ]
+        for args, field in cases:
+            with self.subTest(field=field):
+                code, stdout, stderr = self.invoke(args)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(field, json.loads(stderr)["message"])
+                self.assertNotIn(self.token, stderr)
