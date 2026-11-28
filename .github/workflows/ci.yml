@@ -146,6 +146,26 @@ jobs:
       - name: End-to-end
         run: cargo test -p fabric --test e2e --locked
 
+      # The hot paths against crates/fabric/tests/e2e/budget.toml, with a
+      # table in the step summary. A process count that differs from the
+      # budget fails on both runners, and so does a time over its limit
+      # twice where the runner has baselines: linux-x86_64 holds the
+      # anchor's times on ubuntu-latest. The macOS runner is not the Mac of
+      # the macos-aarch64 baselines, and runs of one commit there differ by
+      # up to 1.34 times, more than the 1.3 ratio, so it names a platform
+      # with no baselines and only reports its times.
+      - name: Time budget
+        timeout-minutes: 20
+        env:
+          FABRIC_BUDGET: enforce
+          FABRIC_BUDGET_PLATFORM: ${{ runner.os == 'macOS' && 'macos-aarch64-github' || '' }}
+        run: cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # Reuse the node binary built by the Linux end-to-end step for the
       # installed Python wheel. The TypeScript job has its own SDK checks.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -166,26 +186,6 @@ jobs:
           "$scratch/venv/bin/python" -m pip install --no-index --no-deps "$scratch"/fabric_jobs-*.whl
           cd "$scratch"
           venv/bin/python -I "$GITHUB_WORKSPACE/sdk/python/tests/installed_smoke.py" "$GITHUB_WORKSPACE/target/debug/fabric"
-
-      # The hot paths against crates/fabric/tests/e2e/budget.toml, with a
-      # table in the step summary. A process count that differs from the
-      # budget fails on both runners, and so does a time over its limit
-      # twice where the runner has baselines: linux-x86_64 holds the
-      # anchor's times on ubuntu-latest. The macOS runner is not the Mac of
-      # the macos-aarch64 baselines, and runs of one commit there differ by
-      # up to 1.34 times, more than the 1.3 ratio, so it names a platform
-      # with no baselines and only reports its times.
-      - name: Time budget
-        timeout-minutes: 20
-        env:
-          FABRIC_BUDGET: enforce
-          FABRIC_BUDGET_PLATFORM: ${{ runner.os == 'macOS' && 'macos-aarch64-github' || '' }}
-        run: cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
-
-      - name: Docs
-        run: cargo doc --workspace --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
 
   # The TypeScript SDK: its types, its build, its contract test against the
   # shared fixtures in protocol/fixtures, its end-to-end test against a real
