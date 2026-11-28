@@ -7,7 +7,12 @@ There are no runtime dependencies.
 
 [Run your first job over HTTPS](https://github.com/EfeDurmaz16/fabric/blob/3c7c776d/examples/first-https-job/README.md) walks through a clean install, authority startup, token grants, submission and a completed turn.
 
-## Install the wheel
+## Install
+
+Once the first release is on PyPI, install into a virtual environment with
+`python -m pip install fabric-jobs`. The package includes the `fbrc` CLI.
+
+### Local preview wheel
 
 From the Fabric repository root, build to a directory outside the checkout:
 

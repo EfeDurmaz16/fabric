@@ -2,6 +2,9 @@
 
 [Run your first job over HTTPS](https://github.com/EfeDurmaz16/fabric/blob/3c7c776d/examples/first-https-job/README.md) builds this package, installs it in a fresh Node project and reads a completed turn from the gateway.
 
+Once the first release is on npm, run `npm install @fabric-jobs/client` in
+your Node.js 22+ project. For a source checkout, see the tarball steps below.
+
 Agents can use six managed-job methods over HTTPS with a scoped facade token.
 The gateway selects the authority. Use its printed endpoint and a token minted
 for the agent's jobs and operations.

@@ -1,0 +1,126 @@
+name: SDK release
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: Registry to prepare
+        type: choice
+        options: [npm, pypi]
+        required: true
+      version:
+        description: Expected version in the selected SDK manifest
+        type: string
+        required: true
+      publish:
+        description: Publish the tested files from main
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-release-${{ inputs.registry }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - name: Check requested version
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          EXPECTED: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [[ "$PUBLISH" == "true" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Select main to publish"
+            exit 1
+          fi
+          case "$REGISTRY" in
+            npm) actual=$(node -p "require('./sdk/typescript/package.json').version") ;;
+            pypi) actual=$(python -c "import tomllib; print(tomllib.load(open('sdk/python/pyproject.toml', 'rb'))['project']['version'])") ;;
+            *) echo "::error::Unknown registry"; exit 1 ;;
+          esac
+          if [[ "$actual" != "$EXPECTED" ]]; then
+            echo "::error::The selected SDK manifest declares version $actual"
+            exit 1
+          fi
+      - name: Build packages
+        run: |
+          mkdir -p "$RUNNER_TEMP/packages/npm" "$RUNNER_TEMP/packages/pypi"
+          python -m pip install --only-binary=:all: --no-deps uv==0.11.26
+          uv build --out-dir "$RUNNER_TEMP/packages/pypi" sdk/python
+          cd sdk/typescript
+          bun install --frozen-lockfile
+          npm pack --pack-destination "$RUNNER_TEMP/packages/npm"
+      - name: Test the archives against a real gateway
+        run: |
+          cargo build --locked -p fabric
+          consumer=$(mktemp -d)
+          cd "$consumer"
+          npm install --ignore-scripts --no-audit --no-fund "$RUNNER_TEMP"/packages/npm/*.tgz
+          python -m venv venv
+          venv/bin/pip install --no-index --no-deps "$RUNNER_TEMP"/packages/pypi/*.whl
+          venv/bin/python -I "$GITHUB_WORKSPACE/sdk/python/tests/https_smoke.py" \
+            "$GITHUB_WORKSPACE/target/debug/fabric" "$consumer"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sdk-packages
+          path: ${{ runner.temp }}/packages/
+          if-no-files-found: error
+
+  npm:
+    if: inputs.publish && inputs.registry == 'npm' && github.ref == 'refs/heads/main'
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdk-packages
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Publish tested tarball
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag=latest
+          if [[ "${VERSION%%+*}" == *-* ]]; then tag=next; fi
+          npm publish ./npm/*.tgz --tag "$tag" --access public --provenance --ignore-scripts --registry=https://registry.npmjs.org
+
+  pypi:
+    if: inputs.publish && inputs.registry == 'pypi' && github.ref == 'refs/heads/main'
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdk-packages
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: pypi/
