@@ -72,8 +72,11 @@ timeout. After a transport failure, retry a mutation using its original key.
 
 The gateway admits 16 concurrent connections. TLS negotiation, headers and
 body reads each have a five-second deadline. The authority call has 30 seconds,
-including facade watches of up to 25 seconds. The full message including the
-injected bearer is limited to 1 MiB and the answer to 16 MiB. Each connection
+including facade watches of up to 25 seconds. The HTTP body, the message with
+the injected bearer, and the canonical request sent to the owner socket must
+each fit in 1 MiB. The socket request also includes the operation name and
+authority ID. Exceeding any request limit returns HTTP 413. Answers may be up
+to 16 MiB. Each connection
 serves one request. The gateway emits no per-request logs.
 
 ## Failure modes first

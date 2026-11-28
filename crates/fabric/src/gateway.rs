@@ -11,7 +11,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fabric_client::Client;
-use fabric_client::facade::{Bearer, ClientMessage, MAX_ANSWER_BYTES, MAX_MESSAGE_BYTES};
+use fabric_client::api::{Reply, Request as NodeRequest};
+use fabric_client::facade::{
+    Bearer, ClientMessage, FacadeAnswer, MAX_ANSWER_BYTES, MAX_MESSAGE_BYTES,
+};
+use fabric_client::frame::MAX_REQUEST;
 use fabric_core::id::NodeId;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -184,20 +188,37 @@ async fn dispatch(
         }
     })?
     .to_bytes();
-    let message = parse_message(&body, &token)?;
-    let answer = timeout(
-        AUTHORITY_TIME,
-        client.facade_call(authority, &message, |_| {}),
-    )
-    .await
-    .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "authority_timeout"))?
-    .map_err(|_| (StatusCode::BAD_GATEWAY, "authority_unavailable"))?;
+    let request = node_request(authority, parse_message(&body, &token)?)?;
+    let reply = timeout(AUTHORITY_TIME, client.call(&request, |_| {}))
+        .await
+        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "authority_timeout"))?
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "authority_unavailable"))?;
+    let Reply::FacadeCall(envelope) = reply else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid_answer"));
+    };
+    let answer = FacadeAnswer::from_json(&envelope.message)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "invalid_answer"))?;
     let bytes = serde_json::to_vec(&answer.to_json())
         .map_err(|_| (StatusCode::BAD_GATEWAY, "invalid_answer"))?;
     if bytes.len() > MAX_ANSWER_BYTES {
         return Err((StatusCode::BAD_GATEWAY, "answer_too_large"));
     }
     Ok(bytes.into())
+}
+
+fn node_request(authority: NodeId, message: ClientMessage) -> Result<NodeRequest, HttpError> {
+    let request = NodeRequest::FacadeCall {
+        authority,
+        message: message.to_json(),
+    };
+    // The daemon limits the entire owner-socket request, including its envelope.
+    let size = serde_json::to_vec(&request)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid_message"))?
+        .len();
+    if size > MAX_REQUEST {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"));
+    }
+    Ok(request)
 }
 
 fn parse_message(body: &[u8], token: &str) -> Result<ClientMessage, HttpError> {
@@ -230,6 +251,33 @@ mod tests {
         assert_eq!(bearer(&headers), Some(token.as_str()));
         headers.append(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         assert_eq!(bearer(&headers), None);
+    }
+
+    #[test]
+    fn applies_the_daemon_limit_to_the_full_canonical_request() {
+        let authority = NodeId::from_bytes([1; 32]);
+        let token = "ab".repeat(32);
+        // Keep each individual intent string within the facade text limit.
+        let mut acceptance = vec!["x".repeat(16 * 1024); 63];
+        acceptance.push(String::new());
+        let message = |acceptance: &[String]| {
+            let json = json!({"facade":1,"type":"submit","key":"k",
+                "intent":{"goal":"size","harness":{"kind":"codex"},"acceptance":acceptance},
+                "source":{"kind":"empty"}});
+            parse_message(&serde_json::to_vec(&json).unwrap(), &token).unwrap()
+        };
+        let base = node_request(authority, message(&acceptance)).unwrap();
+        let padding = MAX_REQUEST - serde_json::to_vec(&base).unwrap().len();
+        acceptance
+            .last_mut()
+            .unwrap()
+            .push_str(&"x".repeat(padding));
+        assert!(node_request(authority, message(&acceptance)).is_ok());
+        acceptance.last_mut().unwrap().push('x');
+        assert_eq!(
+            node_request(authority, message(&acceptance)).unwrap_err(),
+            (StatusCode::PAYLOAD_TOO_LARGE, "request_too_large")
+        );
     }
 
     #[test]
