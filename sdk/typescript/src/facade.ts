@@ -77,11 +77,11 @@ export type Refusal = {
 /** The authority refused a message; the refusal is the answer to send. */
 export class FacadeRefusal extends Error {
   readonly refusal: Refusal;
-  constructor(code: RefusalCode, reason: string, message?: string) {
+  constructor(code: RefusalCode, reason: string, message?: string, currentRevision?: Counter) {
     const text = message ?? `${code}: ${reason}`;
     super(text);
     this.name = "FacadeRefusal";
-    this.refusal = { code, reason, message: text };
+    this.refusal = { code, reason, message: text, ...(currentRevision === undefined ? {} : { current_revision: currentRevision }) };
   }
 }
 

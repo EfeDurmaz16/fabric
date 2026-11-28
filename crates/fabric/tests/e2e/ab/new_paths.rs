@@ -86,7 +86,16 @@ impl Fixture {
         a.start(None)?;
         b.start(None)?;
         pair(&b, &a)?;
-        let minted = a.ok(&["facade", "mint", "--actor", "ab", "--ttl-ms", "86400000"])?;
+        let minted = a.ok(&[
+            "facade",
+            "mint",
+            "--allow",
+            "submit,inspect,watch,continue,cancel,checkpoint",
+            "--actor",
+            "ab",
+            "--ttl-ms",
+            "86400000",
+        ])?;
         let token = minted
             .lines()
             .find_map(|line| line.strip_prefix("bearer "))

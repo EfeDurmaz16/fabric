@@ -41,6 +41,10 @@ const ELSEWHERE: &[(&str, &str)] = &[
         "codex-runner submit",
         "tests/cli_contract.rs: codex_runner_keeps_job_output_on_stdout",
     ),
+    (
+        "gateway",
+        "sdk/python/tests/https_smoke.py: the gateway announces its HTTPS endpoint on stdout",
+    ),
     ("help", "tests/cli_contract.rs: help prints on stdout"),
     ("job run", "headless.rs: the harness owns standard output"),
     (
@@ -297,7 +301,16 @@ fn m5_commands_keep_their_streams(
 
     // The facade: a mint prints its token and bearer, a facade message the
     // authority's own JSON on one line.
-    let mint = ["facade", "mint", "--actor", "streams", "--ttl-ms", "600000"];
+    let mint = [
+        "facade",
+        "mint",
+        "--allow",
+        "submit,inspect,watch,cancel",
+        "--actor",
+        "streams",
+        "--ttl-ms",
+        "600000",
+    ];
     let minted = asked.words(a, &mint)?;
     let bearer = minted
         .lines()

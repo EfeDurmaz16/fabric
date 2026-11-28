@@ -484,9 +484,10 @@ export class FabricClient {
     jobs: JobScope,
     resources: ResourceScope,
     expiresMs: number,
-    options?: CallOptions,
+    options: CallOptions & { readonly allow?: ReadonlyArray<ClientMessage["type"]> } = {},
   ): Promise<Minted> {
-    return this.call({ op: "facade_mint", actor, jobs, resources, expires_ms: expiresMs }, options);
+    const grant = { jobs, allow: [...(options.allow ?? ["inspect", "watch"])] };
+    return this.call({ op: "facade_mint", actor, jobs: grant, resources, expires_ms: expiresMs }, options);
   }
 
   /** Revokes a facade token. */

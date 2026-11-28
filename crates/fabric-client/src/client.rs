@@ -829,7 +829,7 @@ impl Client {
     ) -> Result<Minted, ClientError> {
         let request = Request::FacadeMint {
             actor,
-            jobs,
+            jobs: JobScopeWire::Scoped(jobs.scoped()),
             resources,
             expires_ms,
         };

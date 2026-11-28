@@ -14,11 +14,74 @@ Ownership does not move:
 | Forwarding a message and its answer; nothing else | the local node |
 | Choosing a key for a command, resuming a watch from its cursor | the client |
 
-Out of scope for v1: any public listener, any browser or mobile client, any owner-only socket operation (host paths, launch plans, process registration), minting a token for another owner.
+The owner can also start an HTTPS gateway on a registered node. Its contract is the same six job operations. Minting, revocation, host paths, launch plans and process registration remain on the private owner socket.
+
+## Delegated operations
+
+The owner chooses an operation allowlist at mint. CLI and SDK defaults grant
+`inspect` and `watch`. On the CLI, repeat `--allow` or pass a comma-separated
+list to replace that default. For example, `--job <id> --allow inspect,watch,cancel`
+grants observation and cancellation of that job. The job and resource scopes still
+apply. A token restricted to existing job IDs cannot submit a new job.
+
+The client API's `facade_mint.jobs` can carry
+`{"jobs":"any","allow":["inspect","watch"]}`; the inner `jobs` may also be
+an array of job IDs. Both fields are required. An empty allowlist grants no
+operations. Older authorities reject this shape before minting. An updated
+authority interprets older mint requests with plain job scope as read-only.
+Tokens minted before operation scopes retain their previous job and resource
+access until expiry or revocation. Revoke and reissue them to narrow access.
+Scoped journal rows carry a distinct tag that older binaries reject.
+
+Operation checks follow the existing job and resource checks. An otherwise
+in-scope request lacking its verb returns `scope/operation` before replay,
+dispatch or any job write. Clients reach this check through the local socket or
+a registered forwarding node.
+
+## HTTPS gateway
+
+Start the local daemon and mint the client a scoped, expiring bearer on the
+authority. Run the gateway as an account trusted with the local Fabric socket,
+using the same `FABRIC_HOME` as the daemon. The authority may be this node
+or a paired node of the same owner.
+
+```sh
+fabric gateway --authority "$AUTHORITY" --cert chain.pem --key key.pem
+```
+
+The gateway listens on `127.0.0.1:8443` by default. Set `--listen 127.0.0.1:0`
+to choose a free port. The first stdout line contains the bound HTTPS endpoint
+as JSON. Set `--listen` to a specific reachable interface for remote access.
+Clients connect using a hostname or IP present in the server certificate and
+verify its chain with their trust store or a configured CA. The gateway reads
+the certificate chain and matching private key on startup. Restart it to load
+a renewed certificate. Anyone holding an unexpired, unrevoked bearer can
+exercise its grant. Keep it in the client secret store.
+
+Send one HTTP/1.1 `POST /v1/facade` with `Content-Type: application/json`,
+`Authorization: Bearer <token>` and the facade message fields as JSON. For
+example, the body of an inspect is
+`{"facade":1,"type":"inspect","job":"01JABCDEFGHJKMNPQRSTVWXYZ0"}`.
+The request body must omit `token` and `authority`. The gateway supplies the
+bearer from the header and forwards the message to its configured authority.
+HTTP 200 contains the raw facade answer, including authority refusals.
+Application-level HTTP errors contain `{"error":"<code>"}`. These include
+401 for a missing or malformed bearer, 400 for an invalid message, 413 for
+a body above the limit, 502 for an unavailable node and 504 for an authority
+timeout. After a transport failure, retry a mutation using its original key.
+
+The gateway admits 16 concurrent connections. TLS negotiation, headers and
+body reads each have a five-second deadline. The authority call has 30 seconds,
+including facade watches of up to 25 seconds. The HTTP body, the message with
+the injected bearer, and the canonical request sent to the owner socket must
+each fit in 1 MiB. The socket request also includes the operation name and
+authority ID. Exceeding any request limit returns HTTP 413. Answers may be up
+to 16 MiB. Each connection
+serves one request. The gateway emits no per-request logs.
 
 ## Failure modes first
 
-1. **The check order is fixed.** The authority checks, in this order and stops at the first failure: frame, JSON, message schema, `facade` version, token known, token not revoked, token not expired, job scope, resource scope, then the message. A message that fails before "the message" answers `refused` and the journal is unchanged.
+1. **The check order is fixed.** The authority checks, in this order and stops at the first failure: frame, JSON, message schema, `facade` version, token known, token not revoked, token not expired, job scope, resource scope, operation scope, then the message. A message that fails before "the message" answers `refused` and the journal is unchanged.
 2. **A command is accepted after durable commit only.** `accepted` is written only once the authority's transaction committed; a disconnect before it leaves the client not knowing, and a repeat with the same key tells it.
 3. **Same key, same request: one operation.** A repeat answers the stored answer with `replayed: true`. Same key, another request: `conflict`, nothing written. A key is scoped to the token's actor.
 4. **Expected revision is checked by the authority, not the client.** A command naming a revision the job has moved past is `revision_mismatch` with the current one, stored under its key like any refusal.

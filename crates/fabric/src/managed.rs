@@ -363,6 +363,10 @@ pub(crate) enum FacadeCommand {
         /// Who acts under the token: 1 to 64 characters of [A-Za-z0-9._-].
         #[arg(long)]
         actor: String,
+        /// Allowed operations (inspect, watch, submit, cancel, checkpoint, continue).
+        /// Repeat or comma-separate; explicit grants replace the inspect,watch default.
+        #[arg(long, value_delimiter = ',', default_value = "inspect,watch")]
+        allow: Vec<fabric_core::managed::facade::FacadeOperation>,
         /// A job the token may act on; repeatable; every owned job without it.
         #[arg(long = "job")]
         jobs: Vec<JobId>,
@@ -793,6 +797,7 @@ fn facade_request(command: FacadeCommand, notes: Notes) -> Result<(Request, Opti
     let request = match command {
         FacadeCommand::Mint {
             actor,
+            allow,
             jobs,
             nodes,
             expires_ms,
@@ -808,11 +813,14 @@ fn facade_request(command: FacadeCommand, notes: Notes) -> Result<(Request, Opti
             };
             Request::FacadeMint {
                 actor,
-                jobs: if jobs.is_empty() {
-                    JobScopeWire::Any(AnyWord::Any)
-                } else {
-                    JobScopeWire::Jobs(jobs)
-                },
+                jobs: JobScopeWire::Scoped(fabric_client::api::ScopedGrantWire {
+                    jobs: if jobs.is_empty() {
+                        fabric_client::api::GrantJobsWire::Any(AnyWord::Any)
+                    } else {
+                        fabric_client::api::GrantJobsWire::Jobs(jobs)
+                    },
+                    allow,
+                }),
                 resources: if nodes.is_empty() {
                     ResourceScopeWire::Any(AnyWord::Any)
                 } else {

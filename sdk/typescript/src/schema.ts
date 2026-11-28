@@ -1345,7 +1345,10 @@ export const Request = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("facade_mint"),
     actor: Actor,
-    jobs: JobScope,
+    jobs: z.union([JobScope, z.strictObject({
+      jobs: JobScope,
+      allow: z.array(z.enum(["inspect", "watch", "submit", "cancel", "checkpoint", "continue"])),
+    })]),
     resources: ResourceScope,
     expires_ms: count,
   }),

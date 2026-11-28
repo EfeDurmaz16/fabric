@@ -359,6 +359,9 @@ impl Node {
         let Some(record) = record else {
             return FacadeAnswer::Refused(Refusal::new(RefusalCode::Unauthorized, "unknown_token"));
         };
+        if !record.permits(message.operation()) {
+            return FacadeAnswer::Refused(Refusal::new(RefusalCode::Scope, "operation"));
+        }
         match self.facade_message(&record, message, now_ms).await {
             Ok(answer) => answer,
             Err(refusal) => FacadeAnswer::Refused(refusal),
@@ -577,19 +580,41 @@ impl Node {
             .commits()
             .map_err(|e| authority_refusal(&e))?;
         commits.mark_unchanged();
-        let mut closed: Option<String> = None;
+        let digest = token_digest(&bearer);
         loop {
             let limit = u32::try_from(WATCH_WINDOW + 1).unwrap_or(u32::MAX);
             let read = self
                 .authority
                 .with_journal(false, move |journal| {
+                    // Check the grant and select the page in the same journal turn.
+                    // No revocation can interleave between authorization and the read.
+                    let record = journal.token_by_digest(&digest)?;
+                    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if check_token(
+                        record.as_ref(),
+                        now_ms.saturating_add(elapsed),
+                        JobAsk::Existing(job),
+                        ResourceAsk::Nothing,
+                    ) != TokenCheck::Ok
+                    {
+                        return Ok(None);
+                    }
                     let state = journal.job(job)?.map(|s| s.job.state);
                     let events = journal.events(job, after, limit)?;
-                    Ok((state, events))
+                    Ok(Some((state, events)))
                 })
                 .await;
             let (state, mut events) = match read {
-                Ok(read) => read,
+                Ok(Some(read)) => read,
+                Ok(None) => {
+                    return Ok(FacadeAnswer::Events {
+                        job,
+                        events: Vec::new(),
+                        next: after,
+                        lagged: false,
+                        closed: Some("revoked".to_owned()),
+                    });
+                }
                 Err(AuthorityError::Unavailable(reason))
                     if reason.starts_with("no managed journal") =>
                 {
@@ -618,12 +643,11 @@ impl Node {
                     events,
                     next,
                     lagged,
-                    closed,
+                    closed: None,
                 });
             }
-            if closed.is_none() && matches!(state, JobState::Finished | JobState::Cancelled) {
-                closed = Some("finished".to_owned());
-            }
+            let closed = matches!(state, JobState::Finished | JobState::Cancelled)
+                .then(|| "finished".to_owned());
             if closed.is_some() || tokio::time::Instant::now() >= deadline {
                 return Ok(FacadeAnswer::Events {
                     job,
@@ -640,17 +664,6 @@ impl Node {
                     }
                 }
                 () = tokio::time::sleep_until(deadline.min(expiry)) => {}
-            }
-            let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let live = self.token_record(&bearer).await?;
-            let check = check_token(
-                live.as_ref(),
-                now_ms.saturating_add(elapsed),
-                JobAsk::Existing(job),
-                ResourceAsk::Nothing,
-            );
-            if check != TokenCheck::Ok {
-                closed = Some("revoked".to_owned());
             }
         }
     }
@@ -705,6 +718,7 @@ impl Node {
         &self,
         actor: &str,
         jobs: JobScope,
+        operations: std::collections::BTreeSet<fabric_core::managed::facade::FacadeOperation>,
         resources: ResourceScope,
         expires_ms: u64,
     ) -> Result<Minted, NodeError> {
@@ -723,6 +737,7 @@ impl Node {
             digest: token_digest(&bearer),
             actor,
             jobs,
+            operations: Some(operations),
             resources,
             minted_ms: now,
             expires_ms,
@@ -1499,6 +1514,7 @@ mod tests {
             id: TokenId::from_bytes([id; 16]),
             digest: token_digest(&bearer(0)),
             actor: Actor::parse(actor).unwrap(),
+            operations: None,
             jobs: JobScope::AnyOwned,
             resources: ResourceScope::Any,
             minted_ms: NOW - 1_000,
@@ -1558,6 +1574,54 @@ mod tests {
         };
         let answer = node.authority.submit(envelope).await.unwrap();
         assert!(matches!(answer.result, StoredResult::Accepted(_)));
+    }
+
+    #[tokio::test]
+    async fn operation_grants_refuse_mutations_before_dispatch_and_allow_only_named_verbs() {
+        use fabric_core::managed::facade::FacadeOperation;
+        let (_dir, node) = node();
+        let submitter = FacadeTokenRecord {
+            operations: Some([FacadeOperation::Submit].into_iter().collect()),
+            ..any_token(1, "submitter", NOW + 10_000)
+        };
+        seed_token(&node, bearer(1), submitter).await;
+        let (job, _) = accepted(&submit(&node, &hex_of(1), "s", "test").await);
+        let reader = FacadeTokenRecord {
+            operations: Some(FacadeOperation::read_only()),
+            ..any_token(2, "reader", NOW + 10_000)
+        };
+        seed_token(&node, bearer(2), reader).await;
+        let before = node.authority.job(job).await.unwrap().unwrap().job.revision;
+        let read_token = hex_of(2);
+        let job_text = job.to_string();
+        for request in [
+            submit_json(&read_token, "x", "another"),
+            json!({"type":"cancel","facade":1,"token":read_token,"job":job_text,"key":"c","task":null,"expected_revision":null,"reason":"stop"}),
+            json!({"type":"checkpoint","facade":1,"token":read_token,"job":job_text,"key":"p","expected_revision":null}),
+            json!({"type":"continue","facade":1,"token":read_token,"job":job_text,"key":"m","expected_revision":null,"pin":null}),
+        ] {
+            refused_as(
+                &node.facade_answer(&request, NOW).await,
+                RefusalCode::Scope,
+                "operation",
+            );
+        }
+        assert_eq!(jobs_held(&node).await, 1);
+        assert_eq!(
+            node.authority.job(job).await.unwrap().unwrap().job.revision,
+            before
+        );
+        let mut inspect = json!({"type":"inspect","facade":1,"token":read_token,"job":job_text});
+        assert!(matches!(
+            node.facade_answer(&inspect, NOW).await,
+            FacadeAnswer::Inspection(_)
+        ));
+        inspect["token"] = json!(hex_of(1));
+        refused_as(
+            &node.facade_answer(&inspect, NOW).await,
+            RefusalCode::Scope,
+            "operation",
+        );
     }
 
     #[tokio::test]
@@ -2265,15 +2329,31 @@ mod tests {
             .await
             .unwrap();
         assert!(revoked.revoked);
+        note(&node, job, 99).await;
         let answer = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .unwrap()
             .unwrap();
-        let FacadeAnswer::Events { events, closed, .. } = answer else {
+        let FacadeAnswer::Events {
+            events,
+            closed,
+            next: cursor,
+            ..
+        } = answer
+        else {
             panic!("not events: {answer:?}");
         };
+        assert_eq!(cursor, next);
         assert_eq!(closed.as_deref(), Some("revoked"));
         assert!(events.is_empty());
+        let queued = node
+            .facade_watch(bearer(1), NOW + 1_000, job, next, 0, NOW)
+            .await
+            .unwrap();
+        assert!(
+            matches!(queued, FacadeAnswer::Events { events, next: cursor, closed, .. }
+            if events.is_empty() && cursor == next && closed.as_deref() == Some("revoked"))
+        );
         refused_as(
             &submit(&node, &hex_of(1), "k2", "g").await,
             RefusalCode::Unauthorized,
@@ -2389,6 +2469,7 @@ mod tests {
                 id: token["token_id"].as_str().unwrap().parse().unwrap(),
                 digest: token_digest(&bytes),
                 actor: Actor::parse(token["actor"].as_str().unwrap()).unwrap(),
+                operations: None,
                 jobs,
                 resources,
                 minted_ms: now.saturating_sub(1_000),

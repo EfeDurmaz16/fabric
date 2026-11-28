@@ -8,9 +8,11 @@
 //! The scopes are stored in a one-byte-tagged form of their own, so a
 //! future scope kind is a new tag and an old row still reads.
 
+use std::collections::BTreeSet;
+
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::facade::{
-    Actor, FacadeTokenRecord, JobScope, ResourceScope, TokenDigest, TokenId,
+    Actor, FacadeOperation, FacadeTokenRecord, JobScope, ResourceScope, TokenDigest, TokenId,
 };
 use rusqlite::{OptionalExtension, params};
 
@@ -91,6 +93,42 @@ fn decode_resources(bytes: &[u8]) -> Result<ResourceScope, CommitError> {
     }
 }
 
+// A new reader accepts legacy rows. An old reader refuses the new outer tag,
+// so even a binary downgrade cannot discard the grant and widen the token.
+const TAG_OPERATIONS: u8 = 2;
+
+fn encode_grant(record: &FacadeTokenRecord) -> Vec<u8> {
+    let jobs = encode_jobs(&record.jobs);
+    let Some(operations) = &record.operations else {
+        return jobs;
+    };
+    let mask = operations.iter().fold(0u8, |mask, op| mask | *op as u8);
+    let mut grant = Vec::with_capacity(jobs.len() + 2);
+    grant.extend([TAG_OPERATIONS, mask]);
+    grant.extend(jobs);
+    grant
+}
+
+fn decode_grant(
+    bytes: &[u8],
+) -> Result<(JobScope, Option<BTreeSet<FacadeOperation>>), CommitError> {
+    let [TAG_OPERATIONS, mask, rest @ ..] = bytes else {
+        return Ok((decode_jobs(bytes)?, None));
+    };
+    let mut remaining = *mask;
+    let mut operations = BTreeSet::new();
+    for op in FacadeOperation::ALL {
+        if remaining & op as u8 != 0 {
+            operations.insert(op);
+            remaining &= !(op as u8);
+        }
+    }
+    if remaining != 0 {
+        return Err(corrupt("operation scope"));
+    }
+    Ok((decode_jobs(rest)?, Some(operations)))
+}
+
 impl Journal {
     /// Stores a minted token. Refuses a token id or a digest the table
     /// already holds, as `CommitError::Domain` would a used key: nothing
@@ -119,7 +157,7 @@ impl Journal {
                 record.id.to_bytes(),
                 record.digest.to_bytes(),
                 record.actor.as_str(),
-                encode_jobs(&record.jobs),
+                encode_grant(record),
                 encode_resources(&record.resources),
                 sql_u64(record.minted_ms)?,
                 sql_u64(record.expires_ms)?,
@@ -159,11 +197,13 @@ impl Journal {
         let revoked_ms = revoked
             .map(|ms| u64::try_from(ms).map_err(|_| corrupt("revoked_ms")))
             .transpose()?;
+        let (jobs, operations) = decode_grant(&jobs)?;
         Ok(Some(FacadeTokenRecord {
             id: TokenId::from_bytes(id),
             digest: *digest,
             actor: Actor::parse(&actor).map_err(|_| corrupt("actor"))?,
-            jobs: decode_jobs(&jobs)?,
+            jobs,
+            operations,
             resources: decode_resources(&resources)?,
             minted_ms,
             expires_ms,
@@ -283,12 +323,41 @@ mod tests {
             id: TokenId::from_bytes([id; 16]),
             digest: token_digest(&[bearer; 32]),
             actor: Actor::parse("ci-bot").unwrap(),
+            operations: None,
             jobs: JobScope::Jobs(vec![JobId::from_bytes([1; 16]), JobId::from_bytes([2; 16])]),
             resources: ResourceScope::Nodes(vec![NodeId::from_bytes([3; 32])]),
             minted_ms: 100,
             expires_ms: 1_000,
             revoked_ms: None,
         }
+    }
+
+    #[test]
+    fn new_grants_roundtrip_without_downgrade_and_unknown_operation_bits_fail_closed() {
+        let (_dir, mut journal) = journal();
+        let mut grant = record(3, 5);
+        grant.operations = Some(FacadeOperation::read_only());
+        journal.token_mint(&grant).unwrap();
+        assert_eq!(
+            journal.token_by_digest(&grant.digest).unwrap(),
+            Some(grant.clone())
+        );
+        let bytes = encode_grant(&grant);
+        assert!(
+            decode_jobs(&bytes).is_err(),
+            "legacy readers refuse the new tag"
+        );
+        assert!(decode_grant(&[TAG_OPERATIONS, 0x80, TAG_ANY]).is_err());
+        assert!(decode_grant(&[TAG_OPERATIONS, 3]).is_err());
+        assert!(decode_grant(&[TAG_OPERATIONS, 3, TAG_ANY, 0]).is_err());
+        assert_eq!(
+            decode_grant(&[TAG_OPERATIONS, 0, TAG_ANY]).unwrap(),
+            (JobScope::AnyOwned, Some(BTreeSet::new()))
+        );
+        assert_eq!(
+            decode_grant(&[TAG_ANY]).unwrap(),
+            (JobScope::AnyOwned, None)
+        );
     }
 
     /// A minted token reads back whole by its digest, a repeated id or

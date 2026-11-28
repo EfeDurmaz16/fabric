@@ -593,7 +593,7 @@ describe("the shared fixtures", () => {
             if (!parsed.success) throw new Error(`${where} was refused: ${parsed.error.message}`);
             // The float in the unknown field is a symbol once read as a frame, and writes as `null` on both sides.
             expect(written(parsed.data), `${where} is carried as it came`).toStrictEqual(written(body));
-          } else if (launched(json, pointer)) {
+          } else if (launched(json, pointer) || (pointer === "/jobs" && dir === "request" && field(json, "op") === "facade_mint")) {
             expect(parsed.success, `${where} was skipped in what a client launches`).toBe(false);
           } else if (parsed.success) {
             expect(written(parsed.data), where).toStrictEqual(json);

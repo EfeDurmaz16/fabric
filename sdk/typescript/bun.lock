@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@fabric/client",
+      "name": "@fabric-jobs/client",
       "dependencies": {
         "zod": "4.6.5",
       },

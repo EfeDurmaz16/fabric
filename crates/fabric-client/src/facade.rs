@@ -368,13 +368,20 @@ impl ClientMessage {
     /// The message's type on the wire.
     #[must_use]
     pub fn kind(&self) -> &'static str {
+        self.operation().as_str()
+    }
+
+    /// The operation used for authorization.
+    #[must_use]
+    pub fn operation(&self) -> fabric_core::managed::facade::FacadeOperation {
+        use fabric_core::managed::facade::FacadeOperation as Op;
         match self {
-            ClientMessage::Submit { .. } => "submit",
-            ClientMessage::Inspect { .. } => "inspect",
-            ClientMessage::Watch { .. } => "watch",
-            ClientMessage::Cancel { .. } => "cancel",
-            ClientMessage::Checkpoint { .. } => "checkpoint",
-            ClientMessage::Continue { .. } => "continue",
+            Self::Submit { .. } => Op::Submit,
+            Self::Inspect { .. } => Op::Inspect,
+            Self::Watch { .. } => Op::Watch,
+            Self::Cancel { .. } => Op::Cancel,
+            Self::Checkpoint { .. } => Op::Checkpoint,
+            Self::Continue { .. } => Op::Continue,
         }
     }
 

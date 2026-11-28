@@ -46,7 +46,16 @@ fn world(
     a.start(None)?;
     b.start(None)?;
     pair(&b, &a)?;
-    let token = bearer(&a.ok(&["facade", "mint", "--actor", "e2e", "--ttl-ms", "600000"])?)?;
+    let token = bearer(&a.ok(&[
+        "facade",
+        "mint",
+        "--allow",
+        "submit,inspect,watch,cancel,checkpoint",
+        "--actor",
+        "e2e",
+        "--ttl-ms",
+        "600000",
+    ])?)?;
     Ok((a, b, token))
 }
 
@@ -299,7 +308,16 @@ fn e2e_a_submit_runs_on_the_eligible_node_without_naming_it() -> Fallible {
     a.start(None)?;
     b.start(None)?;
     pair(&b, &a)?;
-    let token = bearer(&a.ok(&["facade", "mint", "--actor", "e2e", "--ttl-ms", "600000"])?)?;
+    let token = bearer(&a.ok(&[
+        "facade",
+        "mint",
+        "--allow",
+        "submit,inspect,watch,cancel,checkpoint",
+        "--actor",
+        "e2e",
+        "--ttl-ms",
+        "600000",
+    ])?)?;
     let job = submit(&b, &a, &token, "submit-run", &[])?;
     let inspection = attempt_is(&b, &a, &token, &job, "running")?;
     let chosen = inspection["placements"][0]["chosen"]
@@ -360,7 +378,16 @@ fn e2e_a_create_accepted_before_a_crash_is_placed_once_after_the_restart() -> Fa
     a.start(Some("before_placement"))?;
     b.start(None)?;
     pair(&b, &a)?;
-    let token = bearer(&a.ok(&["facade", "mint", "--actor", "e2e", "--ttl-ms", "600000"])?)?;
+    let token = bearer(&a.ok(&[
+        "facade",
+        "mint",
+        "--allow",
+        "submit,inspect,watch,cancel,checkpoint",
+        "--actor",
+        "e2e",
+        "--ttl-ms",
+        "600000",
+    ])?)?;
     let job = submit(&b, &a, &token, "submit-crash", &[])?;
     let started = Instant::now();
     while !a.signal().exists() {

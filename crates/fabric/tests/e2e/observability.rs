@@ -153,7 +153,9 @@ async fn e2e_spans_of_two_daemons_share_a_trace_and_the_audit_export_holds_no_se
     pair(&b, &a)?;
     let client = Client::new(a.state().join("fabric.sock"));
 
-    let minted = a.ok(&["facade", "mint", "--actor", "e2e", "--ttl-ms", "600000"])?;
+    let minted = a.ok(&[
+        "facade", "mint", "--allow", "submit", "--actor", "e2e", "--ttl-ms", "600000",
+    ])?;
     let token = minted
         .lines()
         .find_map(|l| l.strip_prefix("bearer "))

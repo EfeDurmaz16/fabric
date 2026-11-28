@@ -166,6 +166,27 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # Reuse the node binary built by the Linux end-to-end step for the
+      # installed Python wheel. The TypeScript job has its own SDK checks.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.10'
+
+      - name: Python SDK contract
+        if: runner.os == 'Linux'
+        run: PYTHONPATH=sdk/python/src python -m unittest discover -s sdk/python/tests -p 'test_*.py'
+
+      - name: Python SDK installed-wheel smoke
+        if: runner.os == 'Linux'
+        run: |
+          scratch=$(mktemp -d "$RUNNER_TEMP/fabric-python.XXXXXX")
+          python -m pip wheel --no-deps --wheel-dir "$scratch" ./sdk/python
+          python -m venv "$scratch/venv"
+          "$scratch/venv/bin/python" -m pip install --no-index --no-deps "$scratch"/fabric_jobs-*.whl
+          cd "$scratch"
+          venv/bin/python -I "$GITHUB_WORKSPACE/sdk/python/tests/installed_smoke.py" "$GITHUB_WORKSPACE/target/debug/fabric"
+
   # The TypeScript SDK: its types, its build, its contract test against the
   # shared fixtures in protocol/fixtures, its end-to-end test against a real
   # node built from this commit, and the packed package imported by plain
@@ -221,6 +242,19 @@ jobs:
         env:
           FABRIC_BIN: ${{ github.workspace }}/target/debug/fabric
         run: bun test
+
+      - name: Test installed Python and Node SDKs against the HTTPS gateway
+        if: runner.os == 'Linux'
+        run: |
+          consumer=$(mktemp -d "$RUNNER_TEMP/fabric-consumer.XXXXXX")
+          npm pack --ignore-scripts --pack-destination "$consumer"
+          cd "$consumer"
+          npm install --ignore-scripts --no-audit --no-fund ./*.tgz
+          python3 -m venv venv
+          venv/bin/pip wheel --no-deps --wheel-dir . "$GITHUB_WORKSPACE/sdk/python"
+          venv/bin/pip install --no-index ./*.whl
+          venv/bin/python -I "$GITHUB_WORKSPACE/sdk/python/tests/https_smoke.py" \
+            "$GITHUB_WORKSPACE/target/debug/fabric" "$consumer"
 
   # Fabric's bridge client against the real Capsule worker
   # (crates/fabric-bridge/tests/capsule_worker.rs): every shared scenario

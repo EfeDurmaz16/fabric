@@ -2104,6 +2104,13 @@ request/facade_mint.json /expires_ms
 request/facade_mint.json /jobs
 request/facade_mint.json /op
 request/facade_mint.json /resources
+request/facade_mint_operations.json /actor
+request/facade_mint_operations.json /expires_ms
+request/facade_mint_operations.json /jobs
+request/facade_mint_operations.json /jobs/allow
+request/facade_mint_operations.json /jobs/jobs
+request/facade_mint_operations.json /op
+request/facade_mint_operations.json /resources
 request/facade_mint_scoped.json /actor
 request/facade_mint_scoped.json /expires_ms
 request/facade_mint_scoped.json /jobs

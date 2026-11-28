@@ -65,7 +65,10 @@ const GROUPS: &[(&str, &[&str])] = &[
         "Work on jobs",
         &["job", "psf", "codex-handoff", "codex-runner"],
     ),
-    ("Managed jobs", &["managed", "facade", "inspect", "audit"]),
+    (
+        "Managed jobs",
+        &["managed", "facade", "gateway", "inspect", "audit"],
+    ),
 ];
 
 /// The examples each command's help shows, by command path. A placeholder
@@ -132,6 +135,13 @@ pub const EXAMPLES: &[(&str, &[(&str, &str)])] = &[
         &[(
             "Run the node, listening on one port",
             "fabric serve --listen 0.0.0.0:7777",
+        )],
+    ),
+    (
+        "gateway",
+        &[(
+            "Serve the delegated facade on loopback",
+            "fabric gateway --authority <NODE> --cert <PATH> --key <PATH>",
         )],
     ),
     (

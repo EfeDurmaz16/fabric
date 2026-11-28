@@ -59,3 +59,43 @@ The tap's files are in `packaging/homebrew-tap`; its README says how the formula
 - The install commands in `README.md`, `docs/start/install.md` and the tap's `TAP.md`.
 
 The binary's own names, such as `FABRIC_HOME`, are in the code and change with it, not with the pipeline.
+
+## SDK registry releases
+
+The `SDK release` workflow prepares both client packages and tests them together
+against the HTTPS gateway. Start it from the Actions tab, select one registry
+and enter that SDK's exact manifest version. Leave `publish` unchecked to build
+only. Download the run's `sdk-packages` artifact to inspect the npm tarball in
+`npm/` and the Python wheel and sdist in `pypi/`.
+
+Before enabling publication, restrict the GitHub environments `npm` and
+`pypi` to the main branch and configure the required release reviewers.
+For each registry, grant the matching environment and workflow filename
+`sdk-release.yml` in `EfeDurmaz16/fabric` permission to publish:
+
+- **npm.** Verify control of the `@fabric-jobs` scope. npm requires a package to
+  exist before it can trust a workflow. For the first version, the scope owner
+  can run an artifact-only build on main and publish that exact tarball with
+  interactive 2FA using `npm publish ./npm/fabric-jobs-client-<version>.tgz --access public --ignore-scripts`.
+  For a prerelease, add `--tag next`. This manual bootstrap has no CI provenance. Configure the GitHub Actions
+  trusted publisher on the resulting package for subsequent releases.
+  [npm trust prerequisites](https://docs.npmjs.com/cli/commands/npm-trust/)
+- **PyPI.** Configure a pending trusted publisher for `fabric-jobs` under
+  the publishing account before the first release. Its first successful use
+  creates the project. [PyPI first publication](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
+
+When the registry is configured, dispatch from main with `publish` checked.
+The selected upload job uses its environment's OIDC identity and the archives
+tested in that run. npm prereleases receive the `next` tag and stable versions
+receive `latest`. Each dispatch targets one registry, so the other can be
+released independently. If an upload is interrupted, compare the registry
+digests with the downloaded artifacts before retrying. Preserve an existing
+version and its contents. For a partial PyPI upload, recover the missing file
+from the same verified artifacts.
+
+Verify the released version in a fresh Node project with
+`npm install @fabric-jobs/client@<version>` or a fresh virtual environment with
+`python -m pip install fabric-jobs==<version>`. Use the installed client to
+inspect a job at a compatible gateway. See the
+[first-job walkthrough](https://github.com/EfeDurmaz16/fabric/blob/3c7c776d/examples/first-https-job/README.md)
+for an operator setup.
