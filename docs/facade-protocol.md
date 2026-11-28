@@ -16,9 +16,31 @@ Ownership does not move:
 
 Out of scope for v1: any public listener, any browser or mobile client, any owner-only socket operation (host paths, launch plans, process registration), minting a token for another owner.
 
+## Delegated operations
+
+The owner chooses an operation allowlist at mint. CLI and SDK defaults grant
+`inspect` and `watch`. On the CLI, repeat `--allow` or pass a comma-separated
+list to replace that default. For example, `--job <id> --allow inspect,watch,cancel`
+grants observation and cancellation of that job. The job and resource scopes still
+apply. A token restricted to existing job IDs cannot submit a new job.
+
+The client API's `facade_mint.jobs` can carry
+`{"jobs":"any","allow":["inspect","watch"]}`; the inner `jobs` may also be
+an array of job IDs. Both fields are required. An empty allowlist grants no
+operations. Older authorities reject this shape before minting. An updated
+authority interprets older mint requests with plain job scope as read-only.
+Tokens minted before operation scopes retain their previous job and resource
+access until expiry or revocation. Revoke and reissue them to narrow access.
+Scoped journal rows carry a distinct tag that older binaries reject.
+
+Operation checks follow the existing job and resource checks. An otherwise
+in-scope request lacking its verb returns `scope/operation` before replay,
+dispatch or any job write. Clients reach this check through the local socket or
+a registered forwarding node.
+
 ## Failure modes first
 
-1. **The check order is fixed.** The authority checks, in this order and stops at the first failure: frame, JSON, message schema, `facade` version, token known, token not revoked, token not expired, job scope, resource scope, then the message. A message that fails before "the message" answers `refused` and the journal is unchanged.
+1. **The check order is fixed.** The authority checks, in this order and stops at the first failure: frame, JSON, message schema, `facade` version, token known, token not revoked, token not expired, job scope, resource scope, operation scope, then the message. A message that fails before "the message" answers `refused` and the journal is unchanged.
 2. **A command is accepted after durable commit only.** `accepted` is written only once the authority's transaction committed; a disconnect before it leaves the client not knowing, and a repeat with the same key tells it.
 3. **Same key, same request: one operation.** A repeat answers the stored answer with `replayed: true`. Same key, another request: `conflict`, nothing written. A key is scoped to the token's actor.
 4. **Expected revision is checked by the authority, not the client.** A command naming a revision the job has moved past is `revision_mismatch` with the current one, stored under its key like any refusal.

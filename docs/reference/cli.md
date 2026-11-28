@@ -1081,6 +1081,7 @@ Mint a token on this node's authority; the bearer is printed once
 
 Options:
       --actor <ACTOR>            Who acts under the token: 1 to 64 characters of [A-Za-z0-9._-]
+      --allow <ALLOW>            Allowed operations (inspect, watch, submit, cancel, checkpoint, continue). Repeat or comma-separate; explicit grants replace the inspect,watch default [default: inspect,watch]
       --expires-ms <EXPIRES_MS>  When the token stops working, in Unix milliseconds
       --job <JOBS>               A job the token may act on; repeatable; every owned job without it
       --node <NODES>             A node the token may pin or place on; repeatable; any node without it

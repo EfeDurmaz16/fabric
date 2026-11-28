@@ -1,0 +1,19 @@
+{
+  "op": "facade_mint",
+  "actor": "ci.runner-1",
+  "jobs": {
+    "jobs": [
+      "01JABCDEFGHJKMNPQRSTVWXYZ0"
+    ],
+    "allow": [
+      "watch",
+      "inspect",
+      "cancel"
+    ]
+  },
+  "resources": [
+    "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+    "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  ],
+  "expires_ms": 1762131600000
+}

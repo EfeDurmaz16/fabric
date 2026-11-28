@@ -1056,7 +1056,9 @@ fn every_object_skips_a_field_it_does_not_know_outside_what_a_client_launches() 
                         ),
                         Err(e) => panic!("{dir}/{name}: a field at {pointer:?} was refused: {e}"),
                     }
-                } else if launched(&json, &pointer) {
+                } else if launched(&json, &pointer)
+                    || (json["op"] == "facade_mint" && pointer == "/jobs")
+                {
                     assert!(
                         parsed.is_err(),
                         "{dir}/{name}: a field at {pointer:?} was skipped in what a client launches"

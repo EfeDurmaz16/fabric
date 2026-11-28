@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use fabric_client::api::{
-    FacadeEnvelope, JobScopeWire, ManagedOperation, ManagedPolicy, ManagedSource, NoteWire, Reason,
-    Reply, Request, ResourceScopeWire, SystemPath,
+    FacadeEnvelope, ManagedOperation, ManagedPolicy, ManagedSource, NoteWire, Reason, Reply,
+    Request, ResourceScopeWire, SystemPath,
 };
 use fabric_client::facade::{Refusal, RefusalCode, Submit};
 use fabric_core::harness::HarnessKind;
@@ -368,17 +368,25 @@ impl Node {
                 resources,
                 expires_ms,
             } => {
-                let jobs = match jobs {
-                    JobScopeWire::Any(_) => JobScope::AnyOwned,
-                    JobScopeWire::Jobs(jobs) => JobScope::Jobs(jobs),
+                use fabric_client::api::GrantJobsWire;
+                let grant = jobs.scoped();
+                let jobs = match grant.jobs {
+                    GrantJobsWire::Any(_) => JobScope::AnyOwned,
+                    GrantJobsWire::Jobs(jobs) => JobScope::Jobs(jobs),
                 };
                 let resources = match resources {
                     ResourceScopeWire::Any(_) => ResourceScope::Any,
                     ResourceScopeWire::Nodes(nodes) => ResourceScope::Nodes(nodes),
                 };
                 Ok(Reply::FacadeMint(
-                    self.facade_mint(&actor, jobs, resources, expires_ms)
-                        .await?,
+                    self.facade_mint(
+                        &actor,
+                        jobs,
+                        grant.allow.into_iter().collect(),
+                        resources,
+                        expires_ms,
+                    )
+                    .await?,
                 ))
             }
             Request::FacadeRevoke { token_id } => {

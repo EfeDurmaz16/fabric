@@ -297,7 +297,16 @@ fn m5_commands_keep_their_streams(
 
     // The facade: a mint prints its token and bearer, a facade message the
     // authority's own JSON on one line.
-    let mint = ["facade", "mint", "--actor", "streams", "--ttl-ms", "600000"];
+    let mint = [
+        "facade",
+        "mint",
+        "--allow",
+        "submit,inspect,watch,cancel",
+        "--actor",
+        "streams",
+        "--ttl-ms",
+        "600000",
+    ];
     let minted = asked.words(a, &mint)?;
     let bearer = minted
         .lines()

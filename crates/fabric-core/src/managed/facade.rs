@@ -7,6 +7,7 @@
 //! token for the same reason and a caller learns nothing about scope from
 //! a token it does not hold.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -181,6 +182,67 @@ pub enum ResourceScope {
     Nodes(Vec<NodeId>),
 }
 
+/// An operation a delegated facade token may perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum FacadeOperation {
+    /// Read the current job state.
+    Inspect = 1,
+    /// Read events following a cursor.
+    Watch = 2,
+    /// Create a job.
+    Submit = 4,
+    /// Cancel work.
+    Cancel = 8,
+    /// Take a checkpoint.
+    Checkpoint = 16,
+    /// Move or resume work.
+    Continue = 32,
+}
+
+impl FacadeOperation {
+    /// Stable bit assignments in a journal scope. New bits require explicit support.
+    pub const ALL: [Self; 6] = [
+        Self::Inspect,
+        Self::Watch,
+        Self::Submit,
+        Self::Cancel,
+        Self::Checkpoint,
+        Self::Continue,
+    ];
+
+    /// Default delegation for a fresh token.
+    #[must_use]
+    pub fn read_only() -> BTreeSet<Self> {
+        [Self::Inspect, Self::Watch].into_iter().collect()
+    }
+
+    /// Its facade protocol verb.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inspect => "inspect",
+            Self::Watch => "watch",
+            Self::Submit => "submit",
+            Self::Cancel => "cancel",
+            Self::Checkpoint => "checkpoint",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+impl FromStr for FacadeOperation {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|op| op.as_str() == value)
+            .ok_or("expected inspect, watch, submit, cancel, checkpoint or continue")
+    }
+}
+
 /// A minted token as the journal keeps it; never the bearer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FacadeTokenRecord {
@@ -192,6 +254,8 @@ pub struct FacadeTokenRecord {
     pub actor: Actor,
     /// Which jobs.
     pub jobs: JobScope,
+    /// Explicit operation grant. Legacy tokens predate operation scopes.
+    pub operations: Option<BTreeSet<FacadeOperation>>,
     /// Which resources.
     pub resources: ResourceScope,
     /// When it was minted, Unix milliseconds.
@@ -200,6 +264,21 @@ pub struct FacadeTokenRecord {
     pub expires_ms: u64,
     /// When it was revoked, if it was.
     pub revoked_ms: Option<u64>,
+}
+
+impl FacadeTokenRecord {
+    /// A stored legacy grant covers the six verbs available when it was minted.
+    #[must_use]
+    pub fn permits(&self, operation: FacadeOperation) -> bool {
+        use FacadeOperation::{Cancel, Checkpoint, Continue, Inspect, Submit, Watch};
+        match &self.operations {
+            Some(allow) => allow.contains(&operation),
+            None => matches!(
+                operation,
+                Inspect | Watch | Submit | Cancel | Checkpoint | Continue
+            ),
+        }
+    }
 }
 
 /// Which scope a token fell outside of.
@@ -311,6 +390,7 @@ mod tests {
             id: TokenId::from_bytes([1; 16]),
             digest: token_digest(&[7; 32]),
             actor: Actor::parse("ci-bot").unwrap(),
+            operations: None,
             jobs: JobScope::Jobs(vec![JobId::from_bytes([1; 16])]),
             resources: ResourceScope::Nodes(vec![NodeId::from_bytes([2; 32])]),
             minted_ms: 100,

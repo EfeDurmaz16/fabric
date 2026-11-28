@@ -165,7 +165,9 @@ async fn e2e_a_job_submitted_to_a_runs_on_b_and_continues_on_a_with_its_package(
 
     // (1) Submitted to `a`'s facade from `b`, pinned to `b`: `a` places it
     // and launches it on `b` over the link.
-    let minted = a.ok(&["facade", "mint", "--actor", "e2e", "--ttl-ms", "600000"])?;
+    let minted = a.ok(&[
+        "facade", "mint", "--allow", "submit", "--actor", "e2e", "--ttl-ms", "600000",
+    ])?;
     let token = minted
         .lines()
         .find_map(|l| l.strip_prefix("bearer "))

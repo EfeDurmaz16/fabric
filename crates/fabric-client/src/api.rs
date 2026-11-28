@@ -2776,14 +2776,55 @@ pub enum AuditRecord {
     },
 }
 
+/// Exact jobs and operations for a scoped mint. Both fields are required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedGrantWire {
+    /// Operation allowlist, with an empty list granting no rights.
+    pub allow: Vec<fabric_core::managed::facade::FacadeOperation>,
+    /// The jobs covered by the token.
+    pub jobs: GrantJobsWire,
+}
+
+/// Job selection within a scoped mint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GrantJobsWire {
+    /// All owned jobs.
+    Any(AnyWord),
+    /// Explicit list of owned jobs.
+    Jobs(#[serde(with = "text::list")] Vec<JobId>),
+}
+
 /// The jobs a facade token may act on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JobScopeWire {
+    /// Tagged grant. Old authorities refuse this object before minting.
+    Scoped(ScopedGrantWire),
     /// Every job of the owner: the string `any`.
     Any(AnyWord),
     /// These jobs.
     Jobs(#[serde(with = "text::list")] Vec<JobId>),
+}
+
+impl JobScopeWire {
+    /// Convert older mint call shapes to an explicit read-only delegation.
+    /// A server without operation scopes cannot decode the resulting object.
+    #[must_use]
+    pub fn scoped(self) -> ScopedGrantWire {
+        let jobs = match self {
+            Self::Scoped(grant) => return grant,
+            Self::Any(any) => GrantJobsWire::Any(any),
+            Self::Jobs(jobs) => GrantJobsWire::Jobs(jobs),
+        };
+        ScopedGrantWire {
+            jobs,
+            allow: fabric_core::managed::facade::FacadeOperation::read_only()
+                .into_iter()
+                .collect(),
+        }
+    }
 }
 
 /// The nodes a facade token may pin or place on.
