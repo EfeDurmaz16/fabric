@@ -10,6 +10,7 @@
 //     const status = await client.jobStatus(job, { onEvent: (event) => console.log(event.kind) });
 //   }
 
+export { FabricJobs, type JobClientOptions, type JobSpec, type JobEvents, type AcceptedOperation } from "./jobs.ts";
 export {
   type CallOptions,
   type ClientOptions,

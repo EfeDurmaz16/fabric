@@ -20,6 +20,7 @@ import {
   encodeFrame,
   Epoch,
   FabricClient,
+  FabricJobs,
   HelloAnswer,
   JobId,
   type KnownEvent,
@@ -321,7 +322,7 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
 
   test("the facade reaches this node's own authority through facade_call", async () => {
     const { client, welcome } = the();
-    const minted = await client.facadeMint("sdk-e2e", "any", "any", Date.now() + 600_000);
+    const minted = await client.facadeMint("sdk-e2e", "any", "any", Date.now() + 600_000, { allow: ["submit", "inspect", "watch", "cancel"] });
     expect(minted.bearer).toMatch(/^[0-9a-f]{64}$/);
     const operationKey = newOperationKey();
     const accepted = await client.facadeCall(welcome.node, {
@@ -367,6 +368,42 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
     expect(revoked.revoked).toBe(true);
     const refused = await client.facadeCall(welcome.node, { type: "inspect", token: minted.bearer, job: accepted.job });
     expect(refused).toMatchObject({ type: "refused", refusal: { code: "unauthorized", reason: "revoked" } });
+  });
+
+  test("job client reconnects its scoped observer and uses an explicit key for every effect", async () => {
+    const { client, socketPath, welcome } = the();
+    const authority = welcome.node;
+    const until = Date.now() + 60_000;
+    const writer = await client.facadeMint("sdk-submitter", "any", "any", until, { allow: ["submit", "cancel"] });
+    const jobs = new FabricJobs({ socketPath, authority, token: writer.bearer });
+    const spec = { goal: "job client smoke", source: { kind: "empty" } as const, harness: { kind: "codex" } as const, acceptance: [] };
+    const submitKey = newOperationKey();
+    const { job, operation } = await jobs.submit(spec, { key: submitKey });
+    expect(await jobs.submit(spec, { key: submitKey })).toMatchObject({ job, operation, replayed: true });
+
+    const grant = await client.facadeMint("sdk-observer", [job], [authority], until);
+    const connect = () => new FabricJobs({ socketPath, authority, token: grant.bearer });
+    expect((await connect().inspect(job)).job.job).toBe(job);
+    const before = await connect().watch(job, { waitMs: 0 });
+    expect(before.events.length).toBeGreaterThan(0);
+    const epoch = await connect().inspect(job);
+    const readOnlyKey = newOperationKey();
+    for (const call of [
+      () => connect().cancel(job, { key: readOnlyKey, reason: "done" }),
+      () => connect().checkpoint(job, { key: readOnlyKey }),
+      () => connect().move(job, { key: readOnlyKey, pin: authority }),
+    ]) {
+      await expect(call()).rejects.toMatchObject({ refusal: { code: "scope", reason: "operation" } });
+    }
+
+    const cancelKey = newOperationKey();
+    expect(await jobs.cancel(job, { key: cancelKey, reason: "done" })).toMatchObject({ job, key: cancelKey });
+    const after = await connect().watch(job, { after: before.next, waitMs: 0 });
+    expect(after.events.length).toBeGreaterThan(0);
+    expect(BigInt(after.events[0]!.seq)).toBeGreaterThan(BigInt(before.next!));
+    expect((await connect().inspect(job)).job.revision).not.toBe(epoch.job.revision);
+    await client.facadeRevoke(grant.token_id);
+    await expect(connect().inspect(job)).rejects.toMatchObject({ refusal: { code: "unauthorized", reason: "revoked" } });
   });
 
   test("a hello of another api version is answered incompatible", async () => {
