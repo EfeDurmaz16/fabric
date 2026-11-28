@@ -161,7 +161,7 @@ fabric managed cancel <job> --reason "done" --operation-key k2
 fabric managed ls
 ```
 
-Applications and CLI agents can submit, inspect, watch, checkpoint, move and cancel managed jobs through the facade. Use the [Node SDK](sdk/typescript/README.md) or [Python SDK](sdk/python/README.md) in a trusted process with access to the local node socket. New facade tokens default to inspect and watch. Grant each required mutation explicitly. Keep the job ID, last processed cursor and command retry keys across process restarts. The SDK guides include installation from local preview artifacts.
+Applications and CLI agents can submit, inspect, watch, checkpoint, move and cancel managed jobs through the facade. Use the [Node SDK](sdk/typescript/README.md) or [Python SDK](sdk/python/README.md) over a trusted node socket or the operator's [HTTPS gateway](docs/facade-protocol.md). The Python wheel also installs the six-command `fbrc` CLI for remote callers. New facade tokens default to inspect and watch. Grant each required mutation explicitly. Keep the job ID, last processed cursor and command retry keys across process restarts. The SDK guides include installation from local preview artifacts.
 
 The same node answers the TypeScript SDK in `sdk/typescript` (`FabricClient` on `$FABRIC_HOME/fabric.sock`: `hello`, `jobList`, `jobStatus`, `jobLog`, `managedList`, `managedStatus`), and the bridge to a Capsule worker is exercised by `cargo test -p fabric-bridge --test capsule_worker -- --ignored` with `CAPSULE_BRIDGE_WORKER` set ([docs/bridge-protocol.md](docs/bridge-protocol.md), Against the Capsule worker).
 
