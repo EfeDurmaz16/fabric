@@ -188,7 +188,7 @@ async fn dispatch(
         }
     })?
     .to_bytes();
-    let request = node_request(authority, parse_message(&body, &token)?)?;
+    let request = node_request(authority, &parse_message(&body, &token)?)?;
     let reply = timeout(AUTHORITY_TIME, client.call(&request, |_| {}))
         .await
         .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "authority_timeout"))?
@@ -206,7 +206,7 @@ async fn dispatch(
     Ok(bytes.into())
 }
 
-fn node_request(authority: NodeId, message: ClientMessage) -> Result<NodeRequest, HttpError> {
+fn node_request(authority: NodeId, message: &ClientMessage) -> Result<NodeRequest, HttpError> {
     let request = NodeRequest::FacadeCall {
         authority,
         message: message.to_json(),
@@ -266,16 +266,16 @@ mod tests {
                 "source":{"kind":"empty"}});
             parse_message(&serde_json::to_vec(&json).unwrap(), &token).unwrap()
         };
-        let base = node_request(authority, message(&acceptance)).unwrap();
+        let base = node_request(authority, &message(&acceptance)).unwrap();
         let padding = MAX_REQUEST - serde_json::to_vec(&base).unwrap().len();
         acceptance
             .last_mut()
             .unwrap()
             .push_str(&"x".repeat(padding));
-        assert!(node_request(authority, message(&acceptance)).is_ok());
+        assert!(node_request(authority, &message(&acceptance)).is_ok());
         acceptance.last_mut().unwrap().push('x');
         assert_eq!(
-            node_request(authority, message(&acceptance)).unwrap_err(),
+            node_request(authority, &message(&acceptance)).unwrap_err(),
             (StatusCode::PAYLOAD_TOO_LARGE, "request_too_large")
         );
     }
