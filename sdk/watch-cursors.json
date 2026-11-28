@@ -1,0 +1,12 @@
+[
+  {"after": null, "sequences": [], "next": null, "valid": true},
+  {"after": "41", "sequences": [], "next": "41", "valid": true},
+  {"after": "41", "sequences": [], "next": "42", "valid": false},
+  {"after": null, "sequences": [], "next": "1", "valid": false},
+  {"after": "41", "sequences": [], "next": null, "valid": false},
+  {"after": "41", "sequences": ["41"], "next": "41", "valid": false},
+  {"after": "41", "sequences": ["43","42"], "next": "42", "valid": false},
+  {"after": "41", "sequences": ["42","42"], "next": "42", "valid": false},
+  {"after": "41", "sequences": ["42","43"], "next": "44", "valid": false},
+  {"after": "9007199254740992", "sequences": ["9007199254740993"], "next": "9007199254740993", "valid": true}
+]

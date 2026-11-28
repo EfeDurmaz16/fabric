@@ -67,6 +67,14 @@ export class FabricJobs {
     });
     expectType(answer, "events");
     if (answer.job !== job) throw new ProtocolViolation("job_mismatch", "events name a different job");
+    let cursor = options.after ?? null;
+    for (const event of answer.events) {
+      if (cursor !== null && BigInt(event.seq) <= BigInt(cursor)) {
+        throw new ProtocolViolation("bad_cursor", "watch event sequence did not advance");
+      }
+      cursor = event.seq;
+    }
+    if (answer.next !== cursor) throw new ProtocolViolation("bad_cursor", "watch cursor does not match the delivered events");
     return answer;
   }
 

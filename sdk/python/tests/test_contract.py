@@ -106,6 +106,20 @@ class FacadeContract(unittest.TestCase):
                 client.watch(data["job"], after=data["events"][0]["seq"])
             self.assertEqual(caught.exception.reason, "bad_cursor")
 
+    def test_shared_watch_cursors(self):
+        client = FabricClient("/no/fabric.sock", AUTHORITY, "1" * 64)
+        for case in json.loads((ROOT / "sdk/watch-cursors.json").read_text()):
+            page = fixture("events_valid")["message"]
+            event = page["events"][0]
+            page.update(events=[{**event, "seq": seq} for seq in case["sequences"]], next=case["next"])
+            with self.subTest(case=case), patch("fabric_jobs._facade.exchange", return_value=page):
+                if case["valid"]:
+                    self.assertEqual(client.watch(page["job"], after=case["after"]).next, case["next"])
+                else:
+                    with self.assertRaises(ProtocolError) as caught:
+                        client.watch(page["job"], after=case["after"])
+                    self.assertEqual(caught.exception.reason, "bad_cursor")
+
     def test_refusal_redacts_the_bearer(self):
         token = "1" * 64
         data = copy.deepcopy(fixture("refused_valid")["message"])

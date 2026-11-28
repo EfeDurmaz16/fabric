@@ -34,6 +34,7 @@ test("watch preserves decimal cursors through empty pages and defaults to the st
   const transport = call().mockResolvedValue({ type: "events", job, next: revision, events: [], closed: null, lagged: false });
   expect((await client.watch(job, { after: revision, waitMs: 0 })).next).toBe(revision);
   expect(transport).toHaveBeenCalledWith(authority, { type: "watch", job, token, after: revision, wait_ms: 0 });
+  transport.mockResolvedValue({ type: "events", job, next: null, events: [], closed: null, lagged: false });
   await client.watch(job);
   expect(transport).toHaveBeenCalledWith(authority, { type: "watch", job, token, after: null });
 });
@@ -59,4 +60,22 @@ test("responses must identify the requested job, effect and expected response ty
   await expect(client.inspect(job)).rejects.toBeInstanceOf(ProtocolViolation);
   transport.mockResolvedValue({ type: "events", job: otherJob, events: [], next: null, lagged: false, closed: null });
   await expect(client.watch(job)).rejects.toBeInstanceOf(ProtocolViolation);
+});
+
+
+test("watch enforces the shared cursor contract", async () => {
+  const vectors: { after: string | null; sequences: string[]; next: string | null; valid: boolean }[] =
+    await Bun.file(new URL("../../watch-cursors.json", import.meta.url)).json();
+  const transport = call();
+  for (const vector of vectors) {
+    const after = vector.after === null ? null : Counter.parse(vector.after);
+    const next = vector.next === null ? null : Counter.parse(vector.next);
+    const events = vector.sequences.map((seq) => ({
+      seq: Counter.parse(seq), revision, at_ms: 1, event: { kind: "attempt_observed" },
+    }));
+    transport.mockResolvedValue({ type: "events", job, next, events, closed: null, lagged: false });
+    const page = client.watch(job, { after });
+    if (vector.valid) expect((await page).next).toBe(next);
+    else await expect(page).rejects.toMatchObject({ reason: "bad_cursor" });
+  }
 });

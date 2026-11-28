@@ -326,8 +326,8 @@ class FabricClient:
             last = int(event.seq)
         if result.events and result.next != result.events[-1].seq:
             raise ProtocolError("bad_cursor", "cursor does not match the last event")
-        if not result.events and (0 if result.next is None else int(result.next)) < last:
-            raise ProtocolError("bad_cursor", "cursor moved backwards")
+        if not result.events and result.next != after:
+            raise ProtocolError("bad_cursor", "empty page must preserve the requested cursor")
         return result
 
     def cancel(

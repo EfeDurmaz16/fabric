@@ -43,9 +43,9 @@ try {
   assert.equal(requests.length, 0);
 
   reply = res => res.end(JSON.stringify({
-    facade: 1, type: "events", job, events: [], next: "42", closed: null, lagged: false,
+    facade: 1, type: "events", job, events: [], next: "41", closed: null, lagged: false,
   }));
-  assert.equal((await jobs.watch(job, { after: "41", waitMs: 0 })).next, "42");
+  assert.equal((await jobs.watch(job, { after: "41", waitMs: 0 })).next, "41");
   assert.deepEqual(requests.pop(), { facade: 1, type: "watch", job, after: "41", wait_ms: 0 });
   reply = res => res.end(JSON.stringify({
     facade: 1, type: "refused", code: "refused", reason: "not_live", message: "parked",
