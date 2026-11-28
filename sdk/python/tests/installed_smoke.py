@@ -154,8 +154,11 @@ def main(binary, legacy_authority):
             refused(lambda: remote_read.cancel(created.job, "blocked-cancel", reason="test"), "scope", "operation")
             refused(lambda: remote_read.checkpoint(created.job, "blocked-checkpoint"), "scope", "operation")
             refused(lambda: remote_read.move(created.job, "blocked-move", pin=peer.id), "scope", "operation")
-            refused(lambda: remote_read.submit(
+            read_all = mint("wheel-read-all", [], "--node", peer.id)
+            observer = peer.client(authority.id, read_all["bearer"])
+            refused(lambda: observer.submit(
                 "blocked-submit", goal="test", harness={"kind": "codex"}, source={"kind": "empty"},
+                policy={"pin": peer.id},
             ), "scope", "operation")
 
         command_grant = mint(
@@ -182,12 +185,24 @@ def main(binary, legacy_authority):
         authority.cli("facade", "revoke", read_grant["token_id"])
         refused(lambda: restarted_client.inspect(created.job), "unauthorized", "revoked")
 
+        second = local.submit(
+            "wheel-submit-2", goal="Python move fixture", harness={"kind": "codex"},
+            source={"kind": "empty"}, policy={"pin": peer.id},
+        )
+        move_grant = mint("wheel-move", ["continue"], "--job", second.job, "--node", peer.id)
+        mover = peer.client(authority.id, move_grant["bearer"])
+        moved = mover.move(second.job, "wheel-move", pin=peer.id)
+        assert moved.job == second.job and not moved.replayed
+        move_replay = mover.move(second.job, "wheel-move", pin=peer.id)
+        assert move_replay.replayed and move_replay.operation == moved.operation
+
         print(json.dumps({
             "installed_version": version("fabric-jobs"),
             "python": sys.version.split()[0],
             "paired_peer": True,
             "same_job": created.job,
             "duplicate_submit_replayed": replay.replayed,
+            "move_request_replayed": move_replay.replayed,
             "initial_cursor": first.next,
             "reconnect_cursor": after_cancel.next,
             "finished_watch": closed.closed,
