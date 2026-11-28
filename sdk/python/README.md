@@ -16,6 +16,32 @@ python -m pip install /path/to/artifacts/fabric_jobs-0.1.0-py3-none-any.whl
 
 The wheel is a preview distributed as a local build artifact.
 
+## HTTPS CLI
+
+The wheel installs `fbrc`. Scripts and agents can also invoke `python -m fabric_jobs`.
+Set `gateway` to the full HTTPS endpoint, including `/v1/facade`. Supply the bearer
+as a single line on standard input, for example by redirecting a private credential
+file. For a private CA, add `--ca-file ca.pem` before the command.
+
+```sh
+fbrc --endpoint "$gateway" inspect "$job" < "$token_file"
+fbrc --endpoint "$gateway" watch "$job" --after "$cursor" --wait-ms 1000 < "$token_file"
+fbrc --endpoint "$gateway" submit --key ci-run-1 --spec job.json < "$token_file"
+```
+
+A submit specification contains the same fields as the Python method.
+
+```json
+{"goal":"Review the fixture","harness":{"kind":"codex"},"source":{"kind":"empty"}}
+```
+
+Run `fbrc --help` for all six commands and `fbrc move --help` for placement
+options. A successful call writes one JSON object to stdout (exit 0). Errors
+write one JSON object to stderr (exit 1 for a refused or failed request, 2 for
+invalid input). Persist the operation key before a mutation and the cursor after
+processing an event page.
+
+
 ## Inspect and watch
 
 Use the authority node ID from `fabric node id` and a bearer minted by the

@@ -14,3 +14,6 @@ dependencies = []
 
 [project.urls]
 Repository = "https://github.com/EfeDurmaz16/fabric"
+
+[project.scripts]
+fbrc = "fabric_jobs.__main__:main"
