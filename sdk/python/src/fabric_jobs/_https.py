@@ -86,6 +86,11 @@ class _DeadlineConnection(http.client.HTTPConnection):
                 return
         raise last_error or OSError("no address for the Fabric gateway")
 
+    def send(self, data) -> None:
+        if self.sock is not None:
+            _remaining(self.sock, self._deadline)
+        super().send(data)
+
     def response_class(self, connection: socket.socket, *, method: str) -> http.client.HTTPResponse:
         response = http.client.HTTPResponse(connection, method=method)
         response.fp.close()
@@ -136,7 +141,6 @@ class HttpsEndpoint:
         connection = _DeadlineConnection(self._host, self._port, self._context, deadline)
         try:
             connection.connect()
-            _remaining(connection.sock, deadline)
             connection.request("POST", _ROUTE, body=body, headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",

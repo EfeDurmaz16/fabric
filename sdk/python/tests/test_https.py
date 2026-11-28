@@ -9,7 +9,9 @@ import unittest
 from email.message import Message
 from unittest.mock import MagicMock, patch
 
-from fabric_jobs import FabricClient, FacadeRefusedError, HttpStatusError, ProtocolError, TlsVerificationError
+from fabric_jobs import (
+    FabricClient, FacadeRefusedError, HttpStatusError, ProtocolError, TlsVerificationError, TransportError,
+)
 from fabric_jobs._https import _DeadlineConnection
 
 ENDPOINT = "https://fabric.example/v1/facade"
@@ -112,6 +114,14 @@ class HttpsFacadeTests(unittest.TestCase):
             left.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
             with self.assertRaises(TimeoutError):
                 parser.begin()
+
+    def test_expired_deadline_prevents_request_write(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        connection = _DeadlineConnection("fabric.example", 443, context, time.monotonic() - 1)
+        connection.sock = MagicMock(spec=socket.socket)
+        with self.assertRaises(TransportError):
+            connection.send(b"request")
+        connection.sock.sendall.assert_not_called()
 
 
 if __name__ == "__main__":
