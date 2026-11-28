@@ -12,6 +12,7 @@ from ._facade import (
     Inspection,
     WatchPage,
 )
+from ._https import HttpStatusError, TlsVerificationError
 from ._wire import (
     API_VERSION,
     SDK_VERSION,
@@ -38,10 +39,12 @@ __all__ = [
     "FabricError",
     "FacadeRefusedError",
     "Fidelity",
+    "HttpStatusError",
     "IncompatibleError",
     "Inspection",
     "NoDaemonError",
     "ProtocolError",
+    "TlsVerificationError",
     "TransportError",
     "UnsupportedError",
     "UntrustedSocketError",

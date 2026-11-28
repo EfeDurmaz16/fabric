@@ -1,10 +1,9 @@
 # Fabric jobs for Python
 
-This preview connects a Python 3.10+ application to a running Fabric node
-through its Unix control socket. It speaks client API 2 and managed-job
-Facade v1. The same client reaches a paired authority by naming that
-authority's node ID and using the local node's socket. There are no runtime
-dependencies.
+This preview gives Python 3.10+ applications access to Fabric's managed-job
+Facade v1. Use a Fabric HTTPS gateway or client API 2 over the local Unix
+control socket. A local node can also forward calls to a paired authority.
+There are no runtime dependencies.
 
 ## Install the wheel
 
@@ -84,6 +83,27 @@ and rejects expired or revoked tokens. Older authorities and legacy
 tokens may allow commands under broader scopes. Use a privately owned
 socket and state directory. A socket on a paired node is
 how this client reaches a remote authority.
+
+## Connect over HTTPS
+
+Use the operator-provided `https://host:port/v1/facade` endpoint. The
+gateway selects the authority. All six job methods work with either
+transport.
+
+```python
+client = FabricClient.from_https(
+    os.environ["FABRIC_ENDPOINT"],
+    os.environ["FABRIC_FACADE_TOKEN"],
+)
+print(client.inspect(os.environ["FABRIC_JOB"]).state)
+```
+
+The client checks the certificate and hostname against the system trust
+store. For a private CA, pass its PEM bundle with `ca_file=`. The bearer
+travels in the Authorization header. Redirects and non-200 responses raise
+`HttpStatusError`. The gateway's HTTP 200 Facade refusals raise
+`FacadeRefusedError` as they do over the Unix socket. The timeout covers
+connection and response I/O, with DNS resolution handled by the platform.
 
 ## Verification
 

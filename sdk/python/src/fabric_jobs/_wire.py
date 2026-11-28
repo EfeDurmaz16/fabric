@@ -113,13 +113,18 @@ def trusted_socket(path: Path) -> Path:
     return resolved
 
 
-def encode_frame(value: JsonObject) -> bytes:
+def encode_json(value: JsonObject) -> bytes:
     try:
         body = json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, TypeError, UnicodeError, RecursionError):
         raise ValueError("Fabric requests must contain valid JSON and Unicode") from None
     if not 1 <= len(body) <= MAX_REQUEST:
         raise ValueError("Fabric request exceeds the one MiB node limit")
+    return body
+
+
+def encode_frame(value: JsonObject) -> bytes:
+    body = encode_json(value)
     return _HEADER.pack(len(body)) + body
 
 
@@ -162,12 +167,15 @@ def read_frame(connection: socket.socket, deadline: float) -> JsonObject:
     size, = _HEADER.unpack(_read_exact(connection, _HEADER.size, deadline))
     if not 1 <= size <= MAX_FRAME:
         raise ProtocolError("bad_length", "frame length must be between one byte and 16 MiB")
-    body = _read_exact(connection, size, deadline)
+    return decode_json(_read_exact(connection, size, deadline))
+
+
+def decode_json(body: bytes | bytearray) -> JsonObject:
     try:
         value = json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
         _check_unicode(value)
     except (UnicodeError, ValueError, RecursionError):
-        raise ProtocolError("bad_json", "frame is not valid UTF-8 JSON") from None
+        raise ProtocolError("bad_json", "response is not valid UTF-8 JSON") from None
     if not isinstance(value, dict):
         raise ProtocolError("bad_object", "response must be a JSON object")
     return value

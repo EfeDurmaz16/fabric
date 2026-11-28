@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from ._https import HttpsEndpoint
 from ._wire import NODE_ID, FabricError, JsonObject, JsonValue, ProtocolError, exchange
 
 FACADE_VERSION = 1
@@ -213,7 +214,7 @@ def _read_answer(data: JsonObject, token: str) -> Accepted | Inspection | WatchP
 
 
 class FabricClient:
-    """Synchronous Facade v1 client. Every call opens a new Unix connection."""
+    """Synchronous Facade v1 client. Every call opens a new connection."""
 
     def __init__(
         self,
@@ -225,18 +226,41 @@ class FabricClient:
     ) -> None:
         if not _matches(authority, NODE_ID):
             raise ValueError("authority must be a canonical Fabric node ID")
+        path = Path(os.path.abspath(socket_path))
+
+        def send(message: JsonObject, bearer: str, budget: float) -> JsonObject:
+            return exchange(path, authority, {**message, "token": bearer}, budget)
+
+        self._configure(send, token, timeout)
+
+    @classmethod
+    def from_https(
+        cls,
+        endpoint: str,
+        token: str,
+        *,
+        ca_file: str | os.PathLike[str] | None = None,
+        timeout: float = 35.0,
+    ) -> FabricClient:
+        """Use the authority configured by a Fabric HTTPS gateway."""
+        client = cls.__new__(cls)
+        client._configure(HttpsEndpoint(endpoint, ca_file), token, timeout)
+        return client
+
+    def _configure(
+        self, send: Callable[[JsonObject, str, float], JsonObject], token: str, timeout: float,
+    ) -> None:
         if not _matches(token, _TOKEN):
             raise ValueError("token must contain 64 lowercase hexadecimal characters")
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be finite and positive")
-        self._path = Path(os.path.abspath(socket_path))
-        self._authority = authority
+        self._send = send
         self.__token = token
         self._timeout = timeout
 
     def _call(self, operation: str, fields: JsonObject) -> Accepted | Inspection | WatchPage:
-        message: JsonObject = {"type": operation, "facade": FACADE_VERSION, "token": self.__token, **fields}
-        return _read_answer(exchange(self._path, self._authority, message, self._timeout), self.__token)
+        message: JsonObject = {"type": operation, "facade": FACADE_VERSION, **fields}
+        return _read_answer(self._send(message, self.__token, self._timeout), self.__token)
 
     def _command(self, operation: str, key: str, fields: JsonObject, job: str | None = None) -> Accepted:
         if not _matches(key, _KEY):
