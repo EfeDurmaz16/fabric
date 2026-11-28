@@ -5,7 +5,7 @@ Facade v1. Use a Fabric HTTPS gateway or client API 2 over the local Unix
 control socket. A local node can also forward calls to a paired authority.
 There are no runtime dependencies.
 
-[Run your first job over HTTPS](../../examples/first-https-job/README.md) walks through a clean install, authority startup, token grants, submission and a completed turn.
+[Run your first job over HTTPS](https://github.com/EfeDurmaz16/fabric/blob/3c7c776d/examples/first-https-job/README.md) walks through a clean install, authority startup, token grants, submission and a completed turn.
 
 ## Install the wheel
 
