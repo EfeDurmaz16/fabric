@@ -243,6 +243,19 @@ jobs:
           FABRIC_BIN: ${{ github.workspace }}/target/debug/fabric
         run: bun test
 
+      - name: Test installed Python and Node SDKs against the HTTPS gateway
+        if: runner.os == 'Linux'
+        run: |
+          consumer=$(mktemp -d "$RUNNER_TEMP/fabric-consumer.XXXXXX")
+          npm pack --ignore-scripts --pack-destination "$consumer"
+          cd "$consumer"
+          npm install --ignore-scripts --no-audit --no-fund ./*.tgz
+          python3 -m venv venv
+          venv/bin/pip wheel --no-deps --wheel-dir . "$GITHUB_WORKSPACE/sdk/python"
+          venv/bin/pip install --no-index ./*.whl
+          venv/bin/python -I "$GITHUB_WORKSPACE/sdk/python/tests/https_smoke.py" \
+            "$GITHUB_WORKSPACE/target/debug/fabric" "$consumer"
+
   # Fabric's bridge client against the real Capsule worker
   # (crates/fabric-bridge/tests/capsule_worker.rs): every shared scenario
   # over the worker's stdio, then the client and a real journal through
