@@ -27,6 +27,7 @@ Work on jobs:
 Managed jobs:
   managed        Make, cancel and read managed jobs, and the M5 operations on them (experimental)
   facade         Mint and revoke facade tokens; reach a job's authority from any of your nodes (experimental)
+  gateway        Serve the scoped job facade over HTTPS for one authority
   inspect        Read a managed job's whole state, or one attempt's, from its authority
   audit          Export the authority's journal for an audit, as JSON lines
 
@@ -1291,6 +1292,27 @@ Examples:
     fabric facade continue --authority <NODE> --token <BEARER> <JOB> --pin <NODE>
 
 Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-facade-continue
+```
+
+### `fabric gateway`
+
+```text
+Usage: fabric gateway [OPTIONS] --authority <AUTHORITY> --cert <CERT> --key <KEY>
+Serve the scoped job facade over HTTPS for one authority
+
+Options:
+      --authority <AUTHORITY>  The only authority that receives facade calls through this listener
+      --cert <CERT>            PEM certificate chain, with the server certificate first
+      --key <KEY>              PEM private key matching the certificate
+      --listen <LISTEN>        TLS listener address. Set a non-loopback address to accept remote clients [default: 127.0.0.1:8443]
+
+Global Options: See `fabric --help`
+
+Examples:
+  Serve the delegated facade on loopback
+    fabric gateway --authority <NODE> --cert <PATH> --key <PATH>
+
+Learn more: https://github.com/EfeDurmaz16/fabric/blob/main/docs/reference/cli.md#fabric-gateway
 ```
 
 ### `fabric inspect`

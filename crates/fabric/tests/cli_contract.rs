@@ -220,7 +220,7 @@ fn sample(id: &str, sandbox: &Sandbox) -> String {
     match id {
         "job" | "JOB" => JOB.to_owned(),
         "node" | "to" | "on" | "peer" | "NODE" | "authority" => node(),
-        "repo" | "path" | "PATH" | "dir" | "workspace" => {
+        "repo" | "path" | "PATH" | "dir" | "workspace" | "cert" | "key" => {
             sandbox.path("repo").display().to_string()
         }
         "goal" | "prompt" | "reason" | "note" | "TEXT" | "label" | "question" => "demo".to_owned(),
@@ -638,6 +638,18 @@ fn runs_a_harness(path: &[String]) -> bool {
     matches!(path, [group, leaf] if group == "job" && (leaf == "run" || leaf == "resume"))
 }
 
+#[test]
+fn the_gateway_validates_its_tls_identity_before_announcing_a_listener() {
+    let sandbox = Sandbox::new();
+    let mut args = runnable(&words(&["gateway"]), &sandbox);
+    add_option(&mut args, "--json");
+    let output = sandbox.run(&args);
+    let doc = error_document(&output, "fabric gateway");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(doc["reason"], "failed");
+    assert!(doc["message"].as_str().unwrap().contains("certificate"));
+}
+
 /// A failure under `--json`: standard output empty, standard error one
 /// JSON document; in words, standard output empty and an `Error:` line.
 /// Two failures every command can meet: a state directory that is not an
@@ -690,8 +702,8 @@ fn a_failure_is_one_document_under_json_and_stdout_stays_empty() {
             continue;
         }
 
-        // `serve` is the node, so it is the one command no node is missing for.
-        if path == ["serve"] {
+        // Both listeners can start without a daemon.
+        if path == ["serve"] || path == ["gateway"] {
             continue;
         }
         if path.first().is_some_and(|name| name == "codex-runner") {

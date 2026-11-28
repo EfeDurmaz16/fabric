@@ -14,7 +14,7 @@ Ownership does not move:
 | Forwarding a message and its answer; nothing else | the local node |
 | Choosing a key for a command, resuming a watch from its cursor | the client |
 
-Out of scope for v1: any public listener, any browser or mobile client, any owner-only socket operation (host paths, launch plans, process registration), minting a token for another owner.
+The owner can also start an HTTPS gateway on a registered node. Its contract is the same six job operations. Minting, revocation, host paths, launch plans and process registration remain on the private owner socket.
 
 ## Delegated operations
 
@@ -37,6 +37,44 @@ Operation checks follow the existing job and resource checks. An otherwise
 in-scope request lacking its verb returns `scope/operation` before replay,
 dispatch or any job write. Clients reach this check through the local socket or
 a registered forwarding node.
+
+## HTTPS gateway
+
+Start the local daemon and mint the client a scoped, expiring bearer on the
+authority. Run the gateway as an account trusted with the local Fabric socket,
+using the same `FABRIC_HOME` as the daemon. The authority may be this node
+or a paired node of the same owner.
+
+```sh
+fabric gateway --authority "$AUTHORITY" --cert chain.pem --key key.pem
+```
+
+The gateway listens on `127.0.0.1:8443` by default. Set `--listen 127.0.0.1:0`
+to choose a free port. The first stdout line contains the bound HTTPS endpoint
+as JSON. Set `--listen` to a specific reachable interface for remote access.
+Clients connect using a hostname or IP present in the server certificate and
+verify its chain with their trust store or a configured CA. The gateway reads
+the certificate chain and matching private key on startup. Restart it to load
+a renewed certificate. Anyone holding an unexpired, unrevoked bearer can
+exercise its grant. Keep it in the client secret store.
+
+Send one HTTP/1.1 `POST /v1/facade` with `Content-Type: application/json`,
+`Authorization: Bearer <token>` and the facade message fields as JSON. For
+example, the body of an inspect is
+`{"facade":1,"type":"inspect","job":"01JABCDEFGHJKMNPQRSTVWXYZ0"}`.
+The request body must omit `token` and `authority`. The gateway supplies the
+bearer from the header and forwards the message to its configured authority.
+HTTP 200 contains the raw facade answer, including authority refusals.
+Application-level HTTP errors contain `{"error":"<code>"}`. These include
+401 for a missing or malformed bearer, 400 for an invalid message, 413 for
+a body above the limit, 502 for an unavailable node and 504 for an authority
+timeout. After a transport failure, retry a mutation using its original key.
+
+The gateway admits 16 concurrent connections. TLS negotiation, headers and
+body reads each have a five-second deadline. The authority call has 30 seconds,
+including facade watches of up to 25 seconds. The full message including the
+injected bearer is limited to 1 MiB and the answer to 16 MiB. Each connection
+serves one request. The gateway emits no per-request logs.
 
 ## Failure modes first
 

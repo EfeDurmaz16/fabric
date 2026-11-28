@@ -69,6 +69,7 @@ mod codex_handoff;
 mod codex_runner;
 mod codex_vm;
 pub mod contract;
+mod gateway;
 mod gc;
 mod managed;
 mod psf;
@@ -88,6 +89,8 @@ pub(crate) struct Cli {
 enum Command {
     /// Run the node daemon in the foreground.
     Serve(ServeArgs),
+    /// Serve the scoped job facade over HTTPS for one authority.
+    Gateway(gateway::Args),
     /// Read this node's identity and pair it with other nodes.
     #[command(subcommand)]
     Node(NodeCommand),
@@ -552,7 +555,12 @@ pub fn main() -> ExitCode {
         // A closed standard error must not end the command: the
         // subscriber's own report of a failed write would panic there.
         .log_internal_errors(false)
-        .with_max_level(level)
+        .with_max_level(if matches!(cli.command, Command::Gateway(_)) {
+            // Raw network traces can contain credentials even on invalid requests.
+            tracing::level_filters::LevelFilter::OFF
+        } else {
+            level.into()
+        })
         .init();
     let runtime = match runtime_for(&cli.command) {
         Ok(runtime) => runtime,
@@ -608,6 +616,7 @@ async fn run(cli: Cli, run: &contract::Run) -> Result<ExitCode> {
     let client = client(&state);
     match cli.command {
         Command::Serve(args) => serve(state, home, args, run).await,
+        Command::Gateway(args) => gateway::serve(client, args).await,
         Command::CodexRunner(args) => {
             if run.modes.json {
                 return Err(contract::Usage(
