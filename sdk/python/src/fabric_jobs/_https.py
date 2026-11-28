@@ -74,7 +74,12 @@ class _DeadlineConnection(http.client.HTTPConnection):
         for family, kind, protocol, _, address in socket.getaddrinfo(
             self.host, self.port, type=socket.SOCK_STREAM,
         ):
-            with socket.socket(family, kind, protocol) as raw:
+            try:
+                candidate = socket.socket(family, kind, protocol)
+            except OSError as error:
+                last_error = error
+                continue
+            with candidate as raw:
                 _remaining(raw, self._deadline)
                 try:
                     raw.connect(address)

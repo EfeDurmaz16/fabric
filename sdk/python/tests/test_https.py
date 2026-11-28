@@ -123,6 +123,24 @@ class HttpsFacadeTests(unittest.TestCase):
             connection.send(b"request")
         connection.sock.sendall.assert_not_called()
 
+    def test_connect_tries_the_next_address_when_a_socket_family_is_unavailable(self):
+        ipv4 = ("127.0.0.1", 443)
+        context = MagicMock(spec=ssl.SSLContext)
+        connection = _DeadlineConnection("fabric.example", 443, context, time.monotonic() + 1)
+        raw = MagicMock(spec=socket.socket)
+        raw.__enter__.return_value = raw
+        candidates = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::1", 443, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ipv4),
+        ]
+        with (
+            patch("fabric_jobs._https.socket.getaddrinfo", return_value=candidates),
+            patch("fabric_jobs._https.socket.socket", side_effect=[OSError("no IPv6"), raw]),
+        ):
+            connection.connect()
+        raw.connect.assert_called_once_with(ipv4)
+        context.wrap_socket.assert_called_once_with(raw, server_hostname="fabric.example")
+
 
 if __name__ == "__main__":
     unittest.main()
