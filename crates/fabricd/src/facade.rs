@@ -580,19 +580,41 @@ impl Node {
             .commits()
             .map_err(|e| authority_refusal(&e))?;
         commits.mark_unchanged();
-        let mut closed: Option<String> = None;
+        let digest = token_digest(&bearer);
         loop {
             let limit = u32::try_from(WATCH_WINDOW + 1).unwrap_or(u32::MAX);
             let read = self
                 .authority
                 .with_journal(false, move |journal| {
+                    // Check the grant and select the page in the same journal turn.
+                    // No revocation can interleave between authorization and the read.
+                    let record = journal.token_by_digest(&digest)?;
+                    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if check_token(
+                        record.as_ref(),
+                        now_ms.saturating_add(elapsed),
+                        JobAsk::Existing(job),
+                        ResourceAsk::Nothing,
+                    ) != TokenCheck::Ok
+                    {
+                        return Ok(None);
+                    }
                     let state = journal.job(job)?.map(|s| s.job.state);
                     let events = journal.events(job, after, limit)?;
-                    Ok((state, events))
+                    Ok(Some((state, events)))
                 })
                 .await;
             let (state, mut events) = match read {
-                Ok(read) => read,
+                Ok(Some(read)) => read,
+                Ok(None) => {
+                    return Ok(FacadeAnswer::Events {
+                        job,
+                        events: Vec::new(),
+                        next: after,
+                        lagged: false,
+                        closed: Some("revoked".to_owned()),
+                    });
+                }
                 Err(AuthorityError::Unavailable(reason))
                     if reason.starts_with("no managed journal") =>
                 {
@@ -621,12 +643,11 @@ impl Node {
                     events,
                     next,
                     lagged,
-                    closed,
+                    closed: None,
                 });
             }
-            if closed.is_none() && matches!(state, JobState::Finished | JobState::Cancelled) {
-                closed = Some("finished".to_owned());
-            }
+            let closed = matches!(state, JobState::Finished | JobState::Cancelled)
+                .then(|| "finished".to_owned());
             if closed.is_some() || tokio::time::Instant::now() >= deadline {
                 return Ok(FacadeAnswer::Events {
                     job,
@@ -643,17 +664,6 @@ impl Node {
                     }
                 }
                 () = tokio::time::sleep_until(deadline.min(expiry)) => {}
-            }
-            let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let live = self.token_record(&bearer).await?;
-            let check = check_token(
-                live.as_ref(),
-                now_ms.saturating_add(elapsed),
-                JobAsk::Existing(job),
-                ResourceAsk::Nothing,
-            );
-            if check != TokenCheck::Ok {
-                closed = Some("revoked".to_owned());
             }
         }
     }
@@ -2319,15 +2329,31 @@ mod tests {
             .await
             .unwrap();
         assert!(revoked.revoked);
+        note(&node, job, 99).await;
         let answer = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .unwrap()
             .unwrap();
-        let FacadeAnswer::Events { events, closed, .. } = answer else {
+        let FacadeAnswer::Events {
+            events,
+            closed,
+            next: cursor,
+            ..
+        } = answer
+        else {
             panic!("not events: {answer:?}");
         };
+        assert_eq!(cursor, next);
         assert_eq!(closed.as_deref(), Some("revoked"));
         assert!(events.is_empty());
+        let queued = node
+            .facade_watch(bearer(1), NOW + 1_000, job, next, 0, NOW)
+            .await
+            .unwrap();
+        assert!(
+            matches!(queued, FacadeAnswer::Events { events, next: cursor, closed, .. }
+            if events.is_empty() && cursor == next && closed.as_deref() == Some("revoked"))
+        );
         refused_as(
             &submit(&node, &hex_of(1), "k2", "g").await,
             RefusalCode::Unauthorized,
